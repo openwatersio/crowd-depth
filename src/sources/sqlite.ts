@@ -4,6 +4,7 @@ import { Readable, Writable } from "stream";
 import { ServerAPI } from "@signalk/server-api";
 import { join } from "path";
 import { runMigrations } from "./sqlite/migrations.js";
+import { NODE_ENV } from "../constants.js";
 
 type BathymetryRow = {
   id: number;
@@ -15,9 +16,10 @@ type BathymetryRow = {
 };
 
 export function createSqliteSource(app: ServerAPI): BathymetrySource {
-  const filename = process.env.VITEST
-    ? ":memory:"
-    : join(app.getDataDirPath(), `bathymetry.sqlite`);
+  const filename =
+    NODE_ENV === "test"
+      ? ":memory:"
+      : join(app.getDataDirPath(), `bathymetry.sqlite`);
 
   app.debug(`Using SQLite source`);
   const db = createDB(filename);

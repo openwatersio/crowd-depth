@@ -1,4 +1,6 @@
-export const NODE_ENV = process.env.NODE_ENV || "development";
+export const NODE_ENV = process.env.VITEST
+  ? "test"
+  : process.env.NODE_ENV || "development";
 
 export const {
   BATHY_URL = NODE_ENV === "production"
