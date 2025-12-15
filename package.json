@@ -40,7 +40,7 @@
     "@types/express": "^4.17.21",
     "@types/geojson": "^7946.0.16",
     "@types/jsonwebtoken": "^9.0.10",
-    "@types/node": "^24.10.0",
+    "@types/node": "^25.0.2",
     "@types/stream-json": "^1.7.8",
     "@types/supertest": "^6.0.3",
     "eslint": "^9.39.1",
