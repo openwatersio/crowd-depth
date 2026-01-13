@@ -10,7 +10,7 @@ import { createReadStream, createWriteStream } from "fs";
 import { unlink } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
-import { createS3Storage } from "./storage/s3.js";
+import { createS3Storage, S3Config } from "./storage/s3.js";
 import { pipeline } from "stream/promises";
 
 // Validate required environment variables in production
@@ -30,6 +30,7 @@ const {
 export type APIOptions = {
   url?: string;
   token?: string;
+  env?: Record<string, string>;
 };
 
 export function createApi(options: APIOptions = {}): IRouter {
@@ -39,8 +40,12 @@ export function createApi(options: APIOptions = {}): IRouter {
 }
 
 export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
-  const { url = NOAA_CSB_URL, token = NOAA_CSB_TOKEN } = options;
-  const storage = createS3Storage();
+  const {
+    url = NOAA_CSB_URL,
+    token = NOAA_CSB_TOKEN,
+    env = process.env,
+  } = options;
+  const storage = createS3Storage(env as S3Config);
 
   router.get("/", (req, res) => {
     res.json({ success: true, message: "API is reachable" });

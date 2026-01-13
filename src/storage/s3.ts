@@ -3,11 +3,11 @@ import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { createReadStream } from "fs";
 
 export type S3Config = {
-  endpoint: string;
-  region: string;
-  accessKeyId: string;
-  secretAccessKey: string;
-  bucket: string;
+  S3_ENDPOINT: string;
+  S3_REGION: string;
+  S3_ACCESS_KEY_ID: string;
+  S3_SECRET_ACCESS_KEY: string;
+  S3_BUCKET: string;
 };
 
 export class S3Storage {
@@ -15,14 +15,14 @@ export class S3Storage {
   private bucket: string;
 
   constructor(config: S3Config) {
-    this.bucket = config.bucket;
+    this.bucket = config.S3_BUCKET;
     this.client = new S3Client({
-      region: config.region,
-      endpoint: config.endpoint,
+      region: config.S3_REGION,
+      endpoint: config.S3_ENDPOINT,
       forcePathStyle: true,
       credentials: {
-        accessKeyId: config.accessKeyId,
-        secretAccessKey: config.secretAccessKey,
+        accessKeyId: config.S3_ACCESS_KEY_ID,
+        secretAccessKey: config.S3_SECRET_ACCESS_KEY,
       },
     });
   }
@@ -65,36 +65,17 @@ export class S3Storage {
  * Create generic S3 storage from environment variables.
  * Required: S3_ENDPOINT, S3_REGION, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_BUCKET
  */
-export function createS3Storage(env = process.env): S3Storage | null {
-  const {
-    S3_ENDPOINT,
-    S3_REGION,
-    S3_ACCESS_KEY_ID,
-    S3_SECRET_ACCESS_KEY,
-    S3_BUCKET,
-  } = env;
-
+export function createS3Storage(
+  config: S3Config = process.env as S3Config,
+): S3Storage | null {
   if (
-    !S3_ENDPOINT ||
-    !S3_REGION ||
-    !S3_ACCESS_KEY_ID ||
-    !S3_SECRET_ACCESS_KEY ||
-    !S3_BUCKET
+    !config.S3_ENDPOINT ||
+    !config.S3_REGION ||
+    !config.S3_ACCESS_KEY_ID ||
+    !config.S3_SECRET_ACCESS_KEY ||
+    !config.S3_BUCKET
   ) {
     return null;
   }
-
-  return new S3Storage({
-    endpoint: S3_ENDPOINT,
-    region: S3_REGION,
-    accessKeyId: S3_ACCESS_KEY_ID,
-    secretAccessKey: S3_SECRET_ACCESS_KEY,
-    bucket: S3_BUCKET,
-  });
+  return new S3Storage(config);
 }
-
-/**
- * Backwards/compat convenience: Create Cloudflare R2 storage from environment variables.
- * R2-specific vars: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
- */
-// Removed createR2Storage in favor of generic createS3Storage
