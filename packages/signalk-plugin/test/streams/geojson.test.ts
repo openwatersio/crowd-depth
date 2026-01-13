@@ -1,9 +1,9 @@
 import { describe, expect, test } from "vitest";
-import { ToGeoJSON } from "../../src/streams/geojson.js";
+import { toGeoJSON } from "../../src/streams/geojson.js";
 import { Readable } from "stream";
 import { text } from "stream/consumers";
 
-describe("ToGeoJSON", () => {
+describe("toGeoJSON", () => {
   test("converts data", async () => {
     const data = [
       {
@@ -19,9 +19,14 @@ describe("ToGeoJSON", () => {
         timestamp: new Date("2025-08-06T23:00:00.000Z"),
       },
     ];
-    const result = await text(Readable.from(data).compose(new ToGeoJSON()));
+    const result = await text(
+      toGeoJSON(Readable.from(data), {
+        properties: { foo: "bar" },
+      }),
+    );
     expect(JSON.parse(result)).toEqual({
       type: "FeatureCollection",
+      properties: { foo: "bar" },
       features: [
         {
           type: "Feature",

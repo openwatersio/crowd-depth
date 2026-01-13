@@ -1,33 +1,18 @@
-import { Transform, TransformOptions } from "stream";
+import { Readable } from "stream";
 import { BathymetryData } from "../types.js";
 import * as GeoJSON from "geojson";
+import { JsonStreamStringify } from "json-stream-stringify";
+import chain from "stream-chain";
 
-export class ToGeoJSON extends Transform {
-  started = false;
-
-  constructor(options: TransformOptions = {}) {
-    super({
-      ...options,
-      readableObjectMode: false,
-      writableObjectMode: true,
-    });
-  }
-
-  _transform(
-    data: BathymetryData,
-    encoding: string,
-    callback: (error?: Error | null) => void,
-  ) {
-    this.push(this.started ? "," : '{"type": "FeatureCollection","features":[');
-    this.started = true;
-    this.push(JSON.stringify(toFeature(data)));
-    callback();
-  }
-
-  _flush(callback: (error?: Error | null) => void) {
-    this.push("]}");
-    callback();
-  }
+/**
+ * Converts BathymetryData objects into a GeoJSON FeatureCollection stream.
+ */
+export function toGeoJSON(data: Readable, additionalProperties: object = {}) {
+  return new JsonStreamStringify({
+    type: "FeatureCollection",
+    ...additionalProperties,
+    features: chain([data, toFeature]),
+  });
 }
 
 /** Converts a Bathymetry data point to a GeoJSON Feature */

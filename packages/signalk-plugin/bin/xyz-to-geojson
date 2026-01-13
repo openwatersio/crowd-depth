@@ -1,5 +1,5 @@
 #!/usr/bin/env node
 
-const { xyzToGeoJSON } = require("../dist/cli.js");
+import { xyzToGeoJSON } from "../dist/cli.js";
 
 xyzToGeoJSON();

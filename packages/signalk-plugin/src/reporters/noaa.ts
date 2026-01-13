@@ -2,10 +2,14 @@ import StreamFormData, { type SubmitOptions } from "form-data";
 import { toXyz } from "../streams/xyz.js";
 import { text } from "stream/consumers";
 import type { VesselInfo } from "../metadata.js";
-import type { Readable } from "stream";
+import { Readable } from "stream";
 import { Config } from "../config.js";
 import pkg from "../../package.json" with { type: "json" };
-import { correctForSensorPosition, toPrecision } from "../streams/index.js";
+import {
+  correctForSensorPosition,
+  toGeoJSON,
+  toPrecision,
+} from "../streams/index.js";
 import chain from "stream-chain";
 import createDebug from "debug";
 
@@ -99,6 +103,38 @@ export class NOAAReporter {
       Authorization: `Bearer ${this.vessel.token}`,
     });
   }
+}
+
+export function submitGeoJSON(
+  endpoint: string,
+  config: Config,
+  vessel: VesselInfo,
+  data: Readable,
+) {
+  const url = new URL("geojson", endpoint);
+  const { crs, ...properties }: Metadata = getMetadata(vessel, config);
+  const body = toGeoJSON(
+    chain([data, correctForSensorPosition(config), toPrecision()]),
+    {
+      crs,
+      properties: {
+        ...properties,
+        convention: "GeoJSON CSB 3.0",
+      },
+    },
+  );
+
+  return fetch(url.toString(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/geo+json",
+      Authorization: `Bearer ${vessel.token}`,
+    },
+    body: body as unknown as BodyInit,
+    // Required when sending a stream body
+    // @ts-expect-error: https://github.com/node-fetch/node-fetch/issues/1769
+    duplex: "half",
+  });
 }
 
 export type Metadata = ReturnType<typeof getMetadata>;
