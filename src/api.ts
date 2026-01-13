@@ -5,8 +5,13 @@ import jwt from "jsonwebtoken";
 import busboy from "busboy";
 import { text } from "stream/consumers";
 import { Metadata, submitFormData } from "./reporters/noaa.js";
-import { Readable, PassThrough } from "stream";
+import { Readable } from "stream";
+import { createReadStream, createWriteStream } from "fs";
+import { unlink } from "fs/promises";
+import { tmpdir } from "os";
+import { join } from "path";
 import { createS3Storage } from "./storage/s3.js";
+import { pipeline } from "stream/promises";
 
 // Validate required environment variables in production
 if (process.env.NODE_ENV === "production") {
@@ -73,21 +78,34 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
 
     const key = `${uuid}-${new Date().toISOString()}`;
 
-    // Duplicate the data stream for parallel operations
-    const dataForNOAA = new PassThrough();
-    const dataForStorage = new PassThrough();
-    data.pipe(dataForNOAA);
-    data.pipe(dataForStorage);
+    // Save data to a temporary file first
+    const tempFile = join(tmpdir(), `${key}.xyz`);
 
-    // Forward to NOAA and store in S3-compatible storage in parallel
-    const [submission] = await Promise.all([
-      submitFormData(new URL("xyz", url), key, metadata, dataForNOAA, {
-        "x-auth-token": token,
-      }),
-      storage?.store(key, metadata, dataForStorage),
-    ]);
+    try {
+      // Pipe the data to a temp file
+      await pipeline(data, createWriteStream(tempFile));
 
-    res.json(submission);
+      // Stream from the temp file to both NOAA and S3
+      const [submission] = await Promise.all([
+        submitFormData(
+          new URL("xyz", url),
+          key,
+          metadata,
+          createReadStream(tempFile),
+          {
+            "x-auth-token": token,
+          },
+        ),
+        storage?.store(key, metadata, tempFile),
+      ]);
+
+      res.json(submission);
+    } finally {
+      // Clean up the temporary file
+      await unlink(tempFile).catch(() => {
+        /* Ignore cleanup errors */
+      });
+    }
   });
 }
 

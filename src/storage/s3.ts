@@ -1,6 +1,6 @@
-import type { Readable } from "stream";
 import type { Metadata } from "../reporters/noaa.js";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { createReadStream } from "fs";
 
 export type S3Config = {
   endpoint: string;
@@ -31,9 +31,13 @@ export class S3Storage {
    * Store metadata and data files in the S3-compatible storage
    * @param key - The base key/path for the files (e.g., "uuid-timestamp")
    * @param metadata - The metadata object to store as JSON
-   * @param data - The CSV data stream
+   * @param tempFilePath - Path to the temporary CSV data file
    */
-  async store(key: string, metadata: Metadata, data: Readable): Promise<void> {
+  async store(
+    key: string,
+    metadata: Metadata,
+    tempFilePath: string,
+  ): Promise<void> {
     const jsonBody = Buffer.from(JSON.stringify(metadata, null, 2), "utf8");
     await this.client.send(
       new PutObjectCommand({
@@ -45,24 +49,15 @@ export class S3Storage {
       }),
     );
 
-    const csvBody = await this.toBuffer(data);
+    const csvStream = createReadStream(tempFilePath);
     await this.client.send(
       new PutObjectCommand({
         Bucket: this.bucket,
         Key: `${key}.csv`,
-        Body: csvBody,
+        Body: csvStream,
         ContentType: "text/csv",
-        ContentLength: csvBody.byteLength,
       }),
     );
-  }
-
-  private async toBuffer(stream: Readable): Promise<Buffer> {
-    const chunks: Buffer[] = [];
-    for await (const chunk of stream) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    }
-    return Buffer.concat(chunks);
   }
 }
 
