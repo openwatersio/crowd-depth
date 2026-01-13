@@ -5,7 +5,8 @@ import jwt from "jsonwebtoken";
 import busboy from "busboy";
 import { text } from "stream/consumers";
 import { Metadata, submitFormData } from "./reporters/noaa.js";
-import { Readable } from "stream";
+import { Readable, PassThrough } from "stream";
+import { createS3Storage } from "./storage/s3.js";
 
 // Validate required environment variables in production
 if (process.env.NODE_ENV === "production") {
@@ -34,6 +35,7 @@ export function createApi(options: APIOptions = {}): IRouter {
 
 export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
   const { url = NOAA_CSB_URL, token = NOAA_CSB_TOKEN } = options;
+  const storage = createS3Storage();
 
   router.get("/", (req, res) => {
     res.json({ success: true, message: "API is reachable" });
@@ -69,14 +71,21 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
         .json({ success: false, message: "Invalid uniqueID" });
     }
 
-    // Forward the submission to NOAA CSB
-    const submission = await submitFormData(
-      new URL("xyz", url),
-      `${uuid}-${new Date().toISOString()}`,
-      metadata,
-      data,
-      { "x-auth-token": token },
-    );
+    const key = `${uuid}-${new Date().toISOString()}`;
+
+    // Duplicate the data stream for parallel operations
+    const dataForNOAA = new PassThrough();
+    const dataForStorage = new PassThrough();
+    data.pipe(dataForNOAA);
+    data.pipe(dataForStorage);
+
+    // Forward to NOAA and store in S3-compatible storage in parallel
+    const [submission] = await Promise.all([
+      submitFormData(new URL("xyz", url), key, metadata, dataForNOAA, {
+        "x-auth-token": token,
+      }),
+      storage?.store(key, metadata, dataForStorage),
+    ]);
 
     res.json(submission);
   });
