@@ -18,7 +18,7 @@
     "eslint": "^9.39.1",
     "eslint-config-prettier": "^10.1.8",
     "supertest": "^7.1.0",
-    "vercel": "^48.10.7"
+    "vercel": "^50.3.2"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.940.0",
