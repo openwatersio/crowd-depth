@@ -26,17 +26,17 @@ function useApp(options: APIOptions = {}) {
   return request(express().use(createApi({ ...defaultOptions, ...options })));
 }
 
-describe("POST /xyz", () => {
+describe("POST /geojson", () => {
   test("rejects requests without token", async () => {
     await useApp()
-      .post("/xyz")
+      .post("/geojson")
       .expect(401)
       .expect({ success: false, message: "No token provided" });
   });
 
   test("rejects requests with malformed token", async () => {
     await useApp()
-      .post("/xyz")
+      .post("/geojson")
       .set("Authorization", "malformed-token")
       .expect(401)
       .expect({ success: false, message: "No token provided" });
@@ -44,7 +44,7 @@ describe("POST /xyz", () => {
 
   test("rejects requests with invalid token", async () => {
     await useApp()
-      .post("/xyz")
+      .post("/geojson")
       .set("Authorization", "Bearer invalid-token")
       .expect(403)
       .expect({ success: false, message: "Invalid token" });
@@ -52,7 +52,7 @@ describe("POST /xyz", () => {
 
   test("rejects requests with missing data", async () => {
     await useApp()
-      .post("/xyz")
+      .post("/geojson")
       .set("Authorization", `Bearer ${createIdentity(vessel.uuid).token}`)
       .expect(400)
       .expect({ success: false, message: "Missing Content-Type" });
@@ -63,15 +63,15 @@ describe("POST /xyz", () => {
     const { token } = createIdentity("WRONG");
 
     await useApp()
-      .post("/xyz")
+      .post("/geojson")
       .set("Authorization", `Bearer ${token}`)
       .field("metadataInput", JSON.stringify(metadata), {
         filename: "test.json",
         contentType: "application/json",
       })
       .field("file", "dummy data", {
-        filename: "test.xyz",
-        contentType: "application/csv",
+        filename: "test.json",
+        contentType: "application/geo+json",
       })
       .expect(403)
       .expect({ success: false, message: "Invalid uniqueID" });
@@ -79,7 +79,7 @@ describe("POST /xyz", () => {
 
   test("proxies to NOAA with valid token", async () => {
     const scope = nock("https://example.com")
-      .post("/xyz")
+      .post("/geojson")
       .matchHeader("x-auth-token", "test-token")
       .matchHeader("authorization", (val) => !val) // Ensure Authorization header is removed
       .reply(200, SUCCESS_RESPONSE, { "Content-Type": "application/json" });
@@ -87,19 +87,19 @@ describe("POST /xyz", () => {
     const metadata = getMetadata(vessel, config);
 
     await useApp()
-      .post("/xyz")
+      .post("/geojson")
       .set("Authorization", `Bearer ${createIdentity(vessel.uuid).token}`)
-      .field("metadataInput", JSON.stringify(metadata), {
+      .field("metadataInput", JSON.stringify(metadata.platform), {
         filename: "test.json",
         contentType: "application/json",
       })
       .field("file", "dummy data", {
-        filename: "test.xyz",
-        contentType: "application/csv",
+        filename: "test.json",
+        contentType: "application/geo+json",
       })
-      .expect("Content-Type", /json/)
       .expect(200)
-      .expect(SUCCESS_RESPONSE);
+      .expect(SUCCESS_RESPONSE)
+      .expect("Content-Type", /json/);
 
     expect(scope.isDone()).toBe(true);
   });
@@ -118,28 +118,26 @@ describe("POST /xyz", () => {
 
     // Mock NOAA endpoint
     const noaaScope = nock("https://example.com")
-      .post("/xyz")
+      .post("/geojson")
       .matchHeader("x-auth-token", "test-token")
       .reply(200, SUCCESS_RESPONSE, { "Content-Type": "application/json" });
 
     // Mock S3 PUT requests - AWS SDK signs and uses specific paths
     // We need to be lenient with the matching since AWS SDK adds auth headers
     const s3Scope = nock(env.S3_ENDPOINT)
-      .filteringPath(() => "/")
-      .put("/")
-      .times(2) // Expect 2 PUT calls (JSON and CSV)
+      .put(/^\/test-bucket\/\d{4}\/\d{2}\/\d{2}\/.*\.geojson\?x-id=PutObject$/)
       .reply(200);
 
     await useApp({ env })
-      .post("/xyz")
+      .post("/geojson")
       .set("Authorization", `Bearer ${createIdentity(vessel.uuid).token}`)
-      .field("metadataInput", JSON.stringify(metadata), {
+      .field("metadataInput", JSON.stringify(metadata.platform), {
         filename: "test.json",
         contentType: "application/json",
       })
       .field("file", "dummy data", {
         filename: "test.xyz",
-        contentType: "application/csv",
+        contentType: "application/geo+json",
       })
       .expect(200)
       .expect(SUCCESS_RESPONSE);

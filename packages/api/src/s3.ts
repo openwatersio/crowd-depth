@@ -1,4 +1,3 @@
-import type { Metadata } from "crowd-depth";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { createReadStream } from "fs";
 import createDebug from "debug";
@@ -32,40 +31,22 @@ export class S3Storage {
 
   /**
    * Store metadata and data files in the S3-compatible storage
-   * @param key - The base key/path for the files (e.g., "uuid-timestamp")
-   * @param metadata - The metadata object to store as JSON
-   * @param tempFilePath - Path to the temporary CSV data file
+   * @param uuid - The uuid of the vessel
+   * @param tempFilePath - Path to the temporary geojson file
    */
-  async store(
-    uuid: string,
-    metadata: Metadata,
-    tempFilePath: string,
-  ): Promise<void> {
+  async store(uuid: string, tempFilePath: string): Promise<void> {
     const key = generateKey(uuid);
 
-    debug("Storing files to S3 with key %s", key);
-    const jsonBody = Buffer.from(JSON.stringify(metadata, null, 2), "utf8");
-    const csvStream = createReadStream(tempFilePath);
+    debug("Storing to S3 with key %s", key);
 
-    await Promise.all([
-      this.client.send(
-        new PutObjectCommand({
-          Bucket: this.bucket,
-          Key: `${key}.json`,
-          Body: jsonBody,
-          ContentType: "application/json",
-          ContentLength: jsonBody.byteLength,
-        }),
-      ),
-      this.client.send(
-        new PutObjectCommand({
-          Bucket: this.bucket,
-          Key: `${key}.csv`,
-          Body: csvStream,
-          ContentType: "text/csv",
-        }),
-      ),
-    ]);
+    await this.client.send(
+      new PutObjectCommand({
+        Bucket: this.bucket,
+        Key: `${key}.geojson`,
+        Body: createReadStream(tempFilePath),
+        ContentType: "application/geo+json",
+      }),
+    );
   }
 }
 

@@ -4,7 +4,7 @@ import { v4 as uuidv4 } from "uuid";
 import jwt from "jsonwebtoken";
 import busboy from "busboy";
 import { text } from "stream/consumers";
-import { Metadata, submitFormData } from "crowd-depth";
+import { submitFormData } from "crowd-depth";
 import { Readable } from "stream";
 import { createReadStream, createWriteStream } from "fs";
 import { unlink } from "fs/promises";
@@ -65,14 +65,14 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
    * @see https://www.ncei.noaa.gov/sites/g/files/anmtlf171/files/2024-04/GuidanceforSubmittingCSBDataToTheIHODCDB%20%281%29.pdf
    */
   router.post(
-    "/xyz",
+    "/geojson",
     verifyIdentity,
     asyncHandler(async (req, res) => {
-      let metadata: Metadata;
+      let metadata: MultipartMetadata;
       let data: Readable;
 
       try {
-        [metadata, data] = await xyzFromRequest(req);
+        [metadata, data] = await getMultipartData(req);
       } catch (error) {
         res
           .status(400)
@@ -82,7 +82,7 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
 
       // Validate that the uniqueID matches the identity UUID
       const { uuid } = res.locals;
-      const uniqueID = metadata?.platform?.uniqueID;
+      const uniqueID = metadata?.uniqueID;
       if (uniqueID !== `SIGNALK-${uuid}`) {
         res.status(403).json({ success: false, message: "Invalid uniqueID" });
         return;
@@ -91,7 +91,7 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
       // Save data to a temporary file first
       const tempFile = join(
         tmpdir(),
-        `${new Date().toISOString()}-${uuid}.xyz`,
+        `${new Date().toISOString()}-${uuid}.geojson`,
       );
 
       try {
@@ -101,7 +101,7 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
         // Stream from the temp file to both NOAA and S3
         const [submission] = await Promise.all([
           submitFormData(
-            new URL("xyz", url),
+            new URL("geojson", url),
             uuid,
             metadata,
             createReadStream(tempFile),
@@ -109,7 +109,7 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
               "x-auth-token": token,
             },
           ),
-          storage?.store(uuid, metadata, tempFile),
+          storage?.store(uuid, tempFile),
         ]);
 
         res.json(submission);
@@ -134,11 +134,15 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
   );
 }
 
-export function xyzFromRequest(
+interface MultipartMetadata {
+  uniqueID: string;
+}
+
+export function getMultipartData(
   req: Request,
-): Promise<[metadata: Metadata, data: Readable]> {
+): Promise<[metadata: MultipartMetadata, data: Readable]> {
   return new Promise((resolve, reject) => {
-    let metadata: Metadata;
+    let metadata: MultipartMetadata;
     let data: Readable;
 
     // Resolve the promise when both metadata and data are received. The caller will read data from the stream.

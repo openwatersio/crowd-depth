@@ -1,5 +1,4 @@
 import StreamFormData, { type SubmitOptions } from "form-data";
-import { toXyz } from "../streams/xyz.js";
 import { text } from "stream/consumers";
 import type { VesselInfo } from "../metadata.js";
 import { Readable } from "stream";
@@ -24,7 +23,7 @@ export type SubmissionResponse = {
 export function submitFormData(
   url: URL,
   prefix: string,
-  metadata: Metadata,
+  metadata: object,
   file: Readable,
   headers: Record<string, string> = {},
 ): Promise<SubmissionResponse> {
@@ -38,8 +37,8 @@ export function submitFormData(
     });
 
     form.append("file", file, {
-      contentType: "application/csv",
-      filename: `${prefix}.csv`,
+      contentType: "application/geo+json",
+      filename: `${prefix}.geojson`,
     });
 
     const options: SubmitOptions = {
@@ -75,34 +74,6 @@ export function submitFormData(
       resolve(JSON.parse(await text(res)));
     });
   });
-}
-
-export class NOAAReporter {
-  constructor(
-    public url: string,
-    public config: Config,
-    public vessel: VesselInfo,
-  ) {}
-
-  correctors() {
-    return chain([correctForSensorPosition(this.config), toPrecision()]);
-  }
-
-  async submit(data: Readable) {
-    const url = new URL("xyz", this.url);
-    const metadata: Metadata = getMetadata(this.vessel, this.config);
-    const { uuid } = this.vessel;
-    const prefix = `${uuid}-${new Date().toISOString()}`;
-    const file = chain([
-      data,
-      this.correctors(),
-      toXyz({ includeHeading: false }),
-    ]);
-
-    return submitFormData(url, prefix, metadata, file, {
-      Authorization: `Bearer ${this.vessel.token}`,
-    });
-  }
 }
 
 export function submitGeoJSON(

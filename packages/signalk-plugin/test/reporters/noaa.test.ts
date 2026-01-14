@@ -1,6 +1,5 @@
 import { describe, test, expect } from "vitest";
 import {
-  NOAAReporter,
   getMetadata,
   BathymetryData,
   BATHY_URL,
@@ -39,49 +38,6 @@ const data: BathymetryData[] = [
     timestamp: new Date("2024-01-01T00:02:02Z"),
   },
 ];
-
-describe("submit", () => {
-  const reporter = new NOAAReporter(BATHY_URL, config, vessel);
-
-  test("success", async () => {
-    const scope = nock(BATHY_URL).post("/xyz").reply(200, SUCCESS_RESPONSE);
-    const res = await reporter.submit(Readable.from(data));
-    expect(res).toEqual(SUCCESS_RESPONSE);
-    expect(scope.isDone()).toBe(true);
-  });
-
-  test("bad stream", async () => {
-    const stream = new Readable({
-      read() {
-        this.emit("error", new Error("Stream error"));
-      },
-    });
-    await expect(reporter.submit(stream)).rejects.toThrowError("Stream error");
-  });
-
-  test("unauthorized", async () => {
-    const scope = nock(BATHY_URL)
-      .post("/xyz")
-      .reply(403, {
-        formErrors: ["Forbidden"],
-        fieldErrors: {},
-        message: "Forbidden",
-        success: false,
-      });
-    await expect(reporter.submit(Readable.from(data))).rejects.toThrowError(
-      /POST to.*failed: 403/,
-    );
-    expect(scope.isDone()).toBe(true);
-  });
-
-  test("bad response", async () => {
-    const scope = nock(BATHY_URL).post("/xyz").reply(500);
-    await expect(reporter.submit(Readable.from(data))).rejects.toThrowError(
-      /POST to.*failed: 500/,
-    );
-    expect(scope.isDone()).toBe(true);
-  });
-});
 
 describe("submitGeoJSON", () => {
   test("success", async () => {

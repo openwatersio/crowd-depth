@@ -1,4 +1,4 @@
-import { NOAAReporter } from "./noaa.js";
+import { submitGeoJSON } from "./noaa.js";
 import { Config } from "../config.js";
 import { ServerAPI } from "@signalk/server-api";
 import { CronJob } from "cron";
@@ -10,6 +10,7 @@ export * from "./noaa.js";
 
 export interface ReporterOptions {
   schedule?: string; // cron schedule string
+  url?: string; // URL of service
 }
 
 export function createReporter(
@@ -17,9 +18,8 @@ export function createReporter(
   config: Config,
   vessel: VesselInfo,
   source: BathymetrySource,
-  { schedule = BATHY_DEFAULT_SCHEDULE }: ReporterOptions = {},
+  { schedule = BATHY_DEFAULT_SCHEDULE, url = BATHY_URL }: ReporterOptions = {},
 ) {
-  const service = new NOAAReporter(BATHY_URL, config, vessel);
   const job = new CronJob(schedule, report);
 
   async function report({
@@ -32,9 +32,10 @@ export function createReporter(
     try {
       const data = await source.createReader({ from, to });
       app.debug(
-        `Reporting data from ${vessel.name} (${vessel.mmsi}) to ${service.url}`,
+        `Reporting data from ${vessel.name} (${vessel.mmsi}) to ${url}`,
       );
-      const submission = await service.submit(data);
+
+      const submission = await submitGeoJSON(url, config, vessel, data);
       app.debug("Submission response: %j", submission);
       app.setPluginStatus(`Reported at ${to.toISOString()}`);
       source.logReport?.({ from, to });
@@ -51,7 +52,7 @@ export function createReporter(
   return {
     start() {
       job.start();
-      app.debug(`Reporting to %s with schedule: %s`, service.url, schedule);
+      app.debug(`Reporting to %s with schedule: %s`, url, schedule);
       app.debug(`Next report at ${job.nextDate()}`);
       app.setPluginStatus(`Next report at ${job.nextDate()}`);
     },
