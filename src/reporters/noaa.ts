@@ -7,6 +7,9 @@ import { Config } from "../config.js";
 import pkg from "../../package.json" with { type: "json" };
 import { correctForSensorPosition, toPrecision } from "../streams/index.js";
 import chain from "stream-chain";
+import createDebug from "debug";
+
+const debug = createDebug("crowd-depth:noaa");
 
 export type SubmissionResponse = {
   success: boolean;
@@ -44,16 +47,21 @@ export function submitFormData(
       headers,
     };
 
+    debug("Submitting to %s", url.toString());
+
     form.submit(options, async (err, res) => {
       if (err) {
+        debug("Error submitting form data: %O", err);
         form.destroy(err);
         return reject(err);
       }
 
+      debug("Received response: %d %s", res.statusCode, res.statusMessage);
+
       if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
         return reject(
           new Error(
-            `Unexpected status code ${res.statusCode} ${res.statusMessage}`,
+            `POST to ${url} failed: ${res.statusCode} ${res.statusMessage}`,
           ),
         );
       }
