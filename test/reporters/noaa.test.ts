@@ -68,7 +68,7 @@ describe("submit", () => {
         success: false,
       });
     await expect(reporter.submit(Readable.from(data))).rejects.toThrowError(
-      "Unexpected status code 403 Forbidden",
+      /POST to.*failed: 403/,
     );
     expect(scope.isDone()).toBe(true);
   });
@@ -76,7 +76,7 @@ describe("submit", () => {
   test("bad response", async () => {
     const scope = nock(BATHY_URL).post("/xyz").reply(500);
     await expect(reporter.submit(Readable.from(data))).rejects.toThrowError(
-      "Unexpected status code 500 Internal Server Error",
+      /POST to.*failed: 500/,
     );
     expect(scope.isDone()).toBe(true);
   });

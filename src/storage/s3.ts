@@ -1,6 +1,9 @@
 import type { Metadata } from "../reporters/noaa.js";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { createReadStream } from "fs";
+import createDebug from "debug";
+
+const debug = createDebug("crowd-depth:s3");
 
 export type S3Config = {
   S3_ENDPOINT: string;
@@ -34,30 +37,35 @@ export class S3Storage {
    * @param tempFilePath - Path to the temporary CSV data file
    */
   async store(
-    key: string,
+    uuid: string,
     metadata: Metadata,
     tempFilePath: string,
   ): Promise<void> {
-    const jsonBody = Buffer.from(JSON.stringify(metadata, null, 2), "utf8");
-    await this.client.send(
-      new PutObjectCommand({
-        Bucket: this.bucket,
-        Key: `${key}.json`,
-        Body: jsonBody,
-        ContentType: "application/json",
-        ContentLength: jsonBody.byteLength,
-      }),
-    );
+    const key = generateKey(uuid);
 
+    debug("Storing files to S3 with key %s", key);
+    const jsonBody = Buffer.from(JSON.stringify(metadata, null, 2), "utf8");
     const csvStream = createReadStream(tempFilePath);
-    await this.client.send(
-      new PutObjectCommand({
-        Bucket: this.bucket,
-        Key: `${key}.csv`,
-        Body: csvStream,
-        ContentType: "text/csv",
-      }),
-    );
+
+    await Promise.all([
+      this.client.send(
+        new PutObjectCommand({
+          Bucket: this.bucket,
+          Key: `${key}.json`,
+          Body: jsonBody,
+          ContentType: "application/json",
+          ContentLength: jsonBody.byteLength,
+        }),
+      ),
+      this.client.send(
+        new PutObjectCommand({
+          Bucket: this.bucket,
+          Key: `${key}.csv`,
+          Body: csvStream,
+          ContentType: "text/csv",
+        }),
+      ),
+    ]);
   }
 }
 
@@ -75,7 +83,22 @@ export function createS3Storage(
     !config.S3_SECRET_ACCESS_KEY ||
     !config.S3_BUCKET
   ) {
+    debug("S3 storage not configured, missing environment variables");
     return null;
   }
+
+  debug(
+    "Using S3 storage with endpoint %s and bucket %s",
+    config.S3_ENDPOINT,
+    config.S3_BUCKET,
+  );
   return new S3Storage(config);
+}
+
+function generateKey(uuid: string) {
+  const now = new Date();
+  const [date, time] = now.toISOString().split("T");
+  const [y, m, d] = date.split("-");
+
+  return `${y}/${m}/${d}/${time}-${uuid}`;
 }

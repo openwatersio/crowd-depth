@@ -12,6 +12,10 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { createS3Storage, S3Config } from "./storage/s3.js";
 import { pipeline } from "stream/promises";
+import createDebug from "debug";
+import asyncHandler from "express-async-handler";
+
+const debug = createDebug("crowd-depth:api");
 
 // Validate required environment variables in production
 if (process.env.NODE_ENV === "production") {
@@ -60,58 +64,74 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
    *
    * @see https://www.ncei.noaa.gov/sites/g/files/anmtlf171/files/2024-04/GuidanceforSubmittingCSBDataToTheIHODCDB%20%281%29.pdf
    */
-  router.post("/xyz", verifyIdentity, async (req, res) => {
-    let metadata: Metadata;
-    let data: Readable;
+  router.post(
+    "/xyz",
+    verifyIdentity,
+    asyncHandler(async (req, res) => {
+      let metadata: Metadata;
+      let data: Readable;
 
-    try {
-      [metadata, data] = await xyzFromRequest(req);
-    } catch (error) {
-      return res
-        .status(400)
-        .json({ success: false, message: (error as Error).message });
-    }
+      try {
+        [metadata, data] = await xyzFromRequest(req);
+      } catch (error) {
+        res
+          .status(400)
+          .json({ success: false, message: (error as Error).message });
+        return;
+      }
 
-    // Validate that the uniqueID matches the identity UUID
-    const { uuid } = res.locals;
-    const uniqueID = metadata?.platform?.uniqueID;
-    if (uniqueID !== `SIGNALK-${uuid}`) {
-      return res
-        .status(403)
-        .json({ success: false, message: "Invalid uniqueID" });
-    }
+      // Validate that the uniqueID matches the identity UUID
+      const { uuid } = res.locals;
+      const uniqueID = metadata?.platform?.uniqueID;
+      if (uniqueID !== `SIGNALK-${uuid}`) {
+        res.status(403).json({ success: false, message: "Invalid uniqueID" });
+        return;
+      }
 
-    const key = `${uuid}-${new Date().toISOString()}`;
+      // Save data to a temporary file first
+      const tempFile = join(
+        tmpdir(),
+        `${new Date().toISOString()}-${uuid}.xyz`,
+      );
 
-    // Save data to a temporary file first
-    const tempFile = join(tmpdir(), `${key}.xyz`);
+      try {
+        // Pipe the data to a temp file
+        await pipeline(data, createWriteStream(tempFile));
 
-    try {
-      // Pipe the data to a temp file
-      await pipeline(data, createWriteStream(tempFile));
+        // Stream from the temp file to both NOAA and S3
+        const [submission] = await Promise.all([
+          submitFormData(
+            new URL("xyz", url),
+            uuid,
+            metadata,
+            createReadStream(tempFile),
+            {
+              "x-auth-token": token,
+            },
+          ),
+          storage?.store(uuid, metadata, tempFile),
+        ]);
 
-      // Stream from the temp file to both NOAA and S3
-      const [submission] = await Promise.all([
-        submitFormData(
-          new URL("xyz", url),
-          key,
-          metadata,
-          createReadStream(tempFile),
-          {
-            "x-auth-token": token,
-          },
-        ),
-        storage?.store(key, metadata, tempFile),
-      ]);
+        res.json(submission);
+      } finally {
+        // Clean up the temporary file
+        await unlink(tempFile).catch(() => {
+          /* Ignore cleanup errors */
+        });
+      }
+    }),
+  );
 
-      res.json(submission);
-    } finally {
-      // Clean up the temporary file
-      await unlink(tempFile).catch(() => {
-        /* Ignore cleanup errors */
-      });
-    }
+  router.all("/boom", () => {
+    throw new Error("Boom!");
   });
+
+  router.all(
+    "/async-boom",
+    asyncHandler(async () => {
+      throw new Error("Async Boom!");
+    }),
+  );
 }
 
 export function xyzFromRequest(
@@ -124,6 +144,7 @@ export function xyzFromRequest(
     // Resolve the promise when both metadata and data are received. The caller will read data from the stream.
     function resolveIfReady() {
       if (metadata && data) {
+        debug("Received both metadata and data, resolving...");
         resolve([metadata, data]);
       }
     }
@@ -131,6 +152,7 @@ export function xyzFromRequest(
     try {
       const body = busboy({ headers: req.headers });
       body.on("file", async (name, file) => {
+        debug("Received file field: %s", name);
         if (name === "metadataInput") {
           metadata = JSON.parse(await text(file));
         } else if (name === "file") {
@@ -170,11 +192,13 @@ export function verifyIdentity(
   res: Response,
   next: NextFunction,
 ) {
+  debug("Verifying identity for request to %s", req.path);
   // Get token from the Authorization header (e.g., "Bearer <token>")
   const authHeader = req.headers["authorization"];
   const token = authHeader && authHeader.split(" ")[1];
 
   if (!token) {
+    debug("No token provided");
     return res
       .status(401)
       .json({ success: false, message: "No token provided" });
@@ -183,10 +207,12 @@ export function verifyIdentity(
   // Verify the token
   jwt.verify(token, BATHY_JWT_SECRET, (err, decoded) => {
     if (err) {
+      debug("Invalid token: %s", err.message);
       return res.status(403).json({ success: false, message: "Invalid token" });
     }
     // If verification is successful, attach the decoded payload to the request
     if (typeof decoded === "object" && "uuid" in decoded) {
+      debug("Token verified for uuid: %s", decoded.uuid);
       res.locals.uuid = decoded.uuid;
     }
     next(); // Proceed to the next middleware or route handler
