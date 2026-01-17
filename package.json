@@ -6,8 +6,8 @@
     "test": "vitest",
     "build": "tsc -b",
     "format": "eslint --fix && prettier --write .",
-    "check": "eslint && prettier --check .",
-    "prepare": "husky && npm run build",
+    "check": "eslint && prettier --check . && npm run lint --workspaces --if-present",
+    "prepare": "husky",
     "start": "npm run start -w crowd-depth-api"
   },
   "devDependencies": {

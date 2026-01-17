@@ -14,8 +14,6 @@ import {
 } from "@signalk/server-api/history";
 import { Temporal } from "@js-temporal/polyfill";
 
-const DEFAULT_HOST = process.env.SIGNALK_HOST ?? "http://localhost:3000/";
-
 export async function createHistorySource(
   app: ServerAPI,
   config: Config,
@@ -133,15 +131,27 @@ type URLSearchParamsOptions = Record<string, any>;
  */
 export async function getHistoryAPI({
   app,
-  host = DEFAULT_HOST,
+  host = process.env.SIGNALK_HOST ?? "http://localhost:3000/",
 }: HistoryAPIOptions): Promise<HistoryApi | undefined> {
-  const api = await app.getHistoryApi?.();
-
-  // Check if there is a built-in history provider
-  if (api) {
+  try {
+    // Try to get the built-in history provider API first. It either returns the API or throws
+    // an error if no provider is configured. It will also throw if the API is not available.
+    const api = await app.getHistoryApi!();
     app.debug("Using built-in history provider");
     return api;
+  } catch {
+    // History provider API not available or no provider configured.
   }
+
+  try {
+    await getContexts();
+    app.debug("Using History API available at %s", host);
+  } catch {
+    app.debug("History API is not available");
+    return;
+  }
+
+  return { getValues, getContexts, getPaths };
 
   async function get(path: string, params: URLSearchParamsOptions = {}) {
     const url = new URL(path, new URL("/signalk/v1/history/", host));
@@ -178,16 +188,6 @@ export async function getHistoryAPI({
   function getPaths(query?: PathsRequest): Promise<PathsResponse> {
     return get("paths", query);
   }
-
-  try {
-    await getContexts();
-    app.debug("Using History API available at %s", host);
-  } catch {
-    app.debug("History API is not available");
-    return;
-  }
-
-  return { getValues, getContexts, getPaths };
 }
 
 function toTemporalInstant(date: Date): Temporal.Instant {

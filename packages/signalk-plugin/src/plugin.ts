@@ -2,7 +2,7 @@ import { ServerAPI, Plugin } from "@signalk/server-api";
 import { schema, Config } from "./config.js";
 import { createReporter } from "./reporters/index.js";
 import { createSqliteSource } from "./sources/sqlite.js";
-import { NODE_ENV } from "./constants.js";
+import { ENV } from "./constants.js";
 import { createHistorySource } from "./sources/history.js";
 import { createDB } from "./storage.js";
 import { join } from "path";
@@ -17,7 +17,7 @@ export default function createPlugin(app: ServerAPI): Plugin {
     description: "Collect and share depth data",
 
     async start(config: Config) {
-      app.debug("Starting (NODE_ENV=%s)", NODE_ENV);
+      app.debug("Starting (ENV=%s)", ENV);
 
       abortController = new AbortController();
       const db = createDB(join(app.getDataDirPath(), `bathymetry.sqlite`));
