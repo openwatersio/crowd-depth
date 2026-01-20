@@ -24,7 +24,6 @@ export async function createHistorySource(
 
   async function createReader({ from, to }: Timeframe) {
     app.debug("Reading history from %s to %s", from, to);
-    // @ts-expect-error: https://github.com/SignalK/signalk-server/pull/2264
     const req: ValuesRequest = {
       from: toTemporalInstant(from),
       to: toTemporalInstant(to),
@@ -85,8 +84,7 @@ export async function createHistorySource(
     to = new Date(),
     from = new Date(0),
   } = {}) {
-    // @ts-expect-error: https://github.com/SignalK/signalk-server/pull/2264
-    const res = await history.getValues({
+    const res = await history!.getValues({
       from: toTemporalInstant(from),
       to: toTemporalInstant(to),
       resolution: 86400, // 1 day
