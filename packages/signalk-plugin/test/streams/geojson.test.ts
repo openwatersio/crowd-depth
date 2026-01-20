@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 import { toGeoJSON } from "../../src/streams/geojson.js";
 import { Readable } from "stream";
 import { text } from "stream/consumers";
+import { Temporal } from "@js-temporal/polyfill";
 
 describe("toGeoJSON", () => {
   test("converts data", async () => {
@@ -10,13 +11,13 @@ describe("toGeoJSON", () => {
         longitude: 1,
         latitude: 2,
         depth: 3,
-        timestamp: new Date("2025-08-06T22:00:00.000Z"),
+        timestamp: Temporal.Instant.from("2025-08-06T22:00:00.000Z"),
       },
       {
         longitude: 4,
         latitude: 5,
         depth: 6,
-        timestamp: new Date("2025-08-06T23:00:00.000Z"),
+        timestamp: Temporal.Instant.from("2025-08-06T23:00:00.000Z"),
       },
     ];
     const result = await text(

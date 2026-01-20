@@ -1,6 +1,7 @@
 import { Transform } from "stream";
 import { BathymetryData } from "../types.js";
 import { parse } from "csv-parse";
+import { Temporal } from "@js-temporal/polyfill";
 
 /**
  * Converts BathymetryData to XYZ format.
@@ -24,7 +25,12 @@ export function toXyz({
     transform(data: BathymetryData, encoding, callback) {
       const { latitude, longitude, depth, timestamp, heading } = data;
       try {
-        const fields = [longitude, latitude, depth, timestamp.toISOString()];
+        const fields = [
+          longitude,
+          latitude,
+          depth,
+          timestamp.toString({ smallestUnit: "millisecond" }),
+        ];
         if (includeHeading) fields.push(heading ?? "");
         this.push(fields.join(",") + "\n");
         callback();
@@ -56,7 +62,7 @@ export function fromXyz() {
       if (context.header) return value;
       if (value === "") return undefined;
       if (context.column === "timestamp") {
-        return new Date(value);
+        return Temporal.Instant.from(value);
       } else {
         return Number(value);
       }

@@ -12,6 +12,7 @@ import { text } from "stream/consumers";
 import nock from "nock";
 import { config, vessel } from "../helper.js";
 import schema from "../../../../docs/CSB-schema-3_1_0-2024-04.json" with { type: "json" };
+import { Temporal } from "@js-temporal/polyfill";
 
 nock.disableNetConnect();
 
@@ -27,19 +28,19 @@ const data: BathymetryData[] = [
     longitude: -122.123,
     latitude: 37.123,
     depth: 10,
-    timestamp: new Date("2024-01-01T00:00:00Z"),
+    timestamp: Temporal.Instant.from("2024-01-01T00:00:00Z"),
   },
   {
     longitude: -122.124,
     latitude: 37.124,
     depth: 20,
-    timestamp: new Date("2024-01-01T00:01:01Z"),
+    timestamp: Temporal.Instant.from("2024-01-01T00:01:01Z"),
   },
   {
     longitude: -122.125,
     latitude: 37.125,
     depth: 30,
-    timestamp: new Date("2024-01-01T00:02:02Z"),
+    timestamp: Temporal.Instant.from("2024-01-01T00:02:02Z"),
   },
 ];
 

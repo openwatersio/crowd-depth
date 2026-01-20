@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 import { fromXyz, toXyz } from "../../src/streams/xyz.js";
 import { Readable } from "stream";
 import { text } from "stream/consumers";
+import { Temporal } from "@js-temporal/polyfill";
 
 describe("toXyz", () => {
   const data = [
@@ -9,13 +10,13 @@ describe("toXyz", () => {
       latitude: 1,
       longitude: 2,
       depth: 3,
-      timestamp: new Date("2025-08-06T22:00:00.000Z"),
+      timestamp: Temporal.Instant.from("2025-08-06T22:00:00.000Z"),
     },
     {
       latitude: 4,
       longitude: 5,
       depth: 6,
-      timestamp: new Date("2025-08-06T23:00:00.000Z"),
+      timestamp: Temporal.Instant.from("2025-08-06T23:00:00.000Z"),
       heading: 1.4,
     },
   ];
@@ -58,14 +59,14 @@ describe("FromXyz", () => {
         latitude: 1,
         longitude: 2,
         depth: 3,
-        timestamp: new Date("2025-08-06T22:00:00.000Z"),
+        timestamp: Temporal.Instant.from("2025-08-06T22:00:00.000Z"),
         heading: 2,
       },
       {
         latitude: 4,
         longitude: 5,
         depth: 6,
-        timestamp: new Date("2025-08-06T23:00:00.000Z"),
+        timestamp: Temporal.Instant.from("2025-08-06T23:00:00.000Z"),
         heading: undefined,
       },
     ]);
@@ -81,7 +82,7 @@ describe("FromXyz", () => {
         longitude: 1,
         latitude: 2,
         depth: 3,
-        timestamp: new Date("2025-08-06T22:00:00.000Z"),
+        timestamp: Temporal.Instant.from("2025-08-06T22:00:00.000Z"),
       },
     ]);
   });

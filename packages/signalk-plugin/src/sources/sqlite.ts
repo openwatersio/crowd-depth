@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import { BathymetryData, BathymetrySource } from "../types.js";
 import { Readable, Writable } from "stream";
 import { ServerAPI } from "@signalk/server-api";
+import { Temporal } from "@js-temporal/polyfill";
 
 type BathymetryRow = {
   id: number;
@@ -28,8 +29,8 @@ export function createSqliteSource(
 
 export interface SqliteReaderOptions {
   batchSize?: number;
-  from?: Date;
-  to?: Date;
+  from?: Temporal.Instant;
+  to?: Temporal.Instant;
 }
 
 type QueryOptions = {
@@ -43,18 +44,18 @@ export function createSqliteReader(
   db: Database.Database,
   options: SqliteReaderOptions = {},
 ) {
-  const { batchSize = 1000, from = new Date(0), to = new Date() } = options;
-  const timerange = {
-    from: from.valueOf(),
-    to: to.valueOf(),
-  };
+  const {
+    batchSize = 1000,
+    from = Temporal.Instant.fromEpochMilliseconds(0),
+    to = Temporal.Now.instant(),
+  } = options;
 
   const { count } = db
     .prepare<
-      typeof timerange,
+      { from: number; to: number },
       { count: number }
     >(`SELECT count(*) as count FROM bathymetry WHERE timestamp >= :from AND timestamp <= :to`)
-    .get(timerange)!;
+    .get({ from: from.epochMilliseconds, to: to.epochMilliseconds })!;
 
   if (count <= 0) return;
 
@@ -80,8 +81,8 @@ export function createSqliteReader(
       const rows = query.all({
         limit: batchSize,
         offset,
-        from: from.valueOf(),
-        to: to.valueOf(),
+        from: from.epochMilliseconds,
+        to: to.epochMilliseconds,
       });
 
       rows.forEach(({ longitude, latitude, depth, timestamp, heading }) => {
@@ -89,7 +90,7 @@ export function createSqliteReader(
           longitude,
           latitude,
           depth,
-          timestamp: new Date(timestamp),
+          timestamp: Temporal.Instant.fromEpochMilliseconds(timestamp),
           heading,
         } as BathymetryData);
       });
@@ -125,7 +126,7 @@ export function createSqliteWriter(db: Database.Database) {
           longitude: data.longitude,
           latitude: data.latitude,
           depth: data.depth,
-          timestamp: data.timestamp.valueOf(),
+          timestamp: data.timestamp.epochMilliseconds,
           heading: data.heading ?? null,
         });
         callback();

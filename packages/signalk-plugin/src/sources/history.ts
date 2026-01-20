@@ -25,8 +25,8 @@ export async function createHistorySource(
   async function createReader({ from, to }: Timeframe) {
     app.debug("Reading history from %s to %s", from, to);
     const req: ValuesRequest = {
-      from: toTemporalInstant(from),
-      to: toTemporalInstant(to),
+      from,
+      to,
       resolution: 1, // 1 second,
       pathSpecs: [
         { path: "navigation.position" as Path, aggregate: "first" },
@@ -62,7 +62,7 @@ export async function createHistorySource(
 
         if (depth !== null && longitude !== null && latitude !== null) {
           return {
-            timestamp: new Date(timestamp),
+            timestamp: Temporal.Instant.from(timestamp),
             longitude,
             latitude,
             depth,
@@ -83,15 +83,16 @@ export async function createHistorySource(
    * Get the list of dates that there is data for in the history.
    *
    * @param to - The end date of the range to get available dates for, defaults to now
-   * @param from - The start date of the range to get available dates for, defaults to `new Date(0)`
+   * @param from - The start date of the range to get available dates for, defaults to epoch
    */
   async function getAvailableDates({
-    to = new Date(),
-    from = new Date(0),
+    to = Temporal.Now.instant(),
+    from = Temporal.Instant.fromEpochMilliseconds(0),
   } = {}) {
-    const res = await history!.getValues({
-      from: toTemporalInstant(from),
-      to: toTemporalInstant(to),
+    // @ts-expect-error: https://github.com/SignalK/signalk-server/pull/2264
+    const res = await history.getValues({
+      from,
+      to,
       resolution: 86400, // 1 day
       pathSpecs: [
         {
@@ -103,7 +104,9 @@ export async function createHistorySource(
     });
 
     // Get days with depth data
-    return res.data.filter(([, v]) => v).map(([t]) => new Date(t));
+    return res.data
+      .filter(([, v]) => v)
+      .map((row) => Temporal.Instant.from(row[0]));
   }
 
   return {
@@ -196,8 +199,4 @@ export async function getHistoryAPI({
   function getPaths(query?: PathsRequest): Promise<PathsResponse> {
     return get("paths", query);
   }
-}
-
-function toTemporalInstant(date: Date): Temporal.Instant {
-  return Temporal.Instant.fromEpochMilliseconds(date.getTime());
 }

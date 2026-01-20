@@ -36,7 +36,7 @@ export function toFeature({
     },
     properties: {
       depth: depth,
-      time: timestamp.toISOString(),
+      time: timestamp.toString({ smallestUnit: "millisecond" }),
     },
   };
 }

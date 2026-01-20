@@ -4,6 +4,7 @@ import {
   getOffsets,
 } from "../../src/streams/transforms.js";
 import { getDistance } from "geolib";
+import { Temporal } from "@js-temporal/polyfill";
 
 describe("getOffsets", () => {
   test("same position", () => {
@@ -70,7 +71,7 @@ describe("correctForSensorPosition", () => {
     longitude: 1,
     heading: 0,
     depth: 1,
-    timestamp: new Date(),
+    timestamp: Temporal.Now.instant(),
   };
 
   test("no offset", () => {

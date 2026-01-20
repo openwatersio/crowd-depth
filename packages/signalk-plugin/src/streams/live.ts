@@ -1,6 +1,7 @@
 import { Context, Delta, Path, ServerAPI } from "@signalk/server-api";
 import { PassThrough } from "stream";
 import { Config } from "../config.js";
+import { Temporal } from "@js-temporal/polyfill";
 
 /** Maximum age of last position fix for a depth to be saved */
 const ttl = 2000;
@@ -30,7 +31,9 @@ export function createLiveStream(app: ServerAPI, config: Config) {
     (error) => app.error(error as string),
     (delta: Delta) => {
       delta.updates.forEach((update) => {
-        const timestamp = new Date(update.timestamp ?? Date.now());
+        const timestamp = Temporal.Instant.from(
+          update.timestamp ?? Temporal.Now.instant(),
+        );
         const position = app.getSelfPath("navigation.position");
         let heading = app.getSelfPath("navigation.headingTrue");
 
@@ -70,9 +73,14 @@ export function createLiveStream(app: ServerAPI, config: Config) {
   return stream;
 }
 
-function isStale(object: { timestamp: string }, timestamp: Date, ttl: number) {
+function isStale(
+  object: { timestamp: string },
+  timestamp: Temporal.Instant,
+  ttl: number,
+) {
   return (
     !object?.timestamp ||
-    new Date(object.timestamp).valueOf() < timestamp.valueOf() - ttl
+    Temporal.Instant.from(object.timestamp).epochMilliseconds <
+      timestamp.epochMilliseconds - ttl
   );
 }

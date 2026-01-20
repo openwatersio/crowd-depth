@@ -6,6 +6,7 @@ import { getVesselInfo } from "../metadata.js";
 import { BathymetrySource, Timeframe } from "../types.js";
 import { BATHY_URL, BATHY_DEFAULT_SCHEDULE } from "../constants.js";
 import type { Database } from "better-sqlite3";
+import { Temporal } from "@js-temporal/polyfill";
 
 export * from "./noaa.js";
 
@@ -33,20 +34,14 @@ export function createReporter({
   signal.addEventListener("abort", stop, { once: true });
 
   async function report({
-    from = reportLog.lastReport ?? new Date(0),
-    to = new Date(),
+    from = reportLog.lastReport ?? Temporal.Instant.fromEpochMilliseconds(0),
+    to = Temporal.Now.instant(),
   } = {}) {
-    app.debug(
-      `Generating report from ${from.toISOString()} to ${to.toISOString()}`,
-    );
+    app.debug(`Generating report from ${from} to ${to}`);
     try {
       const data = await source.createReader({ from, to });
       if (!data) {
-        app.debug(
-          "No data to report from %s to %s",
-          from.toISOString(),
-          to.toISOString(),
-        );
+        app.debug("No data to report from %s to %s", from, to);
         return;
       }
 
@@ -57,13 +52,13 @@ export function createReporter({
 
       const submission = await submitGeoJSON(url, config, vessel, data);
       app.debug("Submission response: %j", submission);
-      app.setPluginStatus(`Reported at ${to.toISOString()}`);
+      app.setPluginStatus(`Reported at ${to}`);
       reportLog.logReport({ from, to });
     } catch (err) {
       console.error(err);
       app.error(`Failed to generate or submit report: ${err}`);
       app.setPluginStatus(
-        `Failed to report at ${to.toISOString()}: ${(err as Error).message}`,
+        `Failed to report at ${to}: ${(err as Error).message}`,
       );
       throw err;
     }
@@ -73,13 +68,10 @@ export function createReporter({
     if (!source.getAvailableDates) return;
 
     for (const date of await source.getAvailableDates()) {
-      const from = new Date(date);
-      const to = new Date(date);
-      to.setUTCDate(to.getUTCDate() + 1);
+      const from = date;
+      const to = date.toZonedDateTimeISO("UTC").add({ days: 1 }).toInstant();
 
-      app.debug(
-        `Reporting back history date ${from.toISOString()} to ${to.toISOString()}`,
-      );
+      app.debug(`Reporting back history date ${from} to ${to}`);
       await report({ from, to });
     }
   }
@@ -92,10 +84,14 @@ export function createReporter({
   if (reportLog.lastReport) {
     job.start();
     app.debug(`Reporting to %s with schedule: %s`, url, schedule);
-    app.debug(
-      `Last report at ${reportLog.lastReport.toISOString()}, next report at ${job.nextDate()}`,
+    const nextDate = job.nextDate();
+    const nextReport = Temporal.Instant.fromEpochMilliseconds(
+      nextDate.toMillis(),
     );
-    app.setPluginStatus(`Next report at ${job.nextDate()}`);
+    app.debug(
+      `Last report at ${reportLog.lastReport}, next report at ${nextReport}`,
+    );
+    app.setPluginStatus(`Next report at ${nextReport}`);
   } else {
     app.debug("No previous report found, reporting back history");
     reportBackHistory().then(() => job.start());
@@ -112,11 +108,13 @@ export function createReportLogger(db: Database) {
 
   return {
     logReport({ from, to }: Timeframe) {
-      insert.run(from.valueOf(), to.valueOf());
+      insert.run(from.epochMilliseconds, to.epochMilliseconds);
     },
     get lastReport() {
       const row = select.get();
-      return row ? new Date(row.toTimestamp) : undefined;
+      return row
+        ? Temporal.Instant.fromEpochMilliseconds(row.toTimestamp)
+        : undefined;
     },
   };
 }
