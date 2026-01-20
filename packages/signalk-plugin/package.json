@@ -45,7 +45,7 @@
   },
   "dependencies": {
     "@js-temporal/polyfill": "^0.5",
-    "@signalk/server-api": "^2.10.1",
+    "@signalk/server-api": "^2.10.2",
     "better-sqlite3": "^12.4.1",
     "cron": "^4.3.4",
     "csv-parse": "^5.6.0",

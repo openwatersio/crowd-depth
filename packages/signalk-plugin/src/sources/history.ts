@@ -6,7 +6,6 @@ import {
   ContextsRequest,
   ContextsResponse,
   HistoryApi,
-  PathSpec,
   PathsRequest,
   PathsResponse,
   ValuesRequest,
@@ -25,37 +24,34 @@ export async function createHistorySource(
 
   async function createReader({ from, to }: Timeframe) {
     app.debug("Reading history from %s to %s", from, to);
-    const timerange = {
+    const req: ValuesRequest = {
       from: toTemporalInstant(from),
       to: toTemporalInstant(to),
+      pathSpecs: [
+        { path: "navigation.position" as Path, aggregate: "first" },
+        {
+          path: `environment.depth.${config.path}` as Path,
+          aggregate: "first",
+        },
+        {
+          path: "navigation.headingTrue" as Path,
+          aggregate: "first",
+        },
+      ],
     };
 
-    // @ts-expect-error: https://github.com/SignalK/signalk-server/pull/2264
-    const availablePaths = await history.getPaths(timerange);
+    let res: ValuesResponse;
 
-    const pathSpecs: PathSpec[] = [
-      { path: "navigation.position" as Path, aggregate: "first" },
-      {
-        path: `environment.depth.${config.path}` as Path,
-        aggregate: "first",
-      },
-    ];
-
-    // API returns an error if you request a path that doesn't exist
-    // https://github.com/tkurki/signalk-to-influxdb2/issues/99
-    if (availablePaths.includes("navigation.headingTrue" as Path)) {
-      pathSpecs.push({
-        path: "navigation.headingTrue" as Path,
-        aggregate: "first",
+    try {
+      res = await history!.getValues(req);
+    } catch {
+      // API returns an error if you request a path that doesn't exist, so try again without heading
+      // https://github.com/tkurki/signalk-to-influxdb2/issues/99
+      res = res = await history!.getValues({
+        ...req,
+        pathSpecs: req.pathSpecs.slice(0, 2),
       });
     }
-
-    // @ts-expect-error: https://github.com/SignalK/signalk-server/pull/2264
-    const res = await history.getValues({
-      ...timerange,
-      resolution: 1, // 1 second
-      pathSpecs,
-    });
 
     const data = res.data
       .map((row): BathymetryData | undefined => {
@@ -88,8 +84,7 @@ export async function createHistorySource(
     to = new Date(),
     from = new Date(0),
   } = {}) {
-    // @ts-expect-error: https://github.com/SignalK/signalk-server/pull/2264
-    const res = await history.getValues({
+    const res = await history!.getValues({
       from: toTemporalInstant(from),
       to: toTemporalInstant(to),
       resolution: 86400, // 1 day
