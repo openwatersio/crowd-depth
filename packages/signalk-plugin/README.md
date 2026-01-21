@@ -19,9 +19,9 @@ Configuring the plugin correctly is essential for accurate depth reporting.
 ## How it works
 
 1. **Collection** - Data is collected in one of two ways:
-1. If you're using a plugin that offers a History API (like [signalk-to-influxdb2](https://github.com/tkurki/signalk-to-influxdb2)), this plugin will not store any additional data, but will query the history API for depth/position data when it's time to report. Your historical data will also be reported.
-1. If no History API is available, the plugin will store depth/position data locally in a SQLite database.
-1. **Reporting** - Data will be reported on a schedule to the API. Each report signs the vessel identity and uploads a GeoJSON file to the trusted node API.
+   1. If you're using a plugin that offers a History API (like [signalk-to-influxdb2](https://github.com/tkurki/signalk-to-influxdb2)), this plugin will not store any additional data, but will query the history API for depth/position data when it's time to report. Your historical data will also be reported.
+   2. If no History API is available, the plugin will store depth/position data locally in a SQLite database.
+2. **Reporting** - Data will be reported on a schedule to the API. Each report signs the vessel identity and uploads a GeoJSON file to the trusted node API.
    1. Data is reported every day at midnight in your local timezone, but can be changed by setting a cron-style schedule in `BATHY_DEFAULT_SCHEDULE="0 0 * * *"` environment variable).
    2. The target endpoint defaults to `BATHY_URL` (production: `https://depth.openwaters.io`, otherwise `http://localhost:3001`). Override via environment variables on the Signal K host.
 
