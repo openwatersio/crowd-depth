@@ -12,11 +12,11 @@
   "devDependencies": {
     "@types/busboy": "^1.5.4",
     "@types/express": "^4.17.21",
-    "@types/express-requests-logger": "^4.0.0",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/supertest": "^6.0.3",
     "eslint": "^9.39.1",
     "eslint-config-prettier": "^10.1.8",
+    "pino-pretty": "^13.0.0",
     "supertest": "^7.1.0",
     "vercel": "^50.3.2"
   },
@@ -24,11 +24,11 @@
     "@aws-sdk/client-s3": "^3.940.0",
     "busboy": "^1.6.0",
     "crowd-depth": "*",
-    "debug": "^4.4.3",
     "express": "^4.21.2",
     "express-async-handler": "^1.2.0",
-    "express-requests-logger": "^4.0.3",
     "jsonwebtoken": "^9.0.2",
+    "pino": "^9.6.0",
+    "pino-http": "^11.0.0",
     "uuid": "^13.0.0"
   }
 }

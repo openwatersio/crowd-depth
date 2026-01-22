@@ -1,9 +1,11 @@
 import express from "express";
 import { createApi } from "./api.js";
-import logger from "express-requests-logger";
+import rootLogger from "./logger.js";
+import { pinoHttp } from "pino-http";
 
 const app = express();
-app.use(logger());
+
+app.use(pinoHttp({ logger: rootLogger }));
 app.use(createApi());
 
 export default app;

@@ -1,8 +1,8 @@
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { createReadStream } from "fs";
-import createDebug from "debug";
+import { getLogger } from "./logger.js";
 
-const debug = createDebug("crowd-depth:s3");
+const logger = getLogger("s3");
 
 export type S3Config = {
   S3_ENDPOINT: string;
@@ -37,7 +37,7 @@ export class S3Storage {
   async store(uuid: string, tempFilePath: string): Promise<void> {
     const key = generateKey(uuid);
 
-    debug("Storing to S3 with key %s", key);
+    logger.debug("Storing to S3 with key %s", key);
 
     await this.client.send(
       new PutObjectCommand({
@@ -64,11 +64,11 @@ export function createS3Storage(
     !config.S3_SECRET_ACCESS_KEY ||
     !config.S3_BUCKET
   ) {
-    debug("S3 storage not configured, missing environment variables");
+    logger.warn("S3 storage not configured, missing environment variables");
     return null;
   }
 
-  debug(
+  logger.debug(
     "Using S3 storage with endpoint %s and bucket %s",
     config.S3_ENDPOINT,
     config.S3_BUCKET,

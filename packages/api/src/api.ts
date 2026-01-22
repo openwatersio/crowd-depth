@@ -12,10 +12,10 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { createS3Storage, S3Config } from "./s3.js";
 import { pipeline } from "stream/promises";
-import createDebug from "debug";
 import asyncHandler from "express-async-handler";
+import { getLogger } from "./logger.js";
 
-const debug = createDebug("crowd-depth:api");
+const logger = getLogger("api");
 
 // Validate required environment variables in production
 if (process.env.NODE_ENV === "production") {
@@ -49,6 +49,9 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
     token = NOAA_CSB_TOKEN,
     env = process.env,
   } = options;
+
+  logger.info("API configured to use NOAA CSB URL: %s", url);
+
   const storage = createS3Storage(env as S3Config);
 
   router.get("/", (req, res) => {
@@ -74,6 +77,7 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
       try {
         [metadata, data] = await getMultipartData(req);
       } catch (error) {
+        logger.error(error);
         res
           .status(400)
           .json({ success: false, message: (error as Error).message });
@@ -113,6 +117,11 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
         ]);
 
         res.json(submission);
+      } catch (err) {
+        logger.error(err);
+        res
+          .status(500)
+          .json({ success: false, message: (err as Error).message });
       } finally {
         // Clean up the temporary file
         await unlink(tempFile).catch(() => {
@@ -148,7 +157,7 @@ export function getMultipartData(
     // Resolve the promise when both metadata and data are received. The caller will read data from the stream.
     function resolveIfReady() {
       if (metadata && data) {
-        debug("Received both metadata and data, resolving...");
+        logger.trace("Received both metadata and data, resolving...");
         resolve([metadata, data]);
       }
     }
@@ -156,7 +165,7 @@ export function getMultipartData(
     try {
       const body = busboy({ headers: req.headers });
       body.on("file", async (name, file) => {
-        debug("Received file field: %s", name);
+        logger.trace("Received file field: %s", name);
         if (name === "metadataInput") {
           metadata = JSON.parse(await text(file));
         } else if (name === "file") {
@@ -196,13 +205,13 @@ export function verifyIdentity(
   res: Response,
   next: NextFunction,
 ) {
-  debug("Verifying identity for request to %s", req.path);
+  logger.trace("Verifying identity for request to %s", req.path);
   // Get token from the Authorization header (e.g., "Bearer <token>")
   const authHeader = req.headers["authorization"];
   const token = authHeader && authHeader.split(" ")[1];
 
   if (!token) {
-    debug("No token provided");
+    logger.warn("No token provided");
     return res
       .status(401)
       .json({ success: false, message: "No token provided" });
@@ -211,12 +220,12 @@ export function verifyIdentity(
   // Verify the token
   jwt.verify(token, BATHY_JWT_SECRET, (err, decoded) => {
     if (err) {
-      debug("Invalid token: %s", err.message);
+      logger.warn({ message: "Invalid token: %s", err });
       return res.status(403).json({ success: false, message: "Invalid token" });
     }
     // If verification is successful, attach the decoded payload to the request
     if (typeof decoded === "object" && "uuid" in decoded) {
-      debug("Token verified for uuid: %s", decoded.uuid);
+      logger.debug("Token verified for uuid: %s", decoded.uuid);
       res.locals.uuid = decoded.uuid;
     }
     next(); // Proceed to the next middleware or route handler
@@ -224,6 +233,7 @@ export function verifyIdentity(
 }
 
 export function createIdentity(uuid = uuidv4()) {
+  logger.debug("Creating identity for uuid: %s", uuid);
   return {
     uuid,
     token: jwt.sign({ uuid }, BATHY_JWT_SECRET),
