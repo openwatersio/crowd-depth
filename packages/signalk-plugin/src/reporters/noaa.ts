@@ -1,4 +1,3 @@
-import StreamFormData, { type SubmitOptions } from "form-data";
 import { text } from "stream/consumers";
 import type { VesselInfo } from "../metadata.js";
 import { Readable } from "stream";
@@ -20,60 +19,47 @@ export type SubmissionResponse = {
   submissionIds: string[];
 };
 
-export function submitFormData(
+export async function submitFormData(
   url: URL,
   prefix: string,
   metadata: object,
   file: Readable,
   headers: Record<string, string> = {},
 ): Promise<SubmissionResponse> {
-  return new Promise<SubmissionResponse>((resolve, reject) => {
-    // Using external form-data package to support streaming
-    const form = new StreamFormData();
-    form.on("error", reject);
+  const form = new FormData();
 
-    form.append("metadataInput", JSON.stringify(metadata), {
-      contentType: "application/json",
-    });
+  form.append(
+    "metadataInput",
+    new Blob([JSON.stringify(metadata)], { type: "application/json" }),
+  );
 
-    form.append("file", file, {
-      contentType: "application/geo+json",
-      filename: `${prefix}.geojson`,
-    });
+  // The FormData api can't handle a stream and needs the full blob to
+  // determine the length for the multipart boundary. This previously
+  // used chunked encoding, but Vercel chokes on chunked multipart forms.
+  form.append(
+    "file",
+    new Blob([await text(file)], { type: "application/geo+json" }),
+    `${prefix}.geojson`,
+  );
 
-    const options: SubmitOptions = {
-      protocol: url.protocol === "https:" ? "https:" : "http:",
-      host: url.hostname,
-      path: url.pathname,
-      port: url.port,
-      method: "POST",
-      headers,
-    };
+  debug("Submitting to %s", url.toString());
 
-    debug("Submitting to %s", url.toString());
-
-    form.submit(options, async (err, res) => {
-      if (err) {
-        debug("Error submitting form data: %O", err);
-        form.destroy(err);
-        return reject(err);
-      }
-
-      debug("Received response: %d %s", res.statusCode, res.statusMessage);
-
-      if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
-        return reject(
-          new Error(
-            `POST to ${url} failed: ${res.statusCode} ${res.statusMessage}`,
-          ),
-        );
-      }
-
-      // Drain the response
-      res.resume();
-      resolve(JSON.parse(await text(res)));
-    });
+  const response = await fetch(url, {
+    method: "POST",
+    headers,
+    body: form,
   });
+
+  debug("Received response: %d %s", response.status, response.statusText);
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(
+      `POST to ${url} failed: ${response.status} ${response.statusText}\n${body}`,
+    );
+  }
+
+  return response.json();
 }
 
 export function createGeoJSON(

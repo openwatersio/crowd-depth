@@ -50,7 +50,6 @@
     "cron": "^4.3.4",
     "csv-parse": "^5.6.0",
     "debug": "^4.4.3",
-    "form-data": "^4.0.4",
     "geojson": "^0.5.0",
     "geolib": "^3.3.4",
     "json-stream-stringify": "^3.1.6",
