@@ -4,7 +4,11 @@ import { ServerAPI } from "@signalk/server-api";
 import { CronJob } from "cron";
 import { getVesselInfo } from "../metadata.js";
 import { BathymetrySource, Timeframe } from "../types.js";
-import { BATHY_URL, BATHY_DEFAULT_SCHEDULE } from "../constants.js";
+import {
+  BATHY_URL,
+  BATHY_DEFAULT_SCHEDULE,
+  BATHY_EPOCH,
+} from "../constants.js";
 import type { Database } from "better-sqlite3";
 import { Temporal } from "@js-temporal/polyfill";
 
@@ -34,7 +38,7 @@ export function createReporter({
   signal.addEventListener("abort", stop, { once: true });
 
   async function report({
-    from = reportLog.lastReport ?? Temporal.Instant.fromEpochMilliseconds(0),
+    from = reportLog.lastReport ?? BATHY_EPOCH,
     to = Temporal.Now.instant(),
   } = {}) {
     app.debug(`Generating report from ${from} to ${to}`);
@@ -64,10 +68,13 @@ export function createReporter({
     }
   }
 
-  async function reportBackHistory() {
+  async function reportBackHistory({
+    from = reportLog.lastReport ?? BATHY_EPOCH,
+    to = Temporal.Now.instant(),
+  } = {}) {
     if (!source.getAvailableDates) return;
 
-    for (const date of await source.getAvailableDates()) {
+    for (const date of await source.getAvailableDates({ from, to })) {
       const from = date;
       const to = date.toZonedDateTimeISO("UTC").add({ days: 1 }).toInstant();
 
@@ -81,19 +88,25 @@ export function createReporter({
     job.stop();
   }
 
-  if (reportLog.lastReport) {
+  if (
+    reportLog.lastReport &&
+    // Last report was within 24 hours
+    reportLog.lastReport > Temporal.Now.instant().subtract({ hours: 24 })
+  ) {
     job.start();
     app.debug(`Reporting to %s with schedule: %s`, url, schedule);
-    const nextDate = job.nextDate();
     const nextReport = Temporal.Instant.fromEpochMilliseconds(
-      nextDate.toMillis(),
+      job.nextDate().toMillis(),
     );
     app.debug(
       `Last report at ${reportLog.lastReport}, next report at ${nextReport}`,
     );
     app.setPluginStatus(`Next report at ${nextReport}`);
   } else {
-    app.debug("No previous report found, reporting back history");
+    app.debug(
+      "Last reported %, reporting back history",
+      reportLog.lastReport ?? "never",
+    );
     reportBackHistory().then(() => job.start());
   }
 }

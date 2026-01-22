@@ -32,7 +32,8 @@ export function correctForSensorPosition(config: SensorConfig) {
 
   return ({ heading, ...data }: BathymetryData) => {
     // No heading data provided, or no position offset, so position can't be corrected
-    if (heading === undefined || distance === 0) return data;
+    if (heading === undefined || !Number.isFinite(heading) || distance === 0)
+      return data;
 
     // Convert heading from radians to degrees, and adjust for the offset bearing
     const sensorBearing = ((heading * 180) / Math.PI + bearing) % 360;

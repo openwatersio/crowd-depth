@@ -1,3 +1,5 @@
+import { Temporal } from "@js-temporal/polyfill";
+
 const __filename = new URL(import.meta.url).pathname;
 const isInstalledAsModule = __filename.includes("/node_modules/");
 
@@ -22,3 +24,8 @@ export const {
     : "http://localhost:3001",
   BATHY_DEFAULT_SCHEDULE = "0 0 * * *", // every day at midnight
 } = process.env;
+
+// Earliest date for bathymetry data. signalk-to-influxdb was first released on 2017-06-28
+export const BATHY_EPOCH = Temporal.Instant.from(
+  process.env.BATHY_EPOCH ?? "2017-06-28T00:00:00Z",
+);

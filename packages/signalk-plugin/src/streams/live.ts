@@ -80,7 +80,7 @@ function isStale(
 ) {
   return (
     !object?.timestamp ||
-    Temporal.Instant.from(object.timestamp).epochMilliseconds <
-      timestamp.epochMilliseconds - ttl
+    Temporal.Instant.from(object.timestamp) <
+      timestamp.subtract({ milliseconds: ttl })
   );
 }

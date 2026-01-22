@@ -3,6 +3,7 @@ import { BathymetryData, BathymetrySource } from "../types.js";
 import { Readable, Writable } from "stream";
 import { ServerAPI } from "@signalk/server-api";
 import { Temporal } from "@js-temporal/polyfill";
+import { BATHY_EPOCH } from "../constants.js";
 
 type BathymetryRow = {
   id: number;
@@ -46,7 +47,7 @@ export function createSqliteReader(
 ) {
   const {
     batchSize = 1000,
-    from = Temporal.Instant.fromEpochMilliseconds(0),
+    from = BATHY_EPOCH,
     to = Temporal.Now.instant(),
   } = options;
 
