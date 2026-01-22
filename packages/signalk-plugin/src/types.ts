@@ -1,5 +1,7 @@
 import { Readable, Writable } from "stream";
 
+export type MaybePromise<T> = T | Promise<T>;
+
 export type Timeframe = { from: Date; to: Date };
 
 export type BathymetryData = {
@@ -12,6 +14,6 @@ export type BathymetryData = {
 
 export interface BathymetrySource {
   createWriter?: () => Writable;
-  createReader: (options: Timeframe) => Readable | Promise<Readable>;
+  createReader: (options: Timeframe) => MaybePromise<Readable | undefined>;
   getAvailableDates?(timeframe?: Partial<Timeframe>): Promise<Date[]>;
 }

@@ -41,6 +41,15 @@ export function createReporter({
     );
     try {
       const data = await source.createReader({ from, to });
+      if (!data) {
+        app.debug(
+          "No data to report from %s to %s",
+          from.toISOString(),
+          to.toISOString(),
+        );
+        return;
+      }
+
       const vessel = await getVesselInfo(app);
       app.debug(
         `Reporting data from ${vessel.name} (${vessel.mmsi}) to ${url}`,

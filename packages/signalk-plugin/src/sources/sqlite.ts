@@ -44,6 +44,19 @@ export function createSqliteReader(
   options: SqliteReaderOptions = {},
 ) {
   const { batchSize = 1000, from = new Date(0), to = new Date() } = options;
+  const timerange = {
+    from: from.valueOf(),
+    to: to.valueOf(),
+  };
+
+  const { count } = db
+    .prepare<
+      typeof timerange,
+      { count: number }
+    >(`SELECT count(*) as count FROM bathymetry WHERE timestamp >= :from AND timestamp <= :to`)
+    .get(timerange)!;
+
+  if (count <= 0) return;
 
   let offset = 0;
   let query: Database.Statement<QueryOptions, BathymetryRow>;

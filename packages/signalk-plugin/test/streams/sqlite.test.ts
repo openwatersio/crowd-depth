@@ -60,3 +60,14 @@ test("reading with from and to", async () => {
   expect(result.length).toBe(1);
   expect(result[0].timestamp).toEqual(data[1].timestamp);
 });
+
+test("reading with no data", async () => {
+  const source = createSqliteSource(app, createDB(":memory:"));
+
+  const reader = await source.createReader({
+    from: new Date("2025-08-06T22:30:00.000Z"),
+    to: new Date("2025-08-06T23:30:00.000Z"),
+  });
+
+  expect(reader).toBeUndefined();
+});

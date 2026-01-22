@@ -27,15 +27,17 @@ export async function createHistorySource(
     const req: ValuesRequest = {
       from: toTemporalInstant(from),
       to: toTemporalInstant(to),
+      resolution: 1, // 1 second,
       pathSpecs: [
         { path: "navigation.position" as Path, aggregate: "first" },
         {
           path: `environment.depth.${config.path}` as Path,
-          aggregate: "first",
+          // signalk-to-influxdb returns null when requesting `first`, so using `min` instead
+          aggregate: "min",
         },
         {
           path: "navigation.headingTrue" as Path,
-          aggregate: "first",
+          aggregate: "average",
         },
       ],
     };
@@ -55,7 +57,8 @@ export async function createHistorySource(
 
     const data = res.data
       .map((row): BathymetryData | undefined => {
-        const [timestamp, [longitude, latitude], depth, heading] = row;
+        const [timestamp, position, depth, heading] = row;
+        const [latitude, longitude] = position || [];
 
         if (depth !== null && longitude !== null && latitude !== null) {
           return {
@@ -70,6 +73,8 @@ export async function createHistorySource(
       .filter(Boolean);
 
     app.debug("Read %d bathymetry points from history", data.length);
+
+    if (data.length === 0) return;
 
     return Readable.from(data);
   }
@@ -91,12 +96,14 @@ export async function createHistorySource(
       pathSpecs: [
         {
           path: ("environment.depth." + config.path) as Path,
-          aggregate: "first",
+          // signalk-to-influxdb returns null when requesting `first`, so using `min` instead
+          aggregate: "min",
         },
       ],
     });
 
-    return res.data.map((row) => new Date(row[0]));
+    // Get days with depth data
+    return res.data.filter(([, v]) => v).map(([t]) => new Date(t));
   }
 
   return {
