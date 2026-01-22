@@ -73,19 +73,38 @@ export function createReporter({
     to = Temporal.Now.instant(),
   } = {}) {
     if (!source.getAvailableDates) return;
+    app.debug(
+      "Last reported %s, reporting back history",
+      reportLog.lastReport ?? "never",
+    );
 
     for (const date of await source.getAvailableDates({ from, to })) {
+      // Stop if plugin is stopped
+      if (signal.aborted) return;
+
       const from = date;
       const to = date.toZonedDateTimeISO("UTC").add({ days: 1 }).toInstant();
 
       app.debug(`Reporting back history date ${from} to ${to}`);
       await report({ from, to });
     }
+
+    app.debug("Back history reporting complete");
   }
 
   function stop() {
     app.debug(`Stopping reporter`);
     job.stop();
+  }
+
+  function start() {
+    job.start();
+    app.debug(
+      `Last report at %s, next report at %s`,
+      reportLog.lastReport,
+      job.nextDate(),
+    );
+    app.setPluginStatus(`Next report at ${job.nextDate()}`);
   }
 
   if (
@@ -94,21 +113,9 @@ export function createReporter({
     reportLog.lastReport.epochMilliseconds >
       Temporal.Now.instant().subtract({ hours: 24 }).epochMilliseconds
   ) {
-    job.start();
-    app.debug(`Reporting to %s with schedule: %s`, url, schedule);
-    const nextReport = Temporal.Instant.fromEpochMilliseconds(
-      job.nextDate().toMillis(),
-    );
-    app.debug(
-      `Last report at ${reportLog.lastReport}, next report at ${nextReport}`,
-    );
-    app.setPluginStatus(`Next report at ${nextReport}`);
+    start();
   } else {
-    app.debug(
-      "Last reported %, reporting back history",
-      reportLog.lastReport ?? "never",
-    );
-    reportBackHistory().then(() => job.start());
+    reportBackHistory().then(start);
   }
 }
 
