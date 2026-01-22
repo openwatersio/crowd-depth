@@ -12,6 +12,7 @@ import {
   ValuesResponse,
 } from "@signalk/server-api/history";
 import { Temporal } from "@js-temporal/polyfill";
+import { BATHY_EPOCH } from "../constants.js";
 
 export async function createHistorySource(
   app: ServerAPI,
@@ -82,12 +83,12 @@ export async function createHistorySource(
   /**
    * Get the list of dates that there is data for in the history.
    *
-   * @param to - The end date of the range to get available dates for, defaults to now
    * @param from - The start date of the range to get available dates for, defaults to epoch
+   * @param to - The end date of the range to get available dates for, defaults to now
    */
   async function getAvailableDates({
+    from = BATHY_EPOCH,
     to = Temporal.Now.instant(),
-    from = Temporal.Instant.fromEpochMilliseconds(0),
   } = {}) {
     // @ts-expect-error: https://github.com/SignalK/signalk-server/pull/2264
     const res = await history.getValues({
@@ -153,7 +154,7 @@ export async function getHistoryAPI({
 
   try {
     await getContexts({
-      from: Temporal.Instant.fromEpochMilliseconds(0),
+      from: BATHY_EPOCH,
       to: Temporal.Now.instant(),
     });
     app.debug("Using History API available at %s", host);
