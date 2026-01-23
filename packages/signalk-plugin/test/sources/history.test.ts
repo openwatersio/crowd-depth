@@ -3,6 +3,7 @@ import nock from "nock";
 import { Temporal } from "@js-temporal/polyfill";
 import { createHistorySource } from "../../src/sources/history.js";
 import { app, config } from "../helper.js";
+import { Timeframe } from "../../src/types.js";
 
 afterEach(() => {
   nock.cleanAll();
@@ -38,7 +39,7 @@ test("reads bathymetry from history http api", async () => {
     });
 
   const source = await createHistorySource(app, config, { host: `${host}/` });
-  const reader = await source?.createReader({ from, to });
+  const reader = await source?.createReader(new Timeframe(from, to));
 
   expect(reader).toBeDefined();
   const results = await reader!.toArray();
@@ -85,12 +86,29 @@ test("lists available history dates", async () => {
     });
 
   const source = await createHistorySource(app, config, { host: `${host}/` });
-  const dates = await source?.getAvailableDates?.({ from, to });
+  const dates = await source!.getAvailableTimeframes(
+    new Timeframe(from, to),
+    Temporal.Duration.from({ hours: 24 }),
+  );
 
-  expect(dates?.map((d) => d.toString())).toEqual([
-    "2025-01-01T00:00:00Z",
-    "2025-01-03T00:00:00Z",
-    "2025-01-04T00:00:00Z",
-  ]);
-  expect(nock.isDone()).toBe(true);
+  expect(dates).toBeDefined();
+  expect(dates).toHaveLength(3);
+  expect(dates![0].from).toEqual(
+    Temporal.Instant.from("2025-01-01T00:00:00.000Z"),
+  );
+  expect(dates![0].to).toEqual(
+    Temporal.Instant.from("2025-01-02T00:00:00.000Z"),
+  );
+  expect(dates![1].from).toEqual(
+    Temporal.Instant.from("2025-01-03T00:00:00.000Z"),
+  );
+  expect(dates![1].to).toEqual(
+    Temporal.Instant.from("2025-01-04T00:00:00.000Z"),
+  );
+  expect(dates![2].from).toEqual(
+    Temporal.Instant.from("2025-01-04T00:00:00.000Z"),
+  );
+  expect(dates![2].to).toEqual(
+    Temporal.Instant.from("2025-01-05T00:00:00.000Z"),
+  );
 });

@@ -86,20 +86,17 @@ export async function createHistorySource(
   }
 
   /**
-   * Get the list of dates that there is data for in the history.
-   *
-   * @param from - The start date of the range to get available dates for, defaults to epoch
-   * @param to - The end date of the range to get available dates for, defaults to now
+   * Get the list of timeframes that there is data for in the history.
    */
-  async function getAvailableDates({
-    from = BATHY_EPOCH,
-    to = Temporal.Now.instant(),
-  } = {}) {
+  async function getAvailableTimeframes(
+    timeframe: Timeframe,
+    windowSize: Temporal.Duration,
+  ) {
     // @ts-expect-error: https://github.com/SignalK/signalk-server/pull/2264
     const res = await history.getValues({
-      from,
-      to,
-      resolution: 86400, // 1 day
+      from: timeframe.from,
+      to: timeframe.to,
+      resolution: windowSize.total("seconds"),
       pathSpecs: [
         {
           path: ("environment.depth." + config.path) as Path,
@@ -112,14 +109,18 @@ export async function createHistorySource(
     // Get days with depth data
     return res.data
       .filter(([, v]) => Number.isFinite(v))
-      .map((row) => Temporal.Instant.from(row[0]));
+      .map((row) => {
+        const from = Temporal.Instant.from(row[0]);
+        const to = from.add(windowSize);
+        return new Timeframe(from, to);
+      });
   }
 
   return {
     // History providers handle the recording of data themselves
     createWriter: undefined,
     createReader,
-    getAvailableDates,
+    getAvailableTimeframes,
   };
 }
 

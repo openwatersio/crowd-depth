@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { BathymetryData, BathymetrySource } from "../types.js";
+import { BathymetryData, BathymetrySource, Timeframe } from "../types.js";
 import { Readable, Writable } from "stream";
 import { ServerAPI } from "@signalk/server-api";
 import { Temporal } from "@js-temporal/polyfill";
@@ -22,8 +22,38 @@ export function createSqliteSource(
 
   return {
     createWriter: () => createSqliteWriter(db),
+
     createReader(options) {
       return createSqliteReader(db, options);
+    },
+
+    getAvailableTimeframes(timeframe, windowSize) {
+      const fromMs = timeframe.from.epochMilliseconds;
+      const toMs = timeframe.to.epochMilliseconds;
+      const bucketMs = windowSize.total("milliseconds");
+
+      const stmt = db.prepare<
+        { from: number; to: number; bucket: number },
+        { idx: number }
+      >(
+        `
+          SELECT CAST(((timestamp - :from) / :bucket) AS INTEGER) AS idx
+          FROM bathymetry
+          WHERE timestamp >= :from AND timestamp < :to
+          GROUP BY idx
+          ORDER BY idx
+        `,
+      );
+
+      const rows = stmt.all({ from: fromMs, to: toMs, bucket: bucketMs });
+
+      return rows.map(({ idx }) => {
+        const start = Temporal.Instant.fromEpochMilliseconds(
+          fromMs + idx * bucketMs,
+        );
+        const end = start.add(windowSize);
+        return new Timeframe(start, end);
+      });
     },
   };
 }
