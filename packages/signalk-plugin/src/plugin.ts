@@ -7,6 +7,7 @@ import { createHistorySource } from "./sources/history.js";
 import { createDB } from "./storage.js";
 import { join } from "path";
 import { createCollector } from "./collector.js";
+import { createStatus } from "./status.js";
 
 export default function createPlugin(app: ServerAPI): Plugin {
   let abortController: AbortController | undefined = undefined;
@@ -18,13 +19,23 @@ export default function createPlugin(app: ServerAPI): Plugin {
 
     async start(config: Config) {
       app.debug("Starting (ENV=%s)", ENV);
+      const status = createStatus(app);
 
       abortController = new AbortController();
       const db = createDB(join(app.getDataDirPath(), `bathymetry.sqlite`));
-      const source =
-        (await createHistorySource(app, config)) ?? createSqliteSource(app, db);
+
+      // Try to create history source.
+      let source = await createHistorySource(app, config);
+
+      if (source) {
+        status.set({ usingHistory: true });
+      } else {
+        // No history source, fallback to sqlite.
+        source = createSqliteSource(app, db);
+      }
 
       if (source.createWriter) {
+        status.set({ collecting: true });
         createCollector({
           app,
           config,
@@ -38,12 +49,12 @@ export default function createPlugin(app: ServerAPI): Plugin {
         config,
         source,
         db,
+        status,
         signal: abortController.signal,
       });
     },
 
     stop() {
-      app.debug("Stopping");
       abortController?.abort("Stopping crowd-depth plugin");
     },
 

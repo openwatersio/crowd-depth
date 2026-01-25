@@ -2,6 +2,7 @@ import { Context, Delta, Path, ServerAPI } from "@signalk/server-api";
 import { PassThrough } from "stream";
 import { Config } from "../config.js";
 import { Temporal } from "@js-temporal/polyfill";
+import { BathymetryData } from "../types.js";
 
 /** Maximum age of last position fix for a depth to be saved */
 const ttl = 2000;
@@ -12,7 +13,7 @@ export function createLiveStream(app: ServerAPI, config: Config) {
   if (config.path === "belowTransducer") offset += config.sounder?.z ?? 0;
   if (config.path === "belowKeel") offset += config.sounder?.draft ?? 0;
 
-  app.debug(`Subscribing to ${path}`);
+  app.debug(`Collecting depth data from environment.depth.${path}`);
 
   const unsubscribes: (() => void)[] = [];
 
@@ -51,19 +52,28 @@ export function createLiveStream(app: ServerAPI, config: Config) {
             // 1. Only require heading if configured sensor offsets are significant
             // 2. Use dead reckoning to guess heading from last position
             if (!heading) {
-              app.debug("No heading data");
+              // No heading data
             } else if (isStale(heading, timestamp, ttl)) {
-              app.debug("Stale heading data");
+              app.debug("Stale heading data, discarding");
               heading = undefined;
             }
 
-            stream.push({
+            const data: BathymetryData = {
               longitude: position.value.longitude,
               latitude: position.value.latitude,
               depth,
               timestamp,
               heading: heading?.value,
-            });
+            };
+
+            app.debug(
+              "Collected depth: %dm at %d, %d",
+              data.depth.toFixed(2),
+              data.latitude.toFixed(6),
+              data.longitude.toFixed(6),
+            );
+
+            stream.push(data);
           });
         }
       });

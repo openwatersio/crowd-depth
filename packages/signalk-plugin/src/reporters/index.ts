@@ -12,6 +12,7 @@ import {
 } from "../constants.js";
 import type { Database } from "better-sqlite3";
 import { Temporal } from "@js-temporal/polyfill";
+import { Status } from "../status.js";
 
 export * from "./noaa.js";
 
@@ -20,6 +21,7 @@ export interface ReporterOptions {
   config: Config;
   source: BathymetrySource;
   db: Database;
+  status: Status;
   signal: AbortSignal;
   schedule?: string; // cron schedule string
   url?: string; // URL of service
@@ -30,6 +32,7 @@ export function createReporter({
   config,
   source,
   db,
+  status,
   signal,
   schedule = BATHY_DEFAULT_SCHEDULE,
   url = BATHY_URL,
@@ -63,15 +66,14 @@ export function createReporter({
 
       const submission = await submitGeoJSON(url, config, vessel, data);
       app.debug("Submission response: %j", submission);
-      app.setPluginStatus(`Reported at ${timeframe.to}`);
+      status.set({ lastReport: timeframe.to });
       reportLog.logReport(timeframe);
     } catch (err) {
-      console.error(err);
-      app.error(`Failed to generate or submit report: ${err}`);
-      app.setPluginStatus(
-        `Failed to report at ${timeframe.to}: ${(err as Error).message}`,
+      throw status.error(
+        new Error(`Failed to report to ${url}: ${(err as Error).message}`, {
+          cause: err,
+        }),
       );
-      throw err;
     }
   }
 
@@ -100,6 +102,15 @@ export function createReporter({
     app.debug("Back history reporting complete");
   }
 
+  function updateStatus() {
+    status.set({
+      lastReport: reportLog.lastReport,
+      nextReport: Temporal.Instant.fromEpochMilliseconds(
+        job.nextDate().toMillis(),
+      ),
+    });
+  }
+
   function stop() {
     app.debug(`Stopping reporter`);
     job.stop();
@@ -107,13 +118,7 @@ export function createReporter({
 
   function start() {
     job.start();
-
-    app.debug(
-      `Last report at %s, next report at %s`,
-      reportLog.lastReport,
-      job.nextDate(),
-    );
-    app.setPluginStatus(`Next report at ${job.nextDate()}`);
+    updateStatus();
   }
 
   if (
