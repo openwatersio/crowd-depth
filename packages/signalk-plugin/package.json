@@ -1,6 +1,6 @@
 {
   "name": "crowd-depth",
-  "version": "1.0.0-beta.12",
+  "version": "1.0.0",
   "description": "Collect and share depth data.",
   "keywords": [
     "bathymetry",
