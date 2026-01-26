@@ -60,7 +60,7 @@ export async function createHistorySource(
     const data = res.data
       .map((row): BathymetryData | undefined => {
         const [timestamp, position, depth, heading] = row;
-        const [latitude, longitude] = position || [];
+        const [longitude, latitude] = position || [];
 
         if (
           Number.isFinite(depth) &&

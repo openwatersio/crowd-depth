@@ -47,15 +47,15 @@ test("reads bathymetry from history http api", async () => {
   expect(results).toEqual([
     {
       timestamp: Temporal.Instant.from("2025-01-01T12:00:00.000Z"),
-      latitude: 1,
-      longitude: 2,
+      longitude: 1,
+      latitude: 2,
       depth: 3.2,
       heading: 90,
     },
     {
       timestamp: Temporal.Instant.from("2025-01-01T13:00:00.000Z"),
-      latitude: 4,
-      longitude: 5,
+      longitude: 4,
+      latitude: 5,
       depth: 6.7,
       heading: null,
     },
