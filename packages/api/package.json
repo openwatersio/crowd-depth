@@ -19,7 +19,7 @@
     "eslint-config-prettier": "^10.1.8",
     "pino-pretty": "^13.0.0",
     "supertest": "^7.1.0",
-    "vercel": "^50.3.2"
+    "vercel": "^53.0.1"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.940.0",
