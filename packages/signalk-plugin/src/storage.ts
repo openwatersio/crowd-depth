@@ -47,7 +47,11 @@ export function runMigrations(db: DatabaseSync, migrations: Migration[]) {
       db.exec(`PRAGMA user_version = ${version + i + 1}`);
       db.exec("COMMIT");
     } catch (err) {
-      db.exec("ROLLBACK");
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // Ignore rollback failures to avoid masking the original error.
+      }
       throw err;
     }
   });
