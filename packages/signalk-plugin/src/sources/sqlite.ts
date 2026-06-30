@@ -1,4 +1,4 @@
-import Database from "better-sqlite3";
+import { DatabaseSync, StatementSync } from "node:sqlite";
 import { BathymetryData, BathymetrySource, Timeframe } from "../types.js";
 import { Readable, Writable } from "stream";
 import { ServerAPI } from "@signalk/server-api";
@@ -16,7 +16,7 @@ type BathymetryRow = {
 
 export function createSqliteSource(
   app: ServerAPI,
-  db: Database.Database,
+  db: DatabaseSync,
 ): BathymetrySource {
   app.debug(`Using SQLite source`);
 
@@ -32,10 +32,7 @@ export function createSqliteSource(
       const toMs = timeframe.to.epochMilliseconds;
       const bucketMs = windowSize.total("milliseconds");
 
-      const stmt = db.prepare<
-        { from: number; to: number; bucket: number },
-        { idx: number }
-      >(
+      const stmt = db.prepare(
         `
           SELECT CAST(((timestamp - :from) / :bucket) AS INTEGER) AS idx
           FROM bathymetry
@@ -45,7 +42,9 @@ export function createSqliteSource(
         `,
       );
 
-      const rows = stmt.all({ from: fromMs, to: toMs, bucket: bucketMs });
+      const rows = stmt.all({ from: fromMs, to: toMs, bucket: bucketMs }) as {
+        idx: number;
+      }[];
 
       return rows.map(({ idx }) => {
         const start = Temporal.Instant.fromEpochMilliseconds(
@@ -64,15 +63,8 @@ export interface SqliteReaderOptions {
   to?: Temporal.Instant;
 }
 
-type QueryOptions = {
-  limit: number;
-  offset: number;
-  from?: number;
-  to?: number;
-};
-
 export function createSqliteReader(
-  db: Database.Database,
+  db: DatabaseSync,
   options: SqliteReaderOptions = {},
 ) {
   const {
@@ -82,16 +74,18 @@ export function createSqliteReader(
   } = options;
 
   const { count } = db
-    .prepare<
-      { from: number; to: number },
-      { count: number }
-    >(`SELECT count(*) as count FROM bathymetry WHERE timestamp >= :from AND timestamp <= :to`)
-    .get({ from: from.epochMilliseconds, to: to.epochMilliseconds })!;
+    .prepare(
+      `SELECT count(*) as count FROM bathymetry WHERE timestamp >= :from AND timestamp <= :to`,
+    )
+    .get({
+      from: from.epochMilliseconds,
+      to: to.epochMilliseconds,
+    }) as { count: number };
 
   if (count <= 0) return;
 
   let offset = 0;
-  let query: Database.Statement<QueryOptions, BathymetryRow>;
+  let query: StatementSync;
 
   return new Readable({
     objectMode: true,
@@ -114,7 +108,7 @@ export function createSqliteReader(
         offset,
         from: from.epochMilliseconds,
         to: to.epochMilliseconds,
-      });
+      }) as BathymetryRow[];
 
       rows.forEach(({ longitude, latitude, depth, timestamp, heading }) => {
         this.push({
@@ -133,8 +127,8 @@ export function createSqliteReader(
   });
 }
 
-export function createSqliteWriter(db: Database.Database) {
-  let stmt: Database.Statement<Omit<BathymetryRow, "id">>;
+export function createSqliteWriter(db: DatabaseSync) {
+  let stmt: StatementSync;
 
   return new Writable({
     objectMode: true,

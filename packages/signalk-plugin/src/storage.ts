@@ -1,8 +1,8 @@
-import Database from "better-sqlite3";
+import { DatabaseSync } from "node:sqlite";
 
-export function createDB(filename: string): Database.Database {
-  const db = new Database(filename);
-  db.pragma("journal_mode = WAL");
+export function createDB(filename: string): DatabaseSync {
+  const db = new DatabaseSync(filename);
+  db.exec("PRAGMA journal_mode = WAL");
 
   runMigrations(db, [
     () => {
@@ -34,14 +34,21 @@ export function createDB(filename: string): Database.Database {
   return db;
 }
 
-export type Migration = (db: Database.Database) => void;
+export type Migration = (db: DatabaseSync) => void;
 
-export function runMigrations(db: Database.Database, migrations: Migration[]) {
-  const version = db.pragma("user_version", { simple: true }) as number;
+export function runMigrations(db: DatabaseSync, migrations: Migration[]) {
+  const { user_version: version } = db.prepare("PRAGMA user_version").get() as {
+    user_version: number;
+  };
   migrations.slice(version).forEach((migration, i) => {
-    db.transaction(() => {
+    db.exec("BEGIN");
+    try {
       migration(db);
-      db.pragma(`user_version = ${version + i + 1}`);
-    })();
+      db.exec(`PRAGMA user_version = ${version + i + 1}`);
+      db.exec("COMMIT");
+    } catch (err) {
+      db.exec("ROLLBACK");
+      throw err;
+    }
   });
 }
