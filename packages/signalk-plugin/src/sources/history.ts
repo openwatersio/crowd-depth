@@ -1,7 +1,7 @@
-import { Config } from "../config.js";
+import { Config, resolveSource } from "../config.js";
 import { Readable } from "stream";
 import { BathymetryData, BathymetrySource, Timeframe } from "../types.js";
-import { Path, ServerAPI } from "@signalk/server-api";
+import { Path, ServerAPI, SourceRef } from "@signalk/server-api";
 import {
   ContextsRequest,
   ContextsResponse,
@@ -26,21 +26,38 @@ export async function createHistorySource(
 
   async function createReader({ from, to }: Timeframe) {
     app.debug("Reading history from %s to %s", from, to);
+
+    // Pin position and depth each to a single source (the configured one, else
+    // the source Signal K prioritizes). A vessel can carry more than one GPS,
+    // and their antenna offsets differ, so mixing sources would smear the
+    // soundings' locations.
+    const depthPath = `environment.depth.${config.path}`;
+    const positionSource = resolveSource(
+      app,
+      config.gnss?.source,
+      "navigation.position",
+    );
+    const depthSource = resolveSource(app, config.sounder?.source, depthPath);
+
     const req: ValuesRequest = {
       from,
       to,
-      resolution: 1, // 1 second,
+      // 1s buckets: position updates ~1/s, so each bucket pairs a depth sounding
+      // with a position fix. Finer loses fixes; coarser downsamples soundings.
+      resolution: 1,
       pathSpecs: [
         {
           path: "navigation.position" as Path,
           aggregate: "first",
           parameter: [],
+          ...(positionSource ? { sourceRef: positionSource as SourceRef } : {}),
         },
         {
-          path: `environment.depth.${config.path}` as Path,
+          path: depthPath as Path,
           // signalk-to-influxdb returns null when requesting `first`, so using `min` instead
           aggregate: "min",
           parameter: [],
+          ...(depthSource ? { sourceRef: depthSource as SourceRef } : {}),
         },
         {
           path: "navigation.headingTrue" as Path,
@@ -52,25 +69,20 @@ export async function createHistorySource(
 
     let res: ValuesResponse;
     let pathSpecs = req.pathSpecs;
-
     try {
       res = await history!.getValues(req);
     } catch {
-      // API returns an error if you request a path that doesn't exist, so try again without heading
+      // The provider throws if a requested path doesn't exist; retry without heading.
       // https://github.com/tkurki/signalk-to-influxdb2/issues/99
       pathSpecs = req.pathSpecs.slice(0, 2);
       res = await history!.getValues({ ...req, pathSpecs });
     }
 
-    // The history provider does not guarantee columns come back in the order
-    // requested: v2+ of signalk-to-influxdb2 may reorder them and omits a column
-    // entirely when there is no data for it. Map values to columns by path
-    // rather than by position. `res.values[i]` describes data column i + 1
-    // (column 0 is always the timestamp); providers that don't return `values`
-    // fall back to the requested order.
+    // Map columns by path rather than position: the provider may reorder them
+    // or omit one entirely when a bucket has no data for it.
     const columns = columnsByPath(res.values, pathSpecs);
     const positionColumn = columns.get("navigation.position");
-    const depthColumn = columns.get(`environment.depth.${config.path}`);
+    const depthColumn = columns.get(depthPath);
     const headingColumn = columns.get("navigation.headingTrue");
 
     const data = res.data
