@@ -108,7 +108,9 @@ export function schema(app: ServerAPI) {
     app.getSelfPath(`environment.depth.${path}.value`),
   );
   const positionSources = sourcesFor(app, "navigation.position");
-  const depthSources = sourcesFor(app, `environment.depth.${defaultPath}`);
+  const depthSources = defaultPath
+    ? sourcesFor(app, `environment.depth.${defaultPath}`)
+    : { selected: undefined, available: [] };
   return {
     type: "object",
     description:
