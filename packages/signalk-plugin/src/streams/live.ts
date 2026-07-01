@@ -35,8 +35,14 @@ export function createLiveStream(app: ServerAPI, config: Config) {
         const timestamp = Temporal.Instant.from(
           update.timestamp ?? Temporal.Now.instant(),
         );
-        const position = app.getSelfPath("navigation.position");
-        let heading = app.getSelfPath("navigation.headingTrue");
+        const position = app.getSelfPath("navigation.position") as
+          | {
+              value: { longitude: number; latitude: number };
+              timestamp: string;
+            }
+          | undefined;
+        let heading = app.getSelfPath("navigation.headingTrue") as
+          { value: number; timestamp: string } | undefined;
 
         if ("values" in update) {
           update.values.forEach(({ value }) => {

@@ -31,15 +31,21 @@ export async function createHistorySource(
       to,
       resolution: 1, // 1 second,
       pathSpecs: [
-        { path: "navigation.position" as Path, aggregate: "first" },
+        {
+          path: "navigation.position" as Path,
+          aggregate: "first",
+          parameter: [],
+        },
         {
           path: `environment.depth.${config.path}` as Path,
           // signalk-to-influxdb returns null when requesting `first`, so using `min` instead
           aggregate: "min",
+          parameter: [],
         },
         {
           path: "navigation.headingTrue" as Path,
           aggregate: "average",
+          parameter: [],
         },
       ],
     };
@@ -59,8 +65,13 @@ export async function createHistorySource(
 
     const data = res.data
       .map((row): BathymetryData | undefined => {
-        const [timestamp, position, depth, heading] = row;
-        const [longitude, latitude] = position || [];
+        const [timestamp, position, depth, heading] = row as unknown as [
+          string,
+          [number, number] | null,
+          number,
+          number | undefined,
+        ];
+        const [longitude, latitude] = position ?? [NaN, NaN];
 
         if (
           Number.isFinite(depth) &&
@@ -102,6 +113,7 @@ export async function createHistorySource(
           path: ("environment.depth." + config.path) as Path,
           // signalk-to-influxdb returns null when requesting `first`, so using `min` instead
           aggregate: "min",
+          parameter: [],
         },
       ],
     });
