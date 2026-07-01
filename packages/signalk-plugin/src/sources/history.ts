@@ -51,43 +51,57 @@ export async function createHistorySource(
     };
 
     let res: ValuesResponse;
+    let pathSpecs = req.pathSpecs;
 
     try {
       res = await history!.getValues(req);
     } catch {
       // API returns an error if you request a path that doesn't exist, so try again without heading
       // https://github.com/tkurki/signalk-to-influxdb2/issues/99
-      res = res = await history!.getValues({
-        ...req,
-        pathSpecs: req.pathSpecs.slice(0, 2),
-      });
+      pathSpecs = req.pathSpecs.slice(0, 2);
+      res = await history!.getValues({ ...req, pathSpecs });
     }
+
+    // The history provider does not guarantee columns come back in the order
+    // requested: v2+ of signalk-to-influxdb2 may reorder them and omits a column
+    // entirely when there is no data for it. Map values to columns by path
+    // rather than by position. `res.values[i]` describes data column i + 1
+    // (column 0 is always the timestamp); providers that don't return `values`
+    // fall back to the requested order.
+    const columns = columnsByPath(res.values, pathSpecs);
+    const positionColumn = columns.get("navigation.position");
+    const depthColumn = columns.get(`environment.depth.${config.path}`);
+    const headingColumn = columns.get("navigation.headingTrue");
 
     const data = res.data
       .map((row): BathymetryData | undefined => {
-        const [timestamp, position, depth, heading] = row as unknown as [
-          string,
-          [number, number] | null,
-          number,
-          number | undefined,
-        ];
-        const [longitude, latitude] = position ?? [NaN, NaN];
+        const depth = depthColumn === undefined ? undefined : row[depthColumn];
+        const heading =
+          headingColumn === undefined ? undefined : row[headingColumn];
+        const position =
+          positionColumn === undefined
+            ? undefined
+            : (row[positionColumn] as [number, number] | null | undefined);
+        const [longitude, latitude] = position ?? [];
 
         if (
+          typeof depth === "number" &&
           Number.isFinite(depth) &&
+          typeof longitude === "number" &&
           Number.isFinite(longitude) &&
+          typeof latitude === "number" &&
           Number.isFinite(latitude)
         ) {
           return {
-            timestamp: Temporal.Instant.from(timestamp),
+            timestamp: Temporal.Instant.from(row[0]),
             longitude,
             latitude,
             depth,
-            heading,
+            heading: typeof heading === "number" ? heading : undefined,
           };
         }
       })
-      .filter(Boolean);
+      .filter((point): point is BathymetryData => point !== undefined);
 
     app.debug("Read %d bathymetry points from history", data.length);
 
@@ -103,24 +117,30 @@ export async function createHistorySource(
     timeframe: Timeframe,
     windowSize: Temporal.Duration,
   ) {
+    const pathSpecs = [
+      {
+        path: ("environment.depth." + config.path) as Path,
+        // signalk-to-influxdb returns null when requesting `first`, so using `min` instead
+        aggregate: "min" as const,
+        parameter: [],
+      },
+    ];
     // @ts-expect-error: https://github.com/SignalK/signalk-server/pull/2264
     const res = await history.getValues({
       from: timeframe.from,
       to: timeframe.to,
       resolution: windowSize.total("seconds"),
-      pathSpecs: [
-        {
-          path: ("environment.depth." + config.path) as Path,
-          // signalk-to-influxdb returns null when requesting `first`, so using `min` instead
-          aggregate: "min",
-          parameter: [],
-        },
-      ],
+      pathSpecs,
     });
+
+    const depthColumn = columnsByPath(res.values, pathSpecs).get(
+      `environment.depth.${config.path}`,
+    );
+    if (depthColumn === undefined) return [];
 
     // Get days with depth data
     return res.data
-      .filter(([, v]) => Number.isFinite(v))
+      .filter((row) => Number.isFinite(row[depthColumn]))
       .map((row) => {
         const from = Temporal.Instant.from(row[0]);
         const to = from.add(windowSize);
@@ -218,4 +238,25 @@ export async function getHistoryAPI({
   function getPaths(query?: PathsRequest): Promise<PathsResponse> {
     return get("paths", query);
   }
+}
+
+/**
+ * Build a lookup from SignalK path to its column index in a history `DataRow`.
+ *
+ * `values[i]` describes data column `i + 1` (column 0 is always the timestamp),
+ * so the returned index can be used directly against a `DataRow`. The response's
+ * `values` metadata is authoritative — v2+ providers may reorder or drop columns
+ * — but providers that omit it fall back to the requested path order. When a
+ * path appears more than once the first matching column wins.
+ */
+function columnsByPath(
+  values: ValuesResponse["values"] | undefined,
+  requested: readonly { path: Path }[],
+): Map<string, number> {
+  const source = values && values.length ? values : requested;
+  const columns = new Map<string, number>();
+  source.forEach((column, i) => {
+    if (!columns.has(column.path)) columns.set(column.path, i + 1);
+  });
+  return columns;
 }
