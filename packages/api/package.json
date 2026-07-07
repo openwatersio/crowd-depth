@@ -25,7 +25,7 @@
     "@aws-sdk/client-s3": "^3.940.0",
     "busboy": "^1.6.0",
     "crowd-depth": "*",
-    "express": "^4.21.2",
+    "express": "^5.2.1",
     "express-async-handler": "^1.2.0",
     "jsonwebtoken": "^9.0.2",
     "pino": "^10.2.1",
