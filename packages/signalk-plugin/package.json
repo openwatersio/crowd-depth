@@ -1,6 +1,6 @@
 {
   "name": "crowd-depth",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Collect and share depth data.",
   "keywords": [
     "bathymetry",
@@ -38,24 +38,25 @@
     "lint": "tsc -b && publint --strict",
     "test": "vitest"
   },
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
     "@types/geojson": "^7946.0.16",
     "publint": "^0.3.16"
   },
   "dependencies": {
     "@js-temporal/polyfill": "^0.5",
-    "@signalk/server-api": "^2.10.2",
-    "better-sqlite3": "^12.4.1",
+    "@signalk/server-api": "^2.29.0",
     "cron": "^4.3.4",
     "csv-parse": "^5.6.0",
     "debug": "^4.4.3",
     "geojson": "^0.5.0",
     "geolib": "^3.3.4",
     "json-stream-stringify": "^3.1.6",
-    "stream-chain": "^3.4.0",
+    "stream-chain": "^4.2.5",
     "stream-transform": "^3.4.0",
-    "uuid": "^13.0.0"
+    "uuid": "^14.0.1"
   },
   "lint-staged": {
     "**/*": [

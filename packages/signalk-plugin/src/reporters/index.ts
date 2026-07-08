@@ -10,7 +10,7 @@ import {
   BATHY_EPOCH,
   BATHY_WINDOW_SIZE,
 } from "../constants.js";
-import type { Database } from "better-sqlite3";
+import type { DatabaseSync } from "node:sqlite";
 import { Temporal } from "@js-temporal/polyfill";
 import { Status } from "../status.js";
 
@@ -20,7 +20,7 @@ export interface ReporterOptions {
   app: ServerAPI;
   config: Config;
   source: BathymetrySource;
-  db: Database;
+  db: DatabaseSync;
   status: Status;
   signal: AbortSignal;
   schedule?: string; // cron schedule string
@@ -133,11 +133,11 @@ export function createReporter({
   }
 }
 
-export function createReportLogger(db: Database) {
+export function createReportLogger(db: DatabaseSync) {
   const insert = db.prepare(
     `INSERT INTO reports(fromTimestamp, toTimestamp) VALUES(?, ?)`,
   );
-  const select = db.prepare<[], { toTimestamp: number }>(
+  const select = db.prepare(
     `SELECT toTimestamp FROM reports ORDER BY toTimestamp DESC LIMIT 1`,
   );
 
@@ -146,7 +146,7 @@ export function createReportLogger(db: Database) {
       insert.run(from.epochMilliseconds, to.epochMilliseconds);
     },
     get lastReport() {
-      const row = select.get();
+      const row = select.get() as { toTimestamp: number } | undefined;
       return row
         ? Temporal.Instant.fromEpochMilliseconds(row.toTimestamp)
         : undefined;

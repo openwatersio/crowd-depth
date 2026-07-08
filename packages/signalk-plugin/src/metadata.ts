@@ -22,10 +22,12 @@ export async function getVesselInfo(app: ServerAPI): Promise<VesselInfo> {
     ...(await identify(app)),
     // @ts-expect-error remove after next signalk release
     mmsi: app.config.vesselMMSI,
-    imo: app.getSelfPath("registrations.imo"),
-    name: app.getSelfPath("name"),
-    loa: app.getSelfPath("design.length.value")?.overall,
-    type: app.getSelfPath("design.aisShipType.value")?.name,
+    imo: app.getSelfPath("registrations.imo") as string | undefined,
+    name: app.getSelfPath("name") as string | undefined,
+    loa: (app.getSelfPath("design.length.value") as { overall?: number })
+      ?.overall,
+    type: (app.getSelfPath("design.aisShipType.value") as { name?: string })
+      ?.name,
   };
 }
 

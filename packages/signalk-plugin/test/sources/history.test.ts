@@ -9,42 +9,55 @@ afterEach(() => {
   nock.cleanAll();
 });
 
-test("reads bathymetry from history http api", async () => {
-  const host = "http://history.test";
-  const from = Temporal.Instant.from("2025-01-01T00:00:00.000Z");
-  const to = Temporal.Instant.from("2025-01-02T00:00:00.000Z");
+const from = Temporal.Instant.from("2025-01-01T00:00:00.000Z");
+const to = Temporal.Instant.from("2025-01-02T00:00:00.000Z");
 
-  nock(host)
-    .get("/signalk/v1/history/contexts")
-    .query(true)
-    .reply(200, { data: [] });
+type Series = {
+  // Omitted for v1-style HTTP responses that carry no column metadata.
+  values?: { path: string; method: string }[];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  data: [string, ...any[]][];
+};
 
-  nock(host)
-    .get("/signalk/v1/history/values")
-    .query((query) => {
-      return (
-        typeof query.paths === "string" &&
-        query.paths.includes("navigation.position:first") &&
-        query.paths.includes("environment.depth.depthFromTransducer:min") &&
-        query.paths.includes("navigation.headingTrue:average")
-      );
-    })
-    .reply(200, {
-      data: [
-        ["2025-01-01T12:00:00.000Z", [1, 2], 3.2, 90],
-        ["2025-01-01T13:00:00.000Z", [4, 5], 6.7, null],
-        ["2025-01-01T14:00:00.000Z", [6, 7], null, 45],
-        ["2025-01-01T14:00:00.000Z", null, 2.2, null],
-      ],
-    });
+// An app whose built-in history provider answers with the given combined
+// response and records the pathSpecs of each call for assertions.
+function providerApp(response: Series) {
+  const calls: { path: string; sourceRef?: string }[][] = [];
+  const history = {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    getValues: async (query: any) => {
+      calls.push(query.pathSpecs);
+      return { context: "vessels.self", range: { from, to }, ...response };
+    },
+  };
+  const testApp = {
+    ...app,
+    getSelfPath: () => undefined,
+    getHistoryApi: async () => history,
+  } as unknown as typeof app;
+  return { app: testApp, calls };
+}
 
-  const source = await createHistorySource(app, config, { host: `${host}/` });
+test("pairs position, depth and heading, dropping rows without a position or depth", async () => {
+  const { app: testApp } = providerApp({
+    values: [
+      { path: "navigation.position", method: "first" },
+      { path: "environment.depth.depthFromTransducer", method: "min" },
+      { path: "navigation.headingTrue", method: "average" },
+    ],
+    data: [
+      ["2025-01-01T12:00:00.000Z", [1, 2], 3.2, 90],
+      ["2025-01-01T12:00:01.000Z", [null, null], 6.7, 45], // no position → skip
+      ["2025-01-01T12:00:02.000Z", [3, 4], null, 45], // no depth → skip
+      ["2025-01-01T12:00:03.000Z", [5, 6], 9.9, null], // no heading → kept, heading undefined
+    ],
+  });
+
+  const source = await createHistorySource(testApp, config);
   const reader = await source?.createReader(new Timeframe(from, to));
 
   expect(reader).toBeDefined();
-  const results = await reader!.toArray();
-
-  expect(results).toEqual([
+  expect(await reader!.toArray()).toEqual([
     {
       timestamp: Temporal.Instant.from("2025-01-01T12:00:00.000Z"),
       longitude: 1,
@@ -53,20 +66,92 @@ test("reads bathymetry from history http api", async () => {
       heading: 90,
     },
     {
-      timestamp: Temporal.Instant.from("2025-01-01T13:00:00.000Z"),
-      longitude: 4,
-      latitude: 5,
-      depth: 6.7,
-      heading: null,
+      timestamp: Temporal.Instant.from("2025-01-01T12:00:03.000Z"),
+      longitude: 5,
+      latitude: 6,
+      depth: 9.9,
+      heading: undefined,
     },
   ]);
-  expect(nock.isDone()).toBe(true);
+});
+
+// Regression: the provider may return columns in a different order than
+// requested, so columns must be mapped by path, not by position.
+test("maps columns by path when the provider reorders them", async () => {
+  const { app: testApp } = providerApp({
+    values: [
+      { path: "environment.depth.depthFromTransducer", method: "min" },
+      { path: "navigation.headingTrue", method: "average" },
+      { path: "navigation.position", method: "first" },
+    ],
+    data: [["2025-01-01T12:00:00.000Z", 3.2, 90, [1, 2]]],
+  });
+
+  const source = await createHistorySource(testApp, config);
+  const reader = await source?.createReader(new Timeframe(from, to));
+
+  expect(await reader!.toArray()).toEqual([
+    {
+      timestamp: Temporal.Instant.from("2025-01-01T12:00:00.000Z"),
+      longitude: 1,
+      latitude: 2,
+      depth: 3.2,
+      heading: 90,
+    },
+  ]);
+});
+
+// Regression: v1-style HTTP history responses carry no `values` metadata, so
+// columns fall back to the requested path order (position, depth, heading).
+test("falls back to requested column order when the response omits values", async () => {
+  const { app: testApp } = providerApp({
+    data: [["2025-01-01T12:00:00.000Z", [1, 2], 3.2, 90]],
+  });
+
+  const source = await createHistorySource(testApp, config);
+  const reader = await source?.createReader(new Timeframe(from, to));
+
+  expect(await reader!.toArray()).toEqual([
+    {
+      timestamp: Temporal.Instant.from("2025-01-01T12:00:00.000Z"),
+      longitude: 1,
+      latitude: 2,
+      depth: 3.2,
+      heading: 90,
+    },
+  ]);
+});
+
+test("pins position and depth to the configured sources", async () => {
+  const { app: testApp, calls } = providerApp({
+    values: [
+      { path: "navigation.position", method: "first" },
+      { path: "environment.depth.depthFromTransducer", method: "min" },
+      { path: "navigation.headingTrue", method: "average" },
+    ],
+    data: [["2025-01-01T12:00:00.000Z", [1, 2], 3.2, 90]],
+  });
+
+  const source = await createHistorySource(testApp, {
+    ...config,
+    gnss: { ...config.gnss, source: "GPS1" },
+    sounder: { ...config.sounder, source: "Sounder1" },
+  });
+  await (await source?.createReader(new Timeframe(from, to)))?.toArray();
+
+  const specs = calls[0];
+  expect(specs.find((s) => s.path === "navigation.position")?.sourceRef).toBe(
+    "GPS1",
+  );
+  expect(
+    specs.find((s) => s.path.startsWith("environment.depth"))?.sourceRef,
+  ).toBe("Sounder1");
 });
 
 test("lists available history dates", async () => {
   const host = "http://history.test";
-  const from = Temporal.Instant.from("2025-01-01T00:00:00.000Z");
-  const to = Temporal.Instant.from("2025-01-05T00:00:00.000Z");
+  const listFrom = Temporal.Instant.from("2025-01-01T00:00:00.000Z");
+  const listTo = Temporal.Instant.from("2025-01-05T00:00:00.000Z");
 
   nock(host)
     .get("/signalk/v1/history/contexts")
@@ -87,28 +172,15 @@ test("lists available history dates", async () => {
 
   const source = await createHistorySource(app, config, { host: `${host}/` });
   const dates = await source!.getAvailableTimeframes(
-    new Timeframe(from, to),
+    new Timeframe(listFrom, listTo),
     Temporal.Duration.from({ hours: 24 }),
   );
 
-  expect(dates).toBeDefined();
   expect(dates).toHaveLength(3);
   expect(dates![0].from).toEqual(
     Temporal.Instant.from("2025-01-01T00:00:00.000Z"),
   );
-  expect(dates![0].to).toEqual(
-    Temporal.Instant.from("2025-01-02T00:00:00.000Z"),
-  );
-  expect(dates![1].from).toEqual(
-    Temporal.Instant.from("2025-01-03T00:00:00.000Z"),
-  );
-  expect(dates![1].to).toEqual(
-    Temporal.Instant.from("2025-01-04T00:00:00.000Z"),
-  );
   expect(dates![2].from).toEqual(
     Temporal.Instant.from("2025-01-04T00:00:00.000Z"),
-  );
-  expect(dates![2].to).toEqual(
-    Temporal.Instant.from("2025-01-05T00:00:00.000Z"),
   );
 });

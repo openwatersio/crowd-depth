@@ -11,7 +11,7 @@
   },
   "devDependencies": {
     "@types/busboy": "^1.5.4",
-    "@types/express": "^4.17.21",
+    "@types/express": "^5.0.6",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/semver": "^7.7.1",
     "@types/supertest": "^7.2.0",
@@ -19,18 +19,18 @@
     "eslint-config-prettier": "^10.1.8",
     "pino-pretty": "^13.0.0",
     "supertest": "^7.1.0",
-    "vercel": "^50.3.2"
+    "vercel": "^54.20.0"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.940.0",
     "busboy": "^1.6.0",
     "crowd-depth": "*",
-    "express": "^4.21.2",
+    "express": "^5.2.1",
     "express-async-handler": "^1.2.0",
     "jsonwebtoken": "^9.0.2",
     "pino": "^10.2.1",
     "pino-http": "^11.0.0",
     "semver": "^7.7.3",
-    "uuid": "^13.0.0"
+    "uuid": "^14.0.1"
   }
 }
