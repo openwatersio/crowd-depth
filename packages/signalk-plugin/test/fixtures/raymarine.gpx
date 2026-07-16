@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" xmlns="http://www.topografix.com/GPX/1/1" xmlns:raymarine="http://www.raymarine.com/gpx">
+  <trk><name>Soundings</name><trkseg>
+    <trkpt lat="54.1000" lon="10.2000"><extensions><raymarine:WaterDepth>2.5</raymarine:WaterDepth><raymarine:WaterTemp>293.17</raymarine:WaterTemp></extensions></trkpt>
+    <trkpt lat="54.1001" lon="10.2001"><extensions><raymarine:WaterDepth>3.25</raymarine:WaterDepth></extensions></trkpt>
+    <trkpt lat="54.1002" lon="10.2002"><extensions><raymarine:WaterTemp>293.20</raymarine:WaterTemp></extensions></trkpt>
+  </trkseg></trk>
+</gpx>

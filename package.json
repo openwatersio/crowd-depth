@@ -8,7 +8,8 @@
     "format": "eslint --fix && prettier --write .",
     "check": "eslint && prettier --check . && npm run lint --workspaces --if-present",
     "prepare": "husky",
-    "start": "npm run start -w crowd-depth-api"
+    "start": "npm run start -w crowd-depth-api",
+    "crowd-depth-import": "tsx packages/signalk-plugin/src/importer/cli.ts"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",

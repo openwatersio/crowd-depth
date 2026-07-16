@@ -25,7 +25,8 @@
   },
   "types": "./dist/index.d.ts",
   "bin": {
-    "xyz-to-geojson": "bin/xyz-to-geojson"
+    "xyz-to-geojson": "bin/xyz-to-geojson",
+    "crowd-depth-import": "bin/crowd-depth-import"
   },
   "files": [
     "dist",
@@ -51,6 +52,7 @@
     "cron": "^4.3.4",
     "csv-parse": "^5.6.0",
     "debug": "^4.4.3",
+    "fast-xml-parser": "^5.3.1",
     "geojson": "^0.5.0",
     "geolib": "^3.3.4",
     "json-stream-stringify": "^3.1.6",
