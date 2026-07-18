@@ -5,31 +5,28 @@
   "scripts": {
     "test": "vitest",
     "build": "tsc -b",
-    "format": "eslint --fix && prettier --write .",
-    "check": "eslint && prettier --check . && npm run lint --workspaces --if-present",
+    "format": "oxlint --fix && prettier --write .",
+    "check": "oxlint && prettier --check . && npm run lint --workspaces --if-present",
     "prepare": "husky",
     "start": "npm run start -w crowd-depth-api"
   },
   "devDependencies": {
-    "@eslint/js": "^9.39.1",
     "@types/debug": "^4.1.12",
     "@types/node": "^26.1.0",
     "ajv": "^8.17.1",
-    "eslint": "^9.39.1",
-    "eslint-config-prettier": "^10.1.8",
     "husky": "^9.1.7",
     "lint-staged": "^17.0.8",
     "nock": "^14.0.10",
+    "oxlint": "^1.74.0",
     "prettier": "^3.6.2",
     "tsx": "^4.20.6",
     "typescript": "^7.0.2",
-    "typescript-eslint": "^8.46.3",
     "vitest": "^4.0.8"
   },
   "lint-staged": {
     "**/*": [
       "prettier --write --ignore-unknown",
-      "eslint --fix --no-warn-ignored"
+      "oxlint --fix --no-error-on-unmatched-pattern"
     ]
   },
   "workspaces": {
