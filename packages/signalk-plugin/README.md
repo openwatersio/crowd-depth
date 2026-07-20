@@ -45,3 +45,63 @@ From the root of the monorepo:
 
 - The plugin corrects depth positions using configured sensor offsets and marks data as unprocessed for tides/vertical datums.
 - Includes a helper CLI `xyz-to-geojson` (installed with the package) for converting XYZ files to GeoJSON.
+
+## Importing Raymarine GPX tracks
+
+The `crowd-depth-import` CLI imports Raymarine GPX trackpoints whose extensions
+contain `WaterDepth`. It uses the same `BathymetryData`, GeoJSON metadata,
+precision transform, identity, and upload reporter as the Signal K plugin.
+Namespace prefixes are ignored, so both `raymarine:WaterDepth` and an equivalent
+prefix work.
+
+From a development checkout:
+
+```sh
+npm run crowd-depth-import -- ./track.gpx \
+  --depth-reference belowTransducer \
+  --transducer-depth 0.45 \
+  --started-at 2025-07-12T08:30:00+02:00 \
+  --interval 1s \
+  --dry-run
+```
+
+Installed packages also expose the `crowd-depth-import` executable. Preview is
+the default, and **nothing is uploaded unless `--upload` is explicitly passed**.
+`--dry-run` merely makes that intention explicit. Use `--out result.geojson` to
+write the generated GeoJSON locally.
+
+### Required time information
+
+Times embedded in GPX trackpoints are preserved. If any imported point lacks a
+time, both `--started-at` (an ISO timestamp with offset) and `--interval` (for
+example `500ms`, `1s`, or `2m`) are mandatory. Synthetic times follow file
+order. The importer never silently invents timestamps.
+
+### Required depth reference
+
+`--depth-reference` is always mandatory:
+
+- `belowWaterline`: `WaterDepth` already measures from the waterline and is kept unchanged.
+- `belowTransducer`: also requires `--transducer-depth`; that positive waterline-to-transducer offset is added.
+- `belowKeel`: also requires `--draft`; that positive waterline-to-keel offset is added.
+
+All output is therefore waterline-referenced, matching the existing reporter's
+metadata. No tidal or vertical-datum correction is performed. Verify the GPX
+source setting and vessel offsets before upload; an incorrect reference cannot
+be recovered from the file itself.
+
+### Upload identity and duplicate protection
+
+Upload reuses the existing identity JSON (`uuid` and `token`). The default path
+is `~/.signalk/plugin-data/crowd-depth/identity.json`; override it with
+`--identity-file`. Override the normal plugin endpoint with `--api-base-url`.
+
+After a successful upload, a SHA-256 key covering the file and conversion
+options is recorded in `.crowd-depth-import-ledger.json`. Repeating the same
+upload is rejected. Use `--ledger-file` to place the ledger elsewhere. Preview
+and `--out` do not modify the ledger.
+
+Optional controls include `--dedupe-distance-meters` (off by default) and
+`--max-points` for probe imports. Dedupe only compares consecutive positions.
+`WaterTemp` is currently ignored. Missing heading is valid, so GNSS/sounder
+position correction is not applied to GPX imports.
