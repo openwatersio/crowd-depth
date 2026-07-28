@@ -3,6 +3,9 @@ import { DatabaseSync } from "node:sqlite";
 export function createDB(filename: string): DatabaseSync {
   const db = new DatabaseSync(filename);
   db.exec("PRAGMA journal_mode = WAL");
+  // Skip per-commit fsync so 1Hz depth inserts don't wear out SD cards (#100).
+  // WAL + NORMAL is durable against corruption; worst case loses recent rows on power loss.
+  db.exec("PRAGMA synchronous = NORMAL");
 
   runMigrations(db, [
     () => {
