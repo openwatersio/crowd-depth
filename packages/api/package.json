@@ -25,7 +25,6 @@
     "wrangler": "^4.115.0"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.940.0",
     "busboy": "^1.6.0",
     "crowd-depth": "*",
     "express": "^5.2.1",

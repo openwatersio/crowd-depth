@@ -254,17 +254,25 @@ describe("POST /geojson", () => {
     expect(scope.isDone()).toBe(true);
   });
 
-  // Point storage at our mocked S3 endpoint
-  const s3Env = {
-    S3_ENDPOINT: "https://s3.example.com",
-    S3_REGION: "us-east-1",
-    S3_ACCESS_KEY_ID: "test-key",
-    S3_SECRET_ACCESS_KEY: "test-secret",
-    S3_BUCKET: "test-bucket",
-  };
+  // In-memory storage fake standing in for the R2 binding
+  function fakeStorage() {
+    const stored: Array<{ uuid: string; data: Uint8Array }> = [];
+    const results: Array<{ key: string; result: object }> = [];
+    return {
+      stored,
+      results,
+      async store(uuid: string, data: Uint8Array) {
+        stored.push({ uuid, data });
+        return `2026/01/01/00:00:00.000Z-${uuid}`;
+      },
+      async storeResult(key: string, result: object) {
+        results.push({ key, result });
+      },
+    };
+  }
 
-  function postGeoJSON(uniqueID: string) {
-    return useApp({ env: s3Env })
+  function postGeoJSON(uniqueID: string, storage?: APIOptions["storage"]) {
+    return useApp({ storage })
       .post("/geojson")
       .set("Authorization", `Bearer ${createIdentity(vessel.uuid).token}`)
       .set(
@@ -281,8 +289,9 @@ describe("POST /geojson", () => {
       });
   }
 
-  test("stores data and result to S3-compatible endpoint", async () => {
+  test("stores data and result", async () => {
     const uniqueID = toUniqueID(vessel);
+    const storage = fakeStorage();
 
     // Mock NOAA endpoint
     const noaaScope = nock("https://example.com")
@@ -290,33 +299,21 @@ describe("POST /geojson", () => {
       .matchHeader("x-auth-token", "test-token")
       .reply(200, SUCCESS_RESPONSE, { "Content-Type": "application/json" });
 
-    // Mock S3 PUT requests - AWS SDK signs and uses specific paths
-    // We need to be lenient with the matching since AWS SDK adds auth headers
-    const s3Scope = nock(s3Env.S3_ENDPOINT)
-      .put(/^\/test-bucket\/\d{4}\/\d{2}\/\d{2}\/.*\.geojson\?x-id=PutObject$/)
-      .reply(200);
-
-    let result: Record<string, unknown> | undefined;
-    const resultScope = nock(s3Env.S3_ENDPOINT)
-      .put(/\.result\.json\?x-id=PutObject$/, (body) => {
-        result = body as Record<string, unknown>;
-        return true;
-      })
-      .reply(200);
-
-    await postGeoJSON(uniqueID).expect(200).expect(SUCCESS_RESPONSE);
+    await postGeoJSON(uniqueID, storage).expect(200).expect(SUCCESS_RESPONSE);
 
     expect(noaaScope.isDone()).toBe(true);
-    expect(s3Scope.isDone()).toBe(true);
-    expect(resultScope.isDone()).toBe(true);
-    expect(result).toMatchObject({
+    expect(storage.stored).toHaveLength(1);
+    expect(storage.stored[0].uuid).toBe(vessel.uuid);
+    expect(storage.results).toHaveLength(1);
+    expect(storage.results[0].key).toContain(vessel.uuid);
+    expect(storage.results[0].result).toMatchObject({
       success: true,
       uuid: vessel.uuid,
       uniqueID,
       submission: SUCCESS_RESPONSE,
     });
-    expect(result).toHaveProperty("bytes");
-    expect(result).toHaveProperty("durationMs");
+    expect(storage.results[0].result).toHaveProperty("bytes");
+    expect(storage.results[0].result).toHaveProperty("durationMs");
   });
 
   test("returns 500 when storage fails", async () => {
@@ -325,43 +322,32 @@ describe("POST /geojson", () => {
     // NOAA should never be called if the data couldn't be stored
     const noaaScope = nock("https://example.com").post("/geojson").reply(200);
 
-    const s3Scope = nock(s3Env.S3_ENDPOINT)
-      .put(/\.geojson\?x-id=PutObject$/)
-      .reply(403, "<Error><Code>AccessDenied</Code></Error>", {
-        "Content-Type": "application/xml",
-      });
+    const storage = {
+      async store(): Promise<string> {
+        throw new Error("AccessDenied");
+      },
+      async storeResult() {},
+    };
 
-    await postGeoJSON(uniqueID)
+    await postGeoJSON(uniqueID, storage)
       .expect(500)
       .expect((res) => {
         expect(res.body.success).toBe(false);
       });
 
-    expect(s3Scope.isDone()).toBe(true);
     expect(noaaScope.isDone()).toBe(false);
     nock.cleanAll();
   });
 
   test("stores failure result when NOAA rejects the submission", async () => {
     const uniqueID = toUniqueID(vessel);
+    const storage = fakeStorage();
 
     const noaaScope = nock("https://example.com")
       .post("/geojson")
       .reply(500, { message: "Internal Server Error", success: false });
 
-    const s3Scope = nock(s3Env.S3_ENDPOINT)
-      .put(/\.geojson\?x-id=PutObject$/)
-      .reply(200);
-
-    let result: Record<string, unknown> | undefined;
-    const resultScope = nock(s3Env.S3_ENDPOINT)
-      .put(/\.result\.json\?x-id=PutObject$/, (body) => {
-        result = body as Record<string, unknown>;
-        return true;
-      })
-      .reply(200);
-
-    await postGeoJSON(uniqueID)
+    await postGeoJSON(uniqueID, storage)
       .expect(502)
       .expect((res) => {
         expect(res.body.submissionId).toMatch(
@@ -370,16 +356,16 @@ describe("POST /geojson", () => {
       });
 
     expect(noaaScope.isDone()).toBe(true);
-    expect(s3Scope.isDone()).toBe(true);
-    expect(resultScope.isDone()).toBe(true);
-    expect(result).toMatchObject({
+    expect(storage.stored).toHaveLength(1);
+    expect(storage.results).toHaveLength(1);
+    expect(storage.results[0].result).toMatchObject({
       success: false,
       uuid: vessel.uuid,
       uniqueID,
       noaaStatus: 500,
     });
-    expect(result).toHaveProperty("noaaBody");
-    expect(result).toHaveProperty("message");
+    expect(storage.results[0].result).toHaveProperty("noaaBody");
+    expect(storage.results[0].result).toHaveProperty("message");
   });
 });
 

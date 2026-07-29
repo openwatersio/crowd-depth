@@ -6,7 +6,7 @@ import busboy from "busboy";
 import { buffer, text } from "stream/consumers";
 import { submitFormData, SubmissionError } from "crowd-depth";
 import { Readable } from "stream";
-import { createS3Storage, S3Config, type Storage } from "./s3.js";
+import type { Storage } from "./r2.js";
 import semver from "semver";
 import asyncHandler from "express-async-handler";
 import { getLogger } from "./logger.js";
@@ -36,8 +36,7 @@ export const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 export type APIOptions = {
   url?: string;
   token?: string;
-  env?: Record<string, string>;
-  storage?: Storage | null;
+  storage?: Storage;
 };
 
 export function createApi(options: APIOptions = {}): IRouter {
@@ -47,15 +46,9 @@ export function createApi(options: APIOptions = {}): IRouter {
 }
 
 export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
-  const {
-    url = NOAA_CSB_URL,
-    token = NOAA_CSB_TOKEN,
-    env = process.env,
-  } = options;
+  const { url = NOAA_CSB_URL, token = NOAA_CSB_TOKEN, storage } = options;
 
   logger.info("API configured to use NOAA CSB URL: %s", url);
-
-  const storage = options.storage ?? createS3Storage(env as S3Config);
 
   router.get("/", (req, res) => {
     res.json({ success: true, message: "API is reachable" });

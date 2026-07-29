@@ -1,7 +1,9 @@
-import { generateKey, type Storage } from "./s3.js";
 import { getLogger } from "./logger.js";
 
 const logger = getLogger("r2");
+
+/** What the API needs from a storage backend. */
+export type Storage = Pick<R2Storage, "store" | "storeResult">;
 
 // Structural subset of workerd's R2Bucket so this compiles without
 // @cloudflare/workers-types.
@@ -33,4 +35,12 @@ export class R2Storage implements Storage {
       httpMetadata: { contentType: "application/json" },
     });
   }
+}
+
+function generateKey(uuid: string) {
+  const now = new Date();
+  const [date, time] = now.toISOString().split("T");
+  const [y, m, d] = date.split("-");
+
+  return `${y}/${m}/${d}/${time}-${uuid}`;
 }
