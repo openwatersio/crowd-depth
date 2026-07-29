@@ -7,4 +7,5 @@
   "workers_dev": true,
   "preview_urls": true,
   "observability": { "enabled": true },
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "crowd-depth-injest" }],
 }

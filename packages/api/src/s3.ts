@@ -11,6 +11,9 @@ export type S3Config = {
   S3_BUCKET: string;
 };
 
+/** What the API needs from a storage backend (S3 SDK or R2 binding). */
+export type Storage = Pick<S3Storage, "store" | "storeResult">;
+
 export class S3Storage {
   private client: S3Client;
   private bucket: string;
@@ -93,7 +96,7 @@ export function createS3Storage(
   return new S3Storage(config);
 }
 
-function generateKey(uuid: string) {
+export function generateKey(uuid: string) {
   const now = new Date();
   const [date, time] = now.toISOString().split("T");
   const [y, m, d] = date.split("-");
