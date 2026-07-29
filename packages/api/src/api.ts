@@ -68,10 +68,10 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
   /**
    * API to proxy requests to NOAA CSB XYZ upload endpoint, with authentication.
    *
-   * @see "Guidance for Submitting CSB Data to the IHO DCDB" via
-   * https://www.ncei.noaa.gov/products/crowdsourced-bathymetry
-   * (the direct PDF link has percent-encoded characters that trip
-   * Cloudflare's WAF when uploaded in source maps)
+   * @see the "Guidance for Submitting Crowdsourced Bathymetry Data" link in
+   * the repo README. The PDF URL can't appear here: its percent-encoded
+   * characters trip Cloudflare's WAF when this comment is uploaded in the
+   * deploy's source map.
    */
   router.post(
     "/geojson",

@@ -37,7 +37,7 @@ See [NOAA's Crowdsourced Bathymetry Frequently Asked Questions](https://noaa-dcd
 ## Resources
 
 - [IHO Guidance to Crowdsourced Bathymetry](https://iho.int/uploads/user/pubs/bathy/B_12_CSB-Guidance_Document-Edition_3.0.0_Final.pdf)
-- [Guidance for Submitting Crowdsourced Bathymetry Data](https://www.ncei.noaa.gov/sites/g/files/anmtlf171/files/2024-04/GuidanceforSubmittingCSBDataToTheIHODCDB%20%281%29.pdf)
+- [Guidance for Submitting Crowdsourced Bathymetry Data](https://www.ncei.noaa.gov/sites/default/files/2025-07/Guidance%20for%20Submitting%20CSB%20Data%20to%20the%20IHODCDB_v2.0%20%283%29.pdf)
 - [Crowdsourced Bathymetry File Formats for Submission to the IHO Data Center for Digital Bathymetry](https://www.ncei.noaa.gov/sites/default/files/2024-04/SampleCSBFileFormats.pdf)
 - [Workshop on Crowdsourced Bathemtry (2024)](https://iho.int/uploads/user/Inter-Regional%20Coordination/CSBWG/CSBWG_IRCC_CSB_Workshop/IRCC_CSB_workshop_April24_Master.pdf)
 - [IHO Crowdsourced Bathymetry Trusted Node Agreement](https://www.ncei.noaa.gov/sites/default/files/2024-04/IHOCSBTrustedNodeAgreementFormTemplate.pdf)
