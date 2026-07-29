@@ -169,5 +169,7 @@ describe("describeSubmissionError", () => {
     expect(describeSubmissionError(new Error("fetch failed"))).toBe(
       "fetch failed",
     );
+    expect(describeSubmissionError("boom")).toBe("boom");
+    expect(describeSubmissionError(undefined)).toBe("undefined");
   });
 });

@@ -50,7 +50,7 @@ export function describeSubmissionError(err: unknown): string {
       // Body is not JSON; fall through to the raw error message
     }
   }
-  return (err as Error).message;
+  return err instanceof Error ? err.message : String(err);
 }
 
 export async function submitFormData(
@@ -87,9 +87,11 @@ export async function submitFormData(
   debug("Received response: %d %s", response.status, response.statusText);
 
   if (!response.ok) {
+    // Keep the body out of the message to avoid nested dumps when errors are
+    // re-reported; it is preserved in err.body and the archived result
     const body = await response.text();
     throw new SubmissionError(
-      `POST to ${url} failed: ${response.status} ${response.statusText}\n${body}`,
+      `POST to ${url} failed: ${response.status} ${response.statusText}`,
       response.status,
       body,
     );
