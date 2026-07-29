@@ -256,6 +256,11 @@ export function getMultipartData(
         }, reject);
       });
 
+      // Malformed multipart or a client disconnect would otherwise leave the
+      // promise unsettled and the request hanging.
+      body.on("error", reject);
+      req.on("error", reject);
+
       req.pipe(body);
     } catch (error) {
       reject(error);
