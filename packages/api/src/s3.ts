@@ -1,5 +1,4 @@
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
-import { createReadStream } from "fs";
 import { getLogger } from "./logger.js";
 
 const logger = getLogger("s3");
@@ -32,10 +31,10 @@ export class S3Storage {
   /**
    * Store metadata and data files in the S3-compatible storage
    * @param uuid - The uuid of the vessel
-   * @param tempFilePath - Path to the temporary geojson file
+   * @param data - The geojson payload
    * @returns the key the file was stored under
    */
-  async store(uuid: string, tempFilePath: string): Promise<string> {
+  async store(uuid: string, data: Uint8Array): Promise<string> {
     const key = generateKey(uuid);
 
     logger.debug("Storing to S3 with key %s", key);
@@ -44,7 +43,7 @@ export class S3Storage {
       new PutObjectCommand({
         Bucket: this.bucket,
         Key: `${key}.geojson`,
-        Body: createReadStream(tempFilePath),
+        Body: data,
         ContentType: "application/geo+json",
       }),
     );

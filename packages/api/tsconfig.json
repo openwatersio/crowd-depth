@@ -8,6 +8,8 @@
     "declarationMap": true,
     "tsBuildInfoFile": "./dist/tsconfig.tsbuildinfo"
   },
+  // worker.ts is bundled by wrangler and imports the workerd-only `cloudflare:node`
   "include": ["src/**/*.ts"],
+  "exclude": ["src/worker.ts"],
   "references": [{ "path": "../signalk-plugin" }]
 }

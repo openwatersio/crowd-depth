@@ -3,16 +3,11 @@ import type { IRouter, NextFunction, Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 import jwt from "jsonwebtoken";
 import busboy from "busboy";
-import { text } from "stream/consumers";
+import { buffer, text } from "stream/consumers";
 import { submitFormData, SubmissionError } from "crowd-depth";
 import { Readable } from "stream";
-import { createReadStream, createWriteStream } from "fs";
-import { stat, unlink } from "fs/promises";
-import { tmpdir } from "os";
-import { join } from "path";
 import { createS3Storage, S3Config } from "./s3.js";
 import semver from "semver";
-import { pipeline } from "stream/promises";
 import asyncHandler from "express-async-handler";
 import { getLogger } from "./logger.js";
 
@@ -33,6 +28,10 @@ const {
 } = process.env;
 
 export const MIN_CLIENT_VERSION = "1.0.1";
+
+// The upload is held in memory to reach both storage and NOAA, so it is capped
+// well above the ~3 MB real vessels send.
+export const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 
 export type APIOptions = {
   url?: string;
@@ -76,14 +75,14 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
     verifyClientVersion,
     asyncHandler(async (req, res) => {
       let metadata: MultipartMetadata;
-      let data: Readable;
+      let data: Buffer;
 
       try {
         [metadata, data] = await getMultipartData(req);
       } catch (error) {
         logger.error(error);
         res
-          .status(400)
+          .status(error instanceof PayloadTooLargeError ? 413 : 400)
           .json({ success: false, message: (error as Error).message });
         return;
       }
@@ -96,20 +95,12 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
         return;
       }
 
-      // Save data to a temporary file first
-      const tempFile = join(
-        tmpdir(),
-        `${uuid}-${Date.now().toString(36)}.geojson`,
-      );
+      const bytes = data.byteLength;
 
       try {
-        // Pipe the data to a temp file
-        await pipeline(data, createWriteStream(tempFile));
-        const { size: bytes } = await stat(tempFile);
-
         // Store the data before submitting so a copy is kept even when NOAA
         // rejects it. Failing here fails the request so the client retries.
-        const key = await storage?.store(uuid, tempFile);
+        const key = await storage?.store(uuid, data);
 
         // Record the outcome next to the stored data; diagnosable long after
         // Vercel's log retention expires.
@@ -126,7 +117,7 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
             new URL("geojson", url),
             uuid,
             metadata,
-            createReadStream(tempFile),
+            Readable.from([data]),
             {
               "x-auth-token": token,
             },
@@ -180,11 +171,6 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
         res
           .status(500)
           .json({ success: false, message: (err as Error).message });
-      } finally {
-        // Clean up the temporary file
-        await unlink(tempFile).catch(() => {
-          /* Ignore cleanup errors */
-        });
       }
     }),
   );
@@ -205,34 +191,50 @@ interface MultipartMetadata {
   uniqueID: string;
 }
 
+export class PayloadTooLargeError extends Error {
+  constructor() {
+    super(`File exceeds the maximum size of ${MAX_UPLOAD_BYTES} bytes`);
+    this.name = "PayloadTooLargeError";
+  }
+}
+
 export function getMultipartData(
   req: Request,
-): Promise<[metadata: MultipartMetadata, data: Readable]> {
+): Promise<[metadata: MultipartMetadata, data: Buffer]> {
   return new Promise((resolve, reject) => {
     let metadata: MultipartMetadata;
-    let data: Readable;
+    let data: Buffer;
+    let tooLarge = false;
 
-    // Resolve the promise when both metadata and data are received. The caller will read data from the stream.
-    function resolveIfReady() {
-      if (metadata && data) {
-        logger.trace("Received both metadata and data, resolving...");
-        resolve([metadata, data]);
-      }
-    }
+    // Parts are consumed asynchronously; busboy's close fires before they settle.
+    const parts: Promise<void>[] = [];
 
     try {
-      const body = busboy({ headers: req.headers });
-      body.on("file", async (name, file) => {
+      const body = busboy({
+        headers: req.headers,
+        limits: { fileSize: MAX_UPLOAD_BYTES },
+      });
+      body.on("file", (name, file) => {
         logger.trace("Received file field: %s", name);
         if (name === "metadataInput") {
-          metadata = JSON.parse(await text(file));
+          parts.push(
+            text(file).then((value) => {
+              metadata = JSON.parse(value);
+            }),
+          );
         } else if (name === "file") {
-          data = file;
+          file.on("limit", () => {
+            tooLarge = true;
+          });
+          parts.push(
+            buffer(file).then((value) => {
+              data = value;
+            }),
+          );
         } else {
+          file.resume();
           return reject(new Error(`Unknown field [${name}]`));
         }
-
-        resolveIfReady();
       });
 
       // If metadataInput does not have a filename, it may come as a field
@@ -242,13 +244,16 @@ export function getMultipartData(
         } else {
           return reject(new Error(`Unknown Field [${name}]`));
         }
-
-        resolveIfReady();
       });
 
       body.on("close", () => {
-        if (!metadata) return reject(new Error("Missing [metadataInput]"));
-        if (!data) return reject(new Error("Missing [file]"));
+        Promise.all(parts).then(() => {
+          if (tooLarge) return reject(new PayloadTooLargeError());
+          if (!metadata) return reject(new Error("Missing [metadataInput]"));
+          if (!data) return reject(new Error("Missing [file]"));
+          logger.trace("Received both metadata and data, resolving...");
+          resolve([metadata, data]);
+        }, reject);
       });
 
       req.pipe(body);

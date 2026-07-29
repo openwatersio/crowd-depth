@@ -1,7 +1,7 @@
 import { Temporal } from "@js-temporal/polyfill";
 
-const __filename = new URL(import.meta.url).pathname;
-const isInstalledAsModule = __filename.includes("/node_modules/");
+// import.meta.url is undefined on workerd; string check avoids URL parsing
+const isInstalledAsModule = !!import.meta.url?.includes("/node_modules/");
 
 /**
  * Determine the environment the application is running in.

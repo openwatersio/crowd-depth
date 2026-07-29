@@ -5,9 +5,11 @@ import nock from "nock";
 import {
   createApi,
   createIdentity,
+  MAX_UPLOAD_BYTES,
   MIN_CLIENT_VERSION,
   type APIOptions,
 } from "../src/api.js";
+import { createApp } from "../src/app.js";
 import { toUniqueID } from "crowd-depth";
 import { vessel } from "../../signalk-plugin/test/helper.js";
 
@@ -156,6 +158,33 @@ describe("POST /geojson", () => {
       })
       .expect(403)
       .expect({ success: false, message: "Invalid uniqueID" });
+  });
+
+  test("rejects files over the size cap", async () => {
+    await useApp()
+      .post("/geojson")
+      .set("Authorization", `Bearer ${createIdentity(vessel.uuid).token}`)
+      .set(
+        "User-Agent",
+        `crowd-depth/${MIN_CLIENT_VERSION} (https://github.com/openwatersio/crowd-depth)`,
+      )
+      .field(
+        "metadataInput",
+        JSON.stringify({ uniqueID: toUniqueID(vessel) }),
+        {
+          filename: "test.json",
+          contentType: "application/json",
+        },
+      )
+      .attach("file", Buffer.alloc(MAX_UPLOAD_BYTES + 1, "x"), {
+        filename: "test.geojson",
+        contentType: "application/geo+json",
+      })
+      .expect(413)
+      .expect((res) => {
+        expect(res.body.success).toBe(false);
+        expect(res.body.message).toMatch(/maximum size/);
+      });
   });
 
   test("proxies to NOAA with valid token", async () => {
@@ -351,6 +380,43 @@ describe("POST /geojson", () => {
     });
     expect(result).toHaveProperty("noaaBody");
     expect(result).toHaveProperty("message");
+  });
+});
+
+describe("mount points", () => {
+  const app = () => request(createApp(defaultOptions));
+  const reachable = { success: true, message: "API is reachable" };
+
+  test("serves the api under /bathymetry", async () => {
+    await app().get("/bathymetry").expect(200).expect(reachable);
+  });
+
+  test("serves the api at the root of the legacy host", async () => {
+    await app()
+      .get("/")
+      .set("Host", "depth.openwaters.io")
+      .expect(200)
+      .expect(reachable);
+  });
+
+  test("serves the api at the root of generated and local hosts", async () => {
+    await app()
+      .get("/")
+      .set("Host", "crowd-depth.workers.dev")
+      .expect(200)
+      .expect(reachable);
+  });
+
+  test("reserves the root of the shared api host", async () => {
+    await app().get("/").set("Host", "api.openwaters.io").expect(404);
+  });
+
+  test("serves /bathymetry on the shared api host", async () => {
+    await app()
+      .get("/bathymetry")
+      .set("Host", "api.openwaters.io")
+      .expect(200)
+      .expect(reachable);
   });
 });
 

@@ -3,4 +3,5 @@ dist
 tmp
 .env
 .vercel
+.wrangler
 tsconfig.tsbuildinfo

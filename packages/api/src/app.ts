@@ -1,11 +1,21 @@
 import express from "express";
-import { createApi } from "./api.js";
-import rootLogger from "./logger.js";
-import { pinoHttp } from "pino-http";
+import { createApi, type APIOptions } from "./api.js";
 
-const app = express();
+// Request logging is left to the platform: pino-http reads pino's internal
+// symbols through a CJS require, which resolves to undefined on workerd.
+export function createApp(options: APIOptions = {}) {
+  const app = express();
+  const api = createApi(options);
 
-app.use(pinoHttp({ logger: rootLogger }));
-app.use(createApi());
+  app.use("/bathymetry", api);
 
-export default app;
+  // Legacy vessels post to the root of depth.openwaters.io. Only the shared
+  // api host reserves the root for other services.
+  app.use((req, res, next) =>
+    req.hostname === "api.openwaters.io" ? next() : api(req, res, next),
+  );
+
+  return app;
+}
+
+export default createApp();
