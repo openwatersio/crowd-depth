@@ -1,6 +1,6 @@
 {
   "name": "crowd-depth",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Collect and share depth data.",
   "keywords": [
     "bathymetry",
@@ -57,11 +57,5 @@
     "stream-chain": "^4.2.5",
     "stream-transform": "^3.4.0",
     "uuid": "^14.0.1"
-  },
-  "lint-staged": {
-    "**/*": [
-      "prettier --write --ignore-unknown",
-      "eslint --fix --no-warn-ignored"
-    ]
   }
 }

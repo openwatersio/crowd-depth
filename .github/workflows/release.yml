@@ -36,7 +36,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -m "Bump version to ${TAG#v}" packages/signalk-plugin/package.json
+          git commit --no-verify -m "Bump version to ${TAG#v}" packages/signalk-plugin/package.json
           git tag -f "$TAG"
           git push origin main
           git push -f origin "$TAG"
