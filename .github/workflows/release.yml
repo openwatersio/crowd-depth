@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+  # required for npm trusted publishing (OIDC)
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+
+      - uses: actions/setup-node@v6
+        with:
+          # npm >= 11.5.1 required for trusted publishing
+          node-version: 24
+          registry-url: https://registry.npmjs.org/
+
+      - run: npm install
+
+      - name: Set version from release tag
+        run: npm pkg set version="${TAG#v}" -w crowd-depth
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+
+      - run: npm publish -w crowd-depth
+
+      - name: Commit version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -m "Bump version to ${TAG#v}" packages/signalk-plugin/package.json
+          git tag -f "$TAG"
+          git push origin main
+          git push -f origin "$TAG"
+        env:
+          TAG: ${{ github.event.release.tag_name }}
