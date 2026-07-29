@@ -1,7 +1,7 @@
 node_modules
 dist
 tmp
-.env
+.env*
 .vercel
 .wrangler
 tsconfig.tsbuildinfo
