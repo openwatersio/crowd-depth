@@ -20,6 +20,39 @@ export type SubmissionResponse = {
   submissionIds: string[];
 };
 
+/** Thrown when the upstream service rejects a submission. */
+export class SubmissionError extends Error {
+  constructor(
+    message: string,
+    public status: number,
+    public body: string,
+  ) {
+    super(message);
+    this.name = "SubmissionError";
+  }
+}
+
+/**
+ * Human-readable summary of a submission failure, surfacing the server's own
+ * error message and submission id (for looking up the archived result) when
+ * the response body is the API's JSON error shape.
+ */
+export function describeSubmissionError(err: unknown): string {
+  if (err instanceof SubmissionError) {
+    try {
+      const { message, submissionId } = JSON.parse(err.body);
+      if (message) {
+        return submissionId
+          ? `${message} (submission: ${submissionId})`
+          : message;
+      }
+    } catch {
+      // Body is not JSON; fall through to the raw error message
+    }
+  }
+  return (err as Error).message;
+}
+
 export async function submitFormData(
   url: URL,
   prefix: string,
@@ -55,8 +88,10 @@ export async function submitFormData(
 
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(
+    throw new SubmissionError(
       `POST to ${url} failed: ${response.status} ${response.statusText}\n${body}`,
+      response.status,
+      body,
     );
   }
 

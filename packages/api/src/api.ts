@@ -4,10 +4,10 @@ import { v4 as uuidv4 } from "uuid";
 import jwt from "jsonwebtoken";
 import busboy from "busboy";
 import { text } from "stream/consumers";
-import { submitFormData } from "crowd-depth";
+import { submitFormData, SubmissionError } from "crowd-depth";
 import { Readable } from "stream";
 import { createReadStream, createWriteStream } from "fs";
-import { unlink } from "fs/promises";
+import { stat, unlink } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import { createS3Storage, S3Config } from "./s3.js";
@@ -105,10 +105,24 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
       try {
         // Pipe the data to a temp file
         await pipeline(data, createWriteStream(tempFile));
+        const { size: bytes } = await stat(tempFile);
 
-        // Stream from the temp file to both NOAA and S3
-        const [submission] = await Promise.all([
-          submitFormData(
+        // Store the data before submitting so a copy is kept even when NOAA
+        // rejects it. Failing here fails the request so the client retries.
+        const key = await storage?.store(uuid, tempFile);
+
+        // Record the outcome next to the stored data; diagnosable long after
+        // Vercel's log retention expires.
+        const recordResult = (result: object) =>
+          key
+            ? storage?.storeResult(key, result).catch((err) => {
+                logger.error(err, "Failed to store submission result to S3");
+              })
+            : undefined;
+
+        const started = Date.now();
+        try {
+          const submission = await submitFormData(
             new URL("geojson", url),
             uuid,
             metadata,
@@ -116,11 +130,51 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
             {
               "x-auth-token": token,
             },
-          ),
-          storage?.store(uuid, tempFile),
-        ]);
+          );
+          const durationMs = Date.now() - started;
 
-        res.json(submission);
+          logger.info(
+            { uuid, uniqueID, bytes, durationMs },
+            "NOAA submission succeeded",
+          );
+          await recordResult({
+            success: true,
+            uuid,
+            uniqueID,
+            bytes,
+            durationMs,
+            submission,
+          });
+
+          res.json(submission);
+        } catch (err) {
+          const durationMs = Date.now() - started;
+          const upstream = err instanceof SubmissionError;
+          const noaaStatus = upstream ? err.status : undefined;
+
+          logger.error(
+            { err, uuid, uniqueID, bytes, durationMs, noaaStatus },
+            "NOAA submission failed",
+          );
+          await recordResult({
+            success: false,
+            uuid,
+            uniqueID,
+            bytes,
+            durationMs,
+            noaaStatus,
+            noaaBody: upstream ? err.body : undefined,
+            message: (err as Error).message,
+          });
+
+          // 502 distinguishes upstream NOAA failures from bugs in this API.
+          // submissionId is the storage key of the archived data + result.
+          res.status(upstream ? 502 : 500).json({
+            success: false,
+            message: (err as Error).message,
+            submissionId: key,
+          });
+        }
       } catch (err) {
         logger.error(err);
         res

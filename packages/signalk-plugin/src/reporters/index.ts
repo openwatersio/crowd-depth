@@ -1,4 +1,4 @@
-import { submitGeoJSON } from "./noaa.js";
+import { submitGeoJSON, describeSubmissionError } from "./noaa.js";
 import { Config } from "../config.js";
 import { ServerAPI } from "@signalk/server-api";
 import { CronJob } from "cron";
@@ -70,9 +70,12 @@ export function createReporter({
       reportLog.logReport(timeframe);
     } catch (err) {
       throw status.error(
-        new Error(`Failed to report to ${url}: ${(err as Error).message}`, {
-          cause: err,
-        }),
+        new Error(
+          `Failed to report to ${url}: ${describeSubmissionError(err)}`,
+          {
+            cause: err,
+          },
+        ),
       );
     }
   }

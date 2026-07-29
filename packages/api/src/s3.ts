@@ -33,8 +33,9 @@ export class S3Storage {
    * Store metadata and data files in the S3-compatible storage
    * @param uuid - The uuid of the vessel
    * @param tempFilePath - Path to the temporary geojson file
+   * @returns the key the file was stored under
    */
-  async store(uuid: string, tempFilePath: string): Promise<void> {
+  async store(uuid: string, tempFilePath: string): Promise<string> {
     const key = generateKey(uuid);
 
     logger.debug("Storing to S3 with key %s", key);
@@ -45,6 +46,23 @@ export class S3Storage {
         Key: `${key}.geojson`,
         Body: createReadStream(tempFilePath),
         ContentType: "application/geo+json",
+      }),
+    );
+
+    return key;
+  }
+
+  /**
+   * Record the submission outcome alongside the stored data so failures
+   * remain diagnosable after Vercel's short log retention expires.
+   */
+  async storeResult(key: string, result: object): Promise<void> {
+    await this.client.send(
+      new PutObjectCommand({
+        Bucket: this.bucket,
+        Key: `${key}.result.json`,
+        Body: JSON.stringify(result),
+        ContentType: "application/json",
       }),
     );
   }

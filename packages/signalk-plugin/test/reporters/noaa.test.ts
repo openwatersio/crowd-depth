@@ -6,6 +6,8 @@ import {
   BATHY_URL,
   submitGeoJSON,
   createGeoJSON,
+  SubmissionError,
+  describeSubmissionError,
 } from "../../src/index.js";
 import { Readable } from "stream";
 import { text } from "stream/consumers";
@@ -129,5 +131,43 @@ describe("createGeoJSON", () => {
     const valid = validate(json);
 
     expect(valid, JSON.stringify(validate.errors, null, 2)).toBe(true);
+  });
+});
+
+describe("describeSubmissionError", () => {
+  test("surfaces server message and submission id", () => {
+    const err = new SubmissionError(
+      "POST to https://depth.openwaters.io/geojson failed: 502 Bad Gateway",
+      502,
+      JSON.stringify({
+        success: false,
+        message: "POST to NOAA failed: 500 Internal Server Error",
+        submissionId: "2026/07/29/07:11:13.123Z-abc",
+      }),
+    );
+
+    expect(describeSubmissionError(err)).toBe(
+      "POST to NOAA failed: 500 Internal Server Error (submission: 2026/07/29/07:11:13.123Z-abc)",
+    );
+  });
+
+  test("surfaces server message without submission id", () => {
+    const err = new SubmissionError("failed", 500, '{"message":"boom"}');
+    expect(describeSubmissionError(err)).toBe("boom");
+  });
+
+  test("falls back to error message for non-JSON bodies", () => {
+    const err = new SubmissionError(
+      "POST failed: 503",
+      503,
+      "<html>oops</html>",
+    );
+    expect(describeSubmissionError(err)).toBe("POST failed: 503");
+  });
+
+  test("falls back to error message for plain errors", () => {
+    expect(describeSubmissionError(new Error("fetch failed"))).toBe(
+      "fetch failed",
+    );
   });
 });
