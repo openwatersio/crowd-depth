@@ -21,8 +21,10 @@ if (process.env.NODE_ENV === "production") {
     throw new Error("Missing NOAA_CSB_TOKEN environment variable.");
 }
 
-const {
-  BATHY_JWT_SECRET = "test",
+const { BATHY_JWT_SECRET = "test" } = process.env;
+
+// Also used by the sweep cron, which resubmits stored data out of band
+export const {
   NOAA_CSB_URL = "https://www.ngdc.noaa.gov/ingest-external/upload/csb/test/",
   NOAA_CSB_TOKEN = "test",
 } = process.env;
@@ -99,14 +101,11 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
         // rejects it. Failing here fails the request so the client retries.
         const key = await storage?.store(uuid, data);
 
-        // Record the outcome next to the stored data; diagnosable long after
-        // Vercel's log retention expires.
-        const recordResult = (result: object) =>
-          key
-            ? storage?.storeResult(key, result).catch((err) => {
-                logger.error(err, "Failed to store submission result to S3");
-              })
-            : undefined;
+        // Marker writes must not mask the outcome of the submission itself
+        const record = (write: Promise<void> | undefined) =>
+          write?.catch((err) => {
+            logger.error(err, "Failed to store submission marker");
+          });
 
         const started = Date.now();
         try {
@@ -125,26 +124,43 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
             { uuid, uniqueID, bytes, durationMs },
             "NOAA submission succeeded",
           );
-          await recordResult({
-            success: true,
-            uuid,
-            uniqueID,
-            bytes,
-            durationMs,
-            submission,
-          });
+          if (key) {
+            await record(
+              storage?.storeDone(key, {
+                success: true,
+                uuid,
+                uniqueID,
+                bytes,
+                durationMs,
+                attempts: 1,
+                submission,
+              }),
+            );
+          }
 
           res.json(submission);
         } catch (err) {
           const durationMs = Date.now() - started;
           const upstream = err instanceof SubmissionError;
           const noaaStatus = upstream ? err.status : undefined;
+          // A 4xx means NOAA rejected this payload; retrying it can't help
+          const permanent = upstream && err.status >= 400 && err.status < 500;
 
           logger.error(
             { err, uuid, uniqueID, bytes, durationMs, noaaStatus },
             "NOAA submission failed",
           );
-          await recordResult({
+
+          if (!key) {
+            // Nothing stored (no bucket configured): the client must retry
+            res.status(upstream ? 502 : 500).json({
+              success: false,
+              message: (err as Error).message,
+            });
+            return;
+          }
+
+          const failure = {
             success: false,
             uuid,
             uniqueID,
@@ -153,13 +169,22 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
             noaaStatus,
             noaaBody: upstream ? err.body : undefined,
             message: (err as Error).message,
-          });
+            attempts: 1,
+            lastAttempt: new Date().toISOString(),
+          };
+          await record(
+            permanent
+              ? storage?.storeDone(key, failure)
+              : storage?.storeFailed(key, failure),
+          );
 
-          // 502 distinguishes upstream NOAA failures from bugs in this API.
-          // submissionId is the storage key of the archived data + result.
-          res.status(upstream ? 502 : 500).json({
-            success: false,
-            message: (err as Error).message,
+          // The data is durable, so the vessel should not retry; the sweep
+          // cron delivers retryable failures to NOAA out of band.
+          res.json({
+            success: true,
+            message: permanent
+              ? "Stored; NOAA rejected the submission"
+              : "Stored; queued for submission to NOAA",
             submissionId: key,
           });
         }

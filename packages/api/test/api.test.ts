@@ -257,16 +257,21 @@ describe("POST /geojson", () => {
   // In-memory storage fake standing in for the R2 binding
   function fakeStorage() {
     const stored: Array<{ uuid: string; data: Uint8Array }> = [];
-    const results: Array<{ key: string; result: object }> = [];
+    const done: Array<{ key: string; result: object }> = [];
+    const failed: Array<{ key: string; failure: object }> = [];
     return {
       stored,
-      results,
+      done,
+      failed,
       async store(uuid: string, data: Uint8Array) {
         stored.push({ uuid, data });
         return `2026/01/01/00:00:00.000Z-${uuid}`;
       },
-      async storeResult(key: string, result: object) {
-        results.push({ key, result });
+      async storeDone(key: string, result: object) {
+        done.push({ key, result });
+      },
+      async storeFailed(key: string, failure: object) {
+        failed.push({ key, failure });
       },
     };
   }
@@ -304,16 +309,17 @@ describe("POST /geojson", () => {
     expect(noaaScope.isDone()).toBe(true);
     expect(storage.stored).toHaveLength(1);
     expect(storage.stored[0].uuid).toBe(vessel.uuid);
-    expect(storage.results).toHaveLength(1);
-    expect(storage.results[0].key).toContain(vessel.uuid);
-    expect(storage.results[0].result).toMatchObject({
+    expect(storage.failed).toHaveLength(0);
+    expect(storage.done).toHaveLength(1);
+    expect(storage.done[0].key).toContain(vessel.uuid);
+    expect(storage.done[0].result).toMatchObject({
       success: true,
       uuid: vessel.uuid,
       uniqueID,
       submission: SUCCESS_RESPONSE,
     });
-    expect(storage.results[0].result).toHaveProperty("bytes");
-    expect(storage.results[0].result).toHaveProperty("durationMs");
+    expect(storage.done[0].result).toHaveProperty("bytes");
+    expect(storage.done[0].result).toHaveProperty("durationMs");
   });
 
   test("returns 500 when storage fails", async () => {
@@ -326,7 +332,8 @@ describe("POST /geojson", () => {
       async store(): Promise<string> {
         throw new Error("AccessDenied");
       },
-      async storeResult() {},
+      async storeDone() {},
+      async storeFailed() {},
     };
 
     await postGeoJSON(uniqueID, storage)
@@ -339,7 +346,7 @@ describe("POST /geojson", () => {
     nock.cleanAll();
   });
 
-  test("stores failure result when NOAA rejects the submission", async () => {
+  test("returns 200 and queues when NOAA fails but data is stored", async () => {
     const uniqueID = toUniqueID(vessel);
     const storage = fakeStorage();
 
@@ -348,8 +355,10 @@ describe("POST /geojson", () => {
       .reply(500, { message: "Internal Server Error", success: false });
 
     await postGeoJSON(uniqueID, storage)
-      .expect(502)
+      .expect(200)
       .expect((res) => {
+        expect(res.body.success).toBe(true);
+        expect(res.body.message).toMatch(/queued/);
         expect(res.body.submissionId).toMatch(
           new RegExp(`^\\d{4}/\\d{2}/\\d{2}/.*${vessel.uuid}$`),
         );
@@ -357,15 +366,41 @@ describe("POST /geojson", () => {
 
     expect(noaaScope.isDone()).toBe(true);
     expect(storage.stored).toHaveLength(1);
-    expect(storage.results).toHaveLength(1);
-    expect(storage.results[0].result).toMatchObject({
+    expect(storage.done).toHaveLength(0);
+    expect(storage.failed).toHaveLength(1);
+    expect(storage.failed[0].failure).toMatchObject({
       success: false,
       uuid: vessel.uuid,
       uniqueID,
       noaaStatus: 500,
+      attempts: 1,
     });
-    expect(storage.results[0].result).toHaveProperty("noaaBody");
-    expect(storage.results[0].result).toHaveProperty("message");
+    expect(storage.failed[0].failure).toHaveProperty("noaaBody");
+    expect(storage.failed[0].failure).toHaveProperty("lastAttempt");
+  });
+
+  test("records a terminal outcome when NOAA rejects with a 4xx", async () => {
+    const uniqueID = toUniqueID(vessel);
+    const storage = fakeStorage();
+
+    const noaaScope = nock("https://example.com")
+      .post("/geojson")
+      .reply(422, { message: "Invalid GeoJSON", success: false });
+
+    await postGeoJSON(uniqueID, storage)
+      .expect(200)
+      .expect((res) => {
+        expect(res.body.success).toBe(true);
+        expect(res.body.message).toMatch(/rejected/);
+      });
+
+    expect(noaaScope.isDone()).toBe(true);
+    expect(storage.failed).toHaveLength(0);
+    expect(storage.done).toHaveLength(1);
+    expect(storage.done[0].result).toMatchObject({
+      success: false,
+      noaaStatus: 422,
+    });
   });
 });
 
