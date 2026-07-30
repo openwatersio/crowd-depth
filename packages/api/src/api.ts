@@ -3,16 +3,11 @@ import type { IRouter, NextFunction, Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 import jwt from "jsonwebtoken";
 import busboy from "busboy";
-import { text } from "stream/consumers";
+import { buffer, text } from "stream/consumers";
 import { submitFormData, SubmissionError } from "crowd-depth";
 import { Readable } from "stream";
-import { createReadStream, createWriteStream } from "fs";
-import { stat, unlink } from "fs/promises";
-import { tmpdir } from "os";
-import { join } from "path";
-import { createS3Storage, S3Config } from "./s3.js";
+import type { Storage } from "./r2.js";
 import semver from "semver";
-import { pipeline } from "stream/promises";
 import asyncHandler from "express-async-handler";
 import { getLogger } from "./logger.js";
 
@@ -26,18 +21,24 @@ if (process.env.NODE_ENV === "production") {
     throw new Error("Missing NOAA_CSB_TOKEN environment variable.");
 }
 
-const {
-  BATHY_JWT_SECRET = "test",
+const { BATHY_JWT_SECRET = "test" } = process.env;
+
+// Also used by the sweep cron, which resubmits stored data out of band
+export const {
   NOAA_CSB_URL = "https://www.ngdc.noaa.gov/ingest-external/upload/csb/test/",
   NOAA_CSB_TOKEN = "test",
 } = process.env;
 
 export const MIN_CLIENT_VERSION = "1.0.1";
 
+// The upload is held in memory to reach both storage and NOAA, so it is capped
+// well above the ~3 MB real vessels send.
+export const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+
 export type APIOptions = {
   url?: string;
   token?: string;
-  env?: Record<string, string>;
+  storage?: Storage;
 };
 
 export function createApi(options: APIOptions = {}): IRouter {
@@ -47,15 +48,9 @@ export function createApi(options: APIOptions = {}): IRouter {
 }
 
 export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
-  const {
-    url = NOAA_CSB_URL,
-    token = NOAA_CSB_TOKEN,
-    env = process.env,
-  } = options;
+  const { url = NOAA_CSB_URL, token = NOAA_CSB_TOKEN, storage } = options;
 
   logger.info("API configured to use NOAA CSB URL: %s", url);
-
-  const storage = createS3Storage(env as S3Config);
 
   router.get("/", (req, res) => {
     res.json({ success: true, message: "API is reachable" });
@@ -68,7 +63,10 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
   /**
    * API to proxy requests to NOAA CSB XYZ upload endpoint, with authentication.
    *
-   * @see https://www.ncei.noaa.gov/sites/g/files/anmtlf171/files/2024-04/GuidanceforSubmittingCSBDataToTheIHODCDB%20%281%29.pdf
+   * @see the "Guidance for Submitting Crowdsourced Bathymetry Data" link in
+   * the repo README. The PDF URL can't appear here: its percent-encoded
+   * characters trip Cloudflare's WAF when this comment is uploaded in the
+   * deploy's source map.
    */
   router.post(
     "/geojson",
@@ -76,14 +74,14 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
     verifyClientVersion,
     asyncHandler(async (req, res) => {
       let metadata: MultipartMetadata;
-      let data: Readable;
+      let data: Buffer;
 
       try {
         [metadata, data] = await getMultipartData(req);
       } catch (error) {
         logger.error(error);
         res
-          .status(400)
+          .status(error instanceof PayloadTooLargeError ? 413 : 400)
           .json({ success: false, message: (error as Error).message });
         return;
       }
@@ -96,29 +94,18 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
         return;
       }
 
-      // Save data to a temporary file first
-      const tempFile = join(
-        tmpdir(),
-        `${uuid}-${Date.now().toString(36)}.geojson`,
-      );
+      const bytes = data.byteLength;
 
       try {
-        // Pipe the data to a temp file
-        await pipeline(data, createWriteStream(tempFile));
-        const { size: bytes } = await stat(tempFile);
-
         // Store the data before submitting so a copy is kept even when NOAA
         // rejects it. Failing here fails the request so the client retries.
-        const key = await storage?.store(uuid, tempFile);
+        const key = await storage?.store(uuid, data);
 
-        // Record the outcome next to the stored data; diagnosable long after
-        // Vercel's log retention expires.
-        const recordResult = (result: object) =>
-          key
-            ? storage?.storeResult(key, result).catch((err) => {
-                logger.error(err, "Failed to store submission result to S3");
-              })
-            : undefined;
+        // Marker writes must not mask the outcome of the submission itself
+        const record = (write: Promise<void> | undefined) =>
+          write?.catch((err) => {
+            logger.error(err, "Failed to store submission marker");
+          });
 
         const started = Date.now();
         try {
@@ -126,7 +113,7 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
             new URL("geojson", url),
             uuid,
             metadata,
-            createReadStream(tempFile),
+            Readable.from([data]),
             {
               "x-auth-token": token,
             },
@@ -137,26 +124,43 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
             { uuid, uniqueID, bytes, durationMs },
             "NOAA submission succeeded",
           );
-          await recordResult({
-            success: true,
-            uuid,
-            uniqueID,
-            bytes,
-            durationMs,
-            submission,
-          });
+          if (key) {
+            await record(
+              storage?.storeDone(key, {
+                success: true,
+                uuid,
+                uniqueID,
+                bytes,
+                durationMs,
+                attempts: 1,
+                submission,
+              }),
+            );
+          }
 
           res.json(submission);
         } catch (err) {
           const durationMs = Date.now() - started;
           const upstream = err instanceof SubmissionError;
           const noaaStatus = upstream ? err.status : undefined;
+          // A 4xx means NOAA rejected this payload; retrying it can't help
+          const permanent = upstream && err.status >= 400 && err.status < 500;
 
           logger.error(
             { err, uuid, uniqueID, bytes, durationMs, noaaStatus },
             "NOAA submission failed",
           );
-          await recordResult({
+
+          if (!key) {
+            // Nothing stored (no bucket configured): the client must retry
+            res.status(upstream ? 502 : 500).json({
+              success: false,
+              message: (err as Error).message,
+            });
+            return;
+          }
+
+          const failure = {
             success: false,
             uuid,
             uniqueID,
@@ -165,13 +169,25 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
             noaaStatus,
             noaaBody: upstream ? err.body : undefined,
             message: (err as Error).message,
-          });
+            attempts: 1,
+            lastAttempt: new Date().toISOString(),
+          };
+          if (permanent) {
+            await record(storage?.storeDone(key, failure));
+          } else {
+            // Not via record(): the sweep only finds keys with a .failed.json
+            // marker, so if this write fails the vessel must retry (500 below)
+            // or the data would be stranded.
+            await storage?.storeFailed(key, failure);
+          }
 
-          // 502 distinguishes upstream NOAA failures from bugs in this API.
-          // submissionId is the storage key of the archived data + result.
-          res.status(upstream ? 502 : 500).json({
-            success: false,
-            message: (err as Error).message,
+          // The data is durable, so the vessel should not retry; the sweep
+          // cron delivers retryable failures to NOAA out of band.
+          res.json({
+            success: true,
+            message: permanent
+              ? "Stored; NOAA rejected the submission"
+              : "Stored; queued for submission to NOAA",
             submissionId: key,
           });
         }
@@ -180,11 +196,6 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
         res
           .status(500)
           .json({ success: false, message: (err as Error).message });
-      } finally {
-        // Clean up the temporary file
-        await unlink(tempFile).catch(() => {
-          /* Ignore cleanup errors */
-        });
       }
     }),
   );
@@ -205,34 +216,50 @@ interface MultipartMetadata {
   uniqueID: string;
 }
 
+export class PayloadTooLargeError extends Error {
+  constructor() {
+    super(`File exceeds the maximum size of ${MAX_UPLOAD_BYTES} bytes`);
+    this.name = "PayloadTooLargeError";
+  }
+}
+
 export function getMultipartData(
   req: Request,
-): Promise<[metadata: MultipartMetadata, data: Readable]> {
+): Promise<[metadata: MultipartMetadata, data: Buffer]> {
   return new Promise((resolve, reject) => {
     let metadata: MultipartMetadata;
-    let data: Readable;
+    let data: Buffer;
+    let tooLarge = false;
 
-    // Resolve the promise when both metadata and data are received. The caller will read data from the stream.
-    function resolveIfReady() {
-      if (metadata && data) {
-        logger.trace("Received both metadata and data, resolving...");
-        resolve([metadata, data]);
-      }
-    }
+    // Parts are consumed asynchronously; busboy's close fires before they settle.
+    const parts: Promise<void>[] = [];
 
     try {
-      const body = busboy({ headers: req.headers });
-      body.on("file", async (name, file) => {
+      const body = busboy({
+        headers: req.headers,
+        limits: { fileSize: MAX_UPLOAD_BYTES },
+      });
+      body.on("file", (name, file) => {
         logger.trace("Received file field: %s", name);
         if (name === "metadataInput") {
-          metadata = JSON.parse(await text(file));
+          parts.push(
+            text(file).then((value) => {
+              metadata = JSON.parse(value);
+            }),
+          );
         } else if (name === "file") {
-          data = file;
+          file.on("limit", () => {
+            tooLarge = true;
+          });
+          parts.push(
+            buffer(file).then((value) => {
+              data = value;
+            }),
+          );
         } else {
+          file.resume();
           return reject(new Error(`Unknown field [${name}]`));
         }
-
-        resolveIfReady();
       });
 
       // If metadataInput does not have a filename, it may come as a field
@@ -242,14 +269,22 @@ export function getMultipartData(
         } else {
           return reject(new Error(`Unknown Field [${name}]`));
         }
-
-        resolveIfReady();
       });
 
       body.on("close", () => {
-        if (!metadata) return reject(new Error("Missing [metadataInput]"));
-        if (!data) return reject(new Error("Missing [file]"));
+        Promise.all(parts).then(() => {
+          if (tooLarge) return reject(new PayloadTooLargeError());
+          if (!metadata) return reject(new Error("Missing [metadataInput]"));
+          if (!data) return reject(new Error("Missing [file]"));
+          logger.trace("Received both metadata and data, resolving...");
+          resolve([metadata, data]);
+        }, reject);
       });
+
+      // Malformed multipart or a client disconnect would otherwise leave the
+      // promise unsettled and the request hanging.
+      body.on("error", reject);
+      req.on("error", reject);
 
       req.pipe(body);
     } catch (error) {

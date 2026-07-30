@@ -45,5 +45,7 @@ curl -v \
 
 ## Deployment
 
-- Designed for Vercel: `vercel dev -l 3001` locally, `vercel deploy` to ship.
-- Ensure required environment variables are set in the Vercel project.
+Runs as a Cloudflare Worker (`crowd-depth-api`). `npm start` serves it locally
+on port 3001 via `wrangler dev`; pushes deploy through Workers Builds, or run
+`npm run deploy` manually. Secrets (`BATHY_JWT_SECRET`, `NOAA_CSB_TOKEN`,
+`NOAA_CSB_URL`) are managed with `wrangler secret put`.

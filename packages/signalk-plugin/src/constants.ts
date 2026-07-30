@@ -1,7 +1,7 @@
 import { Temporal } from "@js-temporal/polyfill";
 
-const __filename = new URL(import.meta.url).pathname;
-const isInstalledAsModule = __filename.includes("/node_modules/");
+// import.meta.url is undefined on workerd; string check avoids URL parsing
+const isInstalledAsModule = !!import.meta.url?.includes("/node_modules/");
 
 /**
  * Determine the environment the application is running in.
@@ -19,11 +19,15 @@ export const ENV =
   "development";
 
 /** The URL to report data to */
-export const BATHY_URL =
+export const BATHY_URL = (
   process.env.BATHY_URL ||
   (ENV === "production"
-    ? "https://depth.openwaters.io"
-    : "http://localhost:3001");
+    ? "https://api.openwaters.io/bathymetry"
+    : "http://localhost:3001")
+)
+  // Trailing slash so relative URL joins keep the path prefix:
+  // new URL("geojson", ".../bathymetry") would drop the last segment
+  .replace(/\/?$/, "/");
 
 /** Number of hours of data to report in each submission */
 export const BATHY_WINDOW_SIZE = Temporal.Duration.from({

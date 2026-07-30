@@ -7,7 +7,8 @@
   "scripts": {
     "build": "tsc -b",
     "test": "vitest",
-    "start": "vercel dev -l 3001"
+    "start": "wrangler dev --port 3001",
+    "deploy": "wrangler deploy"
   },
   "devDependencies": {
     "@types/busboy": "^1.5.4",
@@ -19,17 +20,15 @@
     "eslint-config-prettier": "^10.1.8",
     "pino-pretty": "^13.0.0",
     "supertest": "^7.1.0",
-    "vercel": "^54.20.0"
+    "wrangler": "^4.115.0"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.940.0",
     "busboy": "^1.6.0",
     "crowd-depth": "*",
     "express": "^5.2.1",
     "express-async-handler": "^1.2.0",
     "jsonwebtoken": "^9.0.2",
     "pino": "^10.2.1",
-    "pino-http": "^11.0.0",
     "semver": "^7.7.3",
     "uuid": "^14.0.1"
   }

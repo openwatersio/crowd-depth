@@ -1,0 +1,15 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "crowd-depth-api",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "preview_urls": true,
+  "observability": { "enabled": true },
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "crowd-depth-injest" }],
+  "triggers": { "crons": ["47 * * * *"] },
+  // Legacy vessels; api.openwaters.io/bathymetry* arrives via the gateway's
+  // service binding, not a route
+  "routes": [{ "pattern": "depth.openwaters.io", "custom_domain": true }],
+}
