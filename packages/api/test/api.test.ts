@@ -379,6 +379,28 @@ describe("POST /geojson", () => {
     expect(storage.failed[0].failure).toHaveProperty("lastAttempt");
   });
 
+  test("returns 500 when the failed marker cannot be written", async () => {
+    const uniqueID = toUniqueID(vessel);
+    const storage = {
+      ...fakeStorage(),
+      async storeFailed() {
+        throw new Error("R2 write failed");
+      },
+    };
+
+    nock("https://example.com")
+      .post("/geojson")
+      .reply(500, { message: "Internal Server Error", success: false });
+
+    // Without the marker the sweep would never find this key, so the
+    // vessel must keep the data and retry
+    await postGeoJSON(uniqueID, storage)
+      .expect(500)
+      .expect((res) => {
+        expect(res.body.success).toBe(false);
+      });
+  });
+
   test("records a terminal outcome when NOAA rejects with a 4xx", async () => {
     const uniqueID = toUniqueID(vessel);
     const storage = fakeStorage();

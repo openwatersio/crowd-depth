@@ -12,8 +12,6 @@ export type SweepOptions = {
   token?: string;
   /** How many days back to scan for undelivered submissions */
   days?: number;
-  /** Ignore markerless objects younger than this; they may still be in flight */
-  minAgeMs?: number;
 };
 
 export type SweepSummary = {
@@ -27,21 +25,19 @@ export type SweepSummary = {
 
 /**
  * Resubmit stored data that never reached NOAA: objects with a retryable
- * `.failed.json` marker, or no marker at all (the request died mid-flight).
- * Terminal outcomes get a `.done.json` and are never touched again.
+ * `.failed.json` marker and no terminal `.done.json`. Anything else is the
+ * vessel's to retry — it never received a queued 200 for that upload.
  */
 export async function sweep({
   storage,
   url = NOAA_CSB_URL,
   token = NOAA_CSB_TOKEN,
   days = 14,
-  minAgeMs = 10 * 60 * 1000,
 }: SweepOptions): Promise<SweepSummary> {
   const summary: SweepSummary = { submitted: 0, rejected: 0, deferred: 0 };
-  const cutoff = Date.now() - minAgeMs;
 
   for (const prefix of dayPrefixes(days)) {
-    for (const key of await findPending(storage, prefix, cutoff)) {
+    for (const key of await findPending(storage, prefix)) {
       await resubmit(storage, url, token, key, summary);
     }
   }
@@ -61,39 +57,19 @@ function dayPrefixes(days: number): string[] {
 async function findPending(
   storage: R2Storage,
   prefix: string,
-  cutoff: number,
 ): Promise<string[]> {
-  const entries = new Map<
-    string,
-    { uploaded?: Date; done?: boolean; failed?: boolean }
-  >();
-
-  const entry = (key: string) => {
-    let value = entries.get(key);
-    if (!value) entries.set(key, (value = {}));
-    return value;
-  };
+  const failed = new Set<string>();
+  const done = new Set<string>();
 
   for (const object of await storage.list(prefix)) {
-    if (object.key.endsWith(".done.json")) {
-      entry(object.key.slice(0, -".done.json".length)).done = true;
-    } else if (object.key.endsWith(".failed.json")) {
-      entry(object.key.slice(0, -".failed.json".length)).failed = true;
-    } else if (object.key.endsWith(".result.json")) {
-      // Legacy marker from before the sweep existed. Terminal either way:
-      // failures under the old protocol were retried by the vessel itself.
-      entry(object.key.slice(0, -".result.json".length)).done = true;
-    } else if (object.key.endsWith(".geojson")) {
-      entry(object.key.slice(0, -".geojson".length)).uploaded = object.uploaded;
+    if (object.key.endsWith(".failed.json")) {
+      failed.add(object.key.slice(0, -".failed.json".length));
+    } else if (object.key.endsWith(".done.json")) {
+      done.add(object.key.slice(0, -".done.json".length));
     }
   }
 
-  return [...entries]
-    .filter(
-      ([, e]) =>
-        e.uploaded && !e.done && (e.failed || e.uploaded.getTime() < cutoff),
-    )
-    .map(([key]) => key);
+  return [...failed].filter((key) => !done.has(key));
 }
 
 async function resubmit(

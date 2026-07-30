@@ -108,18 +108,13 @@ describe("sweep", () => {
     });
   });
 
-  test("resubmits an old submission with no marker at all", async () => {
+  test("skips markerless submissions; the vessel never got a 200 and retries", async () => {
     const { bucket, objects } = fakeBucket();
     addSubmission(objects, { ageMs: 60 * 60 * 1000 });
 
-    const scope = nock("https://example.com")
-      .post("/bathy/geojson")
-      .reply(200, SUCCESS_RESPONSE, { "Content-Type": "application/json" });
-
     const summary = await useSweep(bucket);
 
-    expect(scope.isDone()).toBe(true);
-    expect(summary.submitted).toBe(1);
+    expect(summary).toEqual({ submitted: 0, rejected: 0, deferred: 0 });
   });
 
   test("skips submissions that are already done", async () => {
@@ -139,15 +134,6 @@ describe("sweep", () => {
       value: JSON.stringify({ success: true }),
       uploaded: new Date(),
     });
-
-    const summary = await useSweep(bucket);
-
-    expect(summary).toEqual({ submitted: 0, rejected: 0, deferred: 0 });
-  });
-
-  test("skips young markerless submissions that may be in flight", async () => {
-    const { bucket, objects } = fakeBucket();
-    addSubmission(objects, { ageMs: 60 * 1000 });
 
     const summary = await useSweep(bucket);
 

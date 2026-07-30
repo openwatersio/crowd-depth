@@ -172,11 +172,14 @@ export function registerWithRouter(router: IRouter, options: APIOptions = {}) {
             attempts: 1,
             lastAttempt: new Date().toISOString(),
           };
-          await record(
-            permanent
-              ? storage?.storeDone(key, failure)
-              : storage?.storeFailed(key, failure),
-          );
+          if (permanent) {
+            await record(storage?.storeDone(key, failure));
+          } else {
+            // Not via record(): the sweep only finds keys with a .failed.json
+            // marker, so if this write fails the vessel must retry (500 below)
+            // or the data would be stranded.
+            await storage?.storeFailed(key, failure);
+          }
 
           // The data is durable, so the vessel should not retry; the sweep
           // cron delivers retryable failures to NOAA out of band.
