@@ -79,6 +79,10 @@ async function findPending(
       entry(object.key.slice(0, -".done.json".length)).done = true;
     } else if (object.key.endsWith(".failed.json")) {
       entry(object.key.slice(0, -".failed.json".length)).failed = true;
+    } else if (object.key.endsWith(".result.json")) {
+      // Legacy marker from before the sweep existed. Terminal either way:
+      // failures under the old protocol were retried by the vessel itself.
+      entry(object.key.slice(0, -".result.json".length)).done = true;
     } else if (object.key.endsWith(".geojson")) {
       entry(object.key.slice(0, -".geojson".length)).uploaded = object.uploaded;
     }

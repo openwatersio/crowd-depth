@@ -132,6 +132,19 @@ describe("sweep", () => {
     expect(nock.pendingMocks()).toEqual([]);
   });
 
+  test("skips submissions with a legacy .result.json marker", async () => {
+    const { bucket, objects } = fakeBucket();
+    const key = addSubmission(objects, { ageMs: 60 * 60 * 1000 });
+    objects.set(`${key}.result.json`, {
+      value: JSON.stringify({ success: true }),
+      uploaded: new Date(),
+    });
+
+    const summary = await useSweep(bucket);
+
+    expect(summary).toEqual({ submitted: 0, rejected: 0, deferred: 0 });
+  });
+
   test("skips young markerless submissions that may be in flight", async () => {
     const { bucket, objects } = fakeBucket();
     addSubmission(objects, { ageMs: 60 * 1000 });
