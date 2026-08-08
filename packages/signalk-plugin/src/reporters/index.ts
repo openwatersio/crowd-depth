@@ -56,6 +56,7 @@ export function createReporter({
           timeframe.from,
           timeframe.to,
         );
+        checkpoint(timeframe);
         return;
       }
 
@@ -66,8 +67,7 @@ export function createReporter({
 
       const submission = await submitGeoJSON(url, config, vessel, data);
       app.debug("Submission response: %j", submission);
-      status.set({ lastReport: timeframe.to });
-      reportLog.logReport(timeframe);
+      checkpoint(timeframe);
     } catch (err) {
       throw status.error(
         new Error(
@@ -92,17 +92,34 @@ export function createReporter({
       reportLog.lastReport ?? "never",
     );
 
-    for (const window of await source.getAvailableTimeframes(
-      timeframe,
-      windowSize,
-    )) {
+    if (signal.aborted) return;
+    const windows = await source.getAvailableTimeframes(timeframe, windowSize);
+    if (signal.aborted) return;
+
+    for (const window of windows) {
       // Stop if plugin is stopped
       if (signal.aborted) return;
 
       await report(window.clamp(timeframe));
     }
 
+    // getAvailableTimeframes intentionally omits empty windows. Once the
+    // complete range has been inspected, advance past those windows too so a
+    // future run does not rescan an ever-growing history range.
+    if (
+      !reportLog.lastReport ||
+      Temporal.Instant.compare(reportLog.lastReport, timeframe.to) < 0
+    ) {
+      checkpoint(timeframe);
+    }
+
     app.debug("Back history reporting complete");
+  }
+
+  function checkpoint(timeframe: Timeframe) {
+    if (signal.aborted) return;
+    status.set({ lastReport: timeframe.to });
+    reportLog.logReport(timeframe);
   }
 
   function updateStatus() {
@@ -134,6 +151,8 @@ export function createReporter({
   } else {
     reportInBatches().then(start);
   }
+
+  return { report, reportInBatches };
 }
 
 export function createReportLogger(db: DatabaseSync) {

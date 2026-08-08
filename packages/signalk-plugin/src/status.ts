@@ -16,7 +16,7 @@ export function createStatus(app: ServerAPI) {
       [
         state.collecting && "Collecting bathymetry",
         state.usingHistory && "Using history",
-        state.lastReport && `Reported at ${state.lastReport.toString()}`,
+        state.lastReport && `Checked through ${state.lastReport.toString()}`,
         state.nextReport && `Next report at ${state.nextReport.toString()}`,
       ]
         .filter(Boolean)

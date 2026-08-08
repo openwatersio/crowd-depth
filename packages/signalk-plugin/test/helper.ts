@@ -24,4 +24,5 @@ export const app = {
   error: () => {},
   getDataDirPath: () => "",
   setPluginStatus: () => {},
+  setPluginError: () => {},
 } as unknown as ServerAPI;
