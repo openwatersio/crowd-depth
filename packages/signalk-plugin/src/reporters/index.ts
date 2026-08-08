@@ -92,6 +92,7 @@ export function createReporter({
       reportLog.lastReport ?? "never",
     );
 
+    if (signal.aborted) return;
     const windows = await source.getAvailableTimeframes(timeframe, windowSize);
     if (signal.aborted) return;
 
@@ -116,6 +117,7 @@ export function createReporter({
   }
 
   function checkpoint(timeframe: Timeframe) {
+    if (signal.aborted) return;
     status.set({ lastReport: timeframe.to });
     reportLog.logReport(timeframe);
   }
