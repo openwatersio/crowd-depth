@@ -1,13 +1,19 @@
 {
   "name": "crowd-depth",
   "version": "1.2.5",
-  "description": "Collect and share depth data.",
+  "description": "Collect depth soundings from your vessel and share them with crowd-sourced bathymetry programs like NOAA's, helping chart shallow waters worldwide.",
   "keywords": [
+    "signalk-node-server-plugin",
+    "signalk-category-cloud",
     "bathymetry",
+    "crowdsourced-bathymetry",
+    "csb",
     "depth",
     "sonar",
-    "signalk-node-server-plugin",
-    "signalk-category-cloud"
+    "sounder",
+    "noaa",
+    "iho",
+    "marine"
   ],
   "homepage": "https://github.com/openwatersio/crowd-depth",
   "bugs": {
@@ -17,7 +23,7 @@
     "type": "git",
     "url": "git+https://github.com/openwatersio/crowd-depth.git"
   },
-  "license": "ISC",
+  "license": "MIT",
   "author": "Brandon Keepers",
   "type": "module",
   "exports": {
@@ -29,7 +35,8 @@
   },
   "files": [
     "dist",
-    "bin"
+    "bin",
+    "icon.svg"
   ],
   "scripts": {
     "build": "tsc -b",
@@ -57,5 +64,9 @@
     "stream-chain": "^4.2.5",
     "stream-transform": "^3.4.0",
     "uuid": "^14.0.1"
+  },
+  "signalk": {
+    "displayName": "Crowd Depth",
+    "appIcon": "icon.svg"
   }
 }

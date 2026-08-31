@@ -1,6 +1,37 @@
-# Crowd Depth Signal K Plugin
+# Crowd Depth
 
-Collect depth and position data from a Signal K server and periodically submit to a trusted node API.
+**Help improve nautical charts by sharing depth data from your vessel.**
+
+Most of the world's coastal waters have never been surveyed, or were last
+surveyed decades ago. Every time you cruise, your depth sounder measures water
+depths that could fill those gaps. Crowd Depth collects those soundings —
+depth, position, and time — and contributes them to [crowdsourced
+bathymetry](https://openwaters.io/bathymetry/crowd-depth/) programs, where
+they help identify uncharted hazards, update charts with recent depth changes,
+and make navigation safer for everyone.
+
+## How it works
+
+1. **Collect** — The plugin runs quietly in your Signal K server, recording
+   depth soundings with GPS coordinates and timestamps as you navigate. If you
+   already log data with a History API plugin (like
+   [signalk-to-influxdb2](https://github.com/tkurki/signalk-to-influxdb2)), it
+   reads from that instead of storing anything extra.
+2. **Correct** — Soundings are adjusted for your configured transducer and
+   antenna offsets, so the reported depth and position reflect the water, not
+   your installation.
+3. **Contribute** — Once a day, the plugin uploads your soundings to [Open
+   Waters](https://openwaters.io/bathymetry/crowd-depth/), an [IHO trusted
+   node](https://iho.int/en/csb-crowdsourced-bathymetry) — an organization
+   authorized to submit crowdsourced bathymetry to the [IHO Data Centre for
+   Digital Bathymetry](https://www.ncei.noaa.gov/maps/iho_dcdb/), hosted by
+   NOAA, on behalf of mariners. From there your soundings become part of the
+   public record, available to hydrographic offices, chart makers, and
+   navigation apps under a [CC0 public
+   domain](https://creativecommons.org/publicdomain/zero/1.0/) dedication.
+
+You stay in control: sharing can be anonymous (a random UUID instead of your
+vessel name and MMSI), and you can disable the plugin at any time.
 
 ## Installation
 
@@ -9,28 +40,51 @@ Collect depth and position data from a Signal K server and periodically submit t
 
 ## Configuration
 
-Configuring the plugin correctly is essential for accurate depth reporting.
+Accurate offsets are what turn raw sounder readings into chart-quality data —
+take a few minutes to measure them. Where your vessel already reports
+`sensors.*` and `design.*` paths, the plugin pre-fills the defaults.
 
-- **Path**: Choose which depth path to use (`belowSurface`, `belowTransducer`, or `belowKeel`) depending on what is reported in your environment.
-- **Depth sounder offsets**: Required `x`, `y`, `z`; optional `draft`, `make`, `model`, `frequency`, `transducer`.
-- **GNSS offsets**: Required `x`, `y`, `z`; optional `make`, `model`.
-- **Sharing**: Set `anonymous` to hide vessel name/ID; data is still tied to a unique UUID.
+### Depth
 
-## How it works
+- **Path** — Which depth path to report (`belowSurface`, `belowTransducer`,
+  or `belowKeel`), depending on what your instruments provide. Defaults to
+  the first one with data.
 
-1. **Collection** - Data is collected in one of two ways:
-   1. If you're using a plugin that offers a History API (like [signalk-to-influxdb2](https://github.com/tkurki/signalk-to-influxdb2)), this plugin will not store any additional data, but will query the history API for depth/position data when it's time to report. Your historical data will also be reported.
-   2. If no History API is available, the plugin will store depth/position data locally in a SQLite database.
-2. **Reporting** - Data will be reported on a schedule to the API. Each report signs the vessel identity and uploads a GeoJSON file to the trusted node API.
-   1. Data is reported every day at midnight in your local timezone, but can be changed by setting a cron-style schedule in `BATHY_DEFAULT_SCHEDULE="0 0 * * *"` environment variable).
-   2. The target endpoint defaults to `BATHY_URL` (production: `https://depth.openwaters.io`, otherwise `http://localhost:3001`). Override via environment variables on the Signal K host.
+### Depth Sounder
 
-## Contributing
+- **Depth source** — The sensor to record when more than one reports depth,
+  so soundings stay pinned to a single transducer.
+- **Offsets** (required) — Transducer distance from the bow, from the
+  centerline (positive to starboard), and below the waterline, in meters.
+- **Details** (optional) — Draft, make, model, frequency, and transducer
+  type. Included in report metadata to help downstream processors assess data
+  quality.
 
-See [CONTRIBUTING.md](https://github.com/openwatersio/crowd-depth/blob/main/CONTRIBUTING.md) for repo layout, the local
-Signal K `npm link` workflow, testing, and releases.
+### GPS Receiver
 
-## Notes
+- **Position source** — The receiver to record when more than one reports
+  position, so all soundings share one antenna location.
+- **Offsets** (required) — Antenna distance from the bow, from the centerline
+  (positive to starboard), and above the waterline, in meters.
+- **Details** (optional) — Make and model.
 
-- The plugin corrects depth positions using configured sensor offsets and marks data as unprocessed for tides/vertical datums.
-- Includes a helper CLI `xyz-to-geojson` (installed with the package) for converting XYZ files to GeoJSON.
+### Data Sharing
+
+- **Share data anonymously** — Withhold your vessel name and MMSI and report
+  under a randomly generated UUID instead.
+
+By enabling the plugin, you agree to share your position and depth data with
+the IHO data collection service under CC0.
+
+## For developers
+
+- Data is reported daily at midnight local time; set a cron-style schedule in
+  the `BATHY_DEFAULT_SCHEDULE` environment variable to change it.
+- Reports go to `BATHY_URL` (production: `https://depth.openwaters.io`,
+  otherwise `http://localhost:3001`).
+- A helper CLI `xyz-to-geojson` (installed with the package) converts XYZ
+  files to GeoJSON.
+
+See [CONTRIBUTING.md](https://github.com/openwatersio/crowd-depth/blob/main/CONTRIBUTING.md)
+for repo layout, the local Signal K `npm link` workflow, testing, and
+releases.

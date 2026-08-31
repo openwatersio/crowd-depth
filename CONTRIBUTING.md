@@ -68,7 +68,7 @@ A husky pre-commit hook runs prettier and oxlint on staged files. CI
 ### Working on the plugin
 
 ```sh
-npm test -w crowd-depth        # plugin tests only
+npm test -- --project crowd-depth   # plugin tests only
 npm run build -w crowd-depth
 npm run dev -w crowd-depth     # tsc --watch
 ```
@@ -83,6 +83,11 @@ cd ~/.signalk && npm link crowd-depth
 Restart the Signal K server after changes (the `dev` watch rebuilds `dist/`,
 but the server only loads the plugin at startup).
 
+If your Signal K server runs in Docker, don't bind-mount the plugin inside
+`node_modules` — the AppStore reifies that tree with npm and can't rename a
+mount point (`EBUSY`), which breaks every plugin install/update. Mount it
+outside `node_modules` and reference it with a `file:` dependency instead.
+
 By default the plugin reports to `http://localhost:3001` unless
 `NODE_ENV=production`; set `BATHY_URL` to override, and
 `BATHY_DEFAULT_SCHEDULE` (cron syntax) to change the reporting schedule.
@@ -91,7 +96,7 @@ By default the plugin reports to `http://localhost:3001` unless
 
 ```sh
 npm start                      # wrangler dev on http://localhost:3001
-npm test -w crowd-depth-api    # API tests only
+npm test -- --project crowd-depth-api   # API tests only
 ```
 
 Copy `.env.example` to configure secrets locally. See
