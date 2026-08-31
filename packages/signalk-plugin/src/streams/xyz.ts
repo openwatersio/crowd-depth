@@ -51,12 +51,13 @@ const XyzToBathymetry = {
 
 export function fromXyz() {
   return parse({
-    cast_date: true,
     skip_empty_lines: true,
     skip_records_with_empty_values: true,
     skip_records_with_error: true,
-    columns(header: (keyof typeof XyzToBathymetry)[]) {
-      return header.map((key) => XyzToBathymetry[key] || key);
+    columns(header: string[]) {
+      return header.map(
+        (key) => XyzToBathymetry[key as keyof typeof XyzToBathymetry] || key,
+      );
     },
     cast(value, context) {
       if (context.header) return value;
