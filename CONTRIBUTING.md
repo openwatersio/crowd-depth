@@ -20,19 +20,19 @@ docs/               # CSB reference material (schemas, IHO/NOAA guidance PDFs)
 Runs inside a Signal K server. Collects depth + position, then reports it on a
 schedule to the trusted node API.
 
-| Path | What it does |
-| --- | --- |
-| `src/plugin.ts` | Plugin entry: wires config, collector, reporter, and schedule together |
-| `src/config.ts` | Plugin settings JSON schema and config types |
-| `src/collector.ts` | Subscribes to live deltas and writes them to storage |
-| `src/sources/` | Where report data comes from: `history.ts` (Signal K History API, e.g. signalk-to-influxdb2) with `sqlite.ts` as the fallback local store |
-| `src/storage.ts` | SQLite database setup (`node:sqlite`) |
-| `src/streams/` | Stream pipeline: `live.ts` (deltas → `BathymetryData`), `transforms.ts` (offset correction, precision), `geojson.ts` / `xyz.ts` (output formats) |
-| `src/reporters/` | Submission to the trusted node API (`noaa.ts` builds and signs the upload) |
-| `src/metadata.ts` | Vessel identity (name/MMSI or anonymous UUID) persistence |
-| `src/status.ts` | Plugin status messages shown in the Signal K admin UI |
-| `src/fetch.ts` | HTTP helpers shared with the API package |
-| `bin/xyz-to-geojson` | Helper CLI for converting XYZ files to GeoJSON |
+| Path                 | What it does                                                                                                                                     |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `src/plugin.ts`      | Plugin entry: wires config, collector, reporter, and schedule together                                                                           |
+| `src/config.ts`      | Plugin settings JSON schema and config types                                                                                                     |
+| `src/collector.ts`   | Subscribes to live deltas and writes them to storage                                                                                             |
+| `src/sources/`       | Where report data comes from: `history.ts` (Signal K History API, e.g. signalk-to-influxdb2) with `sqlite.ts` as the fallback local store        |
+| `src/storage.ts`     | SQLite database setup (`node:sqlite`)                                                                                                            |
+| `src/streams/`       | Stream pipeline: `live.ts` (deltas → `BathymetryData`), `transforms.ts` (offset correction, precision), `geojson.ts` / `xyz.ts` (output formats) |
+| `src/reporters/`     | Submission to the trusted node API (`noaa.ts` builds and signs the upload)                                                                       |
+| `src/metadata.ts`    | Vessel identity (name/MMSI or anonymous UUID) persistence                                                                                        |
+| `src/status.ts`      | Plugin status messages shown in the Signal K admin UI                                                                                            |
+| `src/fetch.ts`       | HTTP helpers shared with the API package                                                                                                         |
+| `bin/xyz-to-geojson` | Helper CLI for converting XYZ files to GeoJSON                                                                                                   |
 
 ### `packages/api` (`crowd-depth-api`, private)
 
@@ -40,15 +40,15 @@ A small Express app deployed as a Cloudflare Worker at
 `https://depth.openwaters.io`. Receives signed GeoJSON reports, stores them in
 R2, and forwards them to NOAA's CSB endpoint.
 
-| Path | What it does |
-| --- | --- |
-| `src/api.ts` | Routes: `POST /identify` (JWT issuance) and `POST /geojson` (authenticated upload) |
-| `src/app.ts` | Express app assembly |
-| `src/worker.ts` | Cloudflare Workers entry (bridges the Express app to workerd) |
-| `src/r2.ts` | R2/S3 storage of received reports |
-| `src/sweep.ts` | Hourly cron (see `wrangler.jsonc` `triggers`) that re-submits stored reports to NOAA |
-| `src/logger.ts` | pino logger setup |
-| `wrangler.jsonc` | Worker config: R2 binding, cron trigger, custom domain |
+| Path             | What it does                                                                         |
+| ---------------- | ------------------------------------------------------------------------------------ |
+| `src/api.ts`     | Routes: `POST /identify` (JWT issuance) and `POST /geojson` (authenticated upload)   |
+| `src/app.ts`     | Express app assembly                                                                 |
+| `src/worker.ts`  | Cloudflare Workers entry (bridges the Express app to workerd)                        |
+| `src/r2.ts`      | R2/S3 storage of received reports                                                    |
+| `src/sweep.ts`   | Hourly cron (see `wrangler.jsonc` `triggers`) that re-submits stored reports to NOAA |
+| `src/logger.ts`  | pino logger setup                                                                    |
+| `wrangler.jsonc` | Worker config: R2 binding, cron trigger, custom domain                               |
 
 ## Development setup
 
@@ -59,6 +59,7 @@ npm install       # installs all workspaces
 npm run build     # tsc -b, all packages
 npm test          # vitest, all packages
 npm run check     # oxlint + prettier + per-package lint (what CI runs)
+npm run format    # auto-fix lint and formatting issues
 ```
 
 A husky pre-commit hook runs prettier and oxlint on staged files. CI
@@ -119,7 +120,7 @@ the existing file naming.
 Releases are cut from GitHub:
 
 1. Go to [Releases](https://github.com/openwatersio/crowd-depth/releases) →
-   *Draft a new release*.
+   _Draft a new release_.
 2. Create a tag `vX.Y.Z` (semver) targeting `main`, write release notes, and
    publish.
 3. The [release workflow](.github/workflows/release.yml) sets the package
