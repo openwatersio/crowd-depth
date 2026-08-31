@@ -1,6 +1,6 @@
 {
   "name": "crowd-depth",
-  "version": "1.2.5",
+  "version": "1.2.6",
   "description": "Collect depth soundings from your vessel and share them with crowd-sourced bathymetry programs like NOAA's, helping chart shallow waters worldwide.",
   "keywords": [
     "signalk-node-server-plugin",
