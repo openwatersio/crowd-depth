@@ -1,6 +1,6 @@
 # Crowd Depth API
 
-This is a minimal API for receiving crowd-sourced bathymetry GeoJSON reports, storing them, and forwarding them to.
+This is a minimal API for receiving crowd-sourced bathymetry GeoJSON reports, storing them, and forwarding them to NOAA.
 
 ## Endpoints
 
