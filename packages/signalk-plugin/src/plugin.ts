@@ -15,7 +15,8 @@ export default function createPlugin(app: ServerAPI): Plugin {
   return {
     id: "crowd-depth",
     name: "Crowd Depth",
-    description: "Collect and share depth data",
+    description:
+      "Collect and share depth data with crowd-sourced bathymetry programs",
 
     async start(config: Config) {
       app.debug("Starting (ENV=%s)", ENV);
