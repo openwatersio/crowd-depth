@@ -66,8 +66,17 @@ function sourceLabel(app: ServerAPI, sourceRef: string): string {
   const sources = app.getPath("sources") as
     | Record<string, Record<string, { n2k?: Record<string, unknown> }>>
     | undefined;
-  const n2k = sources?.[label]?.[instance]?.n2k;
-  const name = [n2k?.["Manufacturer Code"], n2k?.["Model ID"]]
+  const connection = sources?.[label];
+  // The sources tree keys devices by numeric bus address, but with
+  // useCanName the sourceRef carries the hex CAN name instead, so fall
+  // back to matching each device's n2k.canName (mirrors the admin UI's
+  // getDeviceInfo in signalk-server's sourceLabels.ts).
+  const n2k =
+    connection?.[instance]?.n2k ??
+    Object.values(connection ?? {}).find(
+      (device) => device?.n2k?.canName === instance,
+    )?.n2k;
+  const name = [n2k?.manufacturerCode, n2k?.modelId]
     .filter((p): p is string => typeof p === "string" && p.length > 0)
     .join(" ");
   return name ? `${name} (${sourceRef})` : sourceRef;
