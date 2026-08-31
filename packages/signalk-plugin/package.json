@@ -35,7 +35,8 @@
   },
   "files": [
     "dist",
-    "bin"
+    "bin",
+    "icon.svg"
   ],
   "scripts": {
     "build": "tsc -b",
@@ -65,6 +66,7 @@
     "uuid": "^14.0.1"
   },
   "signalk": {
-    "displayName": "Crowd Depth"
+    "displayName": "Crowd Depth",
+    "appIcon": "icon.svg"
   }
 }

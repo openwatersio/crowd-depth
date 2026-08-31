@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <title>Crowd Depth</title>
+  <defs>
+    <linearGradient id="ocean" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#38bdf8"/>
+      <stop offset="0.45" stop-color="#0369a1"/>
+      <stop offset="1" stop-color="#082f49"/>
+    </linearGradient>
+    <clipPath id="underwater">
+      <rect x="0" y="152" width="512" height="360"/>
+    </clipPath>
+  </defs>
+
+  <rect width="512" height="512" fill="url(#ocean)"/>
+
+  <!-- sonar ping arcs, clipped to below the waterline -->
+  <g clip-path="url(#underwater)" fill="none" stroke="#bae6fd" stroke-width="9">
+    <circle cx="256" cy="148" r="70" opacity="0.9"/>
+    <circle cx="256" cy="148" r="130" opacity="0.7"/>
+    <circle cx="256" cy="148" r="190" opacity="0.5"/>
+    <circle cx="256" cy="148" r="250" opacity="0.35"/>
+  </g>
+
+  <!-- soundings from many boats -->
+  <g fill="#e0f2fe">
+    <circle cx="216" cy="200" r="11"/>
+    <circle cx="302" cy="216" r="11"/>
+    <circle cx="256" cy="252" r="11"/>
+    <circle cx="176" cy="264" r="11"/>
+    <circle cx="340" cy="276" r="11"/>
+    <circle cx="228" cy="312" r="11"/>
+    <circle cx="312" cy="330" r="11"/>
+    <circle cx="256" cy="368" r="11"/>
+  </g>
+
+  <!-- seabed -->
+  <path d="M0,424 C56,394 108,446 172,440 C226,435 250,472 288,468 C332,463 348,404 412,398 C452,394 486,414 512,402 L512,512 L0,512 Z"
+        fill="#051e33"/>
+  <path d="M0,424 C56,394 108,446 172,440 C226,435 250,472 288,468 C332,463 348,404 412,398 C452,394 486,414 512,402"
+        fill="none" stroke="#bae6fd" stroke-width="9"/>
+  <!-- shallow-spot marker -->
+  <circle cx="288" cy="490" r="13" fill="#ef4444"/>
+
+  <!-- waterline -->
+  <line x1="92" y1="148" x2="420" y2="148" stroke="#ffffff" stroke-width="9" stroke-linecap="round"/>
+
+  <!-- sailboat -->
+  <g fill="#ffffff">
+    <path d="M186,114 L326,114 L302,142 L210,142 Z"/>
+    <path d="M249,28 L249,104 L186,104 Z"/>
+    <path d="M263,40 L263,104 L318,104 Z"/>
+  </g>
+</svg>
