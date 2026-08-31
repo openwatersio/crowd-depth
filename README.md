@@ -5,7 +5,7 @@ Collect and share depth data from your marine vessel with crowd-sourced bathymet
 ## What's here
 
 - [Signal K Plugin](packages/signalk-plugin/README.md) – collects your depth + position and periodically reports to the API.
-- [API](packages/api/README.md) – a minimal web service for receiving bathymetry reports, storing them, and forwarding them NOAA.
+- [API](packages/api/README.md) – a minimal web service for receiving bathymetry reports, storing them, and forwarding them to NOAA.
 
 ## Frequently Asked Questions
 
@@ -29,10 +29,15 @@ See [NOAA's Crowdsourced Bathymetry Frequently Asked Questions](https://noaa-dcd
 
 ## Contributing
 
-- Install deps: `npm install`
-- Run tests: `npm test`
-- Build all packages: `npm run build`
-- Run the API locally (defaults to http://localhost:3001): `npm start`
+```sh
+npm install    # install all workspace deps
+npm test       # run tests
+npm run build  # build all packages
+npm start      # run the API locally on http://localhost:3001
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the repo layout, per-package
+development workflows, testing, and how releases work.
 
 ## Resources
 

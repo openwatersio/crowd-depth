@@ -27,19 +27,8 @@ Configuring the plugin correctly is essential for accurate depth reporting.
 
 ## Contributing
 
-From the root of the monorepo:
-
-- Build: `npm run build -w crowd-depth`
-- Tests: `npm test -w crowd-depth`
-- Install the plugin into a local Signal K server for development:
-  ```
-  cd packages/signalk-plugin
-  npm link -w crowd-depth
-  cd ~/.signalk
-  npm link crowd-depth
-  ```
-- Watch for changes to the plugin: `npm run dev -w crowd-depth`
-- Restart the Signal K server whenever the plugin changes.
+See [CONTRIBUTING.md](https://github.com/openwatersio/crowd-depth/blob/main/CONTRIBUTING.md) for repo layout, the local
+Signal K `npm link` workflow, testing, and releases.
 
 ## Notes
 
