@@ -8,3 +8,6 @@ export * from "./types.js";
 export * from "./config.js";
 export * from "./metadata.js";
 export * from "./reporters/index.js";
+export * from "./importer/index.js";
+export * from "./importer/gpx.js";
+export * from "./importer/convert.js";
