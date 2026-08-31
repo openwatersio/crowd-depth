@@ -83,6 +83,11 @@ cd ~/.signalk && npm link crowd-depth
 Restart the Signal K server after changes (the `dev` watch rebuilds `dist/`,
 but the server only loads the plugin at startup).
 
+If your Signal K server runs in Docker, don't bind-mount the plugin inside
+`node_modules` — the AppStore reifies that tree with npm and can't rename a
+mount point (`EBUSY`), which breaks every plugin install/update. Mount it
+outside `node_modules` and reference it with a `file:` dependency instead.
+
 By default the plugin reports to `http://localhost:3001` unless
 `NODE_ENV=production`; set `BATHY_URL` to override, and
 `BATHY_DEFAULT_SCHEDULE` (cron syntax) to change the reporting schedule.
