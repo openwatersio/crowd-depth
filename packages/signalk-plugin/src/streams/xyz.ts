@@ -41,7 +41,7 @@ export function toXyz({
   });
 }
 
-const XyzToBathymetry = {
+const XyzToBathymetry: Record<string, string> = {
   LAT: "latitude",
   LON: "longitude",
   DEPTH: "depth",
@@ -55,7 +55,7 @@ export function fromXyz() {
     skip_empty_lines: true,
     skip_records_with_empty_values: true,
     skip_records_with_error: true,
-    columns(header: (keyof typeof XyzToBathymetry)[]) {
+    columns(header: string[]) {
       return header.map((key) => XyzToBathymetry[key] || key);
     },
     cast(value, context) {
