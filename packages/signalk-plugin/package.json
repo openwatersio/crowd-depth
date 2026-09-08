@@ -15,7 +15,7 @@
     "iho",
     "marine"
   ],
-  "homepage": "https://github.com/openwatersio/crowd-depth",
+  "homepage": "https://openwaters.io/bathymetry",
   "bugs": {
     "url": "https://github.com/openwatersio/crowd-depth/issues"
   },
@@ -24,6 +24,9 @@
     "url": "git+https://github.com/openwatersio/crowd-depth.git"
   },
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "author": "Brandon Keepers",
   "type": "module",
   "exports": {
