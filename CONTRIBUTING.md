@@ -52,8 +52,8 @@ R2, and forwards them to NOAA's CSB endpoint.
 
 ## Development setup
 
-Requires Node >= 22.13 (the plugin uses `node:sqlite`). CI pins Node 24, and
-`mise.toml` mirrors that pin, so `mise install` reproduces the tested toolchain.
+Requires Node >= 24, which is what CI pins and what `mise.toml` mirrors, so
+`mise install` reproduces the tested toolchain.
 
 ```sh
 npm ci            # installs all workspaces from package-lock.json
