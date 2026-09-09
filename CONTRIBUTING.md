@@ -52,18 +52,30 @@ R2, and forwards them to NOAA's CSB endpoint.
 
 ## Development setup
 
-Requires Node >= 22.13 (the plugin uses `node:sqlite`).
+Requires Node >= 24, which is what CI pins and what `mise.toml` mirrors, so
+`mise install` reproduces the tested toolchain.
 
 ```sh
-npm install       # installs all workspaces
+npm ci            # installs all workspaces from package-lock.json
 npm run build     # tsc -b, all packages
 npm test          # vitest, all packages
-npm run check     # oxlint + prettier + per-package lint (what CI runs)
+npm run check     # oxlint + prettier + per-package lint
 npm run format    # auto-fix lint and formatting issues
 ```
 
-A husky pre-commit hook runs prettier and oxlint on staged files. CI
-(`.github/workflows/test.yml`) runs `check`, `build`, and `test` on every push.
+A husky pre-commit hook runs prettier and oxlint on staged files.
+
+### Checks
+
+CI (`.github/workflows/test.yml`) runs these on every push:
+
+```sh
+npm ci
+npm run check
+npm run build
+npm run test
+npm pack --dry-run -w crowd-depth
+```
 
 ### Working on the plugin
 
@@ -143,9 +155,23 @@ Cloudflare Workers Builds; `npm run deploy -w crowd-depth-api` deploys
 manually. Production secrets (`BATHY_JWT_SECRET`, `NOAA_CSB_TOKEN`,
 `NOAA_CSB_URL`) are managed with `wrangler secret put`.
 
+## Release preparation
+
+Before cutting a release, review the specs and plans touched since the previous
+one, plus anything carried forward:
+
+- [ ] Preserve lasting API contracts, constraints, and operational guidance in
+      the maintained docs; record user-facing changes in the release notes.
+- [ ] Delete specs and plans whose implementation is complete and merged. Git
+      history keeps them.
+- [ ] Trim roadmaps to remaining work, linking the relevant issues. Carry
+      unfinished plans forward.
+- [ ] Put the deletions in a pull request a human reviews before publishing.
+
 ## Pull requests
 
 - Keep changes scoped to one package where possible.
 - `npm run check && npm test` should pass before pushing (CI will verify).
+- Commit `package-lock.json` alongside any dependency change.
 - Data-format changes (GeoJSON/XYZ/metadata) should cite the relevant CSB
   guidance — see the [README resources](README.md#resources) and `docs/`.
