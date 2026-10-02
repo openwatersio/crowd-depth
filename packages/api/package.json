@@ -17,8 +17,8 @@
     "@types/semver": "^7.7.1",
     "@types/supertest": "^7.2.1",
     "pino-pretty": "^13.0.0",
-    "supertest": "^7.1.0",
-    "wrangler": "^4.115.0"
+    "supertest": "^7.3.0",
+    "wrangler": "^4.143.0"
   },
   "dependencies": {
     "busboy": "^1.6.0",

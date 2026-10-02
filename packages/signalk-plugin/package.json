@@ -57,15 +57,15 @@
   },
   "dependencies": {
     "@js-temporal/polyfill": "^0.5",
-    "@signalk/server-api": "^2.29.0",
+    "@signalk/server-api": "^2.33.0",
     "cron": "^4.3.4",
-    "csv-parse": "^7.0.2",
+    "csv-parse": "^7.0.3",
     "debug": "^4.4.3",
     "geojson": "^0.5.0",
     "geolib": "^3.3.4",
     "json-stream-stringify": "^3.1.6",
-    "stream-chain": "^4.2.5",
-    "stream-transform": "^3.4.0",
+    "stream-chain": "^4.2.6",
+    "stream-transform": "^3.6.0",
     "uuid": "^14.0.1"
   },
   "signalk": {
