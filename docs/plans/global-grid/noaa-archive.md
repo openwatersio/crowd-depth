@@ -34,7 +34,7 @@ UNIQUE_ID,FILE_UUID,LON,LAT,DEPTH,TIME,PLATFORM_NAME,PROVIDER
 - `UNIQUE_ID` identifies the vessel, and stays the same when the vessel's name is withheld. Checked: anonymous files carry ids such as `AQM-13564`, `AQM-Talonewo` and `ROSEP-672e2884-…`, and the same id repeats across a boat's files.
 - `PLATFORM_NAME` is often `Anonymous` or `UNKNOWN`, so it can't identify a vessel.
 - `PROVIDER` is the trusted node or logger maker, such as `Rosepoint`, `AquaMap`, `FarSounder` or `PGS`.
-- `TIME` is ISO 8601 UTC. Most providers write whole seconds; FarSounder writes milliseconds.
+- `TIME` is ISO 8601 UTC. Most providers write whole seconds; FarSounder writes milliseconds. Checked: Signal K files keep the plugin's milliseconds, identical to the R2 copy.
 - `DEPTH` is positive down in metres, written as a float32 value printed as float64 (for example `4.800000190734863`), so storing it as float32 loses nothing.
 - Fields can be quoted, so the file must be parsed as RFC 4180 CSV, not split on commas.
 
@@ -58,8 +58,21 @@ The plugin submits CSB 3.1 GeoJSON to the trusted node API, which stores each su
 
 - `<key>.geojson` is the submission. `<key>.done.json` records NOAA's final response, and `<key>.failed.json` marks a retryable failure that the API's sweep resends. The API records any 4xx from NOAA as final, including authentication failures and throttling, so a `.done.json` with `success: false` doesn't mean the data was bad.
 - The key is `YYYY/MM/DD/<time>-<uuid>`, where the uuid comes from the vessel's authenticated token. The API checks the vessel id in the submission's form metadata but stores the GeoJSON body unchecked, so the key, not the body, identifies the vessel.
-- The bucket holds earlier layouts from the API's history. Before 2026-01-14, submissions were stored as `.json` and `.csv`. From 2026-01-14, they were `.geojson` with no sidecar, so NOAA's response for that period isn't recorded. On 2026-07-29 and 2026-07-30 the response was written to `.result.json`, before `.done.json` and `.failed.json` replaced it. These dates come from the code's history; the bucket's contents should be inventoried before ingest is written.
+- The code's history has submissions stored as `.json` and `.csv` before 2026-01-14, `.geojson` with no sidecar from then, NOAA's response in `.result.json` on 2026-07-29 and 2026-07-30, and `.done.json` and `.failed.json` after that. The bucket (`crowd-depth-injest`) holds no `.json`/`.csv` submissions, so ingest only reads `.geojson`.
+- Checked, by listing the whole bucket on 2026-10-15 (13,725 objects, 10.1 GB):
+
+  | Layout                                     | Stems | Key dates                | Notes                                                            |
+  | ------------------------------------------ | ----- | ------------------------ | ---------------------------------------------------------------- |
+  | `.geojson` alone                           | 8,628 | 2026-01-20 to 2026-09-24 | All but 15 are before 2026-07-29; NOAA's response isn't recorded |
+  | `.geojson` + `.result.json`                | 15    | 2026-07-29 to 2026-07-30 | Every one records a NOAA 500                                     |
+  | `.geojson` + `.done.json`                  | 2,392 | 2026-08-01 to 2026-10-15 | 2,391 `success: true`                                            |
+  | `.geojson` + `.failed.json` + `.done.json` | 94    | 2026-07-30 to 2026-09-22 | Retried by the sweep, then done; `.failed.json` stays behind     |
+  | Other                                      | 1     |                          | `2026/01/.DS_Store`, which matches no key pattern and is skipped |
+
+  The 11,129 `.geojson` files come from 20 vessels, with a median size of 300 KB and a largest of 22 MB. The earliest file (2026-01-20) already carries CSB 3.1 metadata.
+
 - Vessels are identified as `SIGNALK-<uuid>` in `properties.trustedNode.uniqueVesselID` and `properties.platform.uniqueID`.
+- Checked: NOAA keeps that id. The track index has 5,547 `Signal K` submissions from 12 vessels, arriving from 2026-01-20 on, and each `EXTERNAL_ID` is `SIGNALK-<uuid>`, matching the uuid in an R2 key. Those files' bodies carry the same id as their keys, so this doesn't show which one NOAA keeps when they differ. The CSV's `UNIQUE_ID` is the same string, and its `FILE_UUID` is NOAA's arrival timestamp joined to the vessel uuid (for example `20261014000005884253_b0a6561e-…`), not the `submissionIds` the API records in `.done.json`. The other 8 vessels in R2 have no NOAA submissions.
 - `properties.trustedNode.verticalReferenceOfDepth` states what depths are measured from, but only as well as the vessel is configured. Versions up to 1.2.6 always say `Waterline`. Later versions say `Waterline` when the configured offset was added, `Transducer` or `Unknown` when it wasn't, and `Unknown` can mean below the keel. See the plan's [Open Waters data](README.md#open-waters-data).
 - Positions are moved from the GNSS antenna to the transducer by heading, or by course over ground while the boat makes way (about 1 kn or faster), and a sounding that can't be moved is dropped ([#134](https://github.com/openwatersio/crowd-depth/pull/134)). Earlier versions sent the antenna position unchanged when heading was missing, while the metadata still named the transducer as the position reference. The sensor positions in `properties.platform.sensors` are relative to the transducer (`vesselPositionReferencePoint`), so the sounder's is always zero. The sounder's `draft` carries the configured draft when one is set.
 - Anonymous vessels leave out their name, type, length and MMSI.

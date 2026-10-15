@@ -5,3 +5,5 @@ tmp
 .vercel
 .wrangler
 tsconfig.tsbuildinfo
+packages/grid/.venv
+__pycache__

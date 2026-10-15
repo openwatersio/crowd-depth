@@ -5,14 +5,15 @@ organized, how to develop and test each piece, and how releases work.
 
 ## Repository layout
 
-This is an npm workspaces monorepo with two packages:
+This is an npm workspaces monorepo with two npm packages and one Python project:
 
 ```
 packages/
   signalk-plugin/   # "crowd-depth" on npm — the Signal K plugin
   api/              # "crowd-depth-api" — the trusted node API (Cloudflare Worker, not published)
+  grid/             # Python (uv): the global depth grid pipeline, see docs/plans/global-grid
 docs/               # CSB reference material (schemas, IHO/NOAA guidance PDFs)
-.github/workflows/  # CI (test.yml) and npm publishing (release.yml)
+.github/workflows/  # CI (test.yml, grid.yml) and npm publishing (release.yml)
 ```
 
 ### `packages/signalk-plugin` (npm: `crowd-depth`)
@@ -130,6 +131,20 @@ and an end-to-end curl example against your local server.
 Note the API depends on the plugin workspace (`crowd-depth`) for shared
 submission code, so run `npm run build -w crowd-depth` first if plugin sources
 changed.
+
+### Working on the grid
+
+`packages/grid` is a Python project managed with [uv](https://docs.astral.sh/uv/), outside the npm workspaces, so `npm` commands skip it. It builds the point store described in [the global grid plan](docs/plans/global-grid/README.md).
+
+```sh
+cd packages/grid
+uv run pytest                          # tests
+uv run ruff check && uv run ruff format --check
+uv run grid --store /tmp/grid ingest --prefix 2026/10/14   # one day of both sources into a local store
+uv run grid --store /tmp/grid stats
+```
+
+Listing the Open Waters bucket needs `S3_ENDPOINT`, `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` in the environment; NOAA's bucket is public. `--source noaa` limits a run to one source, and `--max-files N` bounds a run so a backfill publishes its progress as it goes. An ingest exits with status 2 when it holds withdrawals, a listing was incomplete, a file couldn't be fetched, or a key matches no known layout; `grid confirm-withdrawals SOURCE` lets held withdrawals apply once two listings agree.
 
 ## Testing
 

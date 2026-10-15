@@ -1,0 +1,26 @@
+[project]
+name = "grid"
+version = "0.1.0"
+description = "Crowd Depth global depth grid pipeline"
+requires-python = ">=3.12"
+dependencies = [
+  "boto3>=1.38",
+  "duckdb>=1.4",
+  "pyarrow>=20",
+]
+
+[project.scripts]
+grid = "grid.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.12"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

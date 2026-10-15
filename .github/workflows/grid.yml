@@ -1,0 +1,30 @@
+name: Grid
+
+on:
+  pull_request:
+    paths: ["packages/grid/**", ".github/workflows/grid.yml"]
+  push:
+    branches: [main]
+    paths: ["packages/grid/**", ".github/workflows/grid.yml"]
+
+jobs:
+  test:
+    name: Grid tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/grid
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v10
+        with:
+          working-directory: packages/grid
+
+      - name: Lint
+        run: uv run --locked ruff check && uv run --locked ruff format --check
+
+      - name: Run tests
+        run: uv run --locked pytest
