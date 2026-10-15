@@ -128,10 +128,10 @@ def position(lon, lat) -> tuple[float, float]:
 
 def depth(value) -> float:
     # Sentinels such as -1e9 and 0 are valid here; QC flags them.
-    d = float(value)
+    d = float32(float(value))  # overflows to inf on some Python versions, raises on others
     if not math.isfinite(d):
-        raise ValueError(f"depth not finite: {value!r}")
-    return float32(d)
+        raise ValueError(f"depth not finite as float32: {value!r}")
+    return d
 
 
 def parse_noaa(body: bytes) -> Parsed:
@@ -235,7 +235,8 @@ def submission_meta(props: dict) -> dict:
 def parse(source: str, key: str, body: bytes) -> Parsed:
     """Parse a file, raising Invalid for anything it can't read: bodies are untrusted input.
 
-    Errors that say nothing about the file, such as MemoryError, propagate so the run fails
+    A body nested deeply enough to exhaust the parser's recursion is invalid too. Errors
+    that say nothing about the file, such as MemoryError, propagate so the run fails
     and the file is read again, instead of being marked invalid for good.
     """
     try:
@@ -249,6 +250,7 @@ def parse(source: str, key: str, body: bytes) -> Parsed:
         IndexError,
         AttributeError,
         OverflowError,
+        RecursionError,
         csv.Error,
     ) as e:
         raise Invalid(f"{type(e).__name__}: {e}") from e

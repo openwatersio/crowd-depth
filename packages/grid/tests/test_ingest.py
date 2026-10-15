@@ -120,7 +120,8 @@ def test_validity():
     ):
         with pytest.raises(Invalid):
             parse("noaa", noaa_key(1), body)
-    for body in (b"[]", b"{", geojson([(1, -78.1, 33.0, 1e39)])):
+    deep = b"[" * 100_000 + b"]" * 100_000  # RecursionError in json on Python 3.12
+    for body in (b"[]", b"{", deep, geojson([(1, -78.1, 33.0, 1e39)])):
         with pytest.raises(Invalid):
             parse("openwaters", ow_key(1), body)
     # Sentinels are QC's business, not invalid files.

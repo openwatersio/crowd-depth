@@ -9,8 +9,12 @@ on:
 
 jobs:
   test:
-    name: Grid tests
+    name: Grid tests (Python ${{ matrix.python }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # The oldest version pyproject.toml allows, and the newest.
+        python: ["3.12", "3.14"]
     defaults:
       run:
         working-directory: packages/grid
@@ -22,6 +26,7 @@ jobs:
         uses: astral-sh/setup-uv@v10
         with:
           working-directory: packages/grid
+          python-version: ${{ matrix.python }}
 
       - name: Lint
         run: uv run --locked ruff check && uv run --locked ruff format --check
