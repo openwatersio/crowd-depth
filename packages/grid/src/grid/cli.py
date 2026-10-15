@@ -22,6 +22,13 @@ SOURCES = {
 }
 
 
+def positive(value: str) -> int:
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more")
+    return n
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="grid", description=__doc__.split("\n")[0])
     p.add_argument(
@@ -33,7 +40,9 @@ def main(argv=None):
     i.add_argument(
         "--prefix", default="", help="Only list keys under this date prefix, e.g. 2026/10/14"
     )
-    i.add_argument("--max-files", type=int, help="Ingest at most N files per source; for backfills")
+    i.add_argument(
+        "--max-files", type=positive, help="Ingest at most N files per source; for backfills"
+    )
     for name in SOURCES:
         i.add_argument(
             f"--{name}-url", default=SOURCES[name][0], help=f"Where to list {name} files"

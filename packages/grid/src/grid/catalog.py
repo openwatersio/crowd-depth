@@ -139,10 +139,17 @@ class Lock:
         self._thread.join()
         if self.lost.is_set():
             return
-        current = self._held()  # never mask the error that ended the run
-        # ponytail: get-then-delete; a run taking over in between loses its lock and fails at the pointer
-        if current and json.loads(current[0])["owner"] == self.owner:
-            self.objects.delete(LOCK)
+        # Releasing marks the lock expired with a write conditional on this run's
+        # version, so it can't clobber a lock another run has taken over since.
+        # The next run takes the expired lock over like any stale one.
+        body = json.dumps({"owner": self.owner, "expires": datetime.now(UTC).isoformat()})
+        try:
+            self.objects.put(LOCK, body.encode(), if_match=self.etag)
+        except Conflict:
+            log.warning("the catalog lock changed hands before release")
+        except (BotoCoreError, ClientError, OSError):
+            # Never mask the error that ended the run; the lock expires on its own.
+            log.warning("releasing the catalog lock failed", exc_info=True)
 
 
 def connect(catalog_path: str, data_url: str) -> duckdb.DuckDBPyConnection:

@@ -166,9 +166,9 @@ def parse_noaa(body: bytes) -> Parsed:
 def parse_openwaters(key: str, body: bytes) -> Parsed:
     vessel = vessel_from_key(key)
     doc = json.loads(body)
-    props = doc.get("properties") or {}
-    node = props.get("trustedNode") or {}
-    platform = props.get("platform") or {}
+    props = mapping(doc.get("properties"))
+    node = mapping(props.get("trustedNode"))
+    platform = mapping(props.get("platform"))
     # The API checks the token, not the body, so the key is the vessel's identity.
     for body_id in (node.get("uniqueVesselID"), platform.get("uniqueID")):
         if body_id is not None and body_id != vessel:
@@ -198,6 +198,11 @@ def parse_openwaters(key: str, body: bytes) -> Parsed:
     )
 
 
+def mapping(v) -> dict:
+    """Metadata containers of the wrong type read as empty, so they can't invalidate soundings."""
+    return v if isinstance(v, dict) else {}
+
+
 def text(v) -> str | None:
     return v if isinstance(v, str) else None
 
@@ -214,8 +219,8 @@ def numbers(v) -> list[float] | None:
 
 def submission_meta(props: dict) -> dict:
     """Metadata is a hint: a field of the wrong type is stored as missing, not trusted or fatal."""
-    node = props.get("trustedNode") or {}
-    sensors = (props.get("platform") or {}).get("sensors")
+    node = mapping(props.get("trustedNode"))
+    sensors = mapping(props.get("platform")).get("sensors")
     sensors = [s for s in sensors if isinstance(s, dict)] if isinstance(sensors, list) else []
     sounder = next((s for s in sensors if s.get("type") == "Sounder"), {})
     gnss = next((s for s in sensors if s.get("type") == "GNSS"), {})

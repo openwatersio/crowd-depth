@@ -111,6 +111,9 @@ class Ingest:
         hidden = sum(o.key.rsplit("/", 1)[-1].startswith(".") for o in listing)
         skipped = len(listing) - len(subs) - len(self.sidecars) - other - hidden
         if skipped:
+            # A key this code can't read may be a renamed file, so its old key
+            # missing from the listing says nothing about a withdrawal.
+            complete = False
             # A new key layout would otherwise read as files withdrawn from the source.
             log.warning("%s: %d keys match no known layout", self.source, skipped)
             self.counts["unknown keys"] = skipped

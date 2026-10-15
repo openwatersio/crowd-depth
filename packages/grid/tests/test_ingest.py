@@ -130,6 +130,7 @@ def test_validity():
 
 def test_malformed_metadata_is_dropped_not_fatal(env):
     doc = json.loads(geojson(ROWS))
+    doc["properties"]["trustedNode"] = "Open Waters"
     doc["properties"]["platform"]["sensors"] = [
         "x",
         {"type": "Sounder", "make": 5, "position": [{"x": 1}], "draft": "abc"},
@@ -360,6 +361,44 @@ def test_vessel_identity_comes_from_key(env):
     ]
 
 
+def lock_free(store):
+    got = store.get(LOCK)
+    return got is None or datetime.fromisoformat(json.loads(got[0])["expires"]) <= datetime.now(UTC)
+
+
+def test_release_never_clobbers_a_lock_taken_over(tmp_path):
+    store = LocalObjects(tmp_path)
+    lock = Lock(store)
+    lock.acquire()
+    lock._stop.set()  # stalls past its expiry...
+    lock._thread.join()
+    other = json.dumps({"owner": "other", "expires": "2999-01-01T00:00:00+00:00"}).encode()
+    store.put(LOCK, other)  # ...and another run takes the lock over
+    lock.release()
+    assert store.get(LOCK)[0] == other
+
+
+def test_released_lock_can_be_taken(tmp_path):
+    store = LocalObjects(tmp_path)
+    a = Lock(store)
+    a.acquire()
+    a.release()
+    b = Lock(store)
+    b.acquire()
+    b.release()
+
+
+def test_unknown_keys_hold_withdrawals(env):
+    for n in (1, 2, 3):
+        env.noaa.put(noaa_key(n), noaa_csv(ROWS, unique_id=f"AQM-{n}"))
+    env.run("noaa")
+    body = env.noaa.get(noaa_key(1))[0]
+    env.noaa.delete(noaa_key(1))
+    env.noaa.put("csb/csv/2026/10/14/renamed.csv", body)
+    assert env.run("noaa")
+    assert env.files()[noaa_key(1)] == ("active", None)
+
+
 def test_lock_is_exclusive_and_stale_locks_are_taken(tmp_path):
     store = LocalObjects(tmp_path)
     a = Lock(store)
@@ -375,7 +414,7 @@ def test_lock_is_exclusive_and_stale_locks_are_taken(tmp_path):
     b.acquire()
     assert json.loads(store.get(LOCK)[0])["owner"] == b.owner
     b.release()
-    assert store.get(LOCK) is None
+    assert lock_free(store)
 
 
 def test_lock_renewal_survives_a_retried_renewal(tmp_path):
@@ -413,7 +452,7 @@ def test_read_only_open_publishes_nothing(tmp_path):
     before = store.list("catalog/")
     with open_store(store, write=False) as con:
         assert con.execute("SELECT count(*) FROM lake.files").fetchone() == (0,)
-        assert store.get(LOCK) is None
+        assert lock_free(store)
     assert store.list("catalog/") == before
 
 
@@ -425,7 +464,7 @@ def test_pointer_moves_only_from_the_version_the_run_started_from(tmp_path):
     with pytest.raises(Conflict), open_store(store):
         store.put(POINTER, b"catalog/someone-else.ducklake")
     assert store.get(POINTER)[0] == b"catalog/someone-else.ducklake" != first
-    assert store.get(LOCK) is None
+    assert lock_free(store)
 
 
 def test_catalog_survives_reopen(tmp_path):
@@ -503,4 +542,4 @@ def test_lock_survives_a_brief_outage(tmp_path, monkeypatch):
     time.sleep(0.25)
     assert not lock.lost.is_set()
     lock.release()
-    assert store.get(LOCK) is None
+    assert lock_free(store)
