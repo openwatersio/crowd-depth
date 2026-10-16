@@ -251,16 +251,16 @@ WHERE from_track AND (outlier IS NULL OR point_id IN (SELECT point_id FROM confi
 
 
 # Base cells holding an active sounding that is still an unconfirmed shoal: neither
-# confirmed nor rejected since.
+# confirmed nor rejected since. The soundings are the deduplicated ones the cells are
+# built from, so a copy dedupe dropped can't hold a cell open. The unit's rows and
+# one row past each edge, which holes read.
 SHOAL_CELLS = f"""
 CREATE OR REPLACE TEMP TABLE shoal_cells AS
 SELECT DISTINCT p.tile_id, {BASE_ROW} AS r,
   least(floor((p.lon - (p.tile_id % 360 - 180)) * {BASE} / {K_LIST}[p.tile_id // 360 - 90 + 91])
     ::INTEGER, {BASE} // {K_LIST}[p.tile_id // 360 - 90 + 91] - 1) AS c
-FROM lake.points p JOIN lake.qc_flags q USING (point_id) JOIN lake.files f USING (file_id)
-WHERE p.cell_id = $partition AND q.cell_id = $partition AND list_contains($tiles, p.tile_id)
-  AND f.status = 'active' AND q.flag = 'unconfirmed' AND q.qc_version = {QC_VERSION}
-  AND {BASE_ROW} BETWEEN $rlo - 1 AND $rhi
+FROM active_points_in($partition, $tiles, $rlo - 1, $rhi + 1) p JOIN lake.qc_flags q USING (point_id)
+WHERE q.cell_id = $partition AND q.flag = 'unconfirmed' AND q.qc_version = {QC_VERSION}
   AND NOT EXISTS (SELECT 1 FROM lake.qc_flags k WHERE k.cell_id = $partition
     AND k.point_id = q.point_id AND k.flag IN ('confirmed', 'reject') AND k.qc_version = {QC_VERSION})
 """

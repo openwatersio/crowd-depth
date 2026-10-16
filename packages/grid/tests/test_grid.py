@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta
 import duckdb
 import pyarrow as pa
 import reference_qc
-from test_ingest import HEADER, env  # noqa: F401  (env is a fixture)
+from test_ingest import HEADER, VESSEL, env, geojson, ow_key  # noqa: F401  (env is a fixture)
 
 from grid import catalog, cells, qc
 from grid.catalog import open_store
@@ -495,3 +495,18 @@ def test_binned_confirmation_brackets_the_windowed_one():
     tolerance = windowed(math.log(1.05))
     assert tolerance <= binned <= windowed(2 * math.log(1.05))
     assert 0 < len(tolerance) < len(binned) < len(rows) * 0.9 * 0.9
+
+
+def test_a_shoal_dedupe_dropped_doesnt_hold_a_hole_open(env):  # noqa: F811
+    # NOAA's copy of an Open Waters track has a 3 m spike in a base cell the Open
+    # Waters track skips. Rule 5 drops NOAA's copy, so the cell is an ordinary hole.
+    vessel = "SIGNALK-" + VESSEL
+    env.ow.put(ow_key(1), geojson([(s, *at(5000, s), 10.0) for s in (0, 2, 3, 4, 5)]))
+    put(env, 1, [(s, *at(5000, s), 3.0 if s == 1 else 10.0) for s in range(6)], vessel)
+    put(env, 2, [(0, *at(4999, 0), 10)], "B")
+    env.run()
+    with open_store(env.store) as con:
+        cells.build(con)
+    assert ("unconfirmed", "spike", 3) in flags(env)
+    [hole] = [row for row in grid(env) if row[:3] == (1, 5000, 1)]
+    assert hole[7] == "filled"
