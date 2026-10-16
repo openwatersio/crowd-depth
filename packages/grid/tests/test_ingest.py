@@ -6,7 +6,7 @@ import duckdb
 import pytest
 from boto3.exceptions import RetriesExceededError
 
-from grid import catalog, ingest
+from grid import catalog, ingest, sources
 from grid.catalog import LOCK, POINTER, Lock, Locked, open_store
 from grid.ingest import Ingest, confirm_withdrawals
 from grid.objects import Conflict, LocalObjects
@@ -631,3 +631,21 @@ def test_runs_prune_catalogs_past_retention(env, monkeypatch):
     catalogs = [o.key for o in env.store.list("catalog/")[0] if o.key.endswith(".ducklake")]
     assert catalogs == [env.store.get(catalog.POINTER)[0].decode()]
     assert len(env.active()) == 3
+
+
+@pytest.mark.parametrize(
+    "error, invalid",
+    [
+        (duckdb.OutOfRangeException, True),
+        (duckdb.NotImplementedException, True),
+        (duckdb.OutOfMemoryException, False),
+        (duckdb.BinderException, False),
+    ],
+)
+def test_only_content_errors_make_a_file_invalid(tmp_path, monkeypatch, error, invalid):
+    def fail(*_):
+        raise error("boom")
+
+    monkeypatch.setattr(sources, "content_hash", fail)
+    with pytest.raises(Invalid if invalid else error):
+        parse("noaa", noaa_key(1), noaa_csv(ROWS), tmp_path)

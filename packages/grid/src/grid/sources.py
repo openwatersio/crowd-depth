@@ -42,10 +42,17 @@ OPENWATERS_PROVIDER = "Signal K"
 # (packages/api/src/api.ts), and the largest object in the bucket is 22 MB.
 MAX_JSON_BYTES = 64 * 2**20
 
-# Errors that come from the file's contents. Others, such as running out of memory or
-# disk, say nothing about the file and fail the run, so the file is read again.
-# Binder and parser errors would come from this module's own SQL, so they fail the run.
-FILE_ERRORS = (duckdb.InvalidInputException, duckdb.ConversionException)
+# Errors that say nothing about the file: running out of memory or disk, or a fault in
+# this module's own SQL. They fail the run, so the file is read again. Any other DuckDB
+# error comes from the file's contents and makes it invalid, so one malformed file
+# can't fail every run.
+RUN_ERRORS = (
+    duckdb.OutOfMemoryException,
+    duckdb.IOException,
+    duckdb.BinderException,
+    duckdb.ParserException,
+    duckdb.CatalogException,
+)
 
 
 class Invalid(Exception):
@@ -274,8 +281,10 @@ def content_hash(con, source: str) -> str:
     streaming aggregate with fixed memory, not a sort. Values are formatted explicitly,
     not by DuckDB's casts, so a DuckDB upgrade can't change the hash; the golden test
     in test_ingest.py fails if anything does. A sum of hashes is easier to collide on
-    purpose than one hash over sorted lines, but each line holds its vessel's id from
-    its key, so a submitter could only aim at their own files. It leaves out FILE_UUID, platform
+    purpose than one hash over sorted lines. An Open Waters line holds its vessel's id
+    from its key, so a submitter could only aim at their own files; a NOAA line holds
+    the id its CSV gives, so a NOAA provider could aim at any NOAA file. NOAA vets its
+    providers, which is what this relies on. It leaves out FILE_UUID, platform
     and provider, so identical resubmissions hash alike. The source is in it because
     NOAA's CSV of a Signal K submission can hold exactly the soundings of the R2 copy:
     rule 1 skips copies within a source, and rule 5 decides between sources. It also
@@ -301,5 +310,7 @@ def load(con, source: str, key: str, path: str) -> Parsed:
             meta = load_openwaters(con, key, path)
         n, tmin, tmax = validate(con, arrival(source, key))
         return Parsed(source, vessel, file_uuid, n, tmin, tmax, content_hash(con, source), meta)
-    except FILE_ERRORS as e:
+    except RUN_ERRORS:
+        raise
+    except duckdb.Error as e:
         raise Invalid(f"{type(e).__name__}: {str(e)[:300]}") from e
