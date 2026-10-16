@@ -4,6 +4,8 @@ import hashlib
 import logging
 import os
 import shutil
+import threading
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -122,6 +124,9 @@ class S3Objects:
         return objs, True
 
 
+_put_lock = threading.Lock()
+
+
 class LocalObjects:
     """A directory standing in for a bucket. ETags are content MD5s, as S3 gives for single-part uploads."""
 
@@ -150,15 +155,20 @@ class LocalObjects:
         return True
 
     def put(self, key: str, data: bytes, if_match: str | None = None, if_none_match=False) -> str:
-        # ponytail: check-then-write isn't atomic; fine for one local process, R2 enforces it for real
+        # The check and write are atomic within one process (a run and its lock renewal),
+        # and a reader never sees a half-written object.
+        # ponytail: not across processes; R2 enforces conditional puts for real
         path = self.root / key
-        current = self.get(key)
-        if if_none_match and current is not None:
-            raise Conflict(key)
-        if if_match and (current is None or current[1] != if_match):
-            raise Conflict(key)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
+        with _put_lock:
+            current = self.get(key)
+            if if_none_match and current is not None:
+                raise Conflict(key)
+            if if_match and (current is None or current[1] != if_match):
+                raise Conflict(key)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}")
+            tmp.write_bytes(data)
+            os.replace(tmp, path)
         return self._etag(data)
 
     def delete(self, key: str):
@@ -168,7 +178,8 @@ class LocalObjects:
         objs = []
         for path in sorted(self.root.rglob("*")):
             key = path.relative_to(self.root).as_posix()
-            if path.is_file() and key.startswith(prefix):
+            # Files starting with "." are puts still being written.
+            if path.is_file() and key.startswith(prefix) and not path.name.startswith("."):
                 stat = path.stat()
                 mtime = datetime.fromtimestamp(stat.st_mtime, UTC)
                 objs.append(Obj(key, self._etag(path.read_bytes()), mtime, stat.st_size))
