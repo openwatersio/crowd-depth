@@ -5,15 +5,14 @@ description = "Crowd Depth global depth grid pipeline"
 requires-python = ">=3.12"
 dependencies = [
   "boto3>=1.38",
-  "duckdb>=1.4",
-  "pyarrow>=20",
+  "duckdb>=1.5",
 ]
 
 [project.scripts]
 grid = "grid.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.12"]
+dev = ["pyarrow>=20", "pytest>=8", "ruff>=0.12"]
 
 [build-system]
 requires = ["hatchling"]

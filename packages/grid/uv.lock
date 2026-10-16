@@ -75,11 +75,11 @@ source = { editable = "." }
 dependencies = [
     { name = "boto3" },
     { name = "duckdb" },
-    { name = "pyarrow" },
 ]
 
 [package.dev-dependencies]
 dev = [
+    { name = "pyarrow" },
     { name = "pytest" },
     { name = "ruff" },
 ]
@@ -87,12 +87,12 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "boto3", specifier = ">=1.38" },
-    { name = "duckdb", specifier = ">=1.4" },
-    { name = "pyarrow", specifier = ">=20" },
+    { name = "duckdb", specifier = ">=1.5" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "pyarrow", specifier = ">=20" },
     { name = "pytest", specifier = ">=8" },
     { name = "ruff", specifier = ">=0.12" },
 ]

@@ -2,13 +2,15 @@ import json
 import time
 from datetime import UTC, datetime, timedelta
 
+import duckdb
 import pytest
+from boto3.exceptions import RetriesExceededError
 
 from grid import catalog, ingest
 from grid.catalog import LOCK, POINTER, Lock, Locked, open_store
 from grid.ingest import Ingest, confirm_withdrawals
 from grid.objects import Conflict, LocalObjects
-from grid.sources import Invalid, is_submission, parse, parse_noaa
+from grid.sources import Invalid, is_submission, load
 
 VESSEL = "b0a6561e-970b-48d2-8a17-5862e6a795bc"
 HEADER = "UNIQUE_ID,FILE_UUID,LON,LAT,DEPTH,TIME,PLATFORM_NAME,PROVIDER\n"
@@ -101,15 +103,27 @@ def env(tmp_path, monkeypatch):
     return e
 
 
-def test_content_hash_ignores_file_uuid_and_order():
-    a = parse_noaa(noaa_csv(ROWS, file_uuid="one"))
-    b = parse_noaa(noaa_csv(list(reversed(ROWS)), file_uuid="two"))
-    c = parse_noaa(noaa_csv(ROWS[:2] + [(3, -78.3, 33.3, 5.3)]))
+def parse(source, key, body, tmp_path):
+    """Load a body through the ingest loader, as ingest does from its download."""
+    path = tmp_path / "body"
+    path.write_bytes(body)
+    con = duckdb.connect()
+    con.execute("SET TimeZone = 'UTC'")
+    return load(con, source, key, str(path))
+
+
+def test_content_hash_ignores_file_uuid_and_order(tmp_path):
+    a = parse("noaa", noaa_key(1), noaa_csv(ROWS, file_uuid="one"), tmp_path)
+    b = parse("noaa", noaa_key(1), noaa_csv(list(reversed(ROWS)), file_uuid="two"), tmp_path)
+    c = parse("noaa", noaa_key(1), noaa_csv(ROWS[:2] + [(3, -78.3, 33.3, 5.3)]), tmp_path)
     assert a.content_hash == b.content_hash
     assert a.content_hash != c.content_hash
+    # A repeated sounding is part of the content: the hash is a multiset's, not a set's.
+    d = parse("noaa", noaa_key(1), noaa_csv(ROWS + ROWS[:1]), tmp_path)
+    assert d.content_hash != a.content_hash
 
 
-def test_validity():
+def test_validity(tmp_path):
     for body in (
         noaa_csv([(1, -78.1, 95.0, 4.8)]),
         b"UNIQUE_ID,LON\nx,1\n",
@@ -117,15 +131,27 @@ def test_validity():
         noaa_csv([(1, -78.1, 33.0, 1e39)]),  # overflows float32
         HEADER.encode(),
         b"\xff\xfe",
+        noaa_csv(ROWS).replace(b'Z"', b'"'),  # times without a zone
     ):
         with pytest.raises(Invalid):
-            parse("noaa", noaa_key(1), body)
-    deep = b"[" * 100_000 + b"]" * 100_000  # RecursionError in json on Python 3.12
-    for body in (b"[]", b"{", deep, geojson([(1, -78.1, 33.0, 1e39)])):
+            parse("noaa", noaa_key(1), body, tmp_path)
+    deep = b"[" * 100_000 + b"]" * 100_000
+    for body in (b"[]", b"{", deep, geojson([(1, -78.1, 33.0, 1e39)]), b'{"features": 5}'):
         with pytest.raises(Invalid):
-            parse("openwaters", ow_key(1), body)
+            parse("openwaters", ow_key(1), body, tmp_path)
+    blank = noaa_csv(ROWS[:1]) + noaa_csv(ROWS[1:2], unique_id="")[len(HEADER) :]
+    with pytest.raises(Invalid, match="without a UNIQUE_ID"):
+        parse("noaa", noaa_key(1), blank, tmp_path)
+    with pytest.raises(Invalid):  # a date alone has no time of day or zone
+        parse("noaa", noaa_key(1), noaa_csv(ROWS).replace(b'T18:00:01Z"', b'"'), tmp_path)
+    # A row with an extra field still reads.
+    extra = noaa_csv(ROWS).replace(b"AquaMap\n", b"AquaMap,extra\n", 1)
+    assert parse("noaa", noaa_key(1), extra, tmp_path).count == 3
+    # A zone of hours alone is still a zone.
+    hours = noaa_csv(ROWS).replace(b'Z"', b'+00"')
+    assert parse("noaa", noaa_key(1), hours, tmp_path).count == 3
     # Sentinels are QC's business, not invalid files.
-    assert parse_noaa(noaa_csv([(1, -78.1, 33.0, -1e9)])).soundings[0].depth == -1e9
+    assert parse("noaa", noaa_key(1), noaa_csv([(1, -78.1, 33.0, -1e9)]), tmp_path).count == 1
 
 
 def test_malformed_metadata_is_dropped_not_fatal(env):
@@ -134,14 +160,16 @@ def test_malformed_metadata_is_dropped_not_fatal(env):
     doc["properties"]["platform"]["sensors"] = [
         "x",
         {"type": "Sounder", "make": 5, "position": [{"x": 1}], "draft": "abc"},
+        {"type": "GNSS", "position": ["1", "2", "3"], "draft": 1e400},
     ]
     env.ow.put(ow_key(1), json.dumps(doc).encode())
     env.ow.put(ow_key(1).replace(".geojson", ".done.json"), b"{truncated")
     env.run("openwaters")
     assert env.files()[ow_key(1)] == ("active", None)
     assert env.query(
-        "SELECT sounder, sounder_position, draft, noaa_response FROM lake.submission_meta"
-    ) == [(None, None, None, "{truncated")]
+        "SELECT sounder, sounder_position, gnss_position, draft, noaa_response "
+        "FROM lake.submission_meta"
+    ) == [(None, None, None, None, "{truncated")]
 
 
 def test_keys_with_impossible_dates_are_skipped():
@@ -150,13 +178,14 @@ def test_keys_with_impossible_dates_are_skipped():
     assert is_submission("noaa", noaa_key(1)) and is_submission("openwaters", ow_key(1))
 
 
-def test_fetch_errors_skip_the_file_until_next_run(env, monkeypatch):
+@pytest.mark.parametrize("error", [OSError("reset"), RetriesExceededError(OSError("reset"))])
+def test_fetch_errors_skip_the_file_until_next_run(env, monkeypatch, error):
     env.noaa.put(noaa_key(1), noaa_csv(ROWS))
-    get = env.noaa.get
-    monkeypatch.setattr(env.noaa, "get", lambda key: (_ for _ in ()).throw(OSError("reset")))
+    download = env.noaa.download
+    monkeypatch.setattr(env.noaa, "download", lambda key, path: (_ for _ in ()).throw(error))
     assert env.run("noaa")
     assert env.files() == {}
-    monkeypatch.setattr(env.noaa, "get", get)
+    monkeypatch.setattr(env.noaa, "download", download)
     assert not env.run("noaa")
     assert env.files() == {noaa_key(1): ("active", None)}
 
@@ -180,6 +209,26 @@ def test_point_ids_are_stable(env, tmp_path):
         Ingest(con, "noaa", env.noaa).run()
         assert con.execute("SELECT point_id FROM lake.points ORDER BY row").fetchall() == ids
     assert len(set(ids)) == 3
+    # Changing point ids means stored flags stop matching: bump catalog.HASH_SCHEME.
+    assert ids[0][0].hex() == POINT_ID_0
+
+
+POINT_ID_0 = "fea3484842780615fc6a719c99fb5fb5"
+
+
+def test_implausible_times_stay_out_of_file_spans(env):
+    """A GPS logging 1970 before its fix, or a far-future year, is QC's to reject; the
+    file's span (and the dedupe it drives) covers only its plausible times."""
+    body = geojson(ROWS).replace(b"2026-10-13T18:00:01", b"1970-01-01T00:00:00")
+    env.ow.put(ow_key(1), body.replace(b"2026-10-13T18:00:03", b"2099-01-01T00:00:00"))
+    env.ow.put(ow_key(2), geojson(ROWS).replace(b"2026-10-13T18:00:03", b"294247-01-10T04:00:54"))
+    env.noaa.put(noaa_key(1), noaa_csv(ROWS, unique_id="SIGNALK-" + VESSEL))
+    env.run()
+    assert env.files()[ow_key(2)] == ("invalid", "1 impossible times")
+    spans = env.query("SELECT time_min, time_max FROM lake.files WHERE key = ?", [ow_key(1)])
+    assert spans == [(datetime(2026, 10, 13, 18, 0, 2), datetime(2026, 10, 13, 18, 0, 2))]
+    # Rule 5 drops only NOAA's sounding at 18:00:02; the OW file keeps all three.
+    assert len(env.active()) == 5
 
 
 def test_rule1_copies_are_skipped(env):
@@ -502,7 +551,9 @@ def test_alerts_from_fetch_errors_survive_applied_withdrawals(env, monkeypatch):
     env.run("noaa")
     env.noaa.delete(noaa_key(1))
     env.noaa.put(noaa_key(2), noaa_csv(ROWS, unique_id="AQM-2"))
-    monkeypatch.setattr(env.noaa, "get", lambda key: (_ for _ in ()).throw(OSError("reset")))
+    monkeypatch.setattr(
+        env.noaa, "download", lambda key, path: (_ for _ in ()).throw(OSError("reset"))
+    )
     assert env.run("noaa")
 
 
@@ -543,3 +594,40 @@ def test_lock_survives_a_brief_outage(tmp_path, monkeypatch):
     assert not lock.lost.is_set()
     lock.release()
     assert lock_free(store)
+
+
+def test_stores_record_and_check_their_hash_scheme(tmp_path, monkeypatch):
+    store = LocalObjects(tmp_path)
+    with open_store(store) as con:
+        assert con.execute("SELECT value FROM lake.store_meta").fetchall() == [
+            (catalog.HASH_SCHEME,)
+        ]
+    monkeypatch.setattr(catalog, "HASH_SCHEME", "another")
+    with pytest.raises(RuntimeError, match="hashes with"), open_store(store, write=False):
+        pass
+
+
+GOLDEN_HASH = "7f1c6278d90a8a3a98d831ac9b6bd4d635c4fe43e85a4dde1d3357043569f45a"
+
+
+def test_content_hash_is_pinned(tmp_path):
+    # Changing this hash means every stored copy stops matching: bump catalog.HASH_SCHEME.
+    a = parse("noaa", noaa_key(1), noaa_csv(ROWS), tmp_path)
+    assert a.content_hash == GOLDEN_HASH
+
+
+def test_times_are_stored_in_utc(env):
+    env.noaa.put(noaa_key(1), noaa_csv(ROWS).replace(b'18:00:01Z"', b'20:00:01+02:00"'))
+    env.run("noaa")
+    times = [t for (t,) in env.query("SELECT time FROM lake.points ORDER BY time")]
+    assert times[0] == datetime(2026, 10, 13, 18, 0, 1)
+
+
+def test_runs_prune_catalogs_past_retention(env, monkeypatch):
+    monkeypatch.setattr(catalog, "RETAIN", timedelta(0))
+    for n in (1, 2, 3):
+        env.noaa.put(noaa_key(n), noaa_csv(ROWS, file_uuid=str(n)))
+        env.run("noaa")
+    catalogs = [o.key for o in env.store.list("catalog/")[0] if o.key.endswith(".ducklake")]
+    assert catalogs == [env.store.get(catalog.POINTER)[0].decode()]
+    assert len(env.active()) == 3

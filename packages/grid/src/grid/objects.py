@@ -3,11 +3,13 @@
 import hashlib
 import logging
 import os
+import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 import boto3
+from boto3.s3.transfer import TransferConfig
 from botocore import UNSIGNED
 from botocore.config import Config
 from botocore.exceptions import ClientError
@@ -27,6 +29,7 @@ class Obj:
     key: str
     etag: str
     modified: datetime
+    size: int
 
 
 class S3Objects:
@@ -70,6 +73,19 @@ class S3Objects:
             raise
         return r["Body"].read(), r["ETag"]
 
+    def download(self, key: str, path) -> bool:
+        """Stream an object to a file; False if it doesn't exist."""
+        try:
+            # One connection per download: ingest already runs downloads in parallel.
+            self.client.download_file(
+                self.bucket, self.prefix + key, str(path), Config=TransferConfig(use_threads=False)
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
+                return False
+            raise
+        return True
+
     def put(self, key: str, data: bytes, if_match: str | None = None, if_none_match=False) -> str:
         args = {"Bucket": self.bucket, "Key": self.prefix + key, "Body": data}
         if if_match:
@@ -99,7 +115,7 @@ class S3Objects:
             ):
                 for o in page.get("Contents", []):
                     key = o["Key"][len(self.prefix) :]
-                    objs.append(Obj(key, o["ETag"], o["LastModified"]))
+                    objs.append(Obj(key, o["ETag"], o["LastModified"], o["Size"]))
         except Exception:
             log.exception("listing %s%s stopped after %d objects", self.url, prefix, len(objs))
             return objs, False
@@ -126,6 +142,13 @@ class LocalObjects:
         data = path.read_bytes()
         return data, self._etag(data)
 
+    def download(self, key: str, path) -> bool:
+        source = self.root / key
+        if not source.exists():
+            return False
+        shutil.copyfile(source, path)
+        return True
+
     def put(self, key: str, data: bytes, if_match: str | None = None, if_none_match=False) -> str:
         # ponytail: check-then-write isn't atomic; fine for one local process, R2 enforces it for real
         path = self.root / key
@@ -146,8 +169,9 @@ class LocalObjects:
         for path in sorted(self.root.rglob("*")):
             key = path.relative_to(self.root).as_posix()
             if path.is_file() and key.startswith(prefix):
-                mtime = datetime.fromtimestamp(path.stat().st_mtime, UTC)
-                objs.append(Obj(key, self._etag(path.read_bytes()), mtime))
+                stat = path.stat()
+                mtime = datetime.fromtimestamp(stat.st_mtime, UTC)
+                objs.append(Obj(key, self._etag(path.read_bytes()), mtime, stat.st_size))
         return objs, True
 
 

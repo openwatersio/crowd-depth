@@ -27,6 +27,7 @@ These follow from the standards and research in [standards.md](standards.md) and
 - **Crowd data is CATZOC D until shown otherwise.** This is the IHO Data Quality Working Group's recommendation for crowdsourced bathymetry. Upgrades need evidence: corrections applied, independent vessels agreeing, validation against surveys.
 - **Metadata is a hint, not a fact.** A submission's depth reference, offsets and sensor positions are whatever the vessel's software and owner set, and they can be wrong without anything looking wrong. Every source is calibrated from its soundings, and reported metadata is at most a starting estimate.
 - **Raw data is never overwritten.** Corrections, QC and calibration are derived tables that can be rebuilt as methods improve.
+- **Every step has a fixed memory budget.** Work runs in units sized by a bound on points, not by area or vessel alone, and DuckDB spills to disk past its memory limit rather than growing, so a dense harbor or a ship's years of logs cost time, not memory. The point store has one writer. Rendering steps read it and run as independent units, so a build scales by running more of them at once, as Seascape's does.
 
 ## Inputs
 
@@ -73,7 +74,7 @@ Tables:
 | `vessel_offsets`  | Vessel, time range, vertical and horizontal offsets, their precision, method and reputation                                                                                                                                                                                                                  |
 | `corrections`     | `point_id`, corrected depth, each correction applied with its method and uncertainty, corrections version                                                                                                                                                                                                    |
 
-`points` is partitioned coarsely (10° cells) and sorted within files by `tile_id` and then a space-filling curve, so row-group statistics prune reads to a few tiles. Compaction runs weekly. Finer directory partitions would produce hundreds of thousands of tiny files, and NOAA's folders are dated by processing, not observation, so partitioning by year would not bound a rebuild.
+`points` is partitioned coarsely (10° cells). Ingest writes points in the order files arrive, one track after another, so row groups stay spatially compact and their statistics prune reads to a few tiles; sorting a whole batch by tile would hold it in memory, so compaction sorts instead. Compaction runs weekly. Finer directory partitions would produce hundreds of thousands of tiny files, and NOAA's folders are dated by processing, not observation, so partitioning by year would not bound a rebuild.
 
 #### Ingest
 
@@ -87,7 +88,7 @@ Withdrawals are guarded per source. Only a listing that completed every page can
 
 Dedupe works on files:
 
-1. A file whose content matches an active file is a copy and is skipped. The content hash covers the soundings (vessel, time, position and depth) in sorted order and leaves out `FILE_UUID`, which differs between identical resubmissions.
+1. A file whose content matches an active file is a copy and is skipped. The content hash covers the source and the soundings (vessel, time, position and depth) whatever their order, and leaves out `FILE_UUID`, which differs between identical resubmissions. Each sounding is hashed and the hashes summed, so hashing a file takes fixed memory however large it is.
 2. A file replaced in place supersedes its old version entirely, so points dropped by reprocessing disappear with it.
 3. A file removed from its source is marked withdrawn, and its points leave every product on the next build.
 4. Within a source, a newer file from the same vessel supersedes an older one only when it holds every sounding of the older file, matched by time and position. A retry or a corrected resubmission covering the same soundings wins. Otherwise both stay, and soundings identical in time, position and depth are counted once. A wider time range alone never supersedes, because a newer file can have gaps or coarser thinning.

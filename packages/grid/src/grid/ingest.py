@@ -16,22 +16,28 @@ that file leaves, a copy takes its points over instead of storing them again.
 
 import hashlib
 import logging
-import math
+import os
+import tempfile
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 
-import pyarrow as pa
+from boto3.exceptions import Boto3Error
 from botocore.exceptions import BotoCoreError, ClientError
 
-from .sources import NOAA_PREFIX, Invalid, Parsed, arrival, is_submission, parse
+from .sources import NOAA_PREFIX, Invalid, Parsed, arrival, is_submission, load
 
 log = logging.getLogger(__name__)
 
 # Share of a source's active files one listing may withdraw before it's held.
 WITHDRAWAL_LIMIT = 0.01
-FLUSH_POINTS = 2_000_000
+# Files are downloaded to disk this many bytes at a time, then loaded one by one into
+# DuckDB, whose memory is capped; points wait in a DuckDB table until a flush.
+FETCH_BYTES = 512 * 2**20
+FLUSH_POINTS = 500_000
 FETCHERS = 16
 # NOAA's response, newest layout first. `.failed.json` marks a retry the API still owes.
 SIDECARS = (".done.json", ".result.json")
@@ -50,28 +56,20 @@ class Row:
     has_points: bool
 
 
-def tile_id(lon: float, lat: float) -> int:
-    """1° tile, row-major from (-180, -90)."""
-    return min(math.floor(lat) + 90, 179) * 360 + min(math.floor(lon) + 180, 359)
-
-
-def cell_id(lon: float, lat: float) -> int:
-    """10° partition cell."""
-    return min(math.floor(lat / 10) + 9, 17) * 36 + min(math.floor(lon / 10) + 18, 35)
-
-
-def morton(lon: float, lat: float) -> int:
-    """Z-order of the position within its 1° tile, at 16 bits (about 1.7 m) per axis."""
-    x = int((lon - math.floor(lon)) * 0xFFFF)
-    y = int((lat - math.floor(lat)) * 0xFFFF)
-    z = 0
-    for i in range(16):
-        z |= ((x >> i) & 1) << (2 * i) | ((y >> i) & 1) << (2 * i + 1)
-    return z
-
-
-def point_id(content_hash: str, row: int) -> bytes:
-    return hashlib.sha256(bytes.fromhex(content_hash) + row.to_bytes(4, "big")).digest()[:16]
+# A loaded file's soundings as points, with their 1° tile and 10° partition cell.
+# Points are written in the order files arrive, one track after another, so each row
+# group holds a few compact tracks and its tile statistics still prune reads. Sorting
+# a whole batch by tile would hold it in memory past the limit; compaction can sort.
+ADD_POINTS = """
+INSERT INTO pending BY NAME
+SELECT unhex(substr(sha256($hash || ':' || "row"), 1, 32)) AS point_id, $file_id AS file_id,
+  "row"::INTEGER AS "row", unique_id, platform, provider, time, time_raw, lon, lat,
+  depth AS depth_raw,
+  least(floor(lat)::INTEGER + 90, 179) * 360 + least(floor(lon)::INTEGER + 180, 359) AS tile_id,
+  least(floor(lat / 10)::INTEGER + 9, 17) * 36 + least(floor(lon / 10)::INTEGER + 18, 35)
+    AS cell_id
+FROM file_points
+"""
 
 
 class Ingest:
@@ -90,9 +88,9 @@ class Ingest:
         # The listing's scope: withdrawals only consider keys under it.
         self.scope = (NOAA_PREFIX if source == "noaa" else "") + prefix
         now = now or datetime.now(UTC)
-        self.batch_id = int(now.timestamp() * 1e6)
         self.now = now.astimezone(UTC).replace(tzinfo=None)
-        self.buffer: dict[int, list[tuple]] = {}
+        self.pending = 0
+        self.last_batch = 0
         self.touched: set[int] = set()
         self.alert = False
         self.counts = Counter()
@@ -120,6 +118,7 @@ class Ingest:
             self.alert = True
 
         self.sql("BEGIN")
+        self.empty_pending()
         self.next_id = self.sql("SELECT coalesce(max(file_id), 0) FROM lake.files").fetchone()[0]
         self.holders = {
             h: (fid, status, reason)
@@ -147,24 +146,33 @@ class Ingest:
             if key not in current or current[key].etag != subs[key].etag
             or current[key].status == "withdrawn"
         ][: self.max_files]  # fmt: skip
-        with ThreadPoolExecutor(FETCHERS) as pool:
-            # Bounded chunks keep only a few parsed files in memory at once.
-            for i in range(0, len(work), FETCHERS * 2):
-                chunk = work[i : i + FETCHERS * 2]
-                for (obj, row), parsed in zip(chunk, pool.map(self.fetch, [o for o, _ in chunk])):
-                    if parsed is None:
+        downloads = tempfile.TemporaryDirectory(dir=os.environ.get("GRID_TEMP_DIR") or None)
+        with downloads as tmp, ThreadPoolExecutor(FETCHERS) as pool:
+            self.tmp = Path(tmp)
+            for chunk in chunks(work, FETCH_BYTES):
+                for (obj, row), path in zip(chunk, pool.map(self.fetch, [o for o, _ in chunk])):
+                    if path is None:
                         continue
-                    if not isinstance(parsed, Parsed | Invalid):
+                    if not isinstance(path, Path):
                         # Unreadable this time: no row, so the next run tries again.
                         self.counts["fetch errors"] += 1
                         self.alert = True
                         continue
-                    if row is None:
-                        self.ingest(obj, 1, parsed)
-                    else:
-                        self.changed(row, obj, parsed)
-                if sum(map(len, self.buffer.values())) >= FLUSH_POINTS:
-                    self.flush()
+                    try:
+                        try:
+                            parsed = load(self.con, self.source, obj.key, str(path))
+                        except Invalid as e:
+                            parsed = e
+                        # The file stays on disk until its points are added: the
+                        # loader's views read it again.
+                        if row is None:
+                            self.ingest(obj, 1, parsed)
+                        else:
+                            self.changed(row, obj, parsed)
+                    finally:
+                        path.unlink()
+                    if self.pending >= FLUSH_POINTS:
+                        self.flush()
 
         self.withdraw(subs, current, complete)
         self.flush()
@@ -177,17 +185,13 @@ class Ingest:
 
     # Files
 
-    def fetch(self, obj) -> Parsed | Invalid | Exception | None:
+    def fetch(self, obj) -> Path | Exception | None:
+        """Download a file to disk; None if it's gone, the error if it can't be read now."""
+        path = self.tmp / hashlib.sha256(obj.key.encode()).hexdigest()
         try:
-            got = self.objects.get(obj.key)
-        except (BotoCoreError, ClientError, OSError) as e:
+            return path if self.objects.download(obj.key, path) else None
+        except (BotoCoreError, ClientError, Boto3Error, OSError) as e:
             log.warning("%s: fetching %s failed: %s", self.source, obj.key, e)
-            return e
-        if got is None:
-            return None
-        try:
-            return parse(self.source, obj.key, got[0])
-        except Invalid as e:
             return e
 
     def ingest(self, obj, version: int, parsed: Parsed | Invalid, prev: Row | None = None):
@@ -201,7 +205,8 @@ class Ingest:
             fresh = h not in self.holders
             status, reason, by, has_points = self.place(fid, h)
             if fresh:
-                self.buffer_points(fid, parsed)
+                self.sql(ADD_POINTS, {"hash": h, "file_id": fid})
+                self.pending += parsed.count
                 self.hold(h, fid, status, reason)
             self.counts["new" if status == "active" else "copy"] += 1
             self.insert_file(fid, obj, version, parsed, status, reason, by, has_points)
@@ -238,8 +243,7 @@ class Ingest:
         # `row` stays the holder's row, which is this file's row only if both list
         # the soundings in the same order.
         self.sql("UPDATE lake.points SET file_id = ? WHERE file_id = ?", [fid, holder_id])
-        if holder_id in self.buffer:
-            self.buffer[fid] = [(r[0], fid, *r[2:]) for r in self.buffer.pop(holder_id)]
+        self.sql("UPDATE pending SET file_id = ? WHERE file_id = ?", [fid, holder_id])
         self.sql("UPDATE lake.files SET has_points = false WHERE file_id = ?", [holder_id])
         del self.hash_of[holder_id]
         self.hold(h, fid, "active", None)
@@ -274,7 +278,7 @@ class Ingest:
         self.hash_of[fid] = h
 
     def insert_file(self, fid, obj, version, parsed, status, reason, by, has_points):
-        tmin, tmax = parsed.time_range if parsed else (None, None)
+        tmin, tmax = (parsed.time_min, parsed.time_max) if parsed else (None, None)
         self.sql(
             "INSERT INTO lake.files VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
@@ -284,7 +288,7 @@ class Ingest:
                 obj.etag,
                 parsed.content_hash if parsed else None,
                 arrival(self.source, obj.key), self.now, tmin, tmax,
-                len(parsed.soundings) if parsed else 0,
+                parsed.count if parsed else 0,
                 has_points, status, reason, by,
             ],
         )  # fmt: skip
@@ -410,35 +414,30 @@ class Ingest:
 
     # Points
 
-    def buffer_points(self, fid: int, parsed: Parsed):
-        h = parsed.content_hash
-        self.buffer[fid] = [
-            (
-                point_id(h, i), fid, i, s.unique_id, s.platform, s.provider, s.time, s.time_raw,
-                s.lon, s.lat, s.depth, tile_id(s.lon, s.lat), cell_id(s.lon, s.lat),
-                self.batch_id, morton(s.lon, s.lat),
-            )
-            for i, s in enumerate(parsed.soundings)
-        ]  # fmt: skip
+    def empty_pending(self):
+        self.sql(
+            "CREATE OR REPLACE TEMP TABLE pending AS "
+            "SELECT * EXCLUDE (batch_id) FROM lake.points LIMIT 0"
+        )
 
     def flush(self):
-        rows = [r for fid in sorted(self.buffer) for r in self.buffer[fid]]
-        self.buffer = {}
-        if not rows:
+        if not self.pending:
             return
-        names = "point_id file_id row unique_id platform provider time time_raw lon lat depth_raw tile_id cell_id batch_id sfc"
-        types = [
-            pa.binary(), pa.int64(), pa.int32(), pa.string(), pa.string(), pa.string(),
-            pa.timestamp("us"), pa.string(), pa.float64(), pa.float64(), pa.float32(),
-            pa.int32(), pa.int16(), pa.int64(), pa.uint32(),
-        ]  # fmt: skip
-        columns = list(zip(*rows))
-        batch = pa.table({n: pa.array(c, t) for n, c, t in zip(names.split(), columns, types)})
-        self.con.register("batch", batch)
-        # Sorted by tile, then Z-order, so row-group statistics prune reads to a few tiles.
-        self.sql("INSERT INTO lake.points SELECT * EXCLUDE (sfc) FROM batch ORDER BY tile_id, sfc")
-        self.con.unregister("batch")
-        self.counts["points"] += len(rows)
+        # Each flush is its own batch, the unit later steps can rerun.
+        batch_id = self.last_batch = max(time.time_ns() // 1000, self.last_batch + 1)
+        self.sql(
+            f"""INSERT INTO lake.points BY NAME
+            SELECT *, {batch_id} AS batch_id FROM pending"""
+        )
+        # Recreated rather than emptied: deleted rows keep their memory until then.
+        self.empty_pending()
+        # A transaction keeps every replaced table's rows, and the rows it inserted,
+        # until it commits, so each batch commits. Nothing is published until the run's
+        # catalog is.
+        self.sql("COMMIT")
+        self.sql("BEGIN")
+        self.counts["points"] += self.pending
+        self.pending = 0
 
     # NOAA's response, recorded but not used to decide anything
 
@@ -463,6 +462,19 @@ class Ingest:
                     "UPDATE lake.submission_meta SET noaa_response = ? WHERE file_id = ?",
                     [got[0].decode(errors="replace"), fid],
                 )
+
+
+def chunks(work, budget: int):
+    """Consecutive pieces of work whose objects add up to about `budget` bytes."""
+    chunk, size = [], 0
+    for item in work:
+        if chunk and size + item[0].size > budget:
+            yield chunk
+            chunk, size = [], 0
+        chunk.append(item)
+        size += item[0].size
+    if chunk:
+        yield chunk
 
 
 def confirm_withdrawals(con, source: str) -> int:

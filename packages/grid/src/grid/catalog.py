@@ -19,6 +19,8 @@ from .objects import Conflict, LocalObjects
 log = logging.getLogger(__name__)
 
 LOCK = "catalog/lock"
+MEMORY_LIMIT = "4GB"
+RETAIN = timedelta(days=7)
 POINTER = "catalog/current"
 
 SCHEMA = """
@@ -41,7 +43,11 @@ CREATE TABLE IF NOT EXISTS lake.submission_meta (
 CREATE TABLE IF NOT EXISTS lake.withdrawal_holds (
   source VARCHAR, key VARCHAR, seen INTEGER, confirmed BOOLEAN
 );
+CREATE TABLE IF NOT EXISTS lake.store_meta (key VARCHAR, value VARCHAR);
 """
+
+# Partitioned by the 10° cell, so a build reads only its partition's rows.
+PARTITIONED = {"points": "cell_id"}
 
 # Points of active files, with the cross-source and same-vessel duplicates of
 # dedupe rules 4 and 5 removed. Rule 5: a noaa sounding inside the time span of
@@ -50,22 +56,48 @@ CREATE TABLE IF NOT EXISTS lake.withdrawal_holds (
 # margin in case a copy is written with fewer.
 # Rule 4: identical soundings in overlapping files count once; every row of the
 # lowest file_id is kept, so loggers faster than 1 Hz keep their repeated times.
-ACTIVE_POINTS = """
-CREATE OR REPLACE TEMP VIEW active_points AS
-WITH f AS (SELECT file_id, source FROM lake.files WHERE status = 'active'),
-ow AS (SELECT vessel, time_min, time_max FROM lake.files WHERE status = 'active' AND source = 'openwaters'),
+# Only a sounding in a time two active files of its vessel both cover can have a twin,
+# so only those go through the dedupe window, whose memory grows with its input. The
+# shared times come from a sweep over the files' start and end times, so their cost
+# follows the number of files, not soundings: a boat logging for years at its mooring
+# shares only the minutes where its uploads overlap.
+# ponytail: the sweep runs for every query; keep it in a table if the files grow slow
+ACTIVE = """
+WITH f AS (
+  SELECT file_id, source, vessel, time_min, time_max FROM lake.files WHERE status = 'active'
+),
+ow AS (SELECT vessel, time_min, time_max FROM f WHERE source = 'openwaters'),
+ends AS (
+  -- A file with no plausible times has no span; QC will reject all its soundings.
+  SELECT source, vessel, time_min AS t, 1 AS d FROM f WHERE time_min IS NOT NULL
+  UNION ALL SELECT source, vessel, time_max, -1 FROM f WHERE time_max IS NOT NULL
+),
+sweep AS (
+  -- Starts sort before ends at the same time, so files that touch count as sharing it.
+  SELECT source, vessel, t, sum(d) OVER (PARTITION BY source, vessel ORDER BY t, d DESC
+      ROWS UNBOUNDED PRECEDING) AS open,
+    lead(t) OVER (PARTITION BY source, vessel ORDER BY t, d DESC) AS t_next
+  FROM ends
+),
+shared AS (SELECT source, vessel, t AS t0, t_next AS t1 FROM sweep WHERE open >= 2),
 p AS (
-  SELECT p.*, f.source FROM lake.points p JOIN f USING (file_id)
-  WHERE NOT (f.source = 'noaa' AND EXISTS (
+  SELECT p.*, f.source, EXISTS (
+      SELECT 1 FROM shared s WHERE s.source = f.source AND s.vessel = f.vessel
+        AND p.time BETWEEN s.t0 AND s.t1) AS twinned
+  FROM lake.points p JOIN f USING (file_id)
+  WHERE {where} AND NOT (f.source = 'noaa' AND EXISTS (
     SELECT 1 FROM ow WHERE ow.vessel = p.unique_id AND p.time >= date_trunc('second', ow.time_min)
     AND p.time < date_trunc('second', ow.time_max) + INTERVAL 1 SECOND))
 )
-SELECT * EXCLUDE (r) FROM (
+SELECT * EXCLUDE (twinned) FROM p WHERE NOT twinned
+UNION ALL BY NAME
+SELECT * EXCLUDE (twinned, r) FROM (
   SELECT *, dense_rank() OVER (
     PARTITION BY source, unique_id, time, lon, lat, depth_raw ORDER BY file_id) AS r
-  FROM p
+  FROM p WHERE twinned
 ) WHERE r = 1
 """
+ACTIVE_POINTS = f"CREATE OR REPLACE TEMP VIEW active_points AS {ACTIVE.format(where='true')}"
 
 
 class Locked(Exception):
@@ -152,8 +184,18 @@ class Lock:
             log.warning("releasing the catalog lock failed", exc_info=True)
 
 
-def connect(catalog_path: str, data_url: str) -> duckdb.DuckDBPyConnection:
+def connect(catalog_path: str, data_url: str, temp_dir: str) -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
+    # A fixed budget per process, so several can run side by side; work past it
+    # spills to disk instead of growing.
+    con.execute("SET memory_limit = ?", [os.environ.get("GRID_MEMORY_LIMIT") or MEMORY_LIMIT])
+    con.execute("SET temp_directory = ?", [temp_dir])
+    # A partitioned write buffers rows for every partition it has open: cap both, so a
+    # track crossing many 10° cells costs a fixed amount.
+    con.execute("SET partitioned_write_flush_threshold = 100000")
+    con.execute("SET partitioned_write_max_open_files = 16")
+    # Times are read and stored in UTC whatever the host's zone.
+    con.execute("SET TimeZone = 'UTC'")
     con.execute("INSTALL ducklake; LOAD ducklake")
     if data_url.startswith("s3://"):
         con.execute("INSTALL httpfs; LOAD httpfs")
@@ -171,14 +213,35 @@ def connect(catalog_path: str, data_url: str) -> duckdb.DuckDBPyConnection:
     con.execute(
         f"ATTACH 'ducklake:{catalog_path}' AS lake (DATA_PATH '{data_url}', DATA_INLINING_ROW_LIMIT 1000)"
     )
-    new = not con.execute(
-        "SELECT 1 FROM duckdb_tables() WHERE database_name = 'lake' AND table_name = 'points'"
-    ).fetchone()
+    existing = {
+        name
+        for (name,) in con.execute(
+            "SELECT table_name FROM duckdb_tables() WHERE database_name = 'lake'"
+        ).fetchall()
+    }
     con.execute(SCHEMA)
-    if new:
-        con.execute("ALTER TABLE lake.points SET PARTITIONED BY (cell_id)")
+    check_hash_scheme(con)
+    # Partitioning is set once, when a table is created.
+    for table in PARTITIONED.keys() - existing:
+        con.execute(f"ALTER TABLE lake.{table} SET PARTITIONED BY ({PARTITIONED[table]})")
     con.execute(ACTIVE_POINTS)
     return con
+
+
+# Content hashes and the point ids derived from them must all come from one scheme, or
+# rule 1 misses copies and points are stored twice. Change this with any change to how
+# sources.content_hash or ingest.ADD_POINTS derives them.
+HASH_SCHEME = "md5-sum-2"
+
+
+def check_hash_scheme(con):
+    scheme = con.execute("SELECT value FROM lake.store_meta WHERE key = 'hash'").fetchone()
+    if scheme is None:
+        if con.execute("SELECT count(*) FROM lake.files").fetchone()[0]:
+            raise RuntimeError("store predates hash scheme records; rebuild it")
+        con.execute("INSERT INTO lake.store_meta VALUES ('hash', ?)", [HASH_SCHEME])
+    elif scheme[0] != HASH_SCHEME:
+        raise RuntimeError(f"store hashes with {scheme[0]}, this build with {HASH_SCHEME}")
 
 
 @contextmanager
@@ -194,7 +257,12 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
     if write:
         lock.acquire()
     try:
-        with tempfile.TemporaryDirectory() as tmp:
+        # Spill files go in a directory of this process's own: DuckDB names them the
+        # same in every process, so two runs sharing one directory crash each other.
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            tempfile.TemporaryDirectory(dir=os.environ.get("GRID_TEMP_DIR") or None) as spill,
+        ):
             local = Path(tmp) / "catalog.ducklake"
             pointer = store.get(POINTER)
             if pointer:
@@ -202,13 +270,19 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
             data_url = store.url + "lake/"
             if isinstance(store, LocalObjects):
                 Path(data_url).mkdir(parents=True, exist_ok=True)
-            con = connect(str(local), data_url)
+            con = connect(str(local), data_url, spill)
             yield con
             if not write:
                 con.close()
                 return
             # Moves rows inlined during the run to Parquet, so the catalog each run downloads stays small.
             con.execute("CALL ducklake_flush_inlined_data('lake')")
+            # A reader may still hold a catalog up to RETAIN old, so snapshots, the files
+            # only they reference, and old catalogs go once they pass it.
+            cutoff = datetime.now(UTC) - RETAIN
+            older = {"cutoff": cutoff.replace(tzinfo=None)}  # session time zone is UTC
+            con.execute("CALL ducklake_expire_snapshots('lake', older_than => $cutoff)", older)
+            con.execute("CALL ducklake_cleanup_old_files('lake', older_than => $cutoff)", older)
             con.execute("DETACH lake")
             con.close()
             if lock.lost.is_set():
@@ -216,12 +290,14 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
             stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
             key = f"catalog/{stamp}-{uuid.uuid4().hex[:8]}.ducklake"
             store.put(key, local.read_bytes(), if_none_match=True)
-            # ponytail: old catalog versions accumulate; prune them once snapshots expire
             if pointer:
                 store.put(POINTER, key.encode(), if_match=pointer[1])
             else:
                 store.put(POINTER, key.encode(), if_none_match=True)
             log.info("catalog now %s", key)
+            for obj in store.list("catalog/")[0]:
+                if obj.key.endswith(".ducklake") and obj.key != key and obj.modified < cutoff:
+                    store.delete(obj.key)
     finally:
         if write:
             lock.release()
