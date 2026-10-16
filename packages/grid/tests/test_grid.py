@@ -166,9 +166,10 @@ def test_single_vessel_dates_are_years(env):  # noqa: F811
 
 
 def test_cell_outliers_are_one_sided_and_shoals_can_be_confirmed(env):  # noqa: F811
+    # Two vessels, so there's no consensus of other vessels and the cell judges alone.
     soundings = [10.0, 10.2, 9.9, 10.1, 10.0, 30.0, 2.0]
     for i, d in enumerate(soundings):
-        put(env, i + 1, [(i, *at(5000, 0, 0.1 + i * 0.1), d)], f"V{i}")
+        put(env, i + 1, [(i, *at(5000, 0, 0.1 + i * 0.1), d)], "V0" if i < 5 else "V1")
     build(env)
     assert flags(env) == [("reject", "cell_deep", 30), ("unconfirmed", "cell_shoal", 2)]
     assert grid(env)[0][3] == float32(9.9)
@@ -176,7 +177,8 @@ def test_cell_outliers_are_one_sided_and_shoals_can_be_confirmed(env):  # noqa: 
     # A second vessel sounding the shoal within its tolerance confirms it.
     put(env, 9, [(20, *at(5000, 0, 0.9), 2.5)], "V9")
     build(env)
-    assert flags(env) == [("reject", "cell_deep", 30)]
+    # Two other vessels now vote on the 30 m sounding, and it's far deeper than both.
+    assert flags(env) == [("reject", "consensus_deep", 30)]
     assert grid(env)[0][3] == 2.0
 
 
@@ -510,3 +512,54 @@ def test_a_shoal_dedupe_dropped_doesnt_hold_a_hole_open(env):  # noqa: F811
     assert ("unconfirmed", "spike", 3) in flags(env)
     [hole] = [row for row in grid(env) if row[:3] == (1, 5000, 1)]
     assert hole[7] == "filled"
+
+
+def test_a_depth_held_over_a_kilometre_is_a_stuck_sounder(env):  # noqa: F811
+    # A sounding every 30 s, 10 base cells (about 86 m) apart: a sounder that lost
+    # bottom holds 601.5 m for 13 soundings, just over a kilometre, in 290 m water.
+    depths = [290.0, 291.0, 289.0, 290.0] + [601.5] * 13 + [290.0, 288.0, 291.0]
+    put(env, 1, [(i * 30, *at(5000, i * 10), d) for i, d in enumerate(depths)], "SHIP")
+    # A slow boat over a flat bottom: 5 m for 40 soundings, about 370 m.
+    put(env, 2, [(i * 10, *at(6000, i), 5.0) for i in range(40)], "BOAT")
+    # A sparse logger: two equal soundings 1.2 km apart are two readings, not a run.
+    put(env, 3, [(0, *at(7000, 0), 20.0), (600, *at(7000, 140), 20.0)], "SPARSE")
+    env.run("noaa")
+    flat = [d for flag, reason, d in flags(env) if reason == "flatline"]
+    assert flat == [601.5] * 13
+    assert all(flag == "reject" for flag, reason, _ in flags(env) if reason == "flatline")
+
+
+def consensus(env, others, vessel_depths):  # noqa: F811
+    """Soundings in one 3″ block: `others` vessels at the given depths, each three times,
+    and then each (vessel, depth) of `vessel_depths` once."""
+    n = 0
+    for i, d in enumerate(others):
+        n += 1
+        put(env, n, [(s, *at(5000 + s, i), d + s * 0.1) for s in range(3)], f"OTHER{i}")
+    for vessel, d in vessel_depths:
+        n += 1
+        put(env, n, [(0, *at(5004, 8), d)], vessel)
+    build(env)
+    return {(reason, d) for flag, reason, d in flags(env) if reason.startswith("consensus")}
+
+
+def test_consensus_rejects_a_sounder_that_lost_bottom(env):  # noqa: F811
+    # Four vessels read about 290 m; one reads 601 m, another a 20 m echo nobody else saw.
+    got = consensus(env, [290, 291, 289, 290], [("DEEP", 601.5), ("ECHO", 20.0)])
+    assert got == {("consensus_deep", 601.5), ("consensus_shoal", 20.0)}
+
+
+def test_consensus_keeps_a_shoal_it_cant_disprove(env):  # noqa: F811
+    # Two other vessels aren't enough to disprove a shoal.
+    assert consensus(env, [290, 291], [("ECHO", 20.0)]) == set()
+
+
+def test_consensus_keeps_a_shoal_another_vessel_saw(env):  # noqa: F811
+    # Three vessels agree on 290 m, but a fourth read 21 m in the next block.
+    put(env, 50, [(0, *at(5004, 12), 21.0)], "OTHER3")
+    assert consensus(env, [290, 291, 289], [("ECHO", 20.0)]) == set()
+
+
+def test_consensus_widens_where_vessels_disagree(env):  # noqa: F811
+    # A slope: other vessels a block apart read 20 to 60 m, so 70 m isn't an outlier.
+    assert consensus(env, [20, 35, 45, 60], [("SLOPE", 70.0)]) == set()

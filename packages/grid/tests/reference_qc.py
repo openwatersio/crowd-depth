@@ -5,6 +5,8 @@ Its windows hold a whole file, which is why ingest doesn't use it.
 
 from grid.cells import OTHER_PASS, SUPPORT
 from grid.qc import (
+    FLAT_M,
+    FLAT_MIN_SOUNDINGS,
     MAX_DEPTH_M,
     MAX_SPEED_KN,
     SHALLOW_M,
@@ -14,6 +16,15 @@ from grid.qc import (
     TRANSIT_GAP,
     TRANSIT_SPAN_S,
 )
+
+
+def _distance(a: str, b: str) -> str:
+    """Metres between soundings `a` and `b`, each "" (this one), "lag" or "lead" along the transit."""
+    lon_a, lat_a = (f"{a}({c}) OVER w" if a else c for c in ("lon", "lat"))
+    lon_b, lat_b = (f"{b}({c}) OVER w" if b else c for c in ("lon", "lat"))
+    dx = f"((({lon_b} - {lon_a} + 540) % 360) - 180) * cos(radians({lat_a})) * 111320"
+    dy = f"({lat_b} - {lat_a}) * 110540"
+    return f"sqrt(({dx}) ^ 2 + ({dy}) ^ 2)"
 
 
 def _speed(a: str, b: str) -> str:
@@ -72,18 +83,31 @@ jumps AS (
   WHERE speed_past IS NOT NULL
     AND least(speed_in, speed_out) > greatest({MAX_SPEED_KN}, 2 * speed_past)
 ),
+flat AS (
+  SELECT point_id FROM (
+    SELECT *, sum(starts::INTEGER) OVER (PARTITION BY file_id, transit ORDER BY time, file_id, "row"
+      ROWS UNBOUNDED PRECEDING) AS run
+    FROM (SELECT *, d IS DISTINCT FROM lag(d) OVER w AS starts, {_distance("lag", "")} AS step
+      FROM legs WHERE point_id NOT IN (SELECT point_id FROM jumps)
+      WINDOW w AS (PARTITION BY file_id, transit ORDER BY time, file_id, "row"))
+  )
+  QUALIFY sum(CASE WHEN NOT starts THEN step END) OVER (PARTITION BY file_id, transit, run) >= {FLAT_M}
+    AND count(*) OVER (PARTITION BY file_id, transit, run) >= {FLAT_MIN_SOUNDINGS}
+),
 spikes AS (
   SELECT point_id, d,
     median(d) OVER (PARTITION BY file_id, transit ORDER BY time, file_id, "row"
       ROWS BETWEEN {SPIKE_WINDOW} PRECEDING AND {SPIKE_WINDOW} FOLLOWING) AS med,
     count(*) OVER (PARTITION BY file_id, transit) AS n
-  FROM legs WHERE point_id NOT IN (SELECT point_id FROM jumps)
+  FROM legs WHERE point_id NOT IN (SELECT point_id FROM jumps UNION ALL SELECT point_id FROM flat)
 )
 SELECT point_id, 'reject' AS flag, reason FROM basic WHERE reason IS NOT NULL
 UNION ALL
 SELECT point_id, 'review', 'very_shallow' FROM p WHERE d > 0 AND d < {SHALLOW_M}
 UNION ALL
 SELECT point_id, 'reject', 'jump' FROM jumps
+UNION ALL
+SELECT point_id, 'reject', 'flatline' FROM flat
 UNION ALL
 SELECT point_id, CASE WHEN d > med THEN 'reject' ELSE 'unconfirmed' END, 'spike'
 FROM spikes

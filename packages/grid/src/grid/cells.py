@@ -21,7 +21,7 @@ BATCH_POINTS = 5_000_000
 BASE = 10_800  # base rows per 1° tile
 SHOAL_QUANTILE = 0.10
 MIN_VESSELS = 2
-CELL_REASONS = ["cell_deep", "cell_shoal", "cell_confirmed"]
+CELL_REASONS = ["cell_deep", "cell_shoal", "cell_confirmed", "consensus_deep", "consensus_shoal"]
 # A sounding of the same vessel this far apart in time is another pass.
 OTHER_PASS = "4 hours"
 DIVISORS = [d for d in range(1, 1201) if 1200 % d == 0]
@@ -94,6 +94,8 @@ def sample(source: str, keys: list[str], name: str) -> str:
 
 # Soundings within tolerance of a shoal that make it a feature rather than noise.
 SUPPORT = 3
+# Other vessels that must agree with each other to disprove a shoal one vessel read.
+DISPROVE = 3
 
 # A unit's points are classified in steps, each a temp table that spills past the
 # memory limit (a MATERIALIZED CTE would hold its whole result in memory), and the cell
@@ -129,6 +131,56 @@ WHERE n.vmin <> s.vessel OR n.vmax <> s.vessel OR n.support >= {SUPPORT}
   OR n.tmax - s.time > INTERVAL '{OTHER_PASS}' OR s.time - n.tmin > INTERVAL '{OTHER_PASS}';
 """
 
+# Consensus: each sounding against the other vessels nearby, since a sounder that has
+# lost bottom is wrong the whole way along its track, so QC along the track can't see
+# it. Each vessel votes once per 3″ block (9 base rows): its median depth there, from
+# soundings QC accepted, and its shoalest sounding, unconfirmed ones included. A
+# sounding is judged against the other vessels' votes in the 3x3 blocks around its own,
+# each vessel once, wherever two or more voted. Deeper than their consensus by more
+# than the tolerance, it's rejected. Shoaler by more than that, it's rejected only when
+# three or more of them agree with the consensus and none read anything within a shoal
+# tolerance of it; otherwise it goes on to the cell's own shoal confirmation. The
+# tolerance is the larger of 2 m + 5% of the consensus and three times the spread of
+# the votes, so it widens on slopes, where vessels a block apart honestly disagree.
+# A vessel's vote is the median of a fixed sample, as cells' are, so one moored in a
+# block for a year costs fixed memory; a vote of the others is the median of at most 9.
+# ponytail: neighbors stop at tile edges; look across them if a tile's edge rows matter
+CONSENSUS = f"""
+CREATE OR REPLACE TEMP TABLE votes AS
+SELECT tile_id, br, bc, vessel, median(d) FILTER (WHERE flag IS NULL AND keep) AS med,
+  min(d) AS shoalest
+FROM {sample("unit_points", ["tile_id", "br", "bc", "vessel"], "keep")} GROUP BY ALL;
+
+CREATE OR REPLACE TEMP TABLE consensus AS
+WITH others AS (
+  SELECT a.tile_id, a.br, a.bc, a.vessel, b.vessel AS other,
+    median(b.med) AS med, min(b.shoalest) AS shoalest
+  FROM (SELECT DISTINCT tile_id, br, bc, vessel FROM votes) a JOIN votes b
+    ON b.tile_id = a.tile_id AND b.br BETWEEN a.br - 1 AND a.br + 1
+    AND b.bc BETWEEN a.bc - 1 AND a.bc + 1 AND b.vessel <> a.vessel
+  GROUP BY ALL
+)
+SELECT tile_id, br, bc, vessel, median(med) AS m, coalesce(mad(med), 0) AS spread,
+  list(med) FILTER (WHERE med IS NOT NULL) AS meds, min(shoalest) AS shoalest
+FROM others GROUP BY ALL HAVING count(med) >= 2;
+DROP TABLE votes;
+
+CREATE OR REPLACE TEMP TABLE consensus_rejects AS
+WITH judged AS (
+  SELECT p.point_id, p.d, c.m, c.meds, c.shoalest,
+    greatest(2 + 0.05 * c.m, 3 * 1.4826 * c.spread) AS tol
+  FROM unit_points p JOIN consensus c
+    ON c.tile_id = p.tile_id AND c.br = p.br AND c.bc = p.bc AND c.vessel = p.vessel
+  WHERE p.r >= $rlo AND p.r < $rhi
+)
+SELECT point_id, CASE WHEN d > m THEN 'consensus_deep' ELSE 'consensus_shoal' END AS reason
+FROM judged
+WHERE d > m + tol
+  OR (d < m - tol AND len(list_filter(meds, x -> abs(x - m) <= tol)) >= {DISPROVE}
+    AND shoalest > d + 2 + 0.05 * d);
+DROP TABLE consensus;
+"""
+
 CLASSIFY = f"""
 CREATE OR REPLACE TEMP TABLE unit_points AS
 WITH flags AS (
@@ -141,7 +193,8 @@ pts AS (
     a.depth_raw AS d, f.flag,
     a.tile_id // 360 - 90 AS lat0, a.tile_id % 360 - 180 AS lon0,
     {K_LIST}[a.tile_id // 360 - 90 + 91] AS k
-  FROM active_points_in($partition, $tiles, $rlo, $rhi) a LEFT JOIN flags f USING (point_id)
+  -- The unit's rows and a 3″ row either side, which consensus reads.
+  FROM active_points_in($partition, $tiles, $rlo - 9, $rhi + 9) a LEFT JOIN flags f USING (point_id)
   WHERE f.flag IS DISTINCT FROM 'reject'
     -- QC rejects these too; cells never trust that QC saw every point.
     AND a.depth_raw > 0 AND a.depth_raw <= {MAX_DEPTH_M}
@@ -152,10 +205,17 @@ idx AS (
     least(floor((lon - lon0) * {BASE} / k)::INTEGER, {BASE} // k - 1) AS c
   FROM pts
 )
-SELECT * FROM idx WHERE r >= $rlo AND r < $rhi;
+SELECT *, r // 9 AS br, c // 9 AS bc FROM idx;
 
-{levels("unit_points", "keyed")}
+{CONSENSUS}
+
+CREATE OR REPLACE TEMP TABLE unit_rows AS
+SELECT * EXCLUDE (br, bc) FROM unit_points WHERE r >= $rlo AND r < $rhi
+  AND point_id NOT IN (SELECT point_id FROM consensus_rejects);
 DROP TABLE unit_points;
+
+{levels("unit_rows", "keyed")}
+DROP TABLE unit_rows;
 
 CREATE OR REPLACE TEMP TABLE classed AS
 WITH robust AS (
@@ -241,6 +301,8 @@ FROM stats s JOIN placed p USING (tile_id, level, cr, cc)
 
 CELL_FLAGS = """
 SELECT point_id, 'reject' AS flag, 'cell_deep' AS reason FROM classed WHERE outlier = 'deep'
+UNION ALL
+SELECT point_id, 'reject', reason FROM consensus_rejects
 UNION ALL
 SELECT point_id, 'unconfirmed', 'cell_shoal' FROM classed
 WHERE outlier = 'shoal' AND NOT from_track AND point_id NOT IN (SELECT point_id FROM confirmed)
@@ -391,7 +453,8 @@ def build(con, tiles: list[int] | None = None) -> dict:
         # Each step commits on its own, so a replaced or dropped table's space is freed
         # at once; only the writes to the store share a transaction.
         for statement in filter(str.strip, CLASSIFY.split(";\n")):
-            con.execute(statement, params if "$" in statement else None)
+            # DuckDB refuses parameters a statement doesn't use.
+            con.execute(statement, {k: v for k, v in params.items() if f"${k}" in statement})
         con.execute("BEGIN")
         con.execute(f"DELETE FROM lake.cells WHERE {scope}", params)
         con.execute(

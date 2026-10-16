@@ -18,7 +18,7 @@ from .sources import EARLIEST
 
 log = logging.getLogger(__name__)
 
-QC_VERSION = 1
+QC_VERSION = 2
 
 # Flags: reject (left out of everything), review (kept, looked at later),
 # unconfirmed (a shoal kept out of cell depths, areas and contours, and published by
@@ -27,7 +27,7 @@ QC_VERSION = 1
 # or pass, or enough of them, confirm; it then counts like any other sounding). A
 # point can carry both an unconfirmed and a confirmed flag: confirmed wins. A reject
 # flag wins over both.
-TRACK_REASONS = ["sentinel", "time", "very_shallow", "jump", "spike"]
+TRACK_REASONS = ["sentinel", "time", "very_shallow", "jump", "flatline", "spike"]
 
 MAX_DEPTH_M = 11_000
 SHALLOW_M = 0.5
@@ -37,19 +37,31 @@ MAX_SPEED_KN = 20
 SPIKE_WINDOW = 5  # soundings either side
 SPIKE_ABS_M = 2.0
 SPIKE_REL = 0.10
+# A sounder that has lost bottom often holds its last depth: the same value over this
+# far is a stuck reading, not a flat seabed. On the Lynn Canal sample, runs this long
+# were a median 17% off the other vessels' depths there, against 5% for shorter ones.
+FLAT_M = 1000
+FLAT_MIN_SOUNDINGS = 3
+
+
+def _at(a: str, column: str) -> str:
+    return f"{a}({column}) OVER w" if a else column
+
+
+def _distance(a: str, b: str) -> str:
+    """Metres between soundings `a` and `b`, each "" (this one), "lag" or "lead" along the transit."""
+    # Equirectangular, well under 1% off at these spacings; longitude wraps at the antimeridian.
+    dx = f"((({_at(b, 'lon')} - {_at(a, 'lon')} + 540) % 360) - 180) * cos(radians({_at(a, 'lat')})) * 111320"
+    dy = f"({_at(b, 'lat')} - {_at(a, 'lat')}) * 110540"
+    return f"sqrt(({dx}) ^ 2 + ({dy}) ^ 2)"
 
 
 def _speed(a: str, b: str) -> str:
     """Knots between soundings `a` and `b`, each "" (this one), "lag" or "lead" along the transit."""
-    lon_a, lat_a, time_a = (f"{a}({c}) OVER w" if a else c for c in ("lon", "lat", "time"))
-    lon_b, lat_b, time_b = (f"{b}({c}) OVER w" if b else c for c in ("lon", "lat", "time"))
-    # Equirectangular distance, well under 1% off at these spacings; longitude wraps
-    # at the antimeridian. Pairs less than a second apart count as one second, since
-    # most providers write whole seconds; it hides jumps of under about 10 m between them.
-    dx = f"((({lon_b} - {lon_a} + 540) % 360) - 180) * cos(radians({lat_a})) * 111320"
-    dy = f"({lat_b} - {lat_a}) * 110540"
-    dt = f"greatest(abs(epoch({time_b}) - epoch({time_a})), 1)"
-    return f"sqrt(({dx}) ^ 2 + ({dy}) ^ 2) / {dt} * 1.943844"
+    # Pairs less than a second apart count as one second, since most providers write
+    # whole seconds; it hides jumps of under about 10 m between them.
+    dt = f"greatest(abs(epoch({_at(b, 'time')}) - epoch({_at(a, 'time')})), 1)"
+    return f"{_distance(a, b)} / {dt} * 1.943844"
 
 
 # Order along a file's track: time, then the order soundings were written in.
@@ -153,8 +165,29 @@ SELECT point_id FROM legs
 WHERE NOT context AND speed_past IS NOT NULL
   AND least(speed_in, speed_out) > greatest({MAX_SPEED_KN}, 2 * speed_past)""",
     f"""
+-- A run of one depth along a transit, held over {FLAT_M} m or more.
+-- ponytail: a run crossing midnight is measured a day at a time, so one that's long only
+-- in total is missed; carry runs across days if stuck sounders slip through that way
+CREATE OR REPLACE TEMP TABLE qc_flat AS
+WITH steps AS (
+  SELECT point_id, file_id, day, transit, "row", time,
+    d IS DISTINCT FROM lag(d) OVER w AS starts, {_distance("lag", "")} AS step
+  FROM qc_track WHERE point_id NOT IN (SELECT point_id FROM qc_jumps)
+  WINDOW w AS (PARTITION BY file_id, day, transit ORDER BY {ORDER})
+),
+runs AS (
+  SELECT *, sum(starts::INTEGER) OVER (PARTITION BY file_id, day, transit ORDER BY {ORDER}
+    ROWS UNBOUNDED PRECEDING) AS run
+  FROM steps
+)
+SELECT point_id FROM runs
+WINDOW r AS (PARTITION BY file_id, day, transit, run)
+QUALIFY sum(CASE WHEN NOT starts THEN step END) OVER r >= {FLAT_M}
+  AND count(*) OVER r >= {FLAT_MIN_SOUNDINGS}""",
+    f"""
 CREATE OR REPLACE TEMP TABLE qc_spikes AS
-WITH clean AS (SELECT * FROM qc_track WHERE point_id NOT IN (SELECT point_id FROM qc_jumps)),
+WITH clean AS (SELECT * FROM qc_track WHERE point_id NOT IN (
+  SELECT point_id FROM qc_jumps UNION ALL SELECT point_id FROM qc_flat)),
 {with_context("clean", SPIKE_WINDOW)},
 sizes AS (SELECT file_id, transit, count(*) AS n FROM clean GROUP BY ALL),
 medians AS (
@@ -173,6 +206,8 @@ UNION ALL
 SELECT point_id, cell_id, 'review', 'very_shallow' FROM qc_points WHERE d > 0 AND d < {SHALLOW_M}
 UNION ALL
 SELECT point_id, cell_id, 'reject', 'jump' FROM qc_jumps JOIN qc_points USING (point_id)
+UNION ALL
+SELECT point_id, cell_id, 'reject', 'flatline' FROM qc_flat JOIN qc_points USING (point_id)
 UNION ALL
 SELECT s.point_id, p.cell_id, CASE WHEN s.d > s.med THEN 'reject' ELSE 'unconfirmed' END, 'spike'
 FROM qc_spikes s JOIN qc_points p USING (point_id)
@@ -198,7 +233,8 @@ def run_batch(con, batch_id: int, fresh=False):
         SELECT *, {QC_VERSION} AS qc_version FROM ({TRACK_FLAGS})"""
     )
     con.execute(
-        "DROP TABLE qc_points; DROP TABLE qc_track; DROP TABLE qc_jumps; DROP TABLE qc_spikes"
+        "DROP TABLE qc_points; DROP TABLE qc_track; DROP TABLE qc_jumps; DROP TABLE qc_flat;"
+        " DROP TABLE qc_spikes"
     )
     con.execute("DELETE FROM lake.qc_batches WHERE batch_id = $batch", params)
     con.execute(f"INSERT INTO lake.qc_batches VALUES ($batch, {QC_VERSION})", params)
