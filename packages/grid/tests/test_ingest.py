@@ -649,3 +649,17 @@ def test_only_content_errors_make_a_file_invalid(tmp_path, monkeypatch, error, i
     monkeypatch.setattr(sources, "content_hash", fail)
     with pytest.raises(Invalid if invalid else error):
         parse("noaa", noaa_key(1), noaa_csv(ROWS), tmp_path)
+
+
+def test_a_run_whose_lease_ran_low_publishes_nothing(tmp_path, monkeypatch):
+    # Renewal stalls without noticing (a hung request): the lock isn't lost yet, but
+    # another run could take it over before a publish that started now finished.
+    store = LocalObjects(tmp_path)
+    with open_store(store):
+        pass
+    first = store.get(POINTER)[0]
+    monkeypatch.setattr(Lock, "_renew", lambda self: self._stop.wait())
+    with pytest.raises(Locked), open_store(store, ttl=timedelta(seconds=0.4)) as con:
+        con.execute("INSERT INTO lake.withdrawal_holds VALUES ('noaa', 'k', 1, false)")
+        time.sleep(0.25)
+    assert store.get(POINTER)[0] == first
