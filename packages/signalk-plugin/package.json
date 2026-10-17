@@ -34,7 +34,8 @@
   },
   "types": "./dist/index.d.ts",
   "bin": {
-    "xyz-to-geojson": "bin/xyz-to-geojson"
+    "xyz-to-geojson": "bin/xyz-to-geojson",
+    "realbathy-to-xyz": "bin/realbathy-to-xyz"
   },
   "files": [
     "dist",

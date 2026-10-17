@@ -105,6 +105,13 @@ Universal](https://creativecommons.org/publicdomain/zero/1.0/).
   otherwise `http://localhost:3001`).
 - A helper CLI `xyz-to-geojson` (installed with the package) converts XYZ
   files to GeoJSON.
+- A helper CLI `realbathy-to-xyz --utc-offset <hours> <track.trl>` converts
+  the RealBathy sounding track a Raymarine LightHouse 4 MFD writes to its chart
+  card (`realbathy/<id>.trl`) to XYZ. The file stores the MFD's local time, so
+  pass its "Time offset from UTC" setting. Positions are as the MFD's GNSS
+  reported them; no sensor offsets are applied and no heading is written, so
+  `xyz-to-geojson` drops them rather than apply this server's offsets to
+  another vessel's recording.
 
 See [CONTRIBUTING.md](https://github.com/openwatersio/crowd-depth/blob/main/CONTRIBUTING.md)
 for repo layout, the local Signal K `npm link` workflow, testing, and
