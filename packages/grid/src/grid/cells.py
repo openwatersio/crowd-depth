@@ -299,7 +299,11 @@ SELECT * FROM (
 
 -- The cell's depth is an actual sounding; SOUNDG sits at that sounding's position.
 CREATE OR REPLACE TEMP TABLE placed AS
-SELECT a.tile_id, a.level, a.cr, a.cc, arg_min({{'lon': a.lon, 'lat': a.lat}}, a.time) AS at
+-- Ties at one depth and time go to the least point_id, not to whichever thread saw
+-- one first, so unchanged soundings always place a cell's sounding in the same spot.
+SELECT a.tile_id, a.level, a.cr, a.cc,
+  arg_min({{'lon': a.lon, 'lat': a.lat}}, (a.time, a.point_id)) FILTER (WHERE a.time IS NOT NULL)
+    AS at
 FROM accepted a JOIN stats s USING (tile_id, level, cr, cc) WHERE a.d = s.depth GROUP BY ALL;
 DROP TABLE accepted;
 """
