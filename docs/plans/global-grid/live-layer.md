@@ -65,7 +65,7 @@ The plugin also lists the tiles as a `type=S-57` chart resource, for plotters wi
 
 ## Open questions
 
-- Whether a MapLibre port of S-52 is close enough, or Freeboard should refresh S-57 chart resources so both layers share its S-52 engine. That needs an upstream change (see [Freeboard refresh](#freeboard-refresh)).
+- Whether a MapLibre port of S-52 is close enough, or Freeboard should refresh S-57 chart resources so both layers share its S-52 engine. That needs the [upstream change](#upstream-change-for-live-chart-resources) below.
 - What the layer shows where there's no tide station or datum separation: raw depths, flagged, or nothing on top of the overlay.
 
 ## Freeboard refresh
@@ -91,4 +91,24 @@ How long a change takes to show:
 | `overlays.data` vector tile with `overlay.refresh` | One tile fetch, under a second on the boat's network                               |
 | `overlays.data` GeoJSON with `overlay.setData`     | The next map render                                                                |
 
-A chart resource for stored cells with an extension for provisional soundings doesn't work: the stored cells would stop changing on screen. The data overlay carries both at the latencies a live layer needs, without per-frame rendering on the client, at the cost of drawing S-52 in a MapLibre style. Keeping Freeboard's own S-52 rendering would need an upstream change: rebuild an S-57 layer's source when a chart delta changes its `url` (a `?rev=` per change), or give S-57 layers `refreshInterval` with a shorter minimum. Even then each change would refetch every visible tile.
+A chart resource for stored cells with an extension for provisional soundings doesn't work in Freeboard as it is: the stored cells would stop changing on screen. The data overlay carries both at the latencies a live layer needs, without per-frame rendering on the client, at the cost of drawing S-52 in a MapLibre style. Keeping Freeboard's own S-52 rendering needs the upstream change below.
+
+### Upstream change for live chart resources
+
+Freeboard needs one change to draw the live layer as a local S-57 chart resource: when a chart's `url` changes, swap it into the existing tile source in place. The signal already exists. The plugin bumps a revision in the chart's URL, for example `/plugins/crowd-depth/tiles/{z}/{x}/{y}.pbf?rev=42`, and sends a `resources.charts.<id>` delta carrying the chart. Freeboard subscribes to `resources.*` once a second ([skstream.facade.ts:286](https://github.com/SignalK/freeboard-sk/blob/afe3b1ca419e26ed5a1f309d065552ecafdbefdf/src/app/modules/skstream/skstream.facade.ts#L286)), so the delta arrives within about a second. The Signal K chart schema needs no new field.
+
+In Freeboard:
+
+1. **Re-point the S-57 layer's source when its `url` changes.** `parseChart` in [layer-s57-chart.component.ts:79-83](https://github.com/SignalK/freeboard-sk/blob/afe3b1ca419e26ed5a1f309d065552ecafdbefdf/src/app/modules/map/ol/lib/charts/layer-s57-chart.component.ts#L79-L83) updates z-index, opacity and extent. It would also compare `chart[1].url` with the URL the source was built from, and call `source.setUrl(url)` when they differ. OpenLayers' `setUrl` re-keys the source without clearing it ([ol/source/UrlTile.js `setUrls`](https://github.com/openlayers/openlayers/blob/v10.7.0/src/ol/source/UrlTile.js)), so old tiles stay drawn until their replacements load. Freeboard already relies on that for vector sources in `startChartTileRecovery` ([chart-utils.ts:944-971](https://github.com/SignalK/freeboard-sk/blob/afe3b1ca419e26ed5a1f309d065552ecafdbefdf/src/app/modules/map/ol/lib/charts/chart-utils.ts#L944-L971)). Don't use `source.refresh()`: it blanks the layer, and Freeboard avoids it for that reason (openlayers#17389). The vector chart layer (`tilelayer` with `pbf`/`mvt`, [layer-vector-chart.component.ts](https://github.com/SignalK/freeboard-sk/blob/afe3b1ca419e26ed5a1f309d065552ecafdbefdf/src/app/modules/map/ol/lib/charts/layer-vector-chart.component.ts)) has the same gap and needs the same change.
+2. **Absorb a URL-only delta in place.** [`absorbChartDelta`](https://github.com/SignalK/freeboard-sk/blob/afe3b1ca419e26ed5a1f309d065552ecafdbefdf/src/app/modules/skresources/resources.service.ts#L597-L617) handles a delta that changes only `time` without re-listing charts. It would also handle one that changes only `url`, and update that chart's entry in the chart cache. Without this, every revision makes Freeboard list every chart from the server again. That works, but it's wasteful every few seconds.
+3. **Tests** alongside the existing [layer-raster-chart.component.spec.ts](https://github.com/SignalK/freeboard-sk/blob/afe3b1ca419e26ed5a1f309d065552ecafdbefdf/src/app/modules/map/ol/lib/charts/layer-raster-chart.component.spec.ts) and the `absorbChartDelta` specs: a changed `url` re-keys the same source, an unchanged one doesn't, and a URL-only delta doesn't re-list.
+
+That's roughly 30 lines plus tests. The benefit isn't specific to crowd-depth: any plugin serving vector data that changes, such as AIS-derived layers or a tide-corrected depth layer, gets live updates through the standard chart resource, and every client that follows `url` behaves the same.
+
+**What it costs.** Changing the URL changes every tile's URL, so each revision refetches every visible tile, not just the changed ones. A typical view is about 12 to 40 tiles of a few KB from the boat's own server. The plugin keeps it cheap by caching encoded tiles and rebuilding only the ones a new cell touched, and by bumping the revision at most every few seconds. Latency is the revision interval, plus up to 1 s for the delta, plus one tile fetch.
+
+**Refetching only changed tiles** would need a way to name them, which the chart resource schema has no field for. Freeboard could take a list of `[z, x, y]` in the delta, as `overlay.refresh` does, and re-key just those tiles, as the data overlay does. That's a schema proposal for Signal K, so it can follow the URL change if the whole-view refetch proves too costly.
+
+**Alternative: `refreshInterval` for S-57.** Giving S-57 and vector layers the raster layers' `startChartTileRefresh` ([chart-utils.ts:1039-1068](https://github.com/SignalK/freeboard-sk/blob/afe3b1ca419e26ed5a1f309d065552ecafdbefdf/src/app/modules/map/ol/lib/charts/chart-utils.ts#L1039-L1068)), with a lower minimum for server-relative URLs, also works. But it polls whether or not anything changed, and the 60 s minimum is there to protect remote tile servers, so a shorter one is a harder sell upstream. The URL change refreshes only when the provider says something changed.
+
+With the change, the chart resource carries the stored cells in Freeboard's own S-52 rendering, including the user's safety contour and units. The plotter extension then only draws the provisional soundings of the last few seconds, as GeoJSON in an `overlays.data` overlay. That's the design this plan started from.
