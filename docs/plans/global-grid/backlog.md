@@ -35,7 +35,7 @@ In order: each step makes the next one measurable.
 - [ ] **Per-tile pipeline.** Cells and surface per 1° tile, web tiles per z8 tile, one low-zoom run, byte-copy assembly into one PMTiles archive. Each tile has a manifest of its input fingerprint, its neighbors' fingerprints, `GRID_VERSION` and `QC_VERSION`. The archive is published only when every dirty unit has finished, and a tile emptied by withdrawals has its outputs removed. Long-lived workers, with a scheduler that weighs memory without stalling small units behind large ones.
 - [ ] **Dirty work below 1° in dense tiles.** Mark the bands that new files touch, plus one band each side, and rebuild surfaces in windows of about 1/8° with a 200 m margin, so daily cost follows each day's new tracks. Compare with an adaptive quadtree that splits tiles until each holds under N soundings.
 - [ ] **Hierarchical low zooms.** z5–z7 per z5 tile, then z0–z4 from those, before the planet's feature volume makes one run slow. Test that shoals survive at z4–z7.
-- [ ] **Measure the planet.** Tile count and density from `points` by `tile_id`, reads from DuckLake on R2 after compaction, timings on cheap x86 cores, and upload cost of the daily archive. Re-run the estimate in [rebuild-cost.md](rebuild-cost.md) against them.
+- [ ] **Measure the planet.** Tile count, density and daily spread are in [planet-size.md](planet-size.md), estimated from NOAA's track index. Still to measure: reads from DuckLake on R2 after compaction, timings on cheap x86 cores, the densest tiles' memory, and upload cost of the daily archive. Re-run the estimate in [rebuild-cost.md](rebuild-cost.md) against them.
 
 ## 4. Clean up QC and seams
 

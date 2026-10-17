@@ -11,6 +11,7 @@ Supporting notes:
 - [Standards](standards.md): what the IHO standards say about data quality, survey accuracy, and deriving depth areas, contours and soundings.
 - [References](references.md): primary sources, research, and reusable code, with links.
 - [Backlog](backlog.md): the prioritized work, from what the spikes below found.
+- [Planet size](planet-size.md): how many 1° tiles the archive covers, how skewed they are, and how a day's arrivals spread.
 - [Rebuild cost](rebuild-cost.md): what a daily planet rebuild costs, and what brings it within a day on cheap hardware.
 - [Point store layout](store-layout.md), [Track QC as pure functions](qc-functions.md) and [Per-tile pipeline](per-tile-pipeline.md): spikes on the Chesapeake set.
 - [Live layer](live-layer.md): the plugin's own-boat layer, drawn on top of the overlay with the same QC, corrections and portrayal.
