@@ -1,5 +1,7 @@
 import json
+import random
 import time
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import duckdb
@@ -13,6 +15,7 @@ from grid.objects import Conflict, LocalObjects
 from grid.sources import Invalid, is_submission, load
 
 VESSEL = "b0a6561e-970b-48d2-8a17-5862e6a795bc"
+OTHER = "5e2f1c3a-6d4b-4f8e-9a1c-2b7d3e4f5a6b"
 HEADER = "UNIQUE_ID,FILE_UUID,LON,LAT,DEPTH,TIME,PLATFORM_NAME,PROVIDER\n"
 
 
@@ -335,6 +338,36 @@ def test_incomplete_listing_withdraws_nothing(env, monkeypatch):
     assert env.files()[noaa_key(1)] == ("active", None)
 
 
+def test_a_run_that_fails_keeps_what_it_published(env, monkeypatch):
+    # Every batch is a checkpoint; the third file can't be downloaded, as an R2 error
+    # late in a long import.
+    monkeypatch.setattr(ingest, "CHECKPOINT_SECONDS", 0)
+    monkeypatch.setattr(ingest, "FLUSH_POINTS", 1)
+    monkeypatch.setattr(ingest, "FETCH_BYTES", 1)
+    env.ow.put(ow_key(1), geojson(ROWS[:2]))
+    env.ow.put(ow_key(2), geojson(ROWS))  # covers the first
+    env.ow.put(ow_key(3, OTHER), geojson(ROWS, OTHER))
+    download = env.ow.download
+
+    def flaky(key, path):
+        if key == ow_key(3, OTHER):
+            raise RuntimeError("RequestTimeTooSkewed")
+        return download(key, path)
+
+    monkeypatch.setattr(env.ow, "download", flaky)
+    with pytest.raises(RuntimeError):
+        env.run("openwaters")
+    assert env.files() == {ow_key(1): ("superseded", "covered"), ow_key(2): ("active", None)}
+    assert len(env.active()) == 3
+    monkeypatch.setattr(env.ow, "download", download)
+    fetched = []
+    monkeypatch.setattr(env.ow, "download", lambda k, p: fetched.append(k) or download(k, p))
+    env.run("openwaters")
+    assert fetched == [ow_key(3, OTHER)]
+    assert env.files()[ow_key(3, OTHER)] == ("active", None)
+    assert len(env.active()) == 6
+
+
 def test_rule4_newer_file_holding_every_sounding_supersedes(env):
     env.ow.put(ow_key(1), geojson(ROWS[:2]))
     env.ow.put(ow_key(2), geojson(ROWS))  # a retry covering the same soundings, and more
@@ -367,6 +400,100 @@ def test_rule4_older_file_arriving_late_is_covered(env):
     env.ow.put(ow_key(1), geojson(ROWS[:2]))
     env.run("openwaters")
     assert env.files() == {ow_key(1): ("superseded", "covered"), ow_key(2): ("active", None)}
+
+
+def test_rule4_reads_points_once_however_many_files_overlap(env, monkeypatch):
+    # Six retries of one track, each a little longer: every pair nests in time.
+    for n in range(1, 7):
+        env.ow.put(ow_key(n), geojson([(s, -78 - s / 100, 33.1, 5.0) for s in range(1, n + 2)]))
+    queries = []
+    sql = Ingest.sql
+    monkeypatch.setattr(Ingest, "sql", lambda self, q, p=None: queries.append(q) or sql(self, q, p))
+    env.run("openwaters")
+    assert sum("FROM lake.points" in q and "GROUP BY ALL" in q for q in queries) == 1
+    assert sum("JOIN lake.files o" in q for q in queries) == 1
+    assert [s for s, _ in env.files().values()].count("active") == 1
+
+
+class PerPairCover(Ingest):
+    """Rule 4 as it ran per file and per pair, with the pairs in file_id order."""
+
+    def cover(self):
+        for fid in sorted(self.touched):
+            found = self.sql(
+                "SELECT arrival, time_min, time_max FROM lake.files WHERE file_id = ? AND status = 'active'",
+                [fid],
+            ).fetchone()
+            if not found:
+                continue
+            arrived, tmin, tmax = found
+            for other, other_arrived, omin, omax in self.sql(
+                """SELECT o.file_id, o.arrival, o.time_min, o.time_max
+                FROM lake.files o JOIN lake.files me
+                  ON o.source = me.source AND o.vessel = me.vessel AND o.file_id <> me.file_id
+                WHERE me.file_id = ? AND o.status = 'active'
+                  AND o.time_min <= me.time_max AND o.time_max >= me.time_min
+                ORDER BY o.file_id""",
+                [fid],
+            ).fetchall():
+                if (arrived, fid) > (other_arrived, other):
+                    newer, older, inside = fid, other, tmin <= omin and omax <= tmax
+                else:
+                    newer, older, inside = other, fid, omin <= tmin and tmax <= omax
+                active = lambda f: (
+                    self.sql("SELECT status FROM lake.files WHERE file_id = ?", [f]).fetchone()[0]
+                    == "active"
+                )
+                if (
+                    inside
+                    and active(older)
+                    and active(newer)
+                    and self.holding({(newer, older)}, {newer: 0, older: 0})
+                ):
+                    self.counts["covered"] += 1
+                    self.set_status(older, "superseded", "covered", newer)
+                    if older == fid:
+                        break
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_rule4_matches_judging_each_pair_in_turn(tmp_path, monkeypatch, seed):
+    # Retries, partial copies and fast-logger repeats of a few vessels' tracks, arriving
+    # over two runs, judged in groups small enough to split them.
+    rng = random.Random(seed)
+    monkeypatch.setattr(ingest, "COVER_POINTS", 12)
+    track = [(s, -78 - s / 100, 33.1, 5.0) for s in range(1, 12)]
+    vessels = [str(uuid.UUID(int=rng.getrandbits(128))) for _ in range(2)]
+    uploads = []
+    for minute in range(1, 13):
+        lo, hi = sorted(rng.sample(range(len(track) + 1), 2))
+        rows = track[lo:hi] or track[:1]
+        if rng.random() < 0.3:
+            rows = rows[:-1] if len(rows) > 1 else rows
+            rows = rows[: len(rows) // 2] + rows[len(rows) // 2 + 1 :] or rows
+        if rng.random() < 0.2:
+            rows = rows + [rng.choice(rows)]
+        vessel = rng.choice(vessels)
+        uploads.append((ow_key(minute, vessel), geojson(rows, vessel)))
+    results = []
+    for cls in (Ingest, PerPairCover):
+        ow, store = (
+            LocalObjects(tmp_path / cls.__name__ / "ow"),
+            LocalObjects(tmp_path / cls.__name__ / "store"),
+        )
+        for half in (uploads[::2], uploads[1::2]):
+            for key, body in half:
+                ow.put(key, body)
+            with open_store(store) as con:
+                cls(con, "openwaters", ow).run()
+        with open_store(store, write=False) as con:
+            results.append(
+                con.execute(
+                    "SELECT key, status, reason, superseded_by FROM lake.files ORDER BY key"
+                ).fetchall()
+            )
+    assert results[0] == results[1]
+    assert any(r[2] == "covered" for r in results[0])
 
 
 def test_rule4_covered_file_returns_when_newer_withdrawn(env, monkeypatch):

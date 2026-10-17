@@ -5,8 +5,8 @@ The work that takes the pipeline from a working point store to a planet rebuilt 
 ## 1. Fix what fails today
 
 - [ ] **Corroboration join runs out of memory.** `cells.CLASSIFY` joins each consensus shoal to every sounding in its 3″ block, which ran out of memory in the bay's `grid cells` at 3.7 GB and on the densest tile at 2 GB. Joining against one row per distinct depth in the block, with its least and greatest vessel, is exact for `CORROBORATE = 1` and takes 24 s on that tile. In progress on the point store branch.
-- [ ] **Ingest can't resume.** A multi-hour import is one transaction, so a single late R2 error discards it. Commit per batch, and record progress so a rerun skips committed files.
-- [ ] **Coverage is half of ingest.** Rule 4's coverage step (9,724 s of 19,153 s for Chesapeake) queries each file against every other file's time range. Sort files by vessel and start time and sweep instead.
+- [x] **Ingest can't resume.** A multi-hour import is one transaction, so a single late R2 error discards it. Commit per batch, and record progress so a rerun skips committed files.
+- [x] **Coverage is half of ingest.** Rule 4's coverage step (9,724 s of 19,153 s for Chesapeake) queries each file against every other file's time range. Sort files by vessel and start time and sweep instead.
 - [ ] **Output isn't deterministic.** `placed` in `cells.CLASSIFY` takes `arg_min(position, time)`, and ties at the same depth and time resolve by thread order, so unchanged inputs give different bytes. Break ties on a stable key. Per-tile change detection depends on this.
 
 ## 2. Calibrate vessels
