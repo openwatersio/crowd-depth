@@ -27,6 +27,7 @@ These follow from the standards and research in [standards.md](standards.md) and
 - **Crowd data is CATZOC D until shown otherwise.** This is the IHO Data Quality Working Group's recommendation for crowdsourced bathymetry. Upgrades need evidence: corrections applied, independent vessels agreeing, validation against surveys.
 - **Metadata is a hint, not a fact.** A submission's depth reference, offsets and sensor positions are whatever the vessel's software and owner set, and they can be wrong without anything looking wrong. Every source is calibrated from its soundings, and reported metadata is at most a starting estimate.
 - **Raw data is never overwritten.** Corrections, QC and calibration are derived tables that can be rebuilt as methods improve.
+- **Every step has a fixed memory budget.** Work runs in units sized by a bound on points, not by area or vessel alone, and DuckDB spills to disk past its memory limit rather than growing, so a dense harbor or a ship's years of logs cost time, not memory. The point store has one writer. Rendering steps read it and run as independent units, so a build scales by running more of them at once, as Seascape's does.
 
 ## Inputs
 
@@ -64,30 +65,30 @@ The unit of storage, replacement and removal is the submitted **file**, not the 
 
 Tables:
 
-| Table             | Holds                                                                                                                                                                                                                                                                         |
-| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `files`           | One row per version of a source file: `source`, object key, `file_uuid`, ETag, content hash, arrival time, time range, `status` (active, superseded, withdrawn, invalid), and what superseded it                                                                              |
-| `points`          | Raw soundings exactly as received. `point_id` (a hash of the file version's content hash and row number), `file_id`, `row`, `unique_id`, `platform`, `provider`, `time` (UTC, microseconds), `time_raw`, `lon` and `lat` (double), `depth_raw` (float), `tile_id`, `batch_id` |
-| `submission_meta` | Per-file metadata: depth reference, sensor and GNSS offsets, sounder, and the original CSB 3.1 JSON                                                                                                                                                                           |
-| `qc_flags`        | `point_id`, flag, reason, QC version                                                                                                                                                                                                                                          |
-| `vessel_offsets`  | Vessel, time range, vertical and horizontal offsets, their precision, method and reputation                                                                                                                                                                                   |
-| `corrections`     | `point_id`, corrected depth, each correction applied with its method and uncertainty, corrections version                                                                                                                                                                     |
+| Table             | Holds                                                                                                                                                                                                                                                                                                        |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `files`           | One row per version of a source file: `source`, object key, `version`, `file_uuid`, `vessel`, ETag, content hash, arrival time, time range, `status` (active, superseded, withdrawn, invalid), the `reason` for it, what superseded it, and whether it holds its content's points                            |
+| `points`          | Raw soundings exactly as received. `point_id` (a hash of the file version's content hash and row number), `file_id`, `row`, `unique_id`, `platform`, `provider`, `time` (UTC, microseconds), `time_raw`, `lon` and `lat` (double), `depth_raw` (float), `tile_id`, `cell_id` (the 10° partition), `batch_id` |
+| `submission_meta` | Per-file metadata: depth reference, sensor and GNSS offsets, sounder, logger version, NOAA's response, and the original CSB 3.1 JSON                                                                                                                                                                         |
+| `qc_flags`        | `point_id`, flag, reason, QC version                                                                                                                                                                                                                                                                         |
+| `vessel_offsets`  | Vessel, time range, vertical and horizontal offsets, their precision, method and reputation                                                                                                                                                                                                                  |
+| `corrections`     | `point_id`, corrected depth, each correction applied with its method and uncertainty, corrections version                                                                                                                                                                                                    |
 
-`points` is partitioned coarsely (10° cells) and sorted within files by `tile_id` and then a space-filling curve, so row-group statistics prune reads to a few tiles. Compaction runs weekly. Finer directory partitions would produce hundreds of thousands of tiny files, and NOAA's folders are dated by processing, not observation, so partitioning by year would not bound a rebuild.
+`points` is partitioned coarsely (10° cells). Ingest writes points in the order files arrive, one track after another, so row groups stay spatially compact and their statistics prune reads to a few tiles; sorting a whole batch by tile would hold it in memory, so compaction sorts instead. Compaction runs weekly. Finer directory partitions would produce hundreds of thousands of tiny files, and NOAA's folders are dated by processing, not observation, so partitioning by year would not bound a rebuild.
 
 #### Ingest
 
 Each run lists the whole NOAA bucket and the whole R2 submissions bucket and compares ETags with `files`, which catches replaced and removed files as well as new ones. Listing costs about one request per thousand objects. A file whose ETag changed but whose content hash didn't keeps its row, with the new ETag recorded.
 
-The R2 bucket holds several layouts from the API's history, described in [noaa-archive.md](noaa-archive.md#open-waters-submissions). Ingest starts from an inventory of what the bucket actually holds and handles each layout it finds. Sidecars are not submissions.
+The R2 bucket's layouts are inventoried in [noaa-archive.md](noaa-archive.md#open-waters-submissions). Only `.geojson` files are submissions; sidecars hold NOAA's response, which ingest records.
 
 Ingest validates every file itself and marks a file it can't parse or whose values are impossible as `invalid`. NOAA's response to a submission is recorded but doesn't decide whether it is used: the API records any 4xx as final, including an expired NOAA token or throttling, so a rejection says little about the data.
 
-Withdrawals are guarded per source. Only a listing that completed every page can withdraw anything. A listing that returns no objects, or that would withdraw more than a small share of a source's active files (1% to start), holds its withdrawals and raises an alert, while new files are still ingested. Held withdrawals apply when two consecutive listings agree and an operator confirms them. `files` is keyed by source and object key, so a file that disappears and comes back with the same content reactivates its row and keeps its point ids.
+Withdrawals are guarded per source. Only a listing that completed every page can withdraw anything. A listing that returns no objects, or that would withdraw more than a small share of a source's active files (1% to start), holds its withdrawals and raises an alert, while new files are still ingested. Held withdrawals, kept in a `withdrawal_holds` table, apply when two consecutive listings agree and an operator confirms them. `files` is keyed by source and object key, so a file that disappears and comes back with the same content reactivates its row and keeps its point ids.
 
 Dedupe works on files:
 
-1. A file whose content matches an active file is a copy and is skipped. The content hash covers the soundings (vessel, time, position and depth) in sorted order and leaves out `FILE_UUID`, which differs between identical resubmissions.
+1. A file whose content matches an active file is a copy and is skipped. The content hash covers the source and the soundings (vessel, time, position and depth) whatever their order, and leaves out `FILE_UUID`, which differs between identical resubmissions. Each sounding is hashed and the hashes summed, so hashing a file takes fixed memory however large it is.
 2. A file replaced in place supersedes its old version entirely, so points dropped by reprocessing disappear with it.
 3. A file removed from its source is marked withdrawn, and its points leave every product on the next build.
 4. Within a source, a newer file from the same vessel supersedes an older one only when it holds every sounding of the older file, matched by time and position. A retry or a corrected resubmission covering the same soundings wins. Otherwise both stay, and soundings identical in time, position and depth are counted once. A wider time range alone never supersedes, because a newer file can have gaps or coarser thinning.
@@ -95,7 +96,7 @@ Dedupe works on files:
 
 A plugin vessel's identity comes from the R2 key, which the API builds from the vessel's authenticated token. The ids inside the GeoJSON body are not checked by the API, so they are never trusted for identity, and a file whose body id disagrees with its key is marked `invalid`.
 
-Vessel matching across sources is required, not optional, because `vessels` counts independent vessels and a boat counted twice would make its own track look corroborated. Plugin vessels are `SIGNALK-<uuid>`. Where NOAA's `UNIQUE_ID` for the same boat differs, or a boat appears under two ids (a reinstalled plugin, a second logger), vessels are matched by sounding at the same time and position.
+Vessel matching across sources is required, not optional, because `vessels` counts independent vessels and a boat counted twice would make its own track look corroborated. Plugin vessels are `SIGNALK-<uuid>`, and NOAA keeps that id as `UNIQUE_ID` ([checked](noaa-archive.md#open-waters-submissions)). Where NOAA's `UNIQUE_ID` for the same boat differs, or a boat appears under two ids (a reinstalled plugin, a second logger), vessels are matched by sounding at the same time and position.
 
 Points are never deduplicated by `(unique_id, time)` alone. Time is recorded to the second, and loggers faster than 1 Hz produce different soundings with the same timestamp.
 
@@ -264,7 +265,6 @@ CI gets a separate job for it, filtered to changes under `packages/grid`, so plu
 ## Open questions
 
 - The shoal statistic and its thresholds: which quantile, and how many independent vessels a cell needs before it publishes at full resolution.
-- Whether NOAA's `UNIQUE_ID` for a plugin vessel is the `SIGNALK-<uuid>` the plugin sends, which cross-source matching depends on.
 - The sound speed each provider's loggers assume, if any provider documents it.
 - Whether the AVISO license asks anything of grids derived from FES2022 predictions, such as attribution.
 - What evidence moves a cell from CATZOC D to C, following the IHO Data Quality Working Group's proposal.
