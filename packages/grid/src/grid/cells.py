@@ -466,8 +466,10 @@ def build(con, tiles: list[int] | None = None) -> dict:
     row past each unit's edges, so a band's edge is filled the same as its middle.
     """
     tiles = tiles or []
-    # Only a build of every tile can say the cells are current.
+    # Only a build of every tile can say the cells are current, and only once it has
+    # finished: the marker goes first, so a build that stops partway leaves none.
     built_from = None if tiles else inputs(con)
+    con.execute("DELETE FROM lake.store_meta WHERE key = 'cells'")
     partitions = [
         p
         for (p,) in con.execute(
@@ -526,7 +528,6 @@ def build(con, tiles: list[int] | None = None) -> dict:
         totals["filled"] += con.execute("SELECT count(*) FROM filled").fetchone()[0]
         con.execute("COMMIT")
     log.info("cells: %s", totals)
-    con.execute("DELETE FROM lake.store_meta WHERE key = 'cells'")
     if built_from:
         con.execute("INSERT INTO lake.store_meta VALUES ('cells', ?)", [built_from])
     return totals

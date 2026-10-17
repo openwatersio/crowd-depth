@@ -436,3 +436,20 @@ def test_float32_depths_label_as_written():
     # 20.9 is stored as float32 20.8999996; it labels 20.9, not 20.8.
     f = overlay.feature(0, 0, float(np.float32(20.9)), False, 10)
     assert f["properties"]["depth_m"] == 20.9 and f["properties"]["VALSOU"] == 20.9
+
+
+def test_a_build_that_stops_partway_leaves_no_marker(env, monkeypatch):  # noqa: F811
+    put_tracks(env, parallel())
+    test_grid.build(env)
+
+    def fail(*_):
+        raise RuntimeError("stopped")
+
+    monkeypatch.setattr(cells, "units", fail)
+    with open_store(env.store, write=False) as con:
+        assert con.execute("SELECT count(*) FROM lake.store_meta WHERE key = 'cells'").fetchone()[0]
+        with pytest.raises(RuntimeError, match="stopped"):
+            cells.build(con)
+        assert not con.execute(
+            "SELECT count(*) FROM lake.store_meta WHERE key = 'cells'"
+        ).fetchone()[0]
