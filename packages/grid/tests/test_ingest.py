@@ -659,8 +659,13 @@ def test_a_key_list_ingests_only_its_keys_and_withdraws_nothing(env):
     env.noaa.put(noaa_key(3), noaa_csv(ROWS, unique_id="C", file_uuid="3"))
     env.noaa.put(noaa_key(4), noaa_csv(ROWS, unique_id="D", file_uuid="4"))
     keys = {noaa_key(3), noaa_key(5)}  # 5 is in the index but not the bucket
+    listed = []
+    list_ = env.noaa.list
+    env.noaa.list = lambda prefix="": listed.append(prefix) or list_(prefix)
     with open_store(env.store) as con:
         run = Ingest(con, "noaa", env.noaa, keys=keys).run()
+    # Only the keys' folder is listed, not the whole bucket.
+    assert listed == ["csb/csv/2026/10/14/"]
     assert not run.alert
     assert run.counts["missing"] == 1 and run.counts["new"] == 1
     assert run.counts["bytes"] == len(noaa_csv(ROWS, unique_id="C", file_uuid="3"))

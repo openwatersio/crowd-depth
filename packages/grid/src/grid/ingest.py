@@ -116,9 +116,23 @@ class Ingest:
     def sql(self, query, params=None):
         return self.con.execute(query, params or [])
 
+    def listing(self):
+        """The objects under the run's scope, and whether every page was read. With a key
+        list, only the folders those keys are in: a region's few thousand day folders,
+        listed in parallel, rather than the whole bucket."""
+        if self.keys is None:
+            return self.objects.list(self.scope)
+        folders = sorted({k.rsplit("/", 1)[0] + "/" for k in self.keys if k.startswith(self.scope)})
+        listing, complete = [], True
+        with ThreadPoolExecutor(FETCHERS) as pool:
+            for objs, ok in pool.map(self.objects.list, folders):
+                listing += objs
+                complete &= ok
+        return listing, complete
+
     def run(self):
         with self.timed("list"):
-            listing, complete = self.objects.list(self.scope)
+            listing, complete = self.listing()
         if self.keys is not None:
             listed = {o.key for o in listing}
             # A key the index names but the bucket doesn't have yet, or any more.
