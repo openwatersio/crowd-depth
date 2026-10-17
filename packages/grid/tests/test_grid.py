@@ -451,6 +451,18 @@ def test_day_split_qc_at_midnight_and_on_sparse_days(env):  # noqa: F811
     assert split == reference
 
 
+@pytest.mark.parametrize("first", ["AQM-1", "AQM-2"])
+def test_a_cells_sounding_sits_at_the_same_tie_whichever_file_came_first(env, first):  # noqa: F811
+    # Two vessels read the same depth at the same time in one base cell.
+    second = "AQM-2" if first == "AQM-1" else "AQM-1"
+    spot = {"AQM-1": at(5000, 0, 0.25, 0.25), "AQM-2": at(5000, 0, 0.75, 0.75)}
+    for n, vessel in enumerate([first, second], 1):
+        put(env, n, [(0, *spot[vessel], 10.0)], vessel)
+    build(env)
+    placed = env.query("SELECT depth_lon, depth_lat FROM lake.cells WHERE level = 1")
+    assert placed == env.query("SELECT lon, lat FROM lake.points ORDER BY point_id LIMIT 1")
+
+
 def test_rebuilds_expire_old_snapshots_files_and_catalogs(env, monkeypatch):  # noqa: F811
     monkeypatch.setattr(catalog, "RETAIN", timedelta(0))
     put(env, 1, line([10.0] * 6))
