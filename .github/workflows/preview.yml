@@ -1,0 +1,32 @@
+name: Preview
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # Publishes the plugin to pkg.pr.new so any commit can be installed on a
+  # Signal K server before it is released. Needs the pkg.pr.new GitHub App
+  # installed on the repository. Fork PRs are skipped so unreviewed code is
+  # never served under the project's URL.
+  plugin:
+    name: Publish plugin preview
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: mise.toml
+          cache: npm
+
+      - run: npm ci
+
+      # prepack builds the plugin.
+      - run: npm exec pkg-pr-new publish --commentWithSha ./packages/signalk-plugin

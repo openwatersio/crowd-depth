@@ -12,7 +12,7 @@ packages/
   signalk-plugin/   # "crowd-depth" on npm — the Signal K plugin
   api/              # "crowd-depth-api" — the trusted node API (Cloudflare Worker, not published)
 docs/               # CSB reference material (schemas, IHO/NOAA guidance PDFs)
-.github/workflows/  # CI (test.yml) and npm publishing (release.yml)
+.github/workflows/  # CI (test.yml, lockfile.yml), PR previews (preview.yml), and npm publishing (release.yml)
 ```
 
 ### `packages/signalk-plugin` (npm: `crowd-depth`)
@@ -161,6 +161,22 @@ Releases are cut from GitHub:
 
 There is no manual `npm publish` or local version bump — the tag is the
 version. Signal K servers pick the new version up from npm in the AppStore.
+
+### Plugin previews
+
+Every pull request from a branch in this repository, and every push to `main`, publishes the plugin to [pkg.pr.new](https://pkg.pr.new) through the [preview workflow](.github/workflows/preview.yml). Pull requests from forks are skipped. The pkg.pr.new bot comments on the pull request with the install URL for the latest commit.
+
+To try a preview, install it from the Signal K config directory (usually `~/.signalk`) and restart the server. Install by commit SHA, as the bot's URL does. A URL ending in the PR number instead follows each new push to the PR:
+
+```bash
+cd ~/.signalk && npm install https://pkg.pr.new/crowd-depth@<sha>
+```
+
+When you are done, go back to the released version by running this from the same directory and restarting the server. A preview that adds a database migration leaves the database at a schema the release does not know, so check the PR for migrations before going back:
+
+```bash
+cd ~/.signalk && npm install crowd-depth@latest
+```
 
 ### API (`crowd-depth-api`)
 
