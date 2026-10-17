@@ -574,6 +574,21 @@ def test_consensus_needs_the_same_depth_close_by_to_keep_a_shoal(env, readings):
     assert ("consensus_shoal", 20.0) in consensus(env, [290, 291, 289], [("ECHO", 20.0)])
 
 
+def test_consensus_doesnt_count_a_shoal_its_own_vessel_read_again(env):  # noqa: F811
+    # ECHO reads 20 m twice in the block; only another vessel's reading corroborates.
+    put(env, 50, [(60, *at(5004, 6), 20.5)], "ECHO")
+    assert ("consensus_shoal", 20.0) in consensus(env, [290, 291, 289], [("ECHO", 20.0)])
+
+
 def test_consensus_widens_where_vessels_disagree(env):  # noqa: F811
     # A slope: other vessels a block apart read 20 to 60 m, so 70 m isn't an outlier.
     assert consensus(env, [20, 35, 45, 60], [("SLOPE", 70.0)]) == set()
+
+
+def test_a_bbox_names_the_tiles_it_touches():
+    from grid.cli import bbox
+
+    # Chesapeake Bay: 36.8-39.7°N, 77.5-75.5°W.
+    tiles = bbox("-77.5,36.8,-75.5,39.7")
+    assert len(tiles) == 4 * 3
+    assert (36 + 90) * 360 + (-78 + 180) in tiles and (39 + 90) * 360 + (-76 + 180) in tiles

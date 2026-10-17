@@ -96,8 +96,6 @@ def sample(source: str, keys: list[str], name: str) -> str:
 SUPPORT = 3
 # Other vessels that must agree with each other to disprove a shoal one vessel read.
 DISPROVE = 3
-# Soundings of other vessels at a shoal's depth, in its 3″ block, that corroborate it.
-CORROBORATE = 1
 
 # A unit's points are classified in steps, each a temp table that spills past the
 # memory limit (a MATERIALIZED CTE would hold its whole result in memory), and the cell
@@ -182,13 +180,18 @@ WITH shoals AS (
   SELECT * FROM consensus_judged
   WHERE d < m AND len(list_filter(meds, x -> abs(x - m) <= tol)) >= {DISPROVE}
 ),
--- The few shoal candidates against their own blocks' soundings: a small join, built
--- on the candidates.
+-- The shoal candidates' blocks, one row per depth read there with the least and
+-- greatest vessel that read it, so a busy harbor block costs its distinct depths, not
+-- its soundings times the candidates. A depth some other vessel read has a least or
+-- greatest vessel other than the shoal's.
+depths AS (
+  SELECT tile_id, br, bc, d, min(vessel) AS vmin, max(vessel) AS vmax FROM unit_points
+  WHERE (tile_id, br, bc) IN (SELECT tile_id, br, bc FROM shoals) GROUP BY ALL
+),
 corroborated AS (
-  SELECT s.point_id FROM shoals s JOIN unit_points o
-    ON o.tile_id = s.tile_id AND o.br = s.br AND o.bc = s.bc AND o.vessel <> s.vessel
-    AND abs(o.d - s.d) <= 2 + 0.05 * s.d
-  GROUP BY s.point_id HAVING count(*) >= {CORROBORATE}
+  SELECT DISTINCT s.point_id FROM shoals s JOIN depths o
+    ON o.tile_id = s.tile_id AND o.br = s.br AND o.bc = s.bc
+    AND abs(o.d - s.d) <= 2 + 0.05 * s.d AND (o.vmin <> s.vessel OR o.vmax <> s.vessel)
 )
 SELECT point_id, 'consensus_deep' AS reason FROM consensus_judged WHERE d > m
 UNION ALL

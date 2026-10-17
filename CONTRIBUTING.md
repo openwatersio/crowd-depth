@@ -13,7 +13,7 @@ packages/
   api/              # "crowd-depth-api" — the trusted node API (Cloudflare Worker, not published)
   grid/             # Python (uv): the global depth grid pipeline, see docs/plans/global-grid
 docs/               # CSB reference material (schemas, IHO/NOAA guidance PDFs)
-.github/workflows/  # CI (test.yml, grid.yml) and npm publishing (release.yml)
+.github/workflows/  # CI (test.yml, grid.yml, lockfile.yml), PR previews (preview.yml), and npm publishing (release.yml)
 ```
 
 ### `packages/signalk-plugin` (npm: `crowd-depth`)
@@ -76,6 +76,8 @@ npm run build
 npm run test
 npm pack --dry-run -w crowd-depth
 ```
+
+It also runs the end-to-end suite (below) and boots the API Worker under `wrangler dev` with production settings, failing if it crashes at startup.
 
 ### Working on the plugin
 
@@ -145,6 +147,8 @@ uv run ruff check && uv run ruff format --check
 uv run grid --store /tmp/grid ingest --prefix 2026/10/14   # one day of both sources into a local store
 uv run grid --store /tmp/grid qc       # rerun QC on every ingest batch (ingest runs it as it goes)
 uv run grid --store /tmp/grid cells    # rebuild every grid cell
+uv run grid --store /tmp/grid ingest --source noaa --keys keys.txt   # only these keys (a region's, from NOAA's track index); withdraws nothing
+uv run grid --store /tmp/grid cells --bbox -77.5,36.8,-75.5,39.7      # only the 1° tiles a box touches
 ./docker.sh uv run grid --store .preview/store overlay --out .preview/out   # overlay layers and PMTiles, in the image; it mounts only packages/grid, so the store must be in it
 uv run grid --store /tmp/grid stats
 ```
@@ -179,6 +183,22 @@ Releases are cut from GitHub:
 
 There is no manual `npm publish` or local version bump — the tag is the
 version. Signal K servers pick the new version up from npm in the AppStore.
+
+### Plugin previews
+
+Every pull request from a branch in this repository, and every push to `main`, publishes the plugin to [pkg.pr.new](https://pkg.pr.new) through the [preview workflow](.github/workflows/preview.yml). Pull requests from forks are skipped. The pkg.pr.new bot comments on the pull request with the install URL for the latest commit.
+
+To try a preview, install it from the Signal K config directory (usually `~/.signalk`) and restart the server. Install by commit SHA, as the bot's URL does. A URL ending in the PR number instead follows each new push to the PR:
+
+```bash
+cd ~/.signalk && npm install https://pkg.pr.new/crowd-depth@<sha>
+```
+
+When you are done, go back to the released version by running this from the same directory and restarting the server. A preview that adds a database migration leaves the database at a schema the release does not know, so check the PR for migrations before going back:
+
+```bash
+cd ~/.signalk && npm install crowd-depth@latest
+```
 
 ### API (`crowd-depth-api`)
 

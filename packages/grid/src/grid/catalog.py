@@ -141,6 +141,9 @@ class Lock:
         self.owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         self.etag = None
         self.lost = threading.Event()
+        # When the last write of the lock that's known to have landed was sent: its
+        # expiry is at least a TTL after this.
+        self.renewed = None
         self._stop = threading.Event()
 
     def _body(self) -> bytes:
@@ -148,6 +151,7 @@ class Lock:
         return json.dumps({"owner": self.owner, "expires": expires.isoformat()}).encode()
 
     def acquire(self):
+        sent = datetime.now(UTC)
         try:
             self.etag = self.objects.put(LOCK, self._body(), if_none_match=True)
         except Conflict:
@@ -162,15 +166,16 @@ class Lock:
                 self.etag = self.objects.put(LOCK, self._body(), if_match=current[1])
             except Conflict:
                 raise Locked("another run took the stale lock first")
+        self.renewed = sent
         self._thread = threading.Thread(target=self._renew, daemon=True)
         self._thread.start()
 
     def _renew(self):
-        renewed = datetime.now(UTC)
         while not self._stop.wait(self.ttl.total_seconds() / 4):
+            sent = datetime.now(UTC)
             try:
                 self.etag = self.objects.put(LOCK, self._body(), if_match=self.etag)
-                renewed = datetime.now(UTC)
+                self.renewed = sent
                 continue
             except Exception:
                 log.warning("renewing the catalog lock failed", exc_info=True)
@@ -179,11 +184,21 @@ class Lock:
             current = self._held()
             if current and json.loads(current[0])["owner"] == self.owner:
                 self.etag = current[1]
-            elif current or datetime.now(UTC) - renewed >= self.ttl:
+            elif current or datetime.now(UTC) - self.renewed >= self.ttl:
                 # Another run holds it, or it may have expired while unreachable.
                 log.error("lost the catalog lock")
                 self.lost.set()
                 return
+
+    def check(self):
+        """Raise Locked unless the lease has at least half its TTL left.
+
+        Another run can take the lock over only once a full TTL has passed without a
+        renewal, so a publish that starts with half of it left finishes while the lock
+        is still this run's, even if renewal has stalled.
+        """
+        if self.lost.is_set() or datetime.now(UTC) - self.renewed >= self.ttl / 2:
+            raise Locked("the catalog lock was lost or its lease ran low; result discarded")
 
     def _held(self):
         try:
@@ -316,11 +331,11 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
             con.execute("CALL ducklake_cleanup_old_files('lake', older_than => $cutoff)", older)
             con.execute("DETACH lake")
             con.close()
-            if lock.lost.is_set():
-                raise Locked("lost the catalog lock; result discarded")
+            lock.check()
             stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
             key = f"catalog/{stamp}-{uuid.uuid4().hex[:8]}.ducklake"
             store.put(key, local.read_bytes(), if_none_match=True)
+            lock.check()  # the upload can take a while
             if pointer:
                 store.put(POINTER, key.encode(), if_match=pointer[1])
             else:
