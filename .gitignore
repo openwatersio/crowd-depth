@@ -6,4 +6,5 @@ tmp
 .wrangler
 tsconfig.tsbuildinfo
 packages/grid/.venv
+packages/grid/.preview
 __pycache__

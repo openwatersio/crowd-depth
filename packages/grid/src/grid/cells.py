@@ -446,6 +446,19 @@ def units(con, partition: int, tiles: list[int]) -> list[tuple[list[int], int, i
     return result
 
 
+def inputs(con) -> str:
+    """A fingerprint of what cells are built from: every file's version and status,
+    every batch's QC version, and the QC and grid versions of this build. Points and
+    flags change only with these, so cells built from the same fingerprint are current."""
+    [(files, batches)] = con.execute(
+        """SELECT
+          (SELECT coalesce(sum(hash(file_id, key, version, status, etag)::HUGEINT), 0)
+            FROM lake.files),
+          (SELECT coalesce(sum(hash(batch_id, qc_version)::HUGEINT), 0) FROM lake.qc_batches)"""
+    ).fetchall()
+    return f"{files}:{batches}:{QC_VERSION}:{GRID_VERSION}"
+
+
 def build(con, tiles: list[int] | None = None) -> dict:
     """Rebuild cells (and cell-level QC flags) for the given tiles, or every tile with points.
 
@@ -453,6 +466,10 @@ def build(con, tiles: list[int] | None = None) -> dict:
     row past each unit's edges, so a band's edge is filled the same as its middle.
     """
     tiles = tiles or []
+    # Only a build of every tile can say the cells are current, and only once it has
+    # finished: the marker goes first, so a build that stops partway leaves none.
+    built_from = None if tiles else inputs(con)
+    con.execute("DELETE FROM lake.store_meta WHERE key = 'cells'")
     partitions = [
         p
         for (p,) in con.execute(
@@ -511,4 +528,6 @@ def build(con, tiles: list[int] | None = None) -> dict:
         totals["filled"] += con.execute("SELECT count(*) FROM filled").fetchone()[0]
         con.execute("COMMIT")
     log.info("cells: %s", totals)
+    if built_from:
+        con.execute("INSERT INTO lake.store_meta VALUES ('cells', ?)", [built_from])
     return totals
