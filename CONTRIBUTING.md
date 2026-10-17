@@ -143,6 +143,8 @@ uv run ruff check && uv run ruff format --check
 uv run grid --store /tmp/grid ingest --prefix 2026/10/14   # one day of both sources into a local store
 uv run grid --store /tmp/grid qc       # rerun QC on every ingest batch (ingest runs it as it goes)
 uv run grid --store /tmp/grid cells    # rebuild every grid cell
+uv run grid --store /tmp/grid ingest --source noaa --keys keys.txt   # only these keys (a region's, from NOAA's track index); withdraws nothing
+uv run grid --store /tmp/grid cells --bbox -77.5,36.8,-75.5,39.7      # only the 1° tiles a box touches
 uv run grid --store /tmp/grid stats
 ```
 

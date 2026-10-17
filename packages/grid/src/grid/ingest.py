@@ -21,6 +21,7 @@ import tempfile
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -82,6 +83,7 @@ class Ingest:
         prefix: str = "",
         now: datetime | None = None,
         max_files: int | None = None,
+        keys: set[str] | None = None,
     ):
         self.con = con
         self.source = source
@@ -97,12 +99,31 @@ class Ingest:
         self.counts = Counter()
         # A backfill runs as several bounded runs, each publishing its catalog.
         self.max_files = max_files
+        # Only these keys, such as a region's from NOAA's track index: the rest of the
+        # listing is someone else's, so nothing missing from it is withdrawn.
+        self.keys = keys
+        # Seconds spent in each step, logged with the counts.
+        self.seconds = Counter()
+
+    @contextmanager
+    def timed(self, step):
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.seconds[step] += time.perf_counter() - start
 
     def sql(self, query, params=None):
         return self.con.execute(query, params or [])
 
     def run(self):
-        listing, complete = self.objects.list(self.scope)
+        with self.timed("list"):
+            listing, complete = self.objects.list(self.scope)
+        if self.keys is not None:
+            listed = {o.key for o in listing}
+            # A key the index names but the bucket doesn't have yet, or any more.
+            self.counts["missing"] = len(self.keys - listed)
+            listing = [o for o in listing if o.key in self.keys]
         subs = {o.key: o for o in listing if is_submission(self.source, o.key)}
         self.sidecars = {o.key for o in listing if o.key.endswith(SIDECARS)}
         other = sum(o.key.endswith(OTHER_SIDECARS) for o in listing)
@@ -151,7 +172,11 @@ class Ingest:
         with downloads as tmp, ThreadPoolExecutor(FETCHERS) as pool:
             self.tmp = Path(tmp)
             for chunk in chunks(work, FETCH_BYTES):
-                for (obj, row), path in zip(chunk, pool.map(self.fetch, [o for o, _ in chunk])):
+                fetched = pool.map(self.fetch, [o for o, _ in chunk])
+                for obj, row in chunk:
+                    # Time spent waiting on downloads, beyond what the work overlaps.
+                    with self.timed("download wait"):
+                        path = next(fetched)
                     if path is None:
                         continue
                     if not isinstance(path, Path):
@@ -159,17 +184,20 @@ class Ingest:
                         self.counts["fetch errors"] += 1
                         self.alert = True
                         continue
+                    self.counts["bytes"] += obj.size
                     try:
-                        try:
-                            parsed = load(self.con, self.source, obj.key, str(path))
-                        except Invalid as e:
-                            parsed = e
+                        with self.timed("parse"):
+                            try:
+                                parsed = load(self.con, self.source, obj.key, str(path))
+                            except Invalid as e:
+                                parsed = e
                         # The file stays on disk until its points are added: the
                         # loader's views read it again.
-                        if row is None:
-                            self.ingest(obj, 1, parsed)
-                        else:
-                            self.changed(row, obj, parsed)
+                        with self.timed("dedupe"):
+                            if row is None:
+                                self.ingest(obj, 1, parsed)
+                            else:
+                                self.changed(row, obj, parsed)
                     finally:
                         path.unlink()
                     if self.pending >= FLUSH_POINTS:
@@ -177,11 +205,13 @@ class Ingest:
 
         self.withdraw(subs, current, complete)
         self.flush()
-        self.cover()
+        with self.timed("cover"):
+            self.cover()
         if self.source == "openwaters":
             self.record_responses()
         self.sql("COMMIT")
         log.info("%s: %s", self.source, dict(self.counts))
+        log.info("%s seconds: %s", self.source, {k: round(v, 1) for k, v in self.seconds.items()})
         return self
 
     # Files
@@ -307,6 +337,8 @@ class Ingest:
     # Rule 3
 
     def withdraw(self, subs, current, complete):
+        if self.keys is not None:
+            return  # a chosen set of keys, not the source's listing
         if not complete:
             log.warning("%s: listing incomplete, no withdrawals this run", self.source)
             self.alert = True
@@ -426,20 +458,23 @@ class Ingest:
             return
         # Each flush is its own batch, the unit QC runs on now and when it's rerun.
         batch_id = self.last_batch = max(time.time_ns() // 1000, self.last_batch + 1)
-        self.sql(
-            f"""INSERT INTO lake.points BY NAME
-            SELECT *, {batch_id} AS batch_id FROM pending"""
-        )
+        with self.timed("write"):
+            self.sql(
+                f"""INSERT INTO lake.points BY NAME
+                SELECT *, {batch_id} AS batch_id FROM pending"""
+            )
         # Recreated rather than emptied: deleted rows keep their memory until then.
         self.empty_pending()
         # A transaction keeps every replaced table's rows, and the rows it inserted,
         # until it commits, so the points commit before QC reads them. Nothing is
         # published until the run's catalog is, and a batch whose QC didn't commit has
         # no qc_batches row, so `grid cells` QCs it.
-        self.sql("COMMIT")
+        with self.timed("write"):
+            self.sql("COMMIT")
         self.sql("BEGIN")
-        qc.run_batch(self.con, batch_id, fresh=True)
-        self.sql("COMMIT")
+        with self.timed("qc"):
+            qc.run_batch(self.con, batch_id, fresh=True)
+            self.sql("COMMIT")
         self.sql("BEGIN")
         self.counts["points"] += self.pending
         self.pending = 0

@@ -1,9 +1,10 @@
 """grid: build the crowd-depth point store.
 
     grid --store DIR_OR_S3_URL ingest [--source noaa|openwaters] [--prefix YYYY/MM/DD] [--max-files N]
+                                       [--keys FILE]
     grid --store DIR_OR_S3_URL confirm-withdrawals SOURCE
     grid --store DIR_OR_S3_URL qc
-    grid --store DIR_OR_S3_URL cells
+    grid --store DIR_OR_S3_URL cells [--bbox W,S,E,N]
     grid --store DIR_OR_S3_URL stats
 
 Sources default to the NOAA CSB bucket and the Open Waters R2 bucket. R2 access
@@ -12,7 +13,9 @@ reads S3_ENDPOINT, S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY.
 
 import argparse
 import logging
+import math
 import sys
+from pathlib import Path
 
 from . import cells, qc
 from .catalog import open_store
@@ -32,6 +35,16 @@ def positive(value: str) -> int:
     return n
 
 
+def bbox(text: str) -> list[int]:
+    """The tile ids of the 1° tiles a west,south,east,north box touches."""
+    west, south, east, north = map(float, text.split(","))
+    return [
+        (lat + 90) * 360 + lon + 180
+        for lat in range(math.floor(south), math.ceil(north))
+        for lon in range(math.floor(west), math.ceil(east))
+    ]
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="grid", description=__doc__.split("\n")[0])
     p.add_argument(
@@ -46,6 +59,12 @@ def main(argv=None):
     i.add_argument(
         "--max-files", type=positive, help="Ingest at most N files per source; for backfills"
     )
+    i.add_argument(
+        "--keys",
+        type=Path,
+        help="Only these keys, one per line, e.g. a region's from NOAA's track index; nothing"
+        " else is withdrawn",
+    )
     for name in SOURCES:
         i.add_argument(
             f"--{name}-url", default=SOURCES[name][0], help=f"Where to list {name} files"
@@ -55,7 +74,12 @@ def main(argv=None):
     )
     c.add_argument("source", choices=SOURCES)
     sub.add_parser("qc", help="Flag impossible values, jumps and spikes along each track")
-    sub.add_parser("cells", help="Run QC, then rebuild every grid cell")
+    cl = sub.add_parser("cells", help="Run QC, then rebuild every grid cell, or a region's")
+    cl.add_argument(
+        "--bbox",
+        type=bbox,
+        help="Only the 1° tiles this box touches: west,south,east,north in degrees",
+    )
     sub.add_parser("stats", help="Count files by source and status")
     args = p.parse_args(argv)
 
@@ -68,15 +92,18 @@ def main(argv=None):
             for name in args.source or SOURCES:
                 url = getattr(args, f"{name}_url")
                 objects = open_objects(url, public=SOURCES[name][1])
+                keys = set(args.keys.read_text().split()) if args.keys else None
                 alert |= (
-                    Ingest(con, name, objects, args.prefix, max_files=args.max_files).run().alert
+                    Ingest(con, name, objects, args.prefix, max_files=args.max_files, keys=keys)
+                    .run()
+                    .alert
                 )
         elif args.command == "qc":
             qc.run(con)
         elif args.command == "cells":
             # Cells read QC's flags: QC any batch that hasn't been at this version.
             qc.run(con, missing_only=True)
-            cells.build(con)
+            cells.build(con, args.bbox)
         elif args.command == "confirm-withdrawals":
             print(f"confirmed {confirm_withdrawals(con, args.source)} held withdrawals")
         else:
