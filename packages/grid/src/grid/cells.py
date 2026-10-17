@@ -96,6 +96,8 @@ def sample(source: str, keys: list[str], name: str) -> str:
 SUPPORT = 3
 # Other vessels that must agree with each other to disprove a shoal one vessel read.
 DISPROVE = 3
+# Soundings of other vessels at a shoal's depth, in its 3″ block, that corroborate it.
+CORROBORATE = 1
 
 # A unit's points are classified in steps, each a temp table that spills past the
 # memory limit (a MATERIALIZED CTE would hold its whole result in memory), and the cell
@@ -134,12 +136,14 @@ WHERE n.vmin <> s.vessel OR n.vmax <> s.vessel OR n.support >= {SUPPORT}
 # Consensus: each sounding against the other vessels nearby, since a sounder that has
 # lost bottom is wrong the whole way along its track, so QC along the track can't see
 # it. Each vessel votes once per 3″ block (9 base rows): its median depth there, from
-# soundings QC accepted, and its shoalest sounding, unconfirmed ones included. A
-# sounding is judged against the other vessels' votes in the 3x3 blocks around its own,
-# each vessel once, wherever two or more voted. Deeper than their consensus by more
-# than the tolerance, it's rejected. Shoaler by more than that, it's rejected only when
-# three or more of them agree with the consensus and none read anything within a shoal
-# tolerance of it; otherwise it goes on to the cell's own shoal confirmation. The
+# soundings QC accepted. A sounding is judged against the other vessels' votes in the
+# 3x3 blocks around its own, each vessel once, wherever two or more voted. Deeper than
+# their consensus by more than the tolerance, it's rejected. Shoaler by more than that,
+# it's rejected when three or more of them agree with the consensus, unless another
+# vessel read the same depth: one of its soundings, unconfirmed ones included, in the
+# same block and within the shoal's own tolerance (2 m + 5%) either way. Every sounder
+# in deep water throws stray shallow echoes, at all sorts of depths, so a shoaler or
+# deeper reading nearby doesn't count; two vessels reading one depth does. A shoal that isn't disproved goes on to the cell's own shoal confirmation. The
 # tolerance is the larger of 2 m + 5% of the consensus and three times the spread of
 # the votes, so it widens on slopes, where vessels a block apart honestly disagree.
 # A vessel's vote is the median of a fixed sample, as cells' are, so one moored in a
@@ -147,37 +151,50 @@ WHERE n.vmin <> s.vessel OR n.vmax <> s.vessel OR n.support >= {SUPPORT}
 # ponytail: neighbors stop at tile edges; look across them if a tile's edge rows matter
 CONSENSUS = f"""
 CREATE OR REPLACE TEMP TABLE votes AS
-SELECT tile_id, br, bc, vessel, median(d) FILTER (WHERE flag IS NULL AND keep) AS med,
-  min(d) AS shoalest
+SELECT tile_id, br, bc, vessel, median(d) FILTER (WHERE flag IS NULL AND keep) AS med
 FROM {sample("unit_points", ["tile_id", "br", "bc", "vessel"], "keep")} GROUP BY ALL;
 
 CREATE OR REPLACE TEMP TABLE consensus AS
 WITH others AS (
   SELECT a.tile_id, a.br, a.bc, a.vessel, b.vessel AS other,
-    median(b.med) AS med, min(b.shoalest) AS shoalest
+    median(b.med) AS med
   FROM (SELECT DISTINCT tile_id, br, bc, vessel FROM votes) a JOIN votes b
     ON b.tile_id = a.tile_id AND b.br BETWEEN a.br - 1 AND a.br + 1
     AND b.bc BETWEEN a.bc - 1 AND a.bc + 1 AND b.vessel <> a.vessel
   GROUP BY ALL
 )
 SELECT tile_id, br, bc, vessel, median(med) AS m, coalesce(mad(med), 0) AS spread,
-  list(med) FILTER (WHERE med IS NOT NULL) AS meds, min(shoalest) AS shoalest
+  list(med) FILTER (WHERE med IS NOT NULL) AS meds
 FROM others GROUP BY ALL HAVING count(med) >= 2;
 DROP TABLE votes;
 
+CREATE OR REPLACE TEMP TABLE consensus_judged AS
+SELECT p.point_id, p.tile_id, p.br, p.bc, p.vessel, p.d, c.m, c.meds,
+  greatest(2 + 0.05 * c.m, 3 * 1.4826 * c.spread) AS tol
+FROM unit_points p JOIN consensus c
+  ON c.tile_id = p.tile_id AND c.br = p.br AND c.bc = p.bc AND c.vessel = p.vessel
+WHERE p.r >= $rlo AND p.r < $rhi
+  AND (p.d > c.m + greatest(2 + 0.05 * c.m, 3 * 1.4826 * c.spread)
+    OR p.d < c.m - greatest(2 + 0.05 * c.m, 3 * 1.4826 * c.spread));
+
 CREATE OR REPLACE TEMP TABLE consensus_rejects AS
-WITH judged AS (
-  SELECT p.point_id, p.d, c.m, c.meds, c.shoalest,
-    greatest(2 + 0.05 * c.m, 3 * 1.4826 * c.spread) AS tol
-  FROM unit_points p JOIN consensus c
-    ON c.tile_id = p.tile_id AND c.br = p.br AND c.bc = p.bc AND c.vessel = p.vessel
-  WHERE p.r >= $rlo AND p.r < $rhi
+WITH shoals AS (
+  SELECT * FROM consensus_judged
+  WHERE d < m AND len(list_filter(meds, x -> abs(x - m) <= tol)) >= {DISPROVE}
+),
+-- The few shoal candidates against their own blocks' soundings: a small join, built
+-- on the candidates.
+corroborated AS (
+  SELECT s.point_id FROM shoals s JOIN unit_points o
+    ON o.tile_id = s.tile_id AND o.br = s.br AND o.bc = s.bc AND o.vessel <> s.vessel
+    AND abs(o.d - s.d) <= 2 + 0.05 * s.d
+  GROUP BY s.point_id HAVING count(*) >= {CORROBORATE}
 )
-SELECT point_id, CASE WHEN d > m THEN 'consensus_deep' ELSE 'consensus_shoal' END AS reason
-FROM judged
-WHERE d > m + tol
-  OR (d < m - tol AND len(list_filter(meds, x -> abs(x - m) <= tol)) >= {DISPROVE}
-    AND shoalest > d + 2 + 0.05 * d);
+SELECT point_id, 'consensus_deep' AS reason FROM consensus_judged WHERE d > m
+UNION ALL
+SELECT point_id, 'consensus_shoal' FROM shoals
+WHERE point_id NOT IN (SELECT point_id FROM corroborated);
+DROP TABLE consensus_judged;
 DROP TABLE consensus;
 """
 

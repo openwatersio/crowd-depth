@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta
 
 import duckdb
 import pyarrow as pa
+import pytest
 import reference_qc
 from test_ingest import HEADER, VESSEL, env, geojson, ow_key  # noqa: F401  (env is a fixture)
 
@@ -554,10 +555,23 @@ def test_consensus_keeps_a_shoal_it_cant_disprove(env):  # noqa: F811
     assert consensus(env, [290, 291], [("ECHO", 20.0)]) == set()
 
 
-def test_consensus_keeps_a_shoal_another_vessel_saw(env):  # noqa: F811
-    # Three vessels agree on 290 m, but a fourth read 21 m in the next block.
-    put(env, 50, [(0, *at(5004, 12), 21.0)], "OTHER3")
+def test_consensus_keeps_a_shoal_another_vessel_read(env):  # noqa: F811
+    # Three vessels agree on 290 m, but a fourth read 21 m in the same block.
+    put(env, 50, [(0, *at(5004, 6), 21.0)], "OTHER3")
     assert consensus(env, [290, 291, 289], [("ECHO", 20.0)]) == set()
+
+
+@pytest.mark.parametrize(
+    "readings",
+    [
+        [(0, 5004, 12, 21.0)],  # the same depth, but in the next block
+        [(0, 5004, 6, 40.0)],  # in the block, but much deeper: a stray echo
+        [(0, 5004, 6, 5.0)],  # in the block, but much shoaler: another stray echo
+    ],
+)
+def test_consensus_needs_the_same_depth_close_by_to_keep_a_shoal(env, readings):  # noqa: F811
+    put(env, 50, [(t, *at(r, c), d) for t, r, c, d in readings], "OTHER3")
+    assert ("consensus_shoal", 20.0) in consensus(env, [290, 291, 289], [("ECHO", 20.0)])
 
 
 def test_consensus_widens_where_vessels_disagree(env):  # noqa: F811
