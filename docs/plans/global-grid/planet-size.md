@@ -42,7 +42,7 @@ New data lands where the data already is. Every day touches most of the dense ti
 ## Method
 
 1. **Track index.** All 787,557 entries of the [track index](noaa-archive.md#layout) (`MapServer/1`), with `NAME`, `FILE_SIZE`, `PROVIDER` and the track line, simplified by the server to 0.002° (`maxAllowableOffset`). The index has no sounding counts. `FILE_SIZE` is the submitted `.tar.gz`.
-2. **Soundings per file.** `FILE_SIZE` times a rate per provider. The rates come from 443 CSVs sampled in proportion to the index by provider and year (at least 2 per provider and year), 2.0M rows in all. The overall rate is 0.029 rows per submitted byte. Rates are tight within a provider: Rosepoint, the largest, has 0.032–0.041 between the 10th and 90th percentile, and SeaKeepers 0.015–0.020. Every sampled entry had a CSV.
+2. **Soundings per file.** `FILE_SIZE` times a rate per provider. The rates come from 443 CSVs sampled in proportion to the index by provider and year (at least 2 per provider and year), 2.0M rows in all. The overall rate is 0.029 rows per submitted byte. Rates are tight within a provider: Rosepoint, the largest, has 0.032–0.041 between the 10th and 90th percentile, and SeaKeepers 0.015–0.020. Every sampled entry had a CSV, which puts the share of index entries without one under 0.7% at 95% confidence.
 3. **Soundings per tile.** Each file's soundings are spread along its track line in proportion to the line's length in each tile.
 4. **Active soundings.** The archive's rows times 0.749, Chesapeake's ratio of active soundings to rows. Dedupe, missing-depth sentinels and QC remove the rest.
 
@@ -53,6 +53,7 @@ Checks:
 
 ## Not measured
 
+- **Index entries without a CSV.** Every index entry is counted, but some have no CSV in the bucket ([noaa-archive.md](noaa-archive.md#quirks)). The rate is 0 of the 443 sampled entries, 5 of Chesapeake's 24,418, and 0.5% in Fiji, but about 7% in the regions of [#127](https://github.com/openwatersio/crowd-depth/pull/127). The missing entries are mostly small fragments, so they hold a smaller share of soundings than of entries. Where the rate is near 7%, the estimate overstates soundings by up to that much and may add a few sparse tiles; the planet totals are likely high by about 1%.
 - **The active ratio outside Chesapeake.** 0.749 comes from one region. Identical resubmissions, sentinels and QC flags may differ by provider and region.
 - **Tiles below one sounding.** A track clipping a tile corner credits it a fraction of a sounding. Tiles under one estimated sounding are left out, and none were. A track's simplified line can miss or add a tile at the edges, which matters only for the count of sparse tiles.
 - **Open Waters submissions.** Plugin data from non-IHO waters isn't in NOAA's archive.
