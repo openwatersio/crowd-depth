@@ -40,6 +40,11 @@ WITHDRAWAL_LIMIT = 0.01
 # DuckDB, whose memory is capped; points wait in a DuckDB table until a flush.
 FETCH_BYTES = 512 * 2**20
 FLUSH_POINTS = 500_000
+# A run publishes its catalog at the first batch past this many seconds since it last did,
+# so a failure later keeps what it had done, and a rerun skips the files it published.
+CHECKPOINT_SECONDS = 15 * 60
+# Rule 4 checks files for coverage in groups holding at most this many points.
+COVER_POINTS = 5_000_000
 FETCHERS = 16
 # NOAA's response, newest layout first. `.failed.json` marks a retry the API still owes.
 SIDECARS = (".done.json", ".result.json")
@@ -94,6 +99,7 @@ class Ingest:
         self.now = now.astimezone(UTC).replace(tzinfo=None)
         self.pending = 0
         self.last_batch = 0
+        self.published = time.monotonic()
         self.touched: set[int] = set()
         self.alert = False
         self.counts = Counter()
@@ -401,63 +407,96 @@ class Ingest:
     # Rule 4
 
     def cover(self):
-        """A newer file from the same vessel supersedes an older one that it holds every sounding of."""
-        for fid in sorted(self.touched):
-            found = self.sql(
-                "SELECT arrival, time_min, time_max FROM lake.files WHERE file_id = ? AND status = 'active'",
-                [fid],
-            ).fetchone()
-            if not found:
+        """A newer file from the same vessel supersedes an older one that it holds every sounding of.
+
+        Each touched file is judged against its vessel's other active files, in file_id
+        order, as statuses change along the way. Whether one file holds every sounding of
+        another depends only on their points, which don't change here, so every pair that
+        needs it is checked first, in one pass over their points.
+        """
+        if not self.touched:
+            return
+        pairs = self.sql(
+            """SELECT me.file_id, o.file_id, me.arrival, o.arrival, me.time_min, me.time_max,
+              o.time_min, o.time_max, me.point_count, o.point_count
+            FROM lake.files me JOIN lake.files o
+              ON o.source = me.source AND o.vessel = me.vessel AND o.file_id <> me.file_id
+            WHERE list_contains($touched, me.file_id) AND me.status = 'active'
+              AND o.status = 'active' AND o.time_min <= me.time_max AND o.time_max >= me.time_min
+            ORDER BY me.file_id, o.file_id""",
+            {"touched": sorted(self.touched)},
+        ).fetchall()
+        self.touched.clear()
+        judged, sizes = [], {}
+        for fid, other, arrived, other_arrived, tmin, tmax, omin, omax, n, on in pairs:
+            sizes[fid], sizes[other] = n, on
+            if (arrived, fid) > (other_arrived, other):
+                newer, older, inside = fid, other, tmin <= omin and omax <= tmax
+            else:
+                newer, older, inside = other, fid, omin <= tmin and tmax <= omax
+            # A wider time range alone never supersedes: the newer file must hold every sounding.
+            judged.append((fid, newer, older, inside))
+        holds = self.holding({(n, o) for _, n, o, inside in judged if inside}, sizes)
+        active = set(sizes)
+        for fid, newer, older, inside in judged:
+            if fid not in active:
                 continue
-            arrived, tmin, tmax = found
-            for other, other_arrived, omin, omax in self.sql(
-                """SELECT o.file_id, o.arrival, o.time_min, o.time_max
-                FROM lake.files o JOIN lake.files me
-                  ON o.source = me.source AND o.vessel = me.vessel AND o.file_id <> me.file_id
-                WHERE me.file_id = ? AND o.status = 'active'
-                  AND o.time_min <= me.time_max AND o.time_max >= me.time_min""",
-                [fid],
-            ).fetchall():
-                if (arrived, fid) > (other_arrived, other):
-                    newer, older, inside = fid, other, tmin <= omin and omax <= tmax
-                else:
-                    newer, older, inside = other, fid, omin <= tmin and tmax <= omax
-                # A wider time range alone never supersedes: the newer file must hold every sounding.
-                if (
-                    inside
-                    and self.is_active(older)
-                    and self.is_active(newer)
-                    and self.covers(newer, older)
-                ):
-                    self.counts["covered"] += 1
-                    self.set_status(older, "superseded", "covered", newer)
-                    if older == fid:
-                        break
+            if inside and older in active and newer in active and (newer, older) in holds:
+                self.counts["covered"] += 1
+                self.set_status(older, "superseded", "covered", newer)
+                active.discard(older)
 
-    def is_active(self, fid):
-        return (
-            self.sql("SELECT status FROM lake.files WHERE file_id = ?", [fid]).fetchone()[0]
-            == "active"
-        )
-
-    def covers(self, newer: int, older: int) -> bool:
-        """Every (time, position) of the older file, as many times as it occurs there, is in the newer.
+    def holding(self, pairs: set, sizes: dict) -> set:
+        """The (newer, older) pairs where the newer file holds every (time, position) of the
+        older, as many times as it occurs there.
 
         Counting matters: loggers faster than 1 Hz repeat a time and position with
         different depths, and a newer file holding fewer of them doesn't hold them all.
+        Pairs are checked in groups whose files hold at most COVER_POINTS points, so
+        memory stays bounded however many files overlap.
         """
-        # ponytail: scans points by file_id, which neither partitioning nor sorting prunes;
-        # sort points by file_id within a batch if overlapping files become common
-        return self.sql(
-            """SELECT NOT EXISTS (
-              SELECT 1
-              FROM (SELECT time, lon, lat, count(*) AS n FROM lake.points
-                    WHERE file_id = $older GROUP BY ALL) a
-              LEFT JOIN (SELECT time, lon, lat, count(*) AS n FROM lake.points
-                    WHERE file_id = $newer GROUP BY ALL) b USING (time, lon, lat)
-              WHERE b.n IS NULL OR b.n < a.n)""",
-            {"older": older, "newer": newer},
-        ).fetchone()[0]
+        held, group, files, size = set(), [], set(), 0
+        for pair in sorted(pairs):
+            new = set(pair) - files
+            if group and size + sum(sizes[f] for f in new) > COVER_POINTS:
+                held |= self.holding_group(group, files)
+                group, files, size = [], set(), 0
+                new = set(pair)
+            group.append(pair)
+            files |= new
+            size += sum(sizes[f] for f in new)
+        if group:
+            held |= self.holding_group(group, files)
+        return held
+
+    def holding_group(self, group, files) -> set:
+        newer, older = zip(*group)
+        ids = sorted(files)
+        # ponytail: points aren't sorted by file_id, so the id range prunes row groups only
+        # as far as files arrived together; sort points by file_id within a batch if not
+        return set(
+            self.sql(
+                """WITH pairs AS (SELECT unnest($newer) AS newer, unnest($older) AS older),
+                g AS (
+                  SELECT file_id, time, lon, lat, count(*) AS n FROM lake.points
+                  WHERE file_id BETWEEN $lo AND $hi AND list_contains($ids, file_id) GROUP BY ALL
+                ),
+                short AS (
+                  SELECT p.newer, p.older FROM pairs p JOIN g a ON a.file_id = p.older
+                  LEFT JOIN g b ON b.file_id = p.newer
+                    AND b.time = a.time AND b.lon = a.lon AND b.lat = a.lat
+                  WHERE b.n IS NULL OR b.n < a.n
+                )
+                SELECT newer, older FROM pairs EXCEPT SELECT newer, older FROM short""",
+                {
+                    "newer": list(newer),
+                    "older": list(older),
+                    "ids": ids,
+                    "lo": ids[0],
+                    "hi": ids[-1],
+                },
+            ).fetchall()
+        )
 
     # Points
 
@@ -480,18 +519,27 @@ class Ingest:
         # Recreated rather than emptied: deleted rows keep their memory until then.
         self.empty_pending()
         # A transaction keeps every replaced table's rows, and the rows it inserted,
-        # until it commits, so the points commit before QC reads them. Nothing is
-        # published until the run's catalog is, and a batch whose QC didn't commit has
-        # no qc_batches row, so `grid cells` QCs it.
+        # until it commits, so the points commit before QC reads them. A batch whose QC
+        # didn't commit has no qc_batches row, so `grid cells` QCs it.
         with self.timed("write"):
             self.sql("COMMIT")
         self.sql("BEGIN")
         with self.timed("qc"):
             qc.run_batch(self.con, batch_id, fresh=True)
-            self.sql("COMMIT")
-        self.sql("BEGIN")
         self.counts["points"] += self.pending
         self.pending = 0
+        # A checkpoint publishes the files so far with their coverage settled: a rerun
+        # skips them, so it would never judge them again.
+        checkpoint = time.monotonic() - self.published >= CHECKPOINT_SECONDS
+        if checkpoint:
+            with self.timed("cover"):
+                self.cover()
+        # Nothing is published until a checkpoint or the end of the run.
+        self.sql("COMMIT")
+        if checkpoint:
+            self.con.publish()
+            self.published = time.monotonic()
+        self.sql("BEGIN")
 
     # NOAA's response, recorded but not used to decide anything
 
