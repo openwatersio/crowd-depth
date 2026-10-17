@@ -10,6 +10,10 @@ Supporting notes:
 - [The NOAA CSB archive](noaa-archive.md): how the archive is laid out and the data quirks the pipeline has to handle.
 - [Standards](standards.md): what the IHO standards say about data quality, survey accuracy, and deriving depth areas, contours and soundings.
 - [References](references.md): primary sources, research, and reusable code, with links.
+- [Backlog](backlog.md): the prioritized work, from what the spikes below found.
+- [Rebuild cost](rebuild-cost.md): what a daily planet rebuild costs, and what brings it within a day on cheap hardware.
+- [Point store layout](store-layout.md), [Track QC as pure functions](qc-functions.md) and [Per-tile pipeline](per-tile-pipeline.md): spikes on the Chesapeake set.
+- [Surface statistic](surface-statistic.md) and [Speckle in busy channels](channel-speckle.md): the grid against NOAA BlueTopo in Thimble Shoal Channel.
 
 ## Goals
 
@@ -125,9 +129,10 @@ A vessel's soundings differ from the truth by its transducer depth below the wat
 - Fit on flat, stable seabed, where a small position error doesn't change depth, using low reference uncertainty and shallow-to-moderate depths (the NOAA tool uses reference uncertainty under 3 to 4 m, reference depth under 20 m, and differences under 12 m).
 - Fit a vertical offset plus a depth scale factor, which absorbs a wrong assumed sound speed. Fit the horizontal offset between GNSS antenna and transducer where the seabed has features to lock on to, as the Canadian Hydrographic Service does.
 - Use robust statistics (median and MAD), require a minimum number of soundings across more than one transit, and reject offsets outside a plausible range.
+- Where a vessel never overlaps a reference, solve its offset relative to other vessels at track crossings by least squares, as GMT's x2sys does, anchored to vessels that have a calibration. Crossovers alone give only relative offsets.
 - Treat calibration as a time series, not one value per vessel. Sounders are moved and replaced. Each vessel carries a reputation that rises with agreement and decays with time since its last comparison, following Calder's work on observer reputation. Reputation weights the vessel's soundings when cells are combined.
 
-A vessel that never overlaps a reference is used with its reported metadata, marked uncalibrated and weighted low. A depth measured below the transducer or keel but treated as below the waterline reads shallower than the truth, which errs safe, but it skews agreement between vessels, which is why uncalibrated vessels count for little.
+Offsets are the largest error in the grid: in Thimble Shoal Channel vessels read 0.6 to 5.4 m shallower than BlueTopo, constant per vessel ([surface-statistic.md](surface-statistic.md)). A vessel with neither a reference nor a crossover to a calibrated vessel is used with its reported metadata, marked uncalibrated and weighted low. A depth measured below the transducer or keel but treated as below the waterline reads shallower than the truth, which errs safe, but it skews agreement between vessels, which is why uncalibrated vessels count for little.
 
 #### Sound speed
 
@@ -255,15 +260,16 @@ CI gets a separate job for it, filtered to changes under `packages/grid`, so plu
 - [ ] Consent: the plugin's consent text says the data goes to Open Waters as well as the DCDB, and that anyone, Open Waters included, may publish and build products from it. Data collected under the earlier text was also dedicated to the public domain under CC0, so it is used the same way. Nothing is published, including previews, until a plugin release carries this text.
 - [ ] Point store: `files` and `points` tables, ingest with ETag tracking, file-level dedupe and supersession, for both sources.
 - [ ] Raw grid: QC, variable-resolution grid with shoal-biased statistics, depth areas and contours, `M_QUAL` coverage, and PMTiles, as an unlisted preview only. Without tide and datum corrections its depths aren't on chart datum, and a plotter would draw them next to ENC depths as if they were. It also waits on vessel matching across sources, so `vessels` doesn't count one boat twice.
+- [ ] Vessel calibration: per-vessel offsets against reference surveys and at anchored crossovers, applied before gridding. Uncorrected, the grid draws a busy channel 3 to 9 m too shallow, so this comes before validation and the other corrections.
 - [ ] Validation: held-out survey comparisons, the S-44 test and shoal detection rate, reported per grid version.
-- [ ] Corrections: vessel calibration with reputation, sound speed, tide, chart datum, and confidence upgrades backed by validation.
+- [ ] Corrections: reputation, sound speed, tide, chart datum, and confidence upgrades backed by validation.
 - [ ] Public overlay: published and listed once tide and datum corrections and validation are in place.
 - [ ] Seascape source: COG output and remove-restore merging in Seascape.
 - [ ] Plugin: calibration feedback.
 
 ## Open questions
 
-- The shoal statistic and its thresholds: which quantile, and how many independent vessels a cell needs before it publishes at full resolution.
+- The shoal statistic and its thresholds: `median − kσ` over per-vessel medians and the value of k, or a quantile ([surface-statistic.md](surface-statistic.md)), and how many independent vessels a cell needs before it publishes at full resolution.
 - Whether NOAA's `UNIQUE_ID` for a plugin vessel is the `SIGNALK-<uuid>` the plugin sends, which cross-source matching depends on.
 - The sound speed each provider's loggers assume, if any provider documents it.
 - Whether the AVISO license asks anything of grids derived from FES2022 predictions, such as attribution.
