@@ -253,7 +253,7 @@ CI gets a separate job for it, filtered to changes under `packages/grid`, so plu
 
 ## Phases
 
-- [ ] Consent: update the plugin's consent text to say Open Waters publishes products derived from the data, and decide how data collected under the earlier text is used. Nothing is published, including previews, until this is done.
+- [ ] Consent: the plugin's consent text says the data goes to Open Waters as well as the DCDB, and that anyone, Open Waters included, may publish and build products from it. Data collected under the earlier text was also dedicated to the public domain under CC0, so it is used the same way. Nothing is published, including previews, until a plugin release carries this text.
 - [ ] Point store: `files` and `points` tables, ingest with ETag tracking, file-level dedupe and supersession, for both sources.
 - [ ] Raw grid: QC, variable-resolution grid with shoal-biased statistics, depth areas and contours, `M_QUAL` coverage, and PMTiles, as an unlisted preview only. Without tide and datum corrections its depths aren't on chart datum, and a plotter would draw them next to ENC depths as if they were. It also waits on vessel matching across sources, so `vessels` doesn't count one boat twice.
 - [ ] Validation: held-out survey comparisons, the S-44 test and shoal detection rate, reported per grid version.

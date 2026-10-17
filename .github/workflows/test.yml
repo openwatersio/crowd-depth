@@ -83,3 +83,49 @@ jobs:
         env:
           SIGNALK_SERVER_DIR: ${{ runner.temp }}/signalk/node_modules/signalk-server
         run: npm run test:e2e
+
+  # Boots the Worker under workerd, as deployed, so a crash at module load fails
+  # here instead of in Cloudflare's build.
+  worker:
+    name: Worker startup
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: mise.toml
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build project
+        run: npm run build
+
+      - name: Start the Worker locally
+        working-directory: packages/api
+        run: |
+          # Deploys bundle with NODE_ENV=production, which enables load-time
+          # secret checks; dev defaults to development.
+          npx wrangler dev --port 8787 \
+            --define 'process.env.NODE_ENV:"production"' \
+            --var BATHY_JWT_SECRET:ci --var NOAA_CSB_TOKEN:ci \
+            > "$RUNNER_TEMP/wrangler.log" 2>&1 &
+          pid=$!
+          for _ in $(seq 60); do
+            grep -q "Ready on" "$RUNNER_TEMP/wrangler.log" && break
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+          done
+          status=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" http://localhost:8787/ || true)
+          sleep 1
+          kill "$pid" 2>/dev/null || true
+          cat "$RUNNER_TEMP/wrangler.log"
+          if ! grep -q "Ready on" "$RUNNER_TEMP/wrangler.log" || [[ "$status" != 200 ]]; then
+            echo "::error::Worker failed to start (GET / returned $status)"
+            exit 1
+          fi
