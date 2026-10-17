@@ -2,6 +2,8 @@
 
     grid --store DIR_OR_S3_URL ingest [--source noaa|openwaters] [--prefix YYYY/MM/DD] [--max-files N]
     grid --store DIR_OR_S3_URL confirm-withdrawals SOURCE
+    grid --store DIR_OR_S3_URL qc
+    grid --store DIR_OR_S3_URL cells
     grid --store DIR_OR_S3_URL stats
 
 Sources default to the NOAA CSB bucket and the Open Waters R2 bucket. R2 access
@@ -12,6 +14,7 @@ import argparse
 import logging
 import sys
 
+from . import cells, qc
 from .catalog import open_store
 from .ingest import Ingest, confirm_withdrawals
 from .objects import open_objects
@@ -51,6 +54,8 @@ def main(argv=None):
         "confirm-withdrawals", help="Let held withdrawals apply once two listings agree"
     )
     c.add_argument("source", choices=SOURCES)
+    sub.add_parser("qc", help="Flag impossible values, jumps and spikes along each track")
+    sub.add_parser("cells", help="Run QC, then rebuild every grid cell")
     sub.add_parser("stats", help="Count files by source and status")
     args = p.parse_args(argv)
 
@@ -66,6 +71,12 @@ def main(argv=None):
                 alert |= (
                     Ingest(con, name, objects, args.prefix, max_files=args.max_files).run().alert
                 )
+        elif args.command == "qc":
+            qc.run(con)
+        elif args.command == "cells":
+            # Cells read QC's flags: QC any batch that hasn't been at this version.
+            qc.run(con, missing_only=True)
+            cells.build(con)
         elif args.command == "confirm-withdrawals":
             print(f"confirmed {confirm_withdrawals(con, args.source)} held withdrawals")
         else:

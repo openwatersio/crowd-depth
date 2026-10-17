@@ -28,6 +28,7 @@ from pathlib import Path
 from boto3.exceptions import Boto3Error
 from botocore.exceptions import BotoCoreError, ClientError
 
+from . import qc
 from .sources import NOAA_PREFIX, Invalid, Parsed, arrival, is_submission, load
 
 log = logging.getLogger(__name__)
@@ -423,7 +424,7 @@ class Ingest:
     def flush(self):
         if not self.pending:
             return
-        # Each flush is its own batch, the unit later steps can rerun.
+        # Each flush is its own batch, the unit QC runs on now and when it's rerun.
         batch_id = self.last_batch = max(time.time_ns() // 1000, self.last_batch + 1)
         self.sql(
             f"""INSERT INTO lake.points BY NAME
@@ -432,8 +433,12 @@ class Ingest:
         # Recreated rather than emptied: deleted rows keep their memory until then.
         self.empty_pending()
         # A transaction keeps every replaced table's rows, and the rows it inserted,
-        # until it commits, so each batch commits. Nothing is published until the run's
-        # catalog is.
+        # until it commits, so the points commit before QC reads them. Nothing is
+        # published until the run's catalog is, and a batch whose QC didn't commit has
+        # no qc_batches row, so `grid cells` QCs it.
+        self.sql("COMMIT")
+        self.sql("BEGIN")
+        qc.run_batch(self.con, batch_id, fresh=True)
         self.sql("COMMIT")
         self.sql("BEGIN")
         self.counts["points"] += self.pending
