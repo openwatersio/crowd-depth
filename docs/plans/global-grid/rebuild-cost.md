@@ -1,8 +1,8 @@
 # Rebuild cost
 
-Can the planet be rebuilt daily on cheap hardware? Not with the pipeline as it stands, but probably with four targeted changes to a per-tile design. Three spikes on the Chesapeake set (98.5M active soundings, 18,434 files, 212 1° tiles) show where the time goes. The store layout and QC are not the bottleneck. Two costs are: a full-size raster for every 1° tile however empty it is, and new data landing in the same dense harbor tiles every day, so rebuilding at 1° granularity re-processes most of the data daily.
+Can the planet be rebuilt daily on cheap hardware? Not with the pipeline as it stands, but probably with four targeted changes to a per-tile design. Three spikes on the Chesapeake set (98.5M active soundings, 18,434 files, 212 1° tiles) show where the time goes. The store layout and QC are not the bottleneck. Two costs are: new data landing in the same dense harbor tiles every day, so rebuilding at 1° granularity re-processes most of the data daily, and a full-size raster for every 1° tile however empty it is. Across the whole NOAA archive the first is the larger: it covers 7,295 tiles, and a day's arrivals touch tiles holding two thirds of its soundings ([planet-size.md](planet-size.md)).
 
-Details are in [store-layout.md](store-layout.md), [qc-functions.md](qc-functions.md) and [per-tile-pipeline.md](per-tile-pipeline.md). The work that follows from them is in [backlog.md](backlog.md).
+Details are in [store-layout.md](store-layout.md), [qc-functions.md](qc-functions.md), [per-tile-pipeline.md](per-tile-pipeline.md) and [planet-size.md](planet-size.md). The work that follows from them is in [backlog.md](backlog.md).
 
 ## Summary of the spikes
 
@@ -33,24 +33,30 @@ The per-tile cells stage costs about the same (36 min serially for Chesapeake). 
 
 ## A planet day
 
-This assumes 8 cores, 32 GB, 2B soundings and 15–30k tiles with data, extrapolated from Chesapeake. None of the planet numbers are measured.
+This assumes 8 cores and 32 GB, and the measured archive from [planet-size.md](planet-size.md): 1.96B active soundings in 7,295 tiles, 42 of which hold half of them, and about 900 tiles touched a day. Costs use the per-tile model in [per-tile-pipeline.md](per-tile-pipeline.md#planet-extrapolation-8-cores-32-gb): a fixed 8.7 s per tile (cells 0.9, surface 6.5, web 1.3) plus 47 s per million soundings (cells 20, surface 19.4, web 7.8) on M-series cores, with cheap cores 1.5× slower and 8 workers giving 6×. A daily run rebuilds cells in the touched tiles, and surfaces and web tiles in those and their neighbors.
 
-|                                                                                    |  Worker-hours | Wall time on cheap cores |
-| ---------------------------------------------------------------------------------- | ------------: | -----------------------: |
-| Full rebuild, per-tile as built                                                    |         62–99 |                  16–25 h |
-| …of which fixed per-tile cost, mostly empty rasters                                |         36–73 |                          |
-| Daily at 1° granularity                                                            |         14–26 |                3.5–6.5 h |
-| Full rebuild with empty blocks skipped, one read per tile and deterministic output | roughly 25–35 |            roughly 5–7 h |
-| Daily with those and sub-tile dirtiness                                            |     about 1–3 |                under 1 h |
+|                                                        |         Worker-hours | Wall time on cheap cores |
+| ------------------------------------------------------ | -------------------: | -----------------------: |
+| Full rebuild, per-tile as built                        |                   43 |                     11 h |
+| …of which fixed per-tile cost, mostly empty rasters    |                   18 |                          |
+| Daily at 1° granularity                                | 22–25 (30-day range) |                5.5–6.5 h |
+| Full rebuild with empty blocks skipped                 |                   29 |                    7.5 h |
+| Daily at 1° with empty blocks skipped                  |                19–22 |                  5–5.5 h |
+| Daily with empty blocks skipped and sub-tile dirtiness |            about 1–3 |                under 1 h |
 
-The last two rows are estimates. The full rebuild drops by most of the fixed cost, leaving about 47 s per million soundings. The daily figure assumes dirty work follows each day's new tracks, a few percent of the dense tiles rather than all of them.
+The last row is an estimate. It assumes dirty work follows each day's new tracks, a few percent of the dense tiles rather than all of them.
 
-Skipping empty raster blocks has the headroom to do this. On a 5,400-pixel tile with 512-pixel blocks, blocks with a sounding within about 200 m are a median 15% of a tile's blocks, and 17% on average across the 171 tiles under 100k soundings. Pixels within 200 m of a sounding are 1% of a median tile. If the fixed stages scale with pixels, as profiling suggests, block skipping cuts the fixed cost by roughly 5 times.
+The per-sounding cost decides the planet, not the fixed cost. With 7,295 tiles, the fixed cost is 18 of 43 worker-hours, and the dense tiles hold most of the work. A day's touched tiles and their neighbors hold 84% of all soundings, so a 1° daily run costs about 55% of a full rebuild as built and about 70% with block skipping, which saves the daily run only 3–4 worker-hours. Sub-tile dirtiness is the change that makes a daily run cheap, and the per-sounding cost of cells and surfaces is what decides a full rebuild.
+
+The densest tile is a critical path of its own. Galveston and Houston (29°N 95°W) holds 67M soundings, more than twice Chesapeake's densest, and needs about 45 min of cells and surface on one M-series core at the linear rate.
+
+Skipping empty raster blocks has the headroom to remove most of the fixed cost. On a 5,400-pixel tile with 512-pixel blocks, blocks with a sounding within about 200 m are a median 15% of a tile's blocks, and 17% on average across the 171 Chesapeake tiles under 100k soundings. Pixels within 200 m of a sounding are 1% of a median tile. If the fixed stages scale with pixels, as profiling suggests, block skipping cuts the fixed cost by roughly 5 times, which the table assumes.
 
 ## Not measured
 
 - Reading tiles out of DuckLake on R2 after compaction, and real R2 latency and throughput.
-- The planet's tile count and density distribution. Read them from `points` by `tile_id` before relying on the extrapolation.
+- The planet's active soundings outside Chesapeake. [planet-size.md](planet-size.md) scales the archive's rows by Chesapeake's active ratio.
+- Memory and time for tiles denser than Chesapeake's densest. Three tiles hold more than twice as many soundings.
 - Cheap x86 cores and a dedicated machine. Every timing here is from a shared M-series laptop.
 - Upload cost of a 15–30 GB daily archive, and how clients handle its ETag changing.
 - Open Waters GeoJSON input, and latitudes above 60°.
