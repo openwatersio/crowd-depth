@@ -673,3 +673,17 @@ def test_a_key_list_ingests_only_its_keys_and_withdraws_nothing(env):
     assert files[noaa_key(1)][0] == "active"  # not withdrawn
     assert noaa_key(4) not in files  # not in the keys
     assert files[noaa_key(3)][0] == "active"
+
+
+def test_a_run_whose_lease_ran_low_publishes_nothing(tmp_path, monkeypatch):
+    # Renewal stalls without noticing (a hung request): the lock isn't lost yet, but
+    # another run could take it over before a publish that started now finished.
+    store = LocalObjects(tmp_path)
+    with open_store(store):
+        pass
+    first = store.get(POINTER)[0]
+    monkeypatch.setattr(Lock, "_renew", lambda self: self._stop.wait())
+    with pytest.raises(Locked), open_store(store, ttl=timedelta(seconds=0.4)) as con:
+        con.execute("INSERT INTO lake.withdrawal_holds VALUES ('noaa', 'k', 1, false)")
+        time.sleep(0.25)
+    assert store.get(POINTER)[0] == first

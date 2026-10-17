@@ -33,6 +33,7 @@ and make navigation safer for everyone.
    public record, available to hydrographic offices, chart makers, and
    navigation apps under a [CC0 public
    domain](https://creativecommons.org/publicdomain/zero/1.0/) dedication.
+   Open Waters also builds openly licensed depth products from them.
 
 You stay in control: sharing can be anonymous (a random UUID instead of your
 vessel name and MMSI), and you can disable the plugin at any time.
@@ -84,8 +85,9 @@ take a few minutes to measure them. Where your vessel already reports
 - **Share data anonymously** — Withhold your vessel name and MMSI and report
   under a randomly generated UUID instead.
 
-By enabling the plugin, you agree to share your position and depth data with
-the IHO data collection service under CC0.
+By enabling the plugin, you agree to share your soundings and your vessel and
+sensor details, and you dedicate them to the public domain under [CC0 1.0
+Universal](https://creativecommons.org/publicdomain/zero/1.0/).
 
 ## For developers
 

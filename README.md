@@ -21,7 +21,7 @@ All data collected by this plugin [will be publicly available soon](https://gith
 
 ### What license is applied to the data?
 
-All collected data is licensed under [CC0 1.0 Universal](https://creativecommons.org/publicdomain/zero/1.0/).
+All collected data is dedicated to the public domain under [CC0 1.0 Universal](https://creativecommons.org/publicdomain/zero/1.0/). Anyone may use, publish and build products from it, including Open Waters and the IHO Data Centre for Digital Bathymetry, which publishes soundings from IHO member waters through NOAA.
 
 ---
 

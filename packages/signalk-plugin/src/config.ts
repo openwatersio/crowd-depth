@@ -154,7 +154,7 @@ export function schema(app: ServerAPI) {
   return {
     type: "object",
     description:
-      "By enabling this plugin, you agree to share your position and depth data with the IHO data collection service under the terms of Creative Commons 1.0 Universal public domain dedication (CCO).",
+      "By enabling this plugin, you agree to share your soundings and your vessel and sensor details, and you dedicate them to the public domain under Creative Commons CC0 1.0 Universal.",
     properties: {
       path: {
         type: "string",
