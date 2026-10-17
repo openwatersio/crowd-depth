@@ -16,6 +16,7 @@ Per-vessel vertical offsets are the largest error in the grid. In Thimble Shoal 
 - [ ] **Spike crossover offsets.** Compare reference-survey calibration with crossover-only offsets (least squares at track crossings, as in GMT's x2sys) anchored to calibrated vessels, check how offsets drift over time and with sounder changes, and cost both at planet scale. Repeat the BlueTopo comparison in a sparse area and on rocky bottom.
 - [ ] **Offsets table.** A `calibration` table of offset, scale and uncertainty per vessel and time span, fit against BlueTopo, S-102 and Seascape's surveyed sources where tracks overlap them, and solved at crossovers elsewhere, as in [Vessel calibration](README.md#vessel-calibration). Applied before gridding. A calibration change dirties every tile the vessel crossed.
 - [ ] **Replace the 10th percentile with `median − kσ`** over per-vessel medians, with σ published per pixel for `M_QUAL` and CATZOC, and k a stated margin. With offsets corrected, k = 1.645 draws more than 1 m deeper than the shoalest BlueTopo cell under it in 0.6% of pixels, against 2.7% for the current surface.
+- [ ] **Mark interpolated cells.** Cells filled within 200 m of tracks get `kind = interpolated` and a σ that widens with distance from the nearest track, and are never interpolated over an unconfirmed shoal, as in [Interpolation](README.md#interpolation).
 - [ ] **Drop the guard on the shoalest sounding.** Carry hazards through confirmed shoals, which publish as soundings anyway. In the channel the guard alone draws a third of pixels under 9 m.
 - [ ] **Better σ.** Per-vessel uncertainty from calibration residuals, plus spread around a local plane, so slopes don't widen σ as noise does. CUBE/CHRT does this formally and suits dense areas.
 
@@ -41,8 +42,3 @@ These change results, so each bumps `QC_VERSION` or `GRID_VERSION` and triggers 
 - [ ] **Score track noise.** Keep the soundings of a track with a large local spread for consensus, but don't let them set depths, cap pixels or punch holes, so one-sided spike rejection doesn't throw out the true bottom.
 - [ ] **Seams between tiles.** Grid each tile with a few pixels of margin and crop after the blur and shoal guard, let consensus votes read across tile edges, then re-measure. This makes cells depend on their neighbors, so design it with the dirty-work item above.
 - [ ] **Mask structures.** The Chesapeake Bay Bridge's piers draw as a line of 0.6–3 m shoals, from real echoes off the piers. Mask soundings on bridges, piers and pylons from OSM or ENC structure layers.
-
-## Decisions needed
-
-- **The surface statistic.** Adopt `median − kσ` and choose k, or keep a percentile. See [surface-statistic.md](surface-statistic.md).
-- **Interpolation between tracks.** The plan's principles rule out interpolating between tracks, but the surface interpolates within a 200 m search radius. Either the principle or the surface changes, and validation should measure missed shoals either way.
