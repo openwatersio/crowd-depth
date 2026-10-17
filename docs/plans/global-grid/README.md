@@ -11,6 +11,7 @@ Supporting notes:
 - [Standards](standards.md): what the IHO standards say about data quality, survey accuracy, and deriving depth areas, contours and soundings.
 - [References](references.md): primary sources, research, and reusable code, with links.
 - [Backlog](backlog.md): the prioritized work, from what the spikes below found.
+- [Planet size](planet-size.md): how many 1° tiles the archive covers, how skewed they are, and how a day's arrivals spread.
 - [Rebuild cost](rebuild-cost.md): what a daily planet rebuild costs, and what brings it within a day on cheap hardware.
 - [Point store layout](store-layout.md), [Track QC as pure functions](qc-functions.md) and [Per-tile pipeline](per-tile-pipeline.md): spikes on the Chesapeake set.
 - [Live layer](live-layer.md): the plugin's own-boat layer, drawn on top of the overlay with the same QC, corrections and portrayal.
@@ -115,6 +116,7 @@ Most of the QC follows NOAA Office of Coast Survey's [CSB processing tool](https
 - Split each vessel's soundings into transits, starting a new one after a gap of more than 4 hours or after 7 days.
 - Per transit: compute speed and flag soundings above about 20 kn as position jumps. Flag depth spikes by their residual from a rolling median along track, with an absolute threshold. The NOAA tool flags a fixed top percentile instead, which rejects some soundings even on clean transits.
 - Per cell: robust outlier detection (median absolute deviation) across all soundings and vessels.
+- Where a sounding carries position quality, flag one without a GNSS fix (dead reckoning, simulator or no fix) and reject or down-weight one whose dilution or accuracy is past a threshold. Its horizontal accuracy sets the sounding's horizontal uncertainty, which feeds `M_QUAL`, and weights its position where positions are combined, such as placing a cell's sounding. A sounding without position quality takes the default of about 10 m.
 - Where a reference survey exists, compare soundings with it using 3.5 times their vertical uncertainty as the limit.
 
 Rejection is one-sided. An outlier deeper than its neighbors or the survey is rejected. An outlier shoaler than them is never silently dropped, because it may be a rock, a pinnacle or a new shoal, which is what crowd data is best at finding. It is marked `unconfirmed`: it stays out of depth areas and contours, but publishes as a sounding with a low-reliability flag. A second vessel or transit sounding it within its uncertainty confirms it.
@@ -238,6 +240,7 @@ The plugin's submissions carry richer metadata than NOAA's files, but how much o
 
 - **The plugin's own metadata shows why metadata can't be trusted.** Released versions up to 1.2.6, which the API still accepts, label every submission `Waterline`. They prefer depth below the surface when the boat provides it, so many of those labels are right, but a vessel logging `belowKeel` or `belowTransducer` through a history provider is labeled `Waterline` with no offset added, and its sensor positions are the raw settings rather than offsets from the transducer. Later versions report the reference more carefully (07d227f), but still only from the owner's settings. Files stored before 2026-01-14 have no CSB metadata at all. Ingest stores the metadata and the `providerLoggerVersion` that produced it, and calibration treats both as a starting estimate, the same as for any other source.
 - **The API should check the vessel id in the body.** It verifies the id in the form metadata against the vessel's token, but stores and forwards the GeoJSON body unchecked. Ingest takes identity from the R2 key, but a body naming another vessel still reaches NOAA's archive and comes back as a `noaa` file under that vessel's id. The API should reject a body whose ids disagree with the authenticated vessel, before storing or forwarding it.
+- **Submissions should carry position quality.** Neither source records how good each position is: NOAA's CSVs have no field for it, and the plugin doesn't send it. The plugin can read it per sounding from Signal K (`navigation.gnss.methodQuality`, `navigation.gnss.horizontalDilution` and `navigation.gnss.satellites`, plus a horizontal accuracy estimate where the receiver reports one) and send it as optional properties on each feature. The API accepts them, and ingest stores them as nullable columns on `points`, so older files and NOAA files simply have none.
 - **Removing a vessel means suppressing both sources.** Deleting a vessel's R2 files would end rule 5's suppression of the matching NOAA soundings, which would then be published. A request to remove a contributor's data is handled by vessel id across both sources, built when the first request arrives.
 
 ## Removing data
