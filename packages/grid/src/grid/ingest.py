@@ -143,6 +143,12 @@ class Ingest:
             listed = {o.key for o in listing}
             # A key the index names but the bucket doesn't have yet, or any more.
             self.counts["missing"] = len(self.keys - listed)
+            if not self.keys & listed:
+                # None found: a key list for another source or bucket layout, most likely.
+                log.warning(
+                    "%s: none of the %d keys are in the bucket", self.source, len(self.keys)
+                )
+                self.alert = True
             listing = [o for o in listing if o.key in self.keys]
         subs = {o.key: o for o in listing if is_submission(self.source, o.key)}
         self.sidecars = {o.key for o in listing if o.key.endswith(SIDECARS)}
@@ -358,7 +364,12 @@ class Ingest:
 
     def withdraw(self, subs, current, complete):
         if self.keys is not None:
-            return  # a chosen set of keys, not the source's listing
+            # A chosen set of keys, not the source's listing, so nothing is withdrawn; a
+            # folder that couldn't be listed still leaves its keys unread.
+            if not complete:
+                log.warning("%s: listing of the keys' folders incomplete", self.source)
+                self.alert = True
+            return
         if not complete:
             log.warning("%s: listing incomplete, no withdrawals this run", self.source)
             self.alert = True

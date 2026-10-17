@@ -778,6 +778,34 @@ def test_only_content_errors_make_a_file_invalid(tmp_path, monkeypatch, error, i
         parse("noaa", noaa_key(1), noaa_csv(ROWS), tmp_path)
 
 
+def test_a_key_list_whose_folders_cant_all_be_listed_alerts(env, monkeypatch):
+    env.noaa.put(noaa_key(1), noaa_csv(ROWS, file_uuid="1"))
+    listing = env.noaa.list
+    monkeypatch.setattr(env.noaa, "list", lambda prefix="": (listing(prefix)[0], False))
+    with open_store(env.store) as con:
+        assert Ingest(con, "noaa", env.noaa, keys={noaa_key(1)}).run().alert
+
+
+def test_a_key_list_that_finds_nothing_alerts(env):
+    env.noaa.put(noaa_key(1), noaa_csv(ROWS, file_uuid="1"))
+    with open_store(env.store) as con:
+        # Keys without NOAA's prefix: listed nowhere, so all missing.
+        run = Ingest(con, "noaa", env.noaa, keys={noaa_key(1).removeprefix("csb/csv/")}).run()
+    assert run.alert and run.counts["missing"] == 1
+    with open_store(env.store) as con:
+        assert Ingest(con, "noaa", env.noaa, keys=set()).run().alert  # an empty key file
+
+
+def test_a_key_list_needs_a_source(tmp_path):
+    from grid.cli import main
+
+    keys = tmp_path / "keys.txt"
+    keys.write_text(noaa_key(1))
+    for picked in ([], ["--source", "noaa", "--source", "openwaters"]):
+        with pytest.raises(SystemExit):
+            main(["--store", str(tmp_path / "store"), "ingest", *picked, "--keys", str(keys)])
+
+
 def test_a_key_list_ingests_only_its_keys_and_withdraws_nothing(env):
     env.noaa.put(noaa_key(1), noaa_csv(ROWS, file_uuid="1"))
     env.noaa.put(noaa_key(2), noaa_csv(ROWS, unique_id="B", file_uuid="2"))

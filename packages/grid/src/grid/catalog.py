@@ -341,12 +341,12 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
                     # Rebuilds delete and reinsert cells and their flags, and DuckLake
                     # deletes by writing delete files, so the replaced files stay live
                     # until rewritten.
-                    # ponytail: points are rewritten by the weekly compaction, not here
+                    # ponytail: points' delete files wait for compaction, which is still to come
                     for table in ("cells", "qc_flags"):
                         con.execute(f"CALL ducklake_rewrite_data_files('lake', '{table}')")
                     # A reader may still hold a catalog up to RETAIN old, so snapshots, the
                     # files only they reference, and old catalogs go once they pass it.
-                    # Taken after the rewrite, so the files it replaced are past it.
+                    # Taken after the rewrite, so this run's rewrite doesn't count toward it.
                     cutoff = datetime.now(UTC) - RETAIN
                     older = {"cutoff": cutoff.replace(tzinfo=None)}  # session time zone is UTC
                     con.execute(

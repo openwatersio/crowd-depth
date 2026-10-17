@@ -12,11 +12,11 @@ import logging
 import math
 
 from .catalog import BASE_ROW
-from .qc import MAX_DEPTH_M, QC_VERSION, TRACK_REASONS
+from .qc import HAZARD_M, MAX_DEPTH_M, QC_VERSION, TRACK_REASONS
 
 log = logging.getLogger(__name__)
 
-GRID_VERSION = 1
+GRID_VERSION = 2
 BATCH_POINTS = 5_000_000
 BASE = 10_800  # base rows per 1° tile
 SHOAL_QUANTILE = 0.10
@@ -74,7 +74,7 @@ FROM {source} s JOIN levels l ON l.tile_id = s.tile_id AND l.r1 = s.r // 3 AND l
 
 
 CELL = ["tile_id", "level", "cr", "cc"]
-# Soundings a cell's median, spread and 10th percentile are taken from, at most. These
+# About how many soundings a cell's median, spread and 10th percentile are taken from. These
 # aggregates hold their values in memory, and a boat logging at its mooring fills one
 # cell for as long as it logs. Larger cells are sampled by point id, the same sample
 # every run; min, max, counts and confirmed shoals still use every sounding.
@@ -96,6 +96,9 @@ def sample(source: str, keys: list[str], name: str) -> str:
 SUPPORT = 3
 # Other vessels that must agree with each other to disprove a shoal one vessel read.
 DISPROVE = 3
+# A disproved shoal shallower than HAZARD_M may still be a hazard one boat found and
+# the others passed beside, so it stays an unconfirmed shoal rather than a reject: out
+# of depths and areas, but published and never filled over. Deeper, it's a stray echo.
 
 # A unit's points are classified in steps, each a temp table that spills past the
 # memory limit (a MATERIALIZED CTE would hold its whole result in memory), and the cell
@@ -137,11 +140,13 @@ WHERE n.vmin <> s.vessel OR n.vmax <> s.vessel OR n.support >= {SUPPORT}
 # soundings QC accepted. A sounding is judged against the other vessels' votes in the
 # 3x3 blocks around its own, each vessel once, wherever two or more voted. Deeper than
 # their consensus by more than the tolerance, it's rejected. Shoaler by more than that,
-# it's rejected when three or more of them agree with the consensus, unless another
+# it's disproved when three or more of them agree with the consensus, unless another
 # vessel read the same depth: one of its soundings, unconfirmed ones included, in the
-# same block and within the shoal's own tolerance (2 m + 5%) either way. Every sounder
+# same block and within the shoal's own tolerance (2 m + 5%) either way. A disproved
+# shoal is rejected at HAZARD_M or deeper and kept unconfirmed shallower. Every sounder
 # in deep water throws stray shallow echoes, at all sorts of depths, so a shoaler or
-# deeper reading nearby doesn't count; two vessels reading one depth does. A shoal that isn't disproved goes on to the cell's own shoal confirmation. The
+# deeper reading nearby doesn't count; two vessels reading one depth does. A shoal
+# that isn't disproved goes on to the cell's own shoal confirmation. The
 # tolerance is the larger of 2 m + 5% of the consensus and three times the spread of
 # the votes, so it widens on slopes, where vessels a block apart honestly disagree.
 # A vessel's vote is the median of a fixed sample, as cells' are, so one moored in a
@@ -193,10 +198,11 @@ corroborated AS (
     ON o.tile_id = s.tile_id AND o.br = s.br AND o.bc = s.bc
     AND abs(o.d - s.d) <= 2 + 0.05 * s.d AND (o.vmin <> s.vessel OR o.vmax <> s.vessel)
 )
-SELECT point_id, 'consensus_deep' AS reason FROM consensus_judged WHERE d > m
+SELECT point_id, 'reject' AS flag, 'consensus_deep' AS reason FROM consensus_judged WHERE d > m
 UNION ALL
-SELECT point_id, 'consensus_shoal' FROM shoals
-WHERE point_id NOT IN (SELECT point_id FROM corroborated);
+SELECT point_id, CASE WHEN d < {HAZARD_M} THEN 'unconfirmed' ELSE 'reject' END,
+  'consensus_shoal'
+FROM shoals WHERE point_id NOT IN (SELECT point_id FROM corroborated);
 DROP TABLE consensus_judged;
 DROP TABLE consensus;
 """
@@ -204,7 +210,10 @@ DROP TABLE consensus;
 CLASSIFY = f"""
 CREATE OR REPLACE TEMP TABLE unit_points AS
 WITH flags AS (
-  SELECT point_id, flag FROM lake.qc_flags
+  -- A stuck run kept as an unconfirmed shoal never sets depths, even agreeing with
+  -- itself: it stays out of cells, as a reject does, and publishes from its flag.
+  SELECT point_id, CASE WHEN reason = 'flatline' THEN 'reject' ELSE flag END AS flag
+  FROM lake.qc_flags
   WHERE cell_id = $partition AND qc_version = {QC_VERSION} AND list_contains({TRACK_REASONS}, reason)
     AND flag IN ('reject', 'unconfirmed')
 ),
@@ -326,7 +335,7 @@ FROM stats s JOIN placed p USING (tile_id, level, cr, cc)
 CELL_FLAGS = """
 SELECT point_id, 'reject' AS flag, 'cell_deep' AS reason FROM classed WHERE outlier = 'deep'
 UNION ALL
-SELECT point_id, 'reject', reason FROM consensus_rejects
+SELECT point_id, flag, reason FROM consensus_rejects
 UNION ALL
 SELECT point_id, 'unconfirmed', 'cell_shoal' FROM classed
 WHERE outlier = 'shoal' AND NOT from_track AND point_id NOT IN (SELECT point_id FROM confirmed)
@@ -459,6 +468,8 @@ def build(con, tiles: list[int] | None = None) -> dict:
     Measured cells first, unit by unit; then holes, which read the measured cells one
     row past each unit's edges, so a band's edge is filled the same as its middle.
     """
+    if tiles is not None and not tiles:
+        raise ValueError("no tiles to build; None builds every tile")
     tiles = tiles or []
     partitions = [
         p
