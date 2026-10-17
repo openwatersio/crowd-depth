@@ -13,7 +13,8 @@
     "sounder",
     "noaa",
     "iho",
-    "marine"
+    "marine",
+    "signalk-category-chart-plotters"
   ],
   "homepage": "https://openwaters.io/bathymetry/crowd-depth",
   "bugs": {
@@ -39,13 +40,15 @@
   "files": [
     "dist",
     "bin",
-    "icon.svg"
+    "icon.svg",
+    "public",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "scripts": {
-    "build": "tsc -b",
+    "build": "tsc -b && node scripts/build-web.mjs",
     "dev": "tsc -w",
     "prepack": "npm run build",
-    "lint": "tsc -b && publint --strict",
+    "lint": "tsc -b && tsc -p tsconfig.web.json && publint --strict",
     "test": "vitest",
     "test:e2e": "vitest run --config vitest.e2e.config.ts"
   },
@@ -53,8 +56,11 @@
     "node": ">=24"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
     "@types/geojson": "^7946.0.16",
-    "publint": "^0.3.16"
+    "esbuild": "^0.27.7",
+    "publint": "^0.3.16",
+    "signalk-plotterext-bus": "^0.20.0"
   },
   "dependencies": {
     "@js-temporal/polyfill": "^0.5",

@@ -26,6 +26,10 @@ export type Config = {
   sharing: {
     anonymous: boolean;
   };
+  chart?: {
+    /** Offer the "My soundings" layer to chartplotters; on unless turned off. */
+    show?: boolean;
+  };
 };
 
 /**
@@ -271,6 +275,19 @@ export function schema(app: ServerAPI) {
             title: "Share data anonymously",
             description:
               "If you do not wish to share your vessel name and MMSI, you can share anonymously with a unique UUID instead.",
+          },
+        },
+      },
+      chart: {
+        type: "object",
+        title: "Chart",
+        properties: {
+          show: {
+            type: "boolean",
+            default: true,
+            title: "Show my soundings on the chart",
+            description:
+              "Draw the depths this boat records as a layer in chartplotters that support Signal K plotter extensions, such as Freeboard-SK 3.4 or later. The depths are raw and not for navigation.",
           },
         },
       },

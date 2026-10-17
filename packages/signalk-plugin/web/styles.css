@@ -1,0 +1,111 @@
+/* Adapted from signalk-livedepth-plugin (MIT); see THIRD_PARTY_NOTICES.md. */
+:root {
+  color-scheme: light dark;
+  --fg: #1a1a1a;
+  --muted: #5a6a72;
+  --bg: #ffffff;
+  --line: #d7dee2;
+  --accent: #1a84d8;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #e8eef1;
+    --muted: #9fb0b8;
+    --bg: #12181b;
+    --line: #2a353a;
+    --accent: #4aa8e8;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: Roboto, Arial, sans-serif;
+  font-size: 14px;
+  color: var(--fg);
+  background: var(--bg);
+}
+
+body.renderer {
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+}
+
+#root {
+  padding: 12px 14px;
+}
+
+h2 {
+  margin: 0 0 12px;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.field.row {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.field .name {
+  font-weight: 500;
+}
+
+.field .hint {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.field .control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.field .control input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.field .suffix {
+  color: var(--muted);
+  min-width: 1.5em;
+}
+
+/* A setting that has no effect for the current depth source. */
+.field.disabled {
+  opacity: 0.5;
+}
+
+input[type="number"],
+select {
+  width: 100%;
+  padding: 6px 8px;
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+}
+
+.status {
+  color: var(--muted);
+}

@@ -5,3 +5,4 @@ tmp
 .vercel
 .wrangler
 tsconfig.tsbuildinfo
+packages/signalk-plugin/public

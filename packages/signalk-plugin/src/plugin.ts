@@ -9,6 +9,7 @@ import { createDB } from "./storage.js";
 import { join } from "path";
 import { createCollector } from "./collector.js";
 import { createStatus } from "./status.js";
+import { startChartSafely } from "./chart.js";
 
 export default function createPlugin(app: ServerAPI): Plugin {
   let abortController: AbortController | undefined = undefined;
@@ -27,6 +28,12 @@ export default function createPlugin(app: ServerAPI): Plugin {
       const controller = new AbortController();
       abortController = controller;
       const db = createDB(join(app.getDataDirPath(), `bathymetry.sqlite`));
+      const chart = startChartSafely({
+        app,
+        config,
+        db,
+        signal: controller.signal,
+      });
 
       const sqlite = createSqliteSource(app, db);
       const source = await settleSource({
@@ -46,6 +53,8 @@ export default function createPlugin(app: ServerAPI): Plugin {
         signal: controller.signal,
       });
       if (!source) return;
+
+      void chart?.backfill(source);
 
       createReporter({
         app,

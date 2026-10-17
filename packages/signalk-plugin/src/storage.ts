@@ -32,6 +32,25 @@ export function createDB(filename: string): DatabaseSync {
         );
       `);
     },
+    () => {
+      // The chart layer's tile pyramid, derived from the soundings above; see
+      // tiles/store.ts.
+      db.exec(`
+        CREATE TABLE tiles(
+          z INTEGER NOT NULL,
+          x INTEGER NOT NULL,
+          y INTEGER NOT NULL,
+          cells BLOB NOT NULL,
+          updated INTEGER NOT NULL,
+          PRIMARY KEY(z, x, y)
+        );
+
+        CREATE TABLE tile_meta(
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        );
+      `);
+    },
   ]);
 
   return db;

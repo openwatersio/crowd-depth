@@ -32,6 +32,10 @@ schedule to the trusted node API.
 | `src/metadata.ts`    | Vessel identity (name/MMSI or anonymous UUID) persistence                                                                                        |
 | `src/status.ts`      | Plugin status messages shown in the Signal K admin UI                                                                                            |
 | `src/fetch.ts`       | HTTP helpers shared with the API package                                                                                                         |
+| `src/chart.ts`       | The "My soundings" chart layer: live tile writer, backfill, tile routes, and the plotter extension                                               |
+| `src/tiles/`         | Shoal-biased tile pyramid of the boat's own soundings in the plugin's SQLite database (`core/` is shared with the browser)                       |
+| `src/plotterext/`    | Plotter extension manifest and resource provider that offer the layer to chartplotters such as Freeboard-SK                                      |
+| `web/`               | Browser code for the layer: background runtime, WebGL render worker and settings panel, bundled into `public/` by `scripts/build-web.mjs`        |
 | `bin/xyz-to-geojson` | Helper CLI for converting XYZ files to GeoJSON                                                                                                   |
 
 ### `packages/api` (`crowd-depth-api`, private)

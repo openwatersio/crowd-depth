@@ -1,5 +1,8 @@
 import { BathymetryData } from "../types.js";
 import { computeDestinationPoint } from "geolib";
+import { MIN_COG_SPEED } from "../tiles/core/correction.js";
+
+export { MIN_COG_SPEED };
 
 /**
  * Fix the precision of incoming data.
@@ -27,13 +30,6 @@ export type SensorConfig = {
   gnss: { x: number; y: number };
   sounder: { x: number; y: number };
 };
-
-/**
- * Slowest speed over ground, in m/s (~1 kn), at which course over ground stands
- * in for a missing heading. Above it, leeway and current rarely put COG more
- * than ~10° off heading, which moves a 6 m offset by ~1 m, under GNSS error.
- */
-export const MIN_COG_SPEED = 0.5144;
 
 /**
  * The direction the bow points, in radians, for moving a sounding from the
