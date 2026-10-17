@@ -20,10 +20,18 @@
  */
 
 export const TILE_SIZE = 256;
-/** Base level: cell ≈ 1.2 m at the equator. GNSS positions are good to a few
- * metres at best, so finer cells would only spread one sounding's position
- * error over more of them. */
-export const BASE_ZOOM = 17;
+/** Base level: cell ≈ 0.15 m at the equator. Fine cells cost little, since a
+ * track is sparse and soundings a few metres apart each take one cell at any
+ * level, and they keep the soundings at full precision: coarser levels can
+ * always be pooled from them later, never the reverse. */
+export const BASE_ZOOM = 20;
+
+/** Finest level the chart draws: cell ≈ 0.6 m at the equator. A single-beam
+ * sounding covers a metre or more of seabed in shallow water, and its position
+ * carries sounder lag and heading error on top of the GNSS fix, so drawing
+ * finer would show precision the soundings don't have and break a track into
+ * dots. */
+export const DISPLAY_MAX_ZOOM = 18;
 /** Coarsest level built and served (≈ 2.4 km/cell at z4). Low enough that a
  * regional zoom-out is covered by a handful of tiles; the min-pool keeps a
  * shoal visible however far the chart is zoomed out. */

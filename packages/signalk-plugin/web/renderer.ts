@@ -29,7 +29,7 @@ import {
   decodeTileSamples,
   tileRangeForBbox,
   zoomForCellSize,
-  BASE_ZOOM,
+  DISPLAY_MAX_ZOOM,
   MIN_COG_SPEED,
   cellSize,
   MIN_ZOOM,
@@ -200,7 +200,7 @@ let fetchSeq = 0;
 async function fetchTiles(req: RenderRequest): Promise<void> {
   const seq = ++fetchSeq;
   const cellMetres = Math.max(req.resolution, 0.01);
-  let zoom = zoomForCellSize(cellMetres, MIN_ZOOM, BASE_ZOOM);
+  let zoom = zoomForCellSize(cellMetres, MIN_ZOOM, DISPLAY_MAX_ZOOM);
   while (zoom > MIN_ZOOM) {
     const { xs, ys } = tileRangeForBbox(req.bounds, zoom);
     if (xs.length * ys.length <= MAX_TILE_FETCHES) break;
