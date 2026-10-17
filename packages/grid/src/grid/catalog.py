@@ -337,7 +337,6 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
                     raise RuntimeError("a read-only store publishes nothing")
                 # Moves rows inlined so far to Parquet, so the catalog each run downloads stays small.
                 con.execute("CALL ducklake_flush_inlined_data('lake')")
-                cutoff = datetime.now(UTC) - RETAIN
                 if final:
                     # Rebuilds delete and reinsert cells and their flags, and DuckLake
                     # deletes by writing delete files, so the replaced files stay live
@@ -347,6 +346,8 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
                         con.execute(f"CALL ducklake_rewrite_data_files('lake', '{table}')")
                     # A reader may still hold a catalog up to RETAIN old, so snapshots, the
                     # files only they reference, and old catalogs go once they pass it.
+                    # Taken after the rewrite, so the files it replaced are past it.
+                    cutoff = datetime.now(UTC) - RETAIN
                     older = {"cutoff": cutoff.replace(tzinfo=None)}  # session time zone is UTC
                     con.execute(
                         "CALL ducklake_expire_snapshots('lake', older_than => $cutoff)", older
