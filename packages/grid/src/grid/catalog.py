@@ -15,6 +15,7 @@ import duckdb
 from botocore.exceptions import BotoCoreError, ClientError
 
 from .objects import Conflict, LocalObjects
+from .sources import literal
 
 log = logging.getLogger(__name__)
 
@@ -159,13 +160,24 @@ class Lock:
             if current is None:
                 return self.acquire()
             held = json.loads(current[0])
+            if held["owner"] == self.owner:
+                # This run's put landed, but its response was lost and the retry failed.
+                self.etag = current[1]
+                return self._start(sent)
             if datetime.fromisoformat(held["expires"]) > datetime.now(UTC):
                 raise Locked(f"catalog locked by {held['owner']} until {held['expires']}")
-            log.warning("taking over stale lock from %s", held["owner"])
+            if not held.get("released"):
+                log.warning("taking over stale lock from %s", held["owner"])
             try:
                 self.etag = self.objects.put(LOCK, self._body(), if_match=current[1])
             except Conflict:
-                raise Locked("another run took the stale lock first")
+                now = self.objects.get(LOCK)
+                if not now or json.loads(now[0])["owner"] != self.owner:
+                    raise Locked("another run took the stale lock first")
+                self.etag = now[1]
+        self._start(sent)
+
+    def _start(self, sent):
         self.renewed = sent
         self._thread = threading.Thread(target=self._renew, daemon=True)
         self._thread.start()
@@ -214,7 +226,9 @@ class Lock:
         # Releasing marks the lock expired with a write conditional on this run's
         # version, so it can't clobber a lock another run has taken over since.
         # The next run takes the expired lock over like any stale one.
-        body = json.dumps({"owner": self.owner, "expires": datetime.now(UTC).isoformat()})
+        body = json.dumps(
+            {"owner": self.owner, "expires": datetime.now(UTC).isoformat(), "released": True}
+        )
         try:
             self.objects.put(LOCK, body.encode(), if_match=self.etag)
         except Conflict:
@@ -268,7 +282,8 @@ def attach(con, catalog_path: str, data_url: str):
     # Inlining keeps the small per-file writes to files and submission_meta in the
     # catalog instead of a Parquet file each.
     con.execute(
-        f"ATTACH 'ducklake:{catalog_path}' AS lake (DATA_PATH '{data_url}', DATA_INLINING_ROW_LIMIT 1000)"
+        f"ATTACH {literal('ducklake:' + catalog_path)} AS lake"
+        f" (DATA_PATH {literal(data_url)}, DATA_INLINING_ROW_LIMIT 1000)"
     )
 
 
@@ -341,12 +356,12 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
                     # Rebuilds delete and reinsert cells, their flags and the cells'
                     # marker, and DuckLake deletes by writing delete files, so the
                     # replaced files stay live until rewritten.
-                    # ponytail: points are rewritten by the weekly compaction, not here
+                    # ponytail: points' delete files wait for compaction, which is still to come
                     for table in ("cells", "qc_flags", "store_meta"):
                         con.execute(f"CALL ducklake_rewrite_data_files('lake', '{table}')")
                     # A reader may still hold a catalog up to RETAIN old, so snapshots, the
                     # files only they reference, and old catalogs go once they pass it.
-                    # Taken after the rewrite, so the files it replaced are past it.
+                    # Taken after the rewrite, so this run's rewrite doesn't count toward it.
                     cutoff = datetime.now(UTC) - RETAIN
                     older = {"cutoff": cutoff.replace(tzinfo=None)}  # session time zone is UTC
                     con.execute(
@@ -359,12 +374,25 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
                 lock.check()
                 stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
                 key = f"catalog/{stamp}-{uuid.uuid4().hex[:8]}.ducklake"
-                store.put(key, local.read_bytes(), if_none_match=True)
+                try:
+                    store.put(key, local.read_bytes(), if_none_match=True)
+                except Conflict:
+                    # The key is this run's own, so a 412 means an earlier try landed.
+                    if store.get(key) is None:
+                        raise
                 lock.check()  # the upload can take a while
-                if base:
-                    base = store.put(POINTER, key.encode(), if_match=base)
-                else:
-                    base = store.put(POINTER, key.encode(), if_none_match=True)
+                try:
+                    if base:
+                        base = store.put(POINTER, key.encode(), if_match=base)
+                    else:
+                        base = store.put(POINTER, key.encode(), if_none_match=True)
+                except Conflict:
+                    # A put whose response was lost fails its retry with a 412; it
+                    # landed if the pointer names this catalog.
+                    current = store.get(POINTER)
+                    if not current or current[0].decode() != key:
+                        raise
+                    base = current[1]
                 log.info("catalog now %s", key)
                 if not final:
                     attach(con, str(local), data_url)
@@ -376,8 +404,11 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
                 return
             key = publish(final=True)
             con.close()
+            # The catalog this run started from stays a run longer: a reader may have
+            # read the pointer just before it moved.
+            keep = {key, pointer and pointer[0].decode()}
             for obj in store.list("catalog/")[0]:
-                if obj.key.endswith(".ducklake") and obj.key != key and obj.modified < cutoff:
+                if obj.key.endswith(".ducklake") and obj.key not in keep and obj.modified < cutoff:
                     store.delete(obj.key)
     finally:
         if write:

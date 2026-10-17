@@ -475,7 +475,7 @@ def test_rebuilds_expire_old_snapshots_files_and_catalogs(env, monkeypatch):  # 
             cells.build(con)
         after.append(sum(1 for _ in lake.rglob("*.parquet")))
         catalogs = [o.key for o in env.store.list("catalog/")[0] if o.key.endswith(".ducklake")]
-        assert len(catalogs) == 1
+        assert len(catalogs) == 2  # this run's, and the one it started from
     assert after[0] == after[1] == after[2]
     assert grid(env)
 
@@ -542,6 +542,53 @@ def test_a_depth_held_over_a_kilometre_is_a_stuck_sounder(env):  # noqa: F811
     assert all(flag == "reject" for flag, reason, _ in flags(env) if reason == "flatline")
 
 
+def test_a_moored_boat_holding_its_depth_isnt_a_stuck_sounder(env):  # noqa: F811
+    # A fix every 5 s for 40 minutes, wandering 3 m about its mooring at a steady 4.2 m:
+    # 1.4 km of path over one spot.
+    put(
+        env, 1, [(i * 5, *at(5000, 0, 0.5, 0.3 + 0.3 * (i % 2)), 4.2) for i in range(480)], "MOORED"
+    )
+    build(env)
+    assert not [f for f in flags(env) if f[1] == "flatline"]
+    assert grid(env)
+
+
+def test_a_sounder_stuck_on_a_boat_drifting_in_shallow_water_isnt_caught(env):  # noqa: F811
+    # The accepted risk: a boat drifting within 200 m in water under 30 m with its sounder
+    # stuck at 12.0 m isn't flagged. The held reading came from within those 200 m, so its
+    # error is at most the depth change across them.
+    drift = [(i * 5, *at(5000 + i % 20, (i // 20) % 2, 0.5, 0.5), 12.0) for i in range(480)]
+    put(env, 1, drift, "DRIFTER")
+    env.run("noaa")
+    assert not [f for f in flags(env) if f[1] == "flatline"]
+
+
+def test_a_sounder_stuck_on_a_boat_drifting_in_deep_water_is_rejected(env):  # noqa: F811
+    # The same drift with its sounder holding 601.5 m: deep, the path alone decides.
+    drift = [(i * 5, *at(5000 + i % 20, (i // 20) % 2, 0.5, 0.5), 601.5) for i in range(480)]
+    put(env, 1, drift, "DRIFTER")
+    env.run("noaa")
+    assert {f for f, reason, _ in flags(env) if reason == "flatline"} == {"reject"}
+
+
+def test_a_flat_shoal_a_coarse_sounder_read_stays_unconfirmed(env):  # noqa: F811
+    # A boat crosses a flat 2.0 m mud shoal 14 3″ cells (126 base cells, 1.17 km) long,
+    # with 3.0 m water in the 3″ cells either side: the run is unconfirmed, not rejected,
+    # and no cell over it publishes deeper water.
+    depths = [3.0] * 9 + [2.0] * 126 + [3.0] * 9
+    put(env, 1, [(i * 4, *at(5004, i), d) for i, d in enumerate(depths)], "SKIFF")
+    build(env)
+    assert {f for f, reason, d in flags(env) if reason == "flatline"} == {"unconfirmed"}
+    assert len([1 for _, reason, d in flags(env) if reason == "flatline" and d == 2.0]) >= 120
+    lon_lo, _ = at(5004, 9, 0, 0)
+    lon_hi, _ = at(5004, 135, 0, 0)
+    over = env.query(
+        "SELECT depth FROM lake.cells WHERE lon_max > ? AND lon_min < ? AND depth > 2.0",
+        [lon_lo, lon_hi],
+    )
+    assert over == []
+
+
 def consensus(env, others, vessel_depths):  # noqa: F811
     """Soundings in one 3″ block: `others` vessels at the given depths, each three times,
     and then each (vessel, depth) of `vessel_depths` once."""
@@ -560,6 +607,14 @@ def test_consensus_rejects_a_sounder_that_lost_bottom(env):  # noqa: F811
     # Four vessels read about 290 m; one reads 601 m, another a 20 m echo nobody else saw.
     got = consensus(env, [290, 291, 289, 290], [("DEEP", 601.5), ("ECHO", 20.0)])
     assert got == {("consensus_deep", 601.5), ("consensus_shoal", 20.0)}
+
+
+@pytest.mark.parametrize("d, flag", [(20.0, "unconfirmed"), (150.0, "reject")])
+def test_a_disproved_shoal_that_could_be_a_hazard_stays_unconfirmed(env, d, flag):  # noqa: F811
+    # Four vessels read about 290 m and one a shoal no other vessel read: shallow enough
+    # to be a rock, it publishes unconfirmed; deeper, it's a stray echo.
+    consensus(env, [290, 291, 289, 290], [("ECHO", d)])
+    assert (flag, "consensus_shoal", d) in flags(env)
 
 
 def test_consensus_keeps_a_shoal_it_cant_disprove(env):  # noqa: F811
@@ -595,6 +650,31 @@ def test_consensus_doesnt_count_a_shoal_its_own_vessel_read_again(env):  # noqa:
 def test_consensus_widens_where_vessels_disagree(env):  # noqa: F811
     # A slope: other vessels a block apart read 20 to 60 m, so 70 m isn't an outlier.
     assert consensus(env, [20, 35, 45, 60], [("SLOPE", 70.0)]) == set()
+
+
+@pytest.mark.parametrize(
+    "box", ["-76,37,-76,38", "179.5,-1,-179.5,1", "-76,38,-75,37", "-181,37,-179,38", "0,0,inf,1"]
+)
+def test_a_box_touching_no_tiles_is_refused(box):
+    from grid.cli import main
+
+    with pytest.raises(SystemExit):
+        main(["--store", "unused", "cells", "--bbox", box])
+
+
+def test_cells_builds_a_western_box(env):  # noqa: F811
+    from grid.cli import main
+
+    put(env, 1, line([10.0] * 6))
+    put(env, 2, line([10.0] * 6, start=1), unique_id="AQM-2")
+    env.run("noaa")
+    main(["--store", str(env.store.root), "cells", f"--bbox={LON0},{LAT0},{LON0 + 1},{LAT0 + 1}"])
+    assert grid(env)
+
+
+def test_a_build_of_no_tiles_is_refused(env):  # noqa: F811
+    with open_store(env.store) as con, pytest.raises(ValueError):
+        cells.build(con, [])
 
 
 def test_a_bbox_names_the_tiles_it_touches():

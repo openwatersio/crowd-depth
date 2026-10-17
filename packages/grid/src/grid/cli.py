@@ -4,7 +4,7 @@
                                        [--keys FILE]
     grid --store DIR_OR_S3_URL confirm-withdrawals SOURCE
     grid --store DIR_OR_S3_URL qc
-    grid --store DIR_OR_S3_URL cells [--bbox W,S,E,N]
+    grid --store DIR_OR_S3_URL cells [--bbox=W,S,E,N]
     grid --store DIR_OR_S3_URL overlay --out DIR
     grid --store DIR_OR_S3_URL stats
 
@@ -39,6 +39,12 @@ def positive(value: str) -> int:
 def bbox(text: str) -> list[int]:
     """The tile ids of the 1° tiles a west,south,east,north box touches."""
     west, south, east, north = map(float, text.split(","))
+    # No tiles would mean every tile to the cells build.
+    if not (-180 <= west < east <= 180 and -90 <= south < north <= 90):
+        raise argparse.ArgumentTypeError(
+            f"{text} is no box: west must be less than east and south less than north, within"
+            " ±180° and ±90°, and a box can't cross the antimeridian"
+        )
     return [
         (lat + 90) * 360 + lon + 180
         for lat in range(math.floor(south), math.ceil(north))
@@ -79,12 +85,16 @@ def main(argv=None):
     cl.add_argument(
         "--bbox",
         type=bbox,
-        help="Only the 1° tiles this box touches: west,south,east,north in degrees",
+        help="Only the 1° tiles this box touches: west,south,east,north in degrees, given as"
+        " --bbox=W,S,E,N since a west longitude starts with -",
     )
     o = sub.add_parser("overlay", help="Build the overlay layers and their PMTiles from the cells")
     o.add_argument("--out", required=True, type=Path, help="Directory for the layers and PMTiles")
     sub.add_parser("stats", help="Count files by source and status")
     args = p.parse_args(argv)
+    if args.command == "ingest" and args.keys and len(set(args.source or SOURCES)) != 1:
+        # Keys name one source's files; listed in the other's bucket, they're all missing.
+        p.error("--keys needs exactly one --source")
 
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
