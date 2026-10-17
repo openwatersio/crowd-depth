@@ -19,6 +19,7 @@
     "lint-staged": "^17.0.8",
     "nock": "^14.0.10",
     "oxlint": "^1.74.0",
+    "pkg-pr-new": "^0.0.88",
     "prettier": "^3.6.2",
     "tsx": "^4.20.6",
     "typescript": "^7.0.2",
