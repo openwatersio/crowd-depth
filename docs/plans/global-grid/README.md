@@ -23,7 +23,7 @@ Supporting notes:
 These follow from the standards and research in [standards.md](standards.md) and [references.md](references.md).
 
 - **Never deeper than measured.** Every rounding, aggregation, rejection and generalization step errs shallow. This is the safety rule in IHO S-4 for charts, and Seascape applies it too. Corrections are the one stated exception: they aim at the true depth, so a correction can make a sounding deeper, but only when its parameters are known, never from an assumed value, and its uncertainty widens the sounding's.
-- **No interpolation between tracks.** Water between tracks is unsurveyed, as S-4 treats passage soundings. Published comparisons of interpolation methods measure overall error, not missed shoals, so nothing shows that interpolating sparse tracks is safe.
+- **Interpolate between tracks, never past them.** Depth areas and contours come from a surface interpolated between tracks within about 200 m, where there's a sounding on every side, and never deeper than an accepted sounding inside a pixel; past the ends of tracks the water is unsounded and has no surface. The surface records each pixel's distance to the nearest sounding, and soundings are always measured positions. The [depth surface](surface.md) plan has the details.
 - **Crowd data is CATZOC D until shown otherwise.** This is the IHO Data Quality Working Group's recommendation for crowdsourced bathymetry. Upgrades need evidence: corrections applied, independent vessels agreeing, validation against surveys.
 - **Metadata is a hint, not a fact.** A submission's depth reference, offsets and sensor positions are whatever the vessel's software and owner set, and they can be wrong without anything looking wrong. Every source is calibrated from its soundings, and reported metadata is at most a starting estimate.
 - **Raw data is never overwritten.** Corrections, QC and calibration are derived tables that can be rebuilt as methods improve.
@@ -183,15 +183,15 @@ Ingest and each derived step write the tiles they touch to a `tile_changes` tabl
 | `kind`             | How the cell got its depth: measured by several vessels, measured by one vessel, or filled                                                                                                                                                                          |
 | `zoc`              | CATZOC: 5 (D), the IHO recommendation for crowdsourced data, until validation supports more                                                                                                                                                                         |
 
-A cell sounded by a single vessel is published but marked, because one vessel's systematic error can't be detected without another to compare it with. Its dates are coarsened to the year, so a chain of single-vessel cells doesn't publish a dated track of one boat, including in waters NOAA doesn't publish. Products never carry vessel ids or names.
+A cell sounded by a single vessel is published but marked, because one vessel's systematic error can't be detected without another to compare it with. Its dates are coarsened to the year, so a chain of single-vessel cells doesn't publish a dated track of one boat, including in waters NOAA doesn't publish. Its sounding still sits at its measured position: vessels that share soundings have chosen to publish where they sounded, and most already broadcast their positions on AIS. Products never carry vessel ids or names.
 
 #### Holes
 
-An empty cell is filled only when sounded cells bracket it on opposite sides within one cell, along a row, column or diagonal. It takes the shoaler neighbor, never an interpolated value, and is marked `filled`. A cell holding an unconfirmed shoal is never filled, since that would show deeper water over a measured shoal. A filled cell has no soundings: it carries its depth, uncertainty and kind, a zero count, and no statistics or dates. Tracks never grow outward and nothing is shaded between tracks. The one-cell fringe along the edge of coverage, where lone soundings are least reliable, is a candidate for trimming, as NOAA's `Bathy_edge_erosion` does for surveys.
+An empty cell is filled only when sounded cells bracket it on opposite sides within one cell, along a row, column or diagonal. It takes the shoaler neighbor, never an interpolated value, and is marked `filled`. A cell holding an unconfirmed shoal is never filled, since that would show deeper water over a measured shoal. A filled cell has no soundings: it carries its depth, uncertainty and kind, a zero count, and no statistics or dates. Cells never grow outward from tracks; between tracks, depth areas come from the depth surface. The one-cell fringe along the edge of coverage, where lone soundings are least reliable, is a candidate for trimming, as NOAA's `Bathy_edge_erosion` does for surveys.
 
 #### Depth areas and contours
 
-Depth areas are made by classifying cells into depth bands and polygonizing the classes, which is exact to the cell and keeps every band edge on the shoal side. A contour drawn by interpolating between cell centers can miss a shoal that the per-cell minimum caught, so contours are taken from the band edges, and any smoothing may only move a contour toward deeper water. An isolated shoal is never removed by generalization; if it is too small to show, it is enlarged.
+Depth areas and contours come from the [depth surface](surface.md): a raster per 1° tile on the cells' latitude and longitude grid (rows of 2/3″), interpolated between tracks with `gdal_grid` and cut into bands on Seascape's isobath ladder with `gdal_contour`. The surface is blurred lightly, never toward deeper water, and no pixel is deeper than the shoalest accepted sounding in it or next to it, so a shoal QC accepted stays in the areas. Contours are the edges the bands share. Crowd soundings past 200 m are mostly sounders that have lost bottom, so areas and contours stop at 200 m and deeper water shows soundings only.
 
 ### 5. Publish
 
@@ -201,10 +201,10 @@ Outputs go to R2 and are served from `tiles.openwaters.io/crowd-depth/`. Like Se
 
 One global PMTiles archive, built so a plotter that styles ENCs portrays it the way charts portray low-quality data:
 
-- `SOUNDG`: one sounding per measured cell (filled cells have none), placed at the position of the sounding that sets the cell's depth rather than the cell center. Depths round toward shoal. Each carries a low-accuracy flag so styles can mark it, and deeper soundings are dropped first as zoom decreases.
-- `DEPARE`: depth bands, only where cells were measured or filled, each with both `DRVAL1` and `DRVAL2`, since a depth area missing `DRVAL1` draws as intertidal. Unsounded water has no depth area.
-- `DEPCNT`: band edges, flagged as approximate so styles can dash them.
-- `M_QUAL`: coverage polygons that never overlap, with CATZOC, survey date range, vertical and horizontal uncertainty, sounding and vessel counts, technique, and a note that the data is crowdsourced and unverified.
+- `SOUNDG`: one sounding per measured cell (filled cells have none), placed at the position of the sounding that sets the cell's depth rather than the cell center. It matches [Seascape](https://github.com/openwatersio/seascape)'s soundings, so Seascape's sounding style draws it unchanged: the same `depth_m`, `depth_ft` and `depth_fm` labels rounded toward shoal (S-4 B-412), and the same shoalest-wins pyramid, which keeps the shoalest sounding of each area at every zoom and thins depths past 200 m and 1,000 m. The least depth inside each closed isobath down to 200 m is `prime` and shows at every zoom from its isobath's. Unconfirmed shoals publish too, marked `unconfirmed`. Each sounding carries `VALSOU`, `TECSOU` and low-quality `QUASOU` and `QUAPOS` (reported, not surveyed; or not confirmed) so ENC styles can mark it.
+- `DEPARE`: depth bands cut from the surface, down to 200 m, each with both `DRVAL1` and `DRVAL2`, since a depth area missing `DRVAL1` draws as intertidal. Water the surface doesn't reach has no depth area.
+- `DEPCNT`: band edges at Seascape's isobaths, each the boundary the shoaler and deeper areas share, so the edge of coverage is never drawn as a contour. Flagged approximate (`QUAPOS` 4) so styles can dash them, and shown by zoom on Seascape's scale tiers.
+- `M_QUAL`: coverage polygons that never overlap, one per 1° tile, the surface's footprint, with CATZOC 5 (D), survey date range, vertical uncertainty (`SOUACC`, the largest of the tile's cells) and horizontal (`POSACC`, 10 m), sounding count, technique, and a note that the data is crowdsourced and unverified.
 
 The archive is the contract with chart plotters and chart providers:
 
@@ -216,7 +216,7 @@ Offline regions are cut from the global archive by range requests, with `pmtiles
 
 #### Seascape source
 
-4326 Cloud Optimized GeoTIFFs on chart datum with depth, uncertainty and cell-kind bands, following BlueTopo's depth, uncertainty and contributor layout, plus a footprint for Seascape's coverage layer. Seascape merges crowd cells over its base by remove-restore, as GEBCO and EMODnet merge sparse sources: the difference from the base is applied only where crowd cells exist, and is never interpolated across gaps. It ranks above GEBCO and below every surveyed source.
+4326 Cloud Optimized GeoTIFFs on chart datum with depth, uncertainty and cell-kind bands, following BlueTopo's depth, uncertainty and contributor layout, plus a footprint for Seascape's coverage layer. Seascape merges crowd cells over its base by remove-restore, as GEBCO and EMODnet merge sparse sources: the difference from the base is applied only where crowd data covers, the depth surface and the cells, and is never interpolated beyond it. It ranks above GEBCO and below every surveyed source.
 
 ### 6. Validation
 

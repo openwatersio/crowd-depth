@@ -6,6 +6,10 @@ requires-python = ">=3.12"
 dependencies = [
   "boto3>=1.38",
   "duckdb>=1.5",
+  "pmtiles>=3.4",
+  "rasterio>=1.4",
+  "scipy>=1.14",
+  "shapely>=2.1",
 ]
 
 [project.scripts]
@@ -20,6 +24,8 @@ build-backend = "hatchling.build"
 
 [tool.ruff]
 line-length = 100
+# Local previews, which docker.sh mounts without the repository's .gitignore.
+extend-exclude = [".preview"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

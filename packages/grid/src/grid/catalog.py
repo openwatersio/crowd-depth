@@ -302,10 +302,11 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
                 return
             # Moves rows inlined during the run to Parquet, so the catalog each run downloads stays small.
             con.execute("CALL ducklake_flush_inlined_data('lake')")
-            # Rebuilds delete and reinsert cells and their flags, and DuckLake deletes by
-            # writing delete files, so the replaced files stay live until rewritten.
+            # Rebuilds delete and reinsert cells, their flags and the cells' marker, and
+            # DuckLake deletes by writing delete files, so the replaced files stay live
+            # until rewritten.
             # ponytail: points are rewritten by the weekly compaction, not here
-            for table in ("cells", "qc_flags"):
+            for table in ("cells", "qc_flags", "store_meta"):
                 con.execute(f"CALL ducklake_rewrite_data_files('lake', '{table}')")
             # A reader may still hold a catalog up to RETAIN old, so snapshots, the files
             # only they reference, and old catalogs go once they pass it.
