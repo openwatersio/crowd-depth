@@ -13,6 +13,7 @@ Supporting notes:
 - [Backlog](backlog.md): the prioritized work, from what the spikes below found.
 - [Rebuild cost](rebuild-cost.md): what a daily planet rebuild costs, and what brings it within a day on cheap hardware.
 - [Point store layout](store-layout.md), [Track QC as pure functions](qc-functions.md) and [Per-tile pipeline](per-tile-pipeline.md): spikes on the Chesapeake set.
+- [Live layer](live-layer.md): the plugin's own-boat layer, drawn on top of the overlay with the same QC, corrections and portrayal.
 - [Surface statistic](surface-statistic.md) and [Speckle in busy channels](channel-speckle.md): the grid against NOAA BlueTopo in Thimble Shoal Channel.
 
 ## Goals
@@ -250,7 +251,7 @@ Files removed from NOAA or deleted from R2 leave every product through `files`, 
 
 Offline charts belong to chart providers, not the crowd-depth plugin. [signalk-charts-provider-simple](https://github.com/dirkwa/signalk-charts-provider-simple) is adding PMTiles support, so it can serve the overlay directly and cut an extract for a box the user draws, the way it handles NOAA ENCs, and use the build version to tell the user when the extract is out of date.
 
-The crowd-depth plugin's part is feedback to the contributor:
+The crowd-depth plugin also draws the boat's own soundings on top of the overlay, with the grid's QC, corrections and portrayal ([live-layer.md](live-layer.md)). Its other part is feedback to the contributor:
 
 - The vessel's own fitted offsets and reputation, shown in the plugin's status, which tells a contributor whether their setup reads true and gives them a reason to keep sharing.
 
