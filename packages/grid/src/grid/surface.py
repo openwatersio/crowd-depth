@@ -3,7 +3,7 @@
 The surface is on the cells' latitude and longitude grid: rows 2/3″ of latitude (about
 20 m), columns widened by latitude band as the cells' are. A tile is gridded in an
 equirectangular projection centred on it, a linear rescaling of latitude and
-longitude, so `gdal_grid`'s search radius is in metres (within about 3% across a tile)
+longitude, so `gdal_grid`'s search radius is in metres (within about 3% across a tile up to 70°, 5% at 80°)
 and its pixels are exactly the latitude and longitude grid's. Interpolation needs a
 sounding in every quadrant around a pixel, so it fills between tracks and never runs
 past their ends. Depth areas and contours are cut from it; soundings never are.
@@ -44,8 +44,8 @@ EARTH_M = 6378137.0
 # unconfirmed shoal unless something confirmed it), within the depths cells trust:
 # the 10th percentile to interpolate from, as cells take it, over a fixed sample so a
 # moored boat costs fixed memory; the shoalest, which no pixel may be deeper than;
-# how many; and whether an unconfirmed shoal is there. One row per sounded pixel, so a
-# tile's memory is bounded by its pixels, not its soundings. Pixels are numbered on
+# how many; and whether an unconfirmed shoal is there. One row per sounded pixel, so
+# what Python holds of a tile is bounded by its pixels, not its soundings. Pixels are numbered on
 # this tile's grid from its south-west corner; a neighboring tile's soundings get
 # numbers outside it, which interpolation reads as a margin.
 PIXELS = f"""
@@ -75,8 +75,9 @@ sampled AS (
 )
 SELECT py, px, quantile_disc(d, 0.1) FILTER (WHERE keep AND NOT unconfirmed) AS d,
   min(d) FILTER (WHERE NOT unconfirmed) AS shoalest,
-  arg_min(lon, d) FILTER (WHERE NOT unconfirmed) AS shoalest_lon,
-  arg_min(lat, d) FILTER (WHERE NOT unconfirmed) AS shoalest_lat,
+  -- Both from one sounding, the same one every run, whatever the ties.
+  arg_min(lon, (d, point_id)) FILTER (WHERE NOT unconfirmed) AS shoalest_lon,
+  arg_min(lat, (d, point_id)) FILTER (WHERE NOT unconfirmed) AS shoalest_lat,
   count(*) AS n, bool_or(unconfirmed) AS unconfirmed
 FROM (SELECT * FROM sampled UNION ALL BY NAME
   SELECT *, false AS keep FROM pts WHERE unconfirmed)
@@ -217,7 +218,9 @@ def finish(depth, shoalest, unconfirmed):
     Depth areas follow the surface between pixel centres, so a shoal held at its own
     pixel's centre alone would cover only part of that pixel; carried to the pixels
     around it, it covers all of its own, and every sounding in it is inside its band.
-    Shoals may be enlarged, never lost.
+    Shoals may be enlarged, never drawn deeper. A pixel the interpolator leaves empty
+    stays empty, shoal or not, as at a lone track or a track's end: the shoal shows
+    there only as a sounding.
     """
     valid = depth != NODATA
     weights = gaussian_filter(valid.astype(np.float32), SIGMA_PX)

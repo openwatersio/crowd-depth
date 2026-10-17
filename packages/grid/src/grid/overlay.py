@@ -7,8 +7,10 @@ cell's depth, never at a cell center, and unconfirmed shoals publish alongside t
 cells' soundings with a flag of their own.
 """
 
+import contextlib
 import json
 import math
+import os
 import sqlite3
 import subprocess
 import tempfile
@@ -30,7 +32,7 @@ from .qc import MAX_DEPTH_M, QC_VERSION
 M_PER_FT = 0.3048
 M_PER_FATHOM = 1.8288
 
-# S-4, Ed 4.10.0, B-412 rounds py depth band, always toward shoal: decimetres to 21 m,
+# S-4, Ed 4.10.0, B-412 rounds by depth band, always toward shoal: decimetres to 21 m,
 # half metres from 21 to 31, whole metres beyond.
 DECIMETRE_MAX_M = 21.0
 HALF_METRE_MAX_M = 31.0
@@ -254,9 +256,11 @@ def areas(con, surfaces: Path):
         params = {"partition": partition, "tile": tile}
         first, last, count, tvu = con.execute(TILE_QUALITY, params).fetchone()
         # Each sounded pixel's shoalest accepted sounding: a prime is the least depth
-        # actually measured inside its isobath.
-        shallow = depth <= PRIME_MAX_DEPTH_M
-        candidates = list(zip(lon[shallow], lat[shallow], depth[shallow]))
+        # actually measured inside its isobath, the sounding that drew it.
+        # ponytail: its cell's own sounding still shows beside it from the prime's zoom
+        # when the two differ; median − kσ redefines both, so they're left apart until then
+        shallow = (depth <= PRIME_MAX_DEPTH_M) & (np.abs(lat) <= MERCATOR_MAX_LAT)
+        candidates = lon[shallow], lat[shallow], depth[shallow]
         bands, footprint, surfaced = surface_bands(path)
         properties = quality(first, last, count, tvu)
         yield from tile_areas(candidates, properties, bands, footprint, surfaced)
@@ -268,16 +272,17 @@ def surface_bands(path):
     soundings sit inside it; and the surface itself, where it has a depth.
 
     Bands come from `gdal_contour -p`, which follows the surface between pixels rather
-    than around them. The band past MAX_AREA_DEPTH_M is kept for the contour at its
-    edge, but never published.
+    than around them. All water past MAX_AREA_DEPTH_M is one more band, kept for the
+    contour at its edge but never published: `gdal_contour -p` makes no polygon past
+    its last level.
     """
-    levels = [lv for lv in LEVELS if lv <= MAX_AREA_DEPTH_M]
+    levels = [lv for lv in LEVELS if lv <= MAX_AREA_DEPTH_M] + [MAX_DEPTH_M]
     with rasterio.open(path) as src:
         depth, count = src.read(1), src.read(3)
         transform = src.transform
     bands = {}
     if (depth != surface.NODATA).any():
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(dir=os.environ.get("GRID_TEMP_DIR") or None) as tmp:
             out = Path(tmp) / "bands.geojson"
             subprocess.run(
                 ["gdal_contour", "-q", "-p", "-b", "1", "-amin", "lo", "-amax", "hi",
@@ -307,7 +312,7 @@ def polygons(mask, transform):
 def tile_areas(candidates, properties, bands, footprint, surfaced=None):
     """Features for one tile: its depth areas from the surface's `bands`, its coverage
     `footprint` with `properties`, the contours between bands, and prime soundings from
-    `candidates`, (lon, lat, depth) of the tile's shoalest measured cells. An isobath is
+    `candidates`, the (lon, lat, depth) arrays of the tile's shoalest measured pixels. An isobath is
     closed when the surface, `surfaced` (the footprint if not given), has deeper water
     all round it."""
     surfaced = footprint if surfaced is None else surfaced
@@ -320,9 +325,7 @@ def tile_areas(candidates, properties, bands, footprint, surfaced=None):
         return
     yield shape("M_QUAL", footprint, properties, 0)
     shapely.prepare(surfaced)
-    lon, lat, depth = (
-        (np.array(a, dtype=float) for a in zip(*candidates)) if candidates else ([],) * 3
-    )
+    lon, lat, depth = (np.asarray(a, dtype=float) for a in candidates)
     points = shapely.points(lon, lat)
     tree = shapely.STRtree(points)
     # The areas shoaler than each level and at or deeper than it, built up one band at
@@ -375,7 +378,8 @@ def quality(first, last, count, tvu):
     properties = {
         "CATZOC": 5,
         "POSACC": POSACC_M,
-        "SOUACC": math.ceil(tvu * 10) / 10 if tvu else None,
+        # Through the decimal tvu was written as: float32 2.2 is 2.2000000477.
+        "SOUACC": math.ceil(round(written(tvu) * 10, 6)) / 10 if tvu else None,
         "TECSOU": TECSOU,
         "soundings": int(count or 0),
         "INFORM": INFORM,
@@ -461,7 +465,7 @@ def build(con, out):
     # Freeboard applies S-52 styling to a vector chart whose metadata says type=S-57, and
     # the version and date let a client tell when an extract is out of date. Tippecanoe
     # can't write custom metadata, so it goes in through MBTiles on the way to PMTiles.
-    with sqlite3.connect(mbtiles) as db:
+    with contextlib.closing(sqlite3.connect(mbtiles)) as db, db:
         db.executemany(
             "INSERT OR REPLACE INTO metadata (name, value) VALUES (?, ?)",
             [("type", "S-57"), ("version", str(GRID_VERSION)), ("built", built)],

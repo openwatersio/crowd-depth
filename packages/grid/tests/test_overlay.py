@@ -173,7 +173,7 @@ def band_index(level):
 def test_contours_are_shared_edges_of_bands():
     # A 2-5 m bank west of 10-20 m water, inside a footprint reaching past both.
     bands = {band_index(2): box(0, 0, 1, 2), band_index(10): box(1, 0, 3, 2)}
-    got = by_layer(overlay.tile_areas([(0.5, 1, 3.0)], PROPERTIES, bands, box(0, 0, 3, 2)))
+    got = by_layer(overlay.tile_areas(([0.5], [1], [3.0]), PROPERTIES, bands, box(0, 0, 3, 2)))
     depare = sorted((f["properties"]["DRVAL1"], f["properties"]["DRVAL2"]) for f in got["DEPARE"])
     assert depare == [(2, 5), (10, 20)]
     # One contour per level crossed (5 and 10 m), each the shared edge only, never the
@@ -191,16 +191,32 @@ def test_contours_are_shared_edges_of_bands():
 
 def test_areas_and_contours_stop_at_200_m():
     bands = {band_index(100): box(0, 0, 1, 1), band_index(200): box(1, 0, 2, 1)}
-    got = by_layer(overlay.tile_areas([], PROPERTIES, bands, box(0, 0, 2, 1)))
+    got = by_layer(overlay.tile_areas(([], [], []), PROPERTIES, bands, box(0, 0, 2, 1)))
     assert [f["properties"]["DRVAL1"] for f in got["DEPARE"]] == [100]
     # The 200 m contour is drawn, at the edge of the last published area.
     assert [f["properties"]["VALDCO"] for f in got["DEPCNT"]] == [200]
 
 
+def test_a_real_surface_draws_its_200_m_contour(tmp_path):
+    # 250 m water with a 150 m rise, through gdal_contour: the 200 m isobath closes
+    # round the rise, and its least depth is prime.
+    depth = np.full((60, 60), 250.0, dtype=np.float32)
+    depth[20:40, 20:40] = 150.0
+    path = tmp_path / "tile.tif"
+    surface.write(path, -78, 33, depth, np.zeros_like(depth), np.ones_like(depth))
+    bands, footprint, surfaced = overlay.surface_bands(path)
+    rise = (-78 + 30 / 60, 33 + 30 / 60, 150.0)
+    got = by_layer(overlay.tile_areas(tuple(zip(rise)), PROPERTIES, bands, footprint, surfaced))
+    assert [f["properties"]["VALDCO"] for f in got["DEPCNT"]] == [200]
+    assert [f["properties"]["DRVAL1"] for f in got["DEPARE"]] == [100]
+    [prime] = got["SOUNDG"]
+    assert prime["properties"]["depth_m"] == 150
+
+
 def test_a_shoal_inside_a_closed_isobath_is_prime():
     deep = shapely.difference(box(0, 0, 3, 3), box(1, 1, 2, 2))
     bands = {band_index(2): box(1, 1, 2, 2), band_index(10): deep}
-    candidates = [(1.4, 1.6, 3.4), (0.5, 0.5, 12.0)]
+    candidates = ([1.4, 0.5], [1.6, 0.5], [3.4, 12.0])
     got = by_layer(overlay.tile_areas(candidates, PROPERTIES, bands, box(0, 0, 3, 3)))
     [prime] = got["SOUNDG"]
     assert prime["properties"]["depth_m"] == 3.4 and prime["properties"]["prime"] == 1
@@ -352,7 +368,7 @@ def test_build_writes_pmtiles_with_every_layer(env, tmp_path):  # noqa: F811
     [coverage] = [geometry(f) for f in areas if f["tippecanoe"]["layer"] == "M_QUAL"]
     # Its survey ends at the end of the cells' month or year, but never after today.
     [props] = [f["properties"] for f in areas if f["tippecanoe"]["layer"] == "M_QUAL"]
-    assert props["SUREND"] == date.today().strftime("%Y%m%d")
+    assert props["SUREND"] == min(date(2026, 12, 31), date.today()).strftime("%Y%m%d")
     assert coverage.contains(shapely.Point(*test_grid.at(7000, 20)))
     # A prime sounding publishes once at any zoom, not again from the pyramid.
     sounds = [json.loads(ln) for ln in (tmp_path / "soundings.geojsons").read_text().splitlines()]
@@ -364,6 +380,29 @@ def test_build_writes_pmtiles_with_every_layer(env, tmp_path):  # noqa: F811
     for f in sounds:
         at = tuple(f["geometry"]["coordinates"])
         assert at not in primes or f["tippecanoe"].get("maxzoom", 99) < primes[at]
+
+
+def test_souacc_rounds_up_from_the_depth_written():
+    assert overlay.quality(None, None, 0, np.float32(2.2))["SOUACC"] == 2.2
+    assert overlay.quality(None, None, 0, np.float32(2.21))["SOUACC"] == 2.3
+
+
+def test_a_new_etag_on_the_same_content_keeps_cells_current(env):  # noqa: F811
+    put_tracks(env, parallel())
+    test_grid.build(env)
+    with open_store(env.store) as con:
+        built = cells.inputs(con)
+        con.execute("UPDATE lake.files SET etag = 'reuploaded'")
+        assert cells.inputs(con) == built
+
+
+def test_a_withdrawal_makes_cells_stale(env):  # noqa: F811
+    put_tracks(env, parallel())
+    test_grid.build(env)
+    with open_store(env.store) as con:
+        built = cells.inputs(con)
+        con.execute("UPDATE lake.files SET status = 'withdrawn' WHERE file_id = 1")
+        assert cells.inputs(con) != built
 
 
 def test_build_refuses_cells_older_than_the_store(env, tmp_path):  # noqa: F811

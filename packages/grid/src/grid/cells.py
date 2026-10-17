@@ -454,12 +454,13 @@ def units(con, partition: int, tiles: list[int]) -> list[tuple[list[int], int, i
 
 
 def inputs(con) -> str:
-    """A fingerprint of what cells are built from: every file's version and status,
-    every batch's QC version, and the QC and grid versions of this build. Points and
-    flags change only with these, so cells built from the same fingerprint are current."""
+    """A fingerprint of what cells are built from: every file's version, content and
+    status, every batch's QC version, and the QC and grid versions of this build. Points
+    and flags change only with these, so cells built from the same fingerprint are
+    current; a new ETag on the same content changes none of them."""
     [(files, batches)] = con.execute(
         """SELECT
-          (SELECT coalesce(sum(hash(file_id, key, version, status, etag)::HUGEINT), 0)
+          (SELECT coalesce(sum(hash(file_id, key, version, status, content_hash)::HUGEINT), 0)
             FROM lake.files),
           (SELECT coalesce(sum(hash(batch_id, qc_version)::HUGEINT), 0) FROM lake.qc_batches)"""
     ).fetchall()

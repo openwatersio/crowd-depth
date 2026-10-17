@@ -199,7 +199,7 @@ An empty cell within 200 m of accepted soundings takes an interpolated depth, sh
 
 #### Depth areas and contours
 
-Depth areas and contours come from the [depth surface](surface.md): a raster per 1° tile on the cells' latitude and longitude grid (rows of 2/3″), interpolated between tracks with `gdal_grid` and cut into bands on Seascape's isobath ladder with `gdal_contour`. The surface is blurred lightly, never toward deeper water, and no pixel is deeper than the shoalest accepted sounding in it or next to it, so a shoal QC accepted stays in the areas. Contours are the edges the bands share. Crowd soundings past 200 m are mostly sounders that have lost bottom, so areas and contours stop at 200 m and deeper water shows soundings only.
+Depth areas and contours come from the [depth surface](surface.md): a raster per 1° tile on the cells' latitude and longitude grid (rows of 2/3″), interpolated between tracks with `gdal_grid` and cut into bands on Seascape's isobath ladder with `gdal_contour`. The surface is blurred lightly, never toward deeper water, and no pixel is deeper than the shoalest accepted sounding in it or next to it, so a shoal QC accepted stays in the areas wherever the surface reaches; at a lone track or a track's end, where it doesn't, the shoal shows only as a sounding. Contours are the edges the bands share. Crowd soundings past 200 m are mostly sounders that have lost bottom, so areas and contours stop at 200 m and deeper water shows soundings only.
 
 ### 5. Publish
 

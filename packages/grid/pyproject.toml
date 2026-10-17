@@ -6,6 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
   "boto3>=1.38",
   "duckdb>=1.5",
+  "numpy>=2",
   "pmtiles>=3.4",
   "rasterio>=1.4",
   "scipy>=1.14",
