@@ -175,7 +175,7 @@ A tile is rebuilt when anything its cells depend on changes:
 - a neighboring tile, within the margin that hole filling and aggregation read across;
 - the grid version.
 
-Ingest and each derived step write the tiles they touch to a `tile_changes` table, and the grid records the last change it consumed. Snapshots are kept until the grid has consumed them, and a grid run that finds its last snapshot gone rebuilds everything.
+Ingest and each derived step write the tiles they touch to a `tile_changes` table, and the grid records the last change it consumed. Snapshots are kept for 7 days, so the incremental grid has to run at least weekly or retention has to wait for it; a grid run that finds its last snapshot gone rebuilds everything.
 
 #### Cell statistics
 

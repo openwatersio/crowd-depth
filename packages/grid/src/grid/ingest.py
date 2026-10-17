@@ -40,8 +40,8 @@ WITHDRAWAL_LIMIT = 0.01
 # DuckDB, whose memory is capped; points wait in a DuckDB table until a flush.
 FETCH_BYTES = 512 * 2**20
 FLUSH_POINTS = 500_000
-# A run publishes its catalog at the first batch past this many seconds since it last did,
-# so a failure later keeps what it had done, and a rerun skips the files it published.
+# A run publishes its catalog after the first file past this many seconds since it last
+# did, so a failure later keeps what it had done, and a rerun skips the files it published.
 CHECKPOINT_SECONDS = 15 * 60
 # Rule 4 checks files for coverage in groups holding at most this many points.
 COVER_POINTS = 5_000_000
@@ -226,7 +226,9 @@ class Ingest:
                                 self.changed(row, obj, parsed)
                     finally:
                         path.unlink()
-                    if self.pending >= FLUSH_POINTS:
+                    # A checkpoint can fall between batches: a run of copies or changed
+                    # ETags adds no points, but still has work to keep.
+                    if self.pending >= FLUSH_POINTS or self.checkpoint_due():
                         self.flush()
 
         self.withdraw(subs, current, complete)
@@ -517,31 +519,33 @@ class Ingest:
             "SELECT * EXCLUDE (batch_id) FROM lake.points LIMIT 0"
         )
 
+    def checkpoint_due(self) -> bool:
+        return time.monotonic() - self.published >= CHECKPOINT_SECONDS
+
     def flush(self):
-        if not self.pending:
-            return
-        # Each flush is its own batch, the unit QC runs on now and when it's rerun.
-        batch_id = self.last_batch = max(time.time_ns() // 1000, self.last_batch + 1)
-        with self.timed("write"):
-            self.sql(
-                f"""INSERT INTO lake.points BY NAME
-                SELECT *, {batch_id} AS batch_id FROM pending"""
-            )
-        # Recreated rather than emptied: deleted rows keep their memory until then.
-        self.empty_pending()
-        # A transaction keeps every replaced table's rows, and the rows it inserted,
-        # until it commits, so the points commit before QC reads them. A batch whose QC
-        # didn't commit has no qc_batches row, so `grid cells` QCs it.
-        with self.timed("write"):
-            self.sql("COMMIT")
-        self.sql("BEGIN")
-        with self.timed("qc"):
-            qc.run_batch(self.con, batch_id, fresh=True)
-        self.counts["points"] += self.pending
-        self.pending = 0
+        if self.pending:
+            # Each flush is its own batch, the unit QC runs on now and when it's rerun.
+            batch_id = self.last_batch = max(time.time_ns() // 1000, self.last_batch + 1)
+            with self.timed("write"):
+                self.sql(
+                    f"""INSERT INTO lake.points BY NAME
+                    SELECT *, {batch_id} AS batch_id FROM pending"""
+                )
+            # Recreated rather than emptied: deleted rows keep their memory until then.
+            self.empty_pending()
+            # A transaction keeps every replaced table's rows, and the rows it inserted,
+            # until it commits, so the points commit before QC reads them. A batch whose
+            # QC didn't commit has no qc_batches row, so `grid cells` QCs it.
+            with self.timed("write"):
+                self.sql("COMMIT")
+            self.sql("BEGIN")
+            with self.timed("qc"):
+                qc.run_batch(self.con, batch_id, fresh=True)
+            self.counts["points"] += self.pending
+            self.pending = 0
         # A checkpoint publishes the files so far with their coverage settled: a rerun
         # skips them, so it would never judge them again.
-        checkpoint = time.monotonic() - self.published >= CHECKPOINT_SECONDS
+        checkpoint = self.checkpoint_due()
         if checkpoint:
             with self.timed("cover"):
                 self.cover()

@@ -475,7 +475,7 @@ def test_rebuilds_expire_old_snapshots_files_and_catalogs(env, monkeypatch):  # 
             cells.build(con)
         after.append(sum(1 for _ in lake.rglob("*.parquet")))
         catalogs = [o.key for o in env.store.list("catalog/")[0] if o.key.endswith(".ducklake")]
-        assert len(catalogs) == 1
+        assert len(catalogs) == 2  # this run's, and the one it started from
     assert after[0] == after[1] == after[2]
     assert grid(env)
 

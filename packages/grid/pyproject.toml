@@ -5,7 +5,8 @@ description = "Crowd Depth global depth grid pipeline"
 requires-python = ">=3.12"
 dependencies = [
   "boto3>=1.38",
-  "duckdb>=1.5",
+  # A newer DuckLake migrates the catalog it attaches, which an older build then can't read.
+  "duckdb>=1.5,<1.6",
 ]
 
 [project.scripts]

@@ -2,15 +2,28 @@ name: Grid
 
 on:
   pull_request:
-    paths: ["packages/grid/**", ".github/workflows/grid.yml"]
+    # Also what ingest parses: the API's R2 keys and sidecars, and the plugin's uploads.
+    paths:
+      - "packages/grid/**"
+      - ".github/workflows/grid.yml"
+      - "packages/api/src/r2.ts"
+      - "packages/signalk-plugin/src/reporters/noaa.ts"
   push:
     branches: [main]
-    paths: ["packages/grid/**", ".github/workflows/grid.yml"]
+    paths:
+      - "packages/grid/**"
+      - ".github/workflows/grid.yml"
+      - "packages/api/src/r2.ts"
+      - "packages/signalk-plugin/src/reporters/noaa.ts"
+
+permissions:
+  contents: read
 
 jobs:
   test:
     name: Grid tests (Python ${{ matrix.python }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       matrix:
         # The oldest version pyproject.toml allows, and the newest.
