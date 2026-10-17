@@ -10,6 +10,10 @@ Supporting notes:
 - [The NOAA CSB archive](noaa-archive.md): how the archive is laid out and the data quirks the pipeline has to handle.
 - [Standards](standards.md): what the IHO standards say about data quality, survey accuracy, and deriving depth areas, contours and soundings.
 - [References](references.md): primary sources, research, and reusable code, with links.
+- [Backlog](backlog.md): the prioritized work, from what the spikes below found.
+- [Rebuild cost](rebuild-cost.md): what a daily planet rebuild costs, and what brings it within a day on cheap hardware.
+- [Point store layout](store-layout.md), [Track QC as pure functions](qc-functions.md) and [Per-tile pipeline](per-tile-pipeline.md): spikes on the Chesapeake set.
+- [Surface statistic](surface-statistic.md) and [Speckle in busy channels](channel-speckle.md): the grid against NOAA BlueTopo in Thimble Shoal Channel.
 
 ## Goals
 
@@ -22,8 +26,8 @@ Supporting notes:
 
 These follow from the standards and research in [standards.md](standards.md) and [references.md](references.md).
 
-- **Never deeper than measured.** Every rounding, aggregation, rejection and generalization step errs shallow. This is the safety rule in IHO S-4 for charts, and Seascape applies it too. Corrections are the one stated exception: they aim at the true depth, so a correction can make a sounding deeper, but only when its parameters are known, never from an assumed value, and its uncertainty widens the sounding's.
-- **No interpolation between tracks.** Water between tracks is unsurveyed, as S-4 treats passage soundings. Published comparisons of interpolation methods measure overall error, not missed shoals, so nothing shows that interpolating sparse tracks is safe.
+- **Shoal-biased by a stated margin.** A cell's depth is a robust estimate minus a multiple of its uncertainty, so the margin toward shoal is explicit and published rather than hidden in a percentile. Rounding, aggregation, rejection and generalization err shallow, as IHO S-4 requires for charts. Published soundings are never deeper than measured, and hazards are carried by confirmed shoals, which generalization never removes. Corrections aim at the true depth, so a correction can make a sounding deeper, but only when its parameters are known, never from an assumed value, and its uncertainty widens the sounding's.
+- **Bounded, marked interpolation.** Water between tracks is unsurveyed, as S-4 treats passage soundings, but a chart of bare tracks isn't useful. The surface interpolates within a fixed distance of soundings (200 m), marks those cells as interpolated, and widens their uncertainty with distance from the nearest track. Beyond that distance water stays empty. Validation measures missed shoals in interpolated cells, since published comparisons of interpolation methods measure only overall error.
 - **Crowd data is CATZOC D until shown otherwise.** This is the IHO Data Quality Working Group's recommendation for crowdsourced bathymetry. Upgrades need evidence: corrections applied, independent vessels agreeing, validation against surveys.
 - **Metadata is a hint, not a fact.** A submission's depth reference, offsets and sensor positions are whatever the vessel's software and owner set, and they can be wrong without anything looking wrong. Every source is calibrated from its soundings, and reported metadata is at most a starting estimate.
 - **Raw data is never overwritten.** Corrections, QC and calibration are derived tables that can be rebuilt as methods improve.
@@ -126,9 +130,10 @@ A vessel's soundings differ from the truth by its transducer depth below the wat
 - Fit on flat, stable seabed, where a small position error doesn't change depth, using low reference uncertainty and shallow-to-moderate depths (the NOAA tool uses reference uncertainty under 3 to 4 m, reference depth under 20 m, and differences under 12 m).
 - Fit a vertical offset plus a depth scale factor, which absorbs a wrong assumed sound speed. Fit the horizontal offset between GNSS antenna and transducer where the seabed has features to lock on to, as the Canadian Hydrographic Service does.
 - Use robust statistics (median and MAD), require a minimum number of soundings across more than one transit, and reject offsets outside a plausible range.
+- Where a vessel never overlaps a reference, solve its offset relative to other vessels at track crossings by least squares, as GMT's x2sys does, anchored to vessels that have a calibration. Crossovers alone give only relative offsets.
 - Treat calibration as a time series, not one value per vessel. Sounders are moved and replaced. Each vessel carries a reputation that rises with agreement and decays with time since its last comparison, following Calder's work on observer reputation. Reputation weights the vessel's soundings when cells are combined.
 
-A vessel that never overlaps a reference is used with its reported metadata, marked uncalibrated and weighted low. A depth measured below the transducer or keel but treated as below the waterline reads shallower than the truth, which errs safe, but it skews agreement between vessels, which is why uncalibrated vessels count for little.
+Offsets are the largest error in the grid: in Thimble Shoal Channel vessels read 0.6 to 5.4 m shallower than BlueTopo, constant per vessel ([surface-statistic.md](surface-statistic.md)). A vessel with neither a reference nor a crossover to a calibrated vessel is used with its reported metadata, marked uncalibrated and weighted low. A depth measured below the transducer or keel but treated as below the waterline reads shallower than the truth, which errs safe, but it skews agreement between vessels, which is why uncalibrated vessels count for little.
 
 #### Sound speed
 
@@ -169,22 +174,23 @@ Ingest and each derived step write the tiles they touch to a `tile_changes` tabl
 
 #### Cell statistics
 
-| Field              | Meaning                                                                                           |
-| ------------------ | ------------------------------------------------------------------------------------------------- |
-| `depth`            | Published shoal-biased depth: a low quantile of accepted soundings, weighted by vessel reputation |
-| `median`, `mad`    | Robust center and spread                                                                          |
-| `min`, `max`       | Range of accepted soundings                                                                       |
-| `count`, `vessels` | Accepted soundings and independent vessels, by `unique_id`                                        |
-| `first`, `last`    | Survey date range, by month, or by year for cells sounded by one vessel                           |
-| `tvu`              | Propagated vertical uncertainty at 95%                                                            |
-| `kind`             | How the cell got its depth: measured by several vessels, measured by one vessel, or filled        |
-| `zoc`              | CATZOC: 5 (D), the IHO recommendation for crowdsourced data, until validation supports more       |
+| Field              | Meaning                                                                                          |
+| ------------------ | ------------------------------------------------------------------------------------------------ |
+| `depth`            | Published depth: the median of per-vessel medians, after calibration, minus k × `sigma`          |
+| `median`, `mad`    | Robust center and spread                                                                         |
+| `min`, `max`       | Range of accepted soundings                                                                      |
+| `count`, `vessels` | Accepted soundings and independent vessels, by `unique_id`                                       |
+| `first`, `last`    | Survey date range, by month, or by year for cells sounded by one vessel                          |
+| `sigma`            | Uncertainty of `depth`: per-vessel uncertainty from calibration plus spread around a local plane |
+| `tvu`              | Propagated vertical uncertainty at 95%                                                           |
+| `kind`             | How the cell got its depth: measured by several vessels, measured by one vessel, or interpolated |
+| `zoc`              | CATZOC: 5 (D), the IHO recommendation for crowdsourced data, until validation supports more      |
 
 A cell sounded by a single vessel is published but marked, because one vessel's systematic error can't be detected without another to compare it with. Its dates are coarsened to the year, so a chain of single-vessel cells doesn't publish a dated track of one boat, including in waters NOAA doesn't publish. Products never carry vessel ids or names.
 
-#### Holes
+#### Interpolation
 
-An empty cell is filled only when sounded cells bracket it on opposite sides within one cell, along a row, column or diagonal. It takes the shoaler neighbor, never an interpolated value, and is marked `filled`. Tracks never grow outward and nothing is shaded between tracks. The one-cell fringe along the edge of coverage, where lone soundings are least reliable, is a candidate for trimming, as NOAA's `Bathy_edge_erosion` does for surveys.
+An empty cell within 200 m of accepted soundings takes an interpolated depth, shoal-biased by the same k × `sigma` margin, with `sigma` widened by its distance from the nearest track, and is marked `interpolated`. A cell holding an unconfirmed shoal is never interpolated over, so the water over it isn't drawn deeper than it was measured. Beyond 200 m the water stays empty; in the Seascape mosaic, crowd cells will later feather into the base there. The fringe along the edge of coverage, where lone soundings are least reliable, is a candidate for trimming, as NOAA's `Bathy_edge_erosion` does for surveys.
 
 #### Depth areas and contours
 
@@ -199,7 +205,7 @@ Outputs go to R2 and are served from `tiles.openwaters.io/crowd-depth/`. Like Se
 One global PMTiles archive, built so a plotter that styles ENCs portrays it the way charts portray low-quality data:
 
 - `SOUNDG`: one sounding per published cell, placed at the position of its shoalest accepted sounding rather than the cell center. Depths round toward shoal. Each carries a low-accuracy flag so styles can mark it, and deeper soundings are dropped first as zoom decreases.
-- `DEPARE`: depth bands, only where cells were measured or filled, each with both `DRVAL1` and `DRVAL2`, since a depth area missing `DRVAL1` draws as intertidal. Unsounded water has no depth area.
+- `DEPARE`: depth bands, only where cells were measured or interpolated, each with both `DRVAL1` and `DRVAL2`, since a depth area missing `DRVAL1` draws as intertidal. Unsounded water has no depth area.
 - `DEPCNT`: band edges, flagged as approximate so styles can dash them.
 - `M_QUAL`: coverage polygons that never overlap, with CATZOC, survey date range, vertical and horizontal uncertainty, sounding and vessel counts, technique, and a note that the data is crowdsourced and unverified.
 
@@ -213,7 +219,7 @@ Offline regions are cut from the global archive by range requests, with `pmtiles
 
 #### Seascape source
 
-4326 Cloud Optimized GeoTIFFs on chart datum with depth, uncertainty and cell-kind bands, following BlueTopo's depth, uncertainty and contributor layout, plus a footprint for Seascape's coverage layer. Seascape merges crowd cells over its base by remove-restore, as GEBCO and EMODnet merge sparse sources: the difference from the base is applied only where crowd cells exist, and is never interpolated across gaps. It ranks above GEBCO and below every surveyed source.
+4326 Cloud Optimized GeoTIFFs on chart datum with depth, uncertainty and cell-kind bands, following BlueTopo's depth, uncertainty and contributor layout, plus a footprint for Seascape's coverage layer. Seascape merges crowd cells over its base by remove-restore, as GEBCO and EMODnet merge sparse sources: the difference from the base is applied where crowd cells exist, and feathered into the base at the edges of crowd coverage, a design still to be worked out. It ranks above GEBCO and below every surveyed source.
 
 ### 6. Validation
 
@@ -253,18 +259,19 @@ CI gets a separate job for it, filtered to changes under `packages/grid`, so plu
 
 ## Phases
 
-- [ ] Consent: the plugin's consent text says the data goes to Open Waters as well as the DCDB, and that anyone, Open Waters included, may publish and build products from it. Data collected under the earlier text was also dedicated to the public domain under CC0, so it is used the same way. Nothing is published, including previews, until a plugin release carries this text.
+- [x] Consent: the plugin's consent text says the data goes to Open Waters as well as the DCDB, and that anyone, Open Waters included, may publish and build products from it. Data collected under the earlier text was also dedicated to the public domain under CC0, so it is used the same way. Nothing is published, including previews, until a plugin release carries this text.
 - [ ] Point store: `files` and `points` tables, ingest with ETag tracking, file-level dedupe and supersession, for both sources.
 - [ ] Raw grid: QC, variable-resolution grid with shoal-biased statistics, depth areas and contours, `M_QUAL` coverage, and PMTiles, as an unlisted preview only. Without tide and datum corrections its depths aren't on chart datum, and a plotter would draw them next to ENC depths as if they were. It also waits on vessel matching across sources, so `vessels` doesn't count one boat twice.
+- [ ] Vessel calibration: per-vessel offsets against reference surveys and at anchored crossovers, applied before gridding. Uncorrected, the grid draws a busy channel 3 to 9 m too shallow, so this comes before validation and the other corrections.
 - [ ] Validation: held-out survey comparisons, the S-44 test and shoal detection rate, reported per grid version.
-- [ ] Corrections: vessel calibration with reputation, sound speed, tide, chart datum, and confidence upgrades backed by validation.
+- [ ] Corrections: reputation, sound speed, tide, chart datum, and confidence upgrades backed by validation.
 - [ ] Public overlay: published and listed once tide and datum corrections and validation are in place.
 - [ ] Seascape source: COG output and remove-restore merging in Seascape.
 - [ ] Plugin: calibration feedback.
 
 ## Open questions
 
-- The shoal statistic and its thresholds: which quantile, and how many independent vessels a cell needs before it publishes at full resolution.
+- The value of k in `median − kσ` ([surface-statistic.md](surface-statistic.md)), and how many independent vessels a cell needs before it publishes at full resolution.
 - The sound speed each provider's loggers assume, if any provider documents it.
 - Whether the AVISO license asks anything of grids derived from FES2022 predictions, such as attribution.
 - What evidence moves a cell from CATZOC D to C, following the IHO Data Quality Working Group's proposal.
