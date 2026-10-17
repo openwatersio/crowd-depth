@@ -7,6 +7,8 @@ from grid.cells import OTHER_PASS, SUPPORT
 from grid.qc import (
     FLAT_M,
     FLAT_MIN_SOUNDINGS,
+    FLAT_SPAN_M,
+    HAZARD_M,
     MAX_DEPTH_M,
     MAX_SPEED_KN,
     SHALLOW_M,
@@ -24,6 +26,13 @@ def _distance(a: str, b: str) -> str:
     lon_b, lat_b = (f"{b}({c}) OVER w" if b else c for c in ("lon", "lat"))
     dx = f"((({lon_b} - {lon_a} + 540) % 360) - 180) * cos(radians({lat_a})) * 111320"
     dy = f"({lat_b} - {lat_a}) * 110540"
+    return f"sqrt(({dx}) ^ 2 + ({dy}) ^ 2)"
+
+
+def _extent(w: str) -> str:
+    span = f"(max(lon) OVER {w} - min(lon) OVER {w})"
+    dx = f"least({span}, 360 - {span}) * cos(radians(avg(lat) OVER {w})) * 111320"
+    dy = f"(max(lat) OVER {w} - min(lat) OVER {w}) * 110540"
     return f"sqrt(({dx}) ^ 2 + ({dy}) ^ 2)"
 
 
@@ -84,7 +93,7 @@ jumps AS (
     AND least(speed_in, speed_out) > greatest({MAX_SPEED_KN}, 2 * speed_past)
 ),
 flat AS (
-  SELECT point_id FROM (
+  SELECT point_id, d FROM (
     SELECT *, sum(starts::INTEGER) OVER (PARTITION BY file_id, transit ORDER BY time, file_id, "row"
       ROWS UNBOUNDED PRECEDING) AS run
     FROM (SELECT *, d IS DISTINCT FROM lag(d) OVER w AS starts, {_distance("lag", "")} AS step
@@ -93,6 +102,7 @@ flat AS (
   )
   QUALIFY sum(CASE WHEN NOT starts THEN step END) OVER (PARTITION BY file_id, transit, run) >= {FLAT_M}
     AND count(*) OVER (PARTITION BY file_id, transit, run) >= {FLAT_MIN_SOUNDINGS}
+    AND (d >= {HAZARD_M} OR {_extent("(PARTITION BY file_id, transit, run)")} >= {FLAT_SPAN_M})
 ),
 spikes AS (
   SELECT point_id, d,
@@ -107,7 +117,7 @@ SELECT point_id, 'review', 'very_shallow' FROM p WHERE d > 0 AND d < {SHALLOW_M}
 UNION ALL
 SELECT point_id, 'reject', 'jump' FROM jumps
 UNION ALL
-SELECT point_id, 'reject', 'flatline' FROM flat
+SELECT point_id, CASE WHEN d < {HAZARD_M} THEN 'unconfirmed' ELSE 'reject' END, 'flatline' FROM flat
 UNION ALL
 SELECT point_id, CASE WHEN d > med THEN 'reject' ELSE 'unconfirmed' END, 'spike'
 FROM spikes

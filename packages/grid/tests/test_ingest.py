@@ -339,10 +339,10 @@ def test_incomplete_listing_withdraws_nothing(env, monkeypatch):
 
 
 def test_a_run_that_fails_keeps_what_it_published(env, monkeypatch):
-    # Every batch is a checkpoint; the third file can't be downloaded, as an R2 error
+    # Every file is a checkpoint; the third file can't be downloaded, as an R2 error
     # late in a long import.
+    # Batches stay under FLUSH_POINTS, so checkpoints fall between them.
     monkeypatch.setattr(ingest, "CHECKPOINT_SECONDS", 0)
-    monkeypatch.setattr(ingest, "FLUSH_POINTS", 1)
     monkeypatch.setattr(ingest, "FETCH_BYTES", 1)
     env.ow.put(ow_key(1), geojson(ROWS[:2]))
     env.ow.put(ow_key(2), geojson(ROWS))  # covers the first
@@ -540,6 +540,85 @@ def test_vessel_identity_comes_from_key(env):
 def lock_free(store):
     got = store.get(LOCK)
     return got is None or datetime.fromisoformat(json.loads(got[0])["expires"]) <= datetime.now(UTC)
+
+
+def test_a_released_lock_is_taken_without_a_stale_warning(tmp_path, caplog):
+    store = LocalObjects(tmp_path)
+    with open_store(store):
+        pass
+    with caplog.at_level("WARNING"), open_store(store):
+        pass
+    assert "stale" not in caplog.text
+    # A run that crashed without releasing.
+    store.put(
+        LOCK, json.dumps({"owner": "crashed", "expires": "2000-01-01T00:00:00+00:00"}).encode()
+    )
+    with caplog.at_level("WARNING"), open_store(store):
+        pass
+    assert "taking over stale lock from crashed" in caplog.text
+
+
+@pytest.mark.parametrize("held", [None, "stale"])
+def test_lock_and_catalog_puts_whose_responses_were_lost_still_succeed(tmp_path, monkeypatch, held):
+    store = LocalObjects(tmp_path)
+    if held:
+        store.put(LOCK, json.dumps({"owner": "x", "expires": "2000-01-01T00:00:00+00:00"}).encode())
+    put = store.put
+    failed = set()
+
+    def lost(key, data, **kw):
+        etag = put(key, data, **kw)
+        if key not in failed and (key == LOCK or key.endswith(".ducklake")):
+            failed.add(key)
+            raise Conflict(key)  # the retry of a put that landed
+        return etag
+
+    monkeypatch.setattr(store, "put", lost)
+    with open_store(store) as con:
+        con.execute("INSERT INTO lake.withdrawal_holds VALUES ('noaa', 'k', 1, false)")
+    with open_store(store, write=False) as con:
+        assert con.execute("SELECT count(*) FROM lake.withdrawal_holds").fetchone() == (1,)
+
+
+def test_a_pointer_move_whose_response_was_lost_still_succeeds(tmp_path, monkeypatch):
+    store = LocalObjects(tmp_path)
+    with open_store(store):
+        pass
+    put = store.put
+
+    def lost(key, data, **kw):
+        etag = put(key, data, **kw)
+        if key == POINTER:
+            raise Conflict(key)  # the retry of a put that landed
+        return etag
+
+    monkeypatch.setattr(store, "put", lost)
+    with open_store(store):
+        pass
+    assert store.get(POINTER)[0].decode().endswith(".ducklake")
+
+
+def test_the_catalog_a_run_started_from_outlives_it(tmp_path, monkeypatch):
+    # A reader may have read the pointer just before the run moved it.
+    monkeypatch.setattr(catalog, "RETAIN", timedelta(0))
+    store = LocalObjects(tmp_path)
+    with open_store(store):
+        pass
+    first = store.get(POINTER)[0].decode()
+    with open_store(store):
+        pass
+    assert store.get(first) is not None
+    with open_store(store):
+        pass
+    assert store.get(first) is None
+
+
+def test_a_store_path_with_a_quote(tmp_path):
+    store = LocalObjects(tmp_path / "o'brien")
+    with open_store(store) as con:
+        con.execute("INSERT INTO lake.withdrawal_holds VALUES ('noaa', 'k', 1, false)")
+    with open_store(store, write=False) as con:
+        assert con.execute("SELECT count(*) FROM lake.withdrawal_holds").fetchone() == (1,)
 
 
 def test_release_never_clobbers_a_lock_taken_over(tmp_path):
@@ -752,11 +831,14 @@ def test_times_are_stored_in_utc(env):
 
 def test_runs_prune_catalogs_past_retention(env, monkeypatch):
     monkeypatch.setattr(catalog, "RETAIN", timedelta(0))
+    published = []
     for n in (1, 2, 3):
         env.noaa.put(noaa_key(n), noaa_csv(ROWS, file_uuid=str(n)))
         env.run("noaa")
+        published.append(env.store.get(catalog.POINTER)[0].decode())
     catalogs = [o.key for o in env.store.list("catalog/")[0] if o.key.endswith(".ducklake")]
-    assert catalogs == [env.store.get(catalog.POINTER)[0].decode()]
+    # The current catalog, and the one the last run started from.
+    assert set(catalogs) == set(published[1:])
     assert len(env.active()) == 3
 
 
@@ -776,6 +858,34 @@ def test_only_content_errors_make_a_file_invalid(tmp_path, monkeypatch, error, i
     monkeypatch.setattr(sources, "content_hash", fail)
     with pytest.raises(Invalid if invalid else error):
         parse("noaa", noaa_key(1), noaa_csv(ROWS), tmp_path)
+
+
+def test_a_key_list_whose_folders_cant_all_be_listed_alerts(env, monkeypatch):
+    env.noaa.put(noaa_key(1), noaa_csv(ROWS, file_uuid="1"))
+    listing = env.noaa.list
+    monkeypatch.setattr(env.noaa, "list", lambda prefix="": (listing(prefix)[0], False))
+    with open_store(env.store) as con:
+        assert Ingest(con, "noaa", env.noaa, keys={noaa_key(1)}).run().alert
+
+
+def test_a_key_list_that_finds_nothing_alerts(env):
+    env.noaa.put(noaa_key(1), noaa_csv(ROWS, file_uuid="1"))
+    with open_store(env.store) as con:
+        # Keys without NOAA's prefix: listed nowhere, so all missing.
+        run = Ingest(con, "noaa", env.noaa, keys={noaa_key(1).removeprefix("csb/csv/")}).run()
+    assert run.alert and run.counts["missing"] == 1
+    with open_store(env.store) as con:
+        assert Ingest(con, "noaa", env.noaa, keys=set()).run().alert  # an empty key file
+
+
+def test_a_key_list_needs_a_source(tmp_path):
+    from grid.cli import main
+
+    keys = tmp_path / "keys.txt"
+    keys.write_text(noaa_key(1))
+    for picked in ([], ["--source", "noaa", "--source", "openwaters"]):
+        with pytest.raises(SystemExit):
+            main(["--store", str(tmp_path / "store"), "ingest", *picked, "--keys", str(keys)])
 
 
 def test_a_key_list_ingests_only_its_keys_and_withdraws_nothing(env):

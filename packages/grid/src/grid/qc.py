@@ -18,7 +18,7 @@ from .sources import EARLIEST
 
 log = logging.getLogger(__name__)
 
-QC_VERSION = 2
+QC_VERSION = 3
 
 # Flags: reject (left out of everything), review (kept, looked at later),
 # unconfirmed (a shoal kept out of cell depths, areas and contours, and published by
@@ -42,6 +42,16 @@ SPIKE_REL = 0.10
 # were a median 17% off the other vessels' depths there, against 5% for shorter ones.
 FLAT_M = 1000
 FLAT_MIN_SOUNDINGS = 3
+# A reading shallower than this may be a hazard, so a rule that can't tell it from noise
+# keeps it as an unconfirmed shoal rather than rejecting it: a stuck run there may be a
+# flat shoal read by a coarse sounder.
+HAZARD_M = 30
+# Shallower than HAZARD_M, a stuck run must also span this far. A boat sitting at its
+# mooring adds a kilometre of GPS jitter in minutes while its depth honestly holds; and a
+# sounder stuck while the boat stays this close still holds a reading from within this
+# distance, so its error is at most the depth change across it. Deeper, a sounder that
+# loses bottom holds anything, so the path alone decides.
+FLAT_SPAN_M = 200
 
 
 def _at(a: str, column: str) -> str:
@@ -53,6 +63,14 @@ def _distance(a: str, b: str) -> str:
     # Equirectangular, well under 1% off at these spacings; longitude wraps at the antimeridian.
     dx = f"((({_at(b, 'lon')} - {_at(a, 'lon')} + 540) % 360) - 180) * cos(radians({_at(a, 'lat')})) * 111320"
     dy = f"({_at(b, 'lat')} - {_at(a, 'lat')}) * 110540"
+    return f"sqrt(({dx}) ^ 2 + ({dy}) ^ 2)"
+
+
+def _extent(w: str) -> str:
+    """Metres across the bounding box of window `w`'s soundings; longitude wraps at the antimeridian."""
+    span = f"(max(lon) OVER {w} - min(lon) OVER {w})"
+    dx = f"least({span}, 360 - {span}) * cos(radians(avg(lat) OVER {w})) * 111320"
+    dy = f"(max(lat) OVER {w} - min(lat) OVER {w}) * 110540"
     return f"sqrt(({dx}) ^ 2 + ({dy}) ^ 2)"
 
 
@@ -170,7 +188,7 @@ WHERE NOT context AND speed_past IS NOT NULL
 -- in total is missed; carry runs across days if stuck sounders slip through that way
 CREATE OR REPLACE TEMP TABLE qc_flat AS
 WITH steps AS (
-  SELECT point_id, file_id, day, transit, "row", time,
+  SELECT point_id, file_id, day, transit, "row", time, lon, lat, d,
     d IS DISTINCT FROM lag(d) OVER w AS starts, {_distance("lag", "")} AS step
   FROM qc_track WHERE point_id NOT IN (SELECT point_id FROM qc_jumps)
   WINDOW w AS (PARTITION BY file_id, day, transit ORDER BY {ORDER})
@@ -183,7 +201,8 @@ runs AS (
 SELECT point_id FROM runs
 WINDOW r AS (PARTITION BY file_id, day, transit, run)
 QUALIFY sum(CASE WHEN NOT starts THEN step END) OVER r >= {FLAT_M}
-  AND count(*) OVER r >= {FLAT_MIN_SOUNDINGS}""",
+  AND count(*) OVER r >= {FLAT_MIN_SOUNDINGS}
+  AND (d >= {HAZARD_M} OR {_extent("r")} >= {FLAT_SPAN_M})""",
     f"""
 CREATE OR REPLACE TEMP TABLE qc_spikes AS
 WITH clean AS (SELECT * FROM qc_track WHERE point_id NOT IN (
@@ -207,7 +226,9 @@ SELECT point_id, cell_id, 'review', 'very_shallow' FROM qc_points WHERE d > 0 AN
 UNION ALL
 SELECT point_id, cell_id, 'reject', 'jump' FROM qc_jumps JOIN qc_points USING (point_id)
 UNION ALL
-SELECT point_id, cell_id, 'reject', 'flatline' FROM qc_flat JOIN qc_points USING (point_id)
+SELECT point_id, cell_id, CASE WHEN d < {HAZARD_M} THEN 'unconfirmed' ELSE 'reject' END,
+  'flatline'
+FROM qc_flat JOIN qc_points USING (point_id)
 UNION ALL
 SELECT s.point_id, p.cell_id, CASE WHEN s.d > s.med THEN 'reject' ELSE 'unconfirmed' END, 'spike'
 FROM qc_spikes s JOIN qc_points p USING (point_id)

@@ -114,6 +114,7 @@ source = { editable = "." }
 dependencies = [
     { name = "boto3" },
     { name = "duckdb" },
+    { name = "numpy" },
     { name = "pmtiles" },
     { name = "rasterio" },
     { name = "scipy" },
@@ -130,7 +131,8 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "boto3", specifier = ">=1.38" },
-    { name = "duckdb", specifier = ">=1.5" },
+    { name = "duckdb", specifier = ">=1.5,<1.6" },
+    { name = "numpy", specifier = ">=2" },
     { name = "pmtiles", specifier = ">=3.4" },
     { name = "rasterio", specifier = ">=1.4" },
     { name = "scipy", specifier = ">=1.14" },
