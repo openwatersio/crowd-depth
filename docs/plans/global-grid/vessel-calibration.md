@@ -117,7 +117,7 @@ At the 2B soundings assumed in [rebuild-cost.md](rebuild-cost.md), crossover det
 ## Recommendation
 
 1. **Key offsets by vessel and step segment.** Run step detection on per-transit offsets against BlueTopo or crossings, and give each segment its own offset and standard error. One constant per vessel leaves 2.1% of channel pixels drawn more than 1 m too deep; per segment leaves none.
-2. **Solve BlueTopo and crossings together.** Use BlueTopo, S-102 and Seascape's surveyed sources as anchors where a segment has at least 50 flat-seabed pixels across 2 transits, and solve every segment's offset at shared pixels. Weight anchors by their standard error rather than fixing them, so one bad anchor can't pull its neighbors.
+2. **Solve BlueTopo and crossings together.** Use BlueTopo and S-102 as anchors where a segment has at least 50 flat-seabed pixels across 2 transits, and solve every segment's offset at shared pixels. Weight anchors by their standard error rather than fixing them, so one bad anchor can't pull its neighbors. Seascape's other surveyed sources can anchor once Seascape carries a quality layer per pixel (uncertainty, source and survey date), which the calibration filter needs.
 3. **Require five crossing transits** before treating a crossover offset as calibrated, about ±0.4 m. Below that, publish the offset with its uncertainty and weight the segment low, as the plan does for uncalibrated vessels.
 4. **Reduce tide before calibrating.** It is most of the remaining per-transit spread, and it would tighten both the offsets and the step detection.
 5. **Offset only, no scale factor,** until deeper water is in the set. Scale fits barely help at 2–20 m.
