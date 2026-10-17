@@ -25,7 +25,6 @@ from scipy.ndimage import binary_dilation
 
 from . import cells, surface
 from .cells import GRID_VERSION
-from .qc import MAX_DEPTH_M, QC_VERSION
 
 M_PER_FT = 0.3048
 M_PER_FATHOM = 1.8288
@@ -94,8 +93,9 @@ def zooms(display):
 
 
 # What SOUNDG is made of: every measured cell (filled cells have no sounding) at the
-# position of the sounding that set its depth, and every unconfirmed shoal.
-# ponytail: reads the whole store; split by 10° partition when the overlay builds by region
+# position of the sounding that set its depth, and every unconfirmed shoal, which the
+# cells build keeps.
+# ponytail: reads every cell; split by 10° partition when the overlay builds by region
 # Web Mercator stops at about 85.05°; soundings past it have no tile to go in.
 MERCATOR_MAX_LAT = 85.0511
 SOURCES = f"""
@@ -103,12 +103,7 @@ SELECT * FROM (
   SELECT depth_lon AS lon, depth_lat AS lat, depth AS d, false AS unconfirmed
   FROM lake.cells WHERE kind <> 'filled' AND depth IS NOT NULL
   UNION ALL
-  SELECT p.lon, p.lat, p.depth_raw, true FROM active_points p
-  WHERE p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M} AND p.point_id IN (
-    SELECT point_id FROM lake.qc_flags WHERE flag = 'unconfirmed' AND qc_version = {QC_VERSION}
-    EXCEPT
-    SELECT point_id FROM lake.qc_flags
-    WHERE flag IN ('confirmed', 'reject') AND qc_version = {QC_VERSION})
+  SELECT lon, lat, depth, true FROM lake.shoals
 ) WHERE abs(lat) <= {MERCATOR_MAX_LAT}
 """
 

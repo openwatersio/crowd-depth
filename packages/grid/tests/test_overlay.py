@@ -6,6 +6,7 @@ import duckdb
 import numpy as np
 import pytest
 import rasterio
+import rasterio.shutil
 import shapely
 import test_grid
 from pmtiles.reader import MmapSource, Reader
@@ -14,7 +15,6 @@ from test_ingest import env  # noqa: F401  (env is a fixture)
 from grid import cells, overlay, surface
 from grid.catalog import open_store
 from grid.overlay import M_PER_FATHOM, M_PER_FT, depths
-from grid.qc import QC_VERSION
 
 
 def test_depths_match_seascape():
@@ -42,16 +42,14 @@ def test_zooms():
 
 @pytest.fixture
 def lake():
-    """The tables SOUNDG reads, in memory: cells, flags and active points."""
+    """The tables SOUNDG reads, in memory: cells and unconfirmed shoals."""
     con = duckdb.connect()
     con.execute("ATTACH ':memory:' AS lake")
     con.execute(
         """CREATE TABLE lake.cells (depth_lon DOUBLE, depth_lat DOUBLE, depth FLOAT, kind VARCHAR,
           tile_id INTEGER, lon_min DOUBLE, lat_min DOUBLE, lon_max DOUBLE, lat_max DOUBLE,
           first DATE, last DATE, count INTEGER, tvu FLOAT);
-        CREATE TABLE lake.qc_flags (point_id INTEGER, flag VARCHAR, qc_version INTEGER);
-        CREATE TABLE points (point_id INTEGER, lon DOUBLE, lat DOUBLE, depth_raw FLOAT);
-        CREATE VIEW active_points AS SELECT * FROM points"""
+        CREATE TABLE lake.shoals (lon DOUBLE, lat DOUBLE, depth FLOAT)"""
     )
     return con
 
@@ -112,20 +110,7 @@ def test_unconfirmed_shoals_publish_flagged(lake):
     lake.execute(
         "INSERT INTO lake.cells (depth_lon, depth_lat, depth, kind) VALUES (-78.0, 33.0, 10.0, 'single')"
     )
-    lake.executemany(
-        "INSERT INTO points VALUES (?, ?, ?, ?)",
-        [(1, -77.5, 33.0, 1.5), (2, -77.0, 33.0, 2.0), (3, -76.5, 33.0, 2.5)],
-    )
-    lake.executemany(
-        "INSERT INTO lake.qc_flags VALUES (?, ?, ?)",
-        [
-            (1, "unconfirmed", QC_VERSION),
-            (2, "unconfirmed", QC_VERSION),
-            (2, "confirmed", QC_VERSION),
-            (3, "unconfirmed", QC_VERSION),
-            (3, "reject", QC_VERSION),
-        ],
-    )
+    lake.execute("INSERT INTO lake.shoals VALUES (-77.5, 33.0, 1.5)")
     shown = at_zoom(features(lake), overlay.MAX_ZOOM)
     props = sorted((f["properties"]["depth_m"], f["properties"].get("unconfirmed")) for f in shown)
     assert props == [(1.5, 1), (10, None)]
@@ -214,6 +199,14 @@ def test_a_shoal_inside_a_closed_isobath_is_prime():
     assert "SOUNDG" not in by_layer(open_)
 
 
+def write_surface(path, lon0, lat0, depth, distance, count):
+    """A whole tile's bands as its surface COG, written as build_tile writes one."""
+    sparse = path.with_suffix(".sparse.tif")
+    with surface.open_sparse(sparse, lon0, lat0, depth.shape) as dst:
+        dst.write(np.stack([depth, distance, count]))
+    rasterio.shutil.copy(sparse, path, driver="COG", compress="deflate", sparse_ok=True)
+
+
 def test_surface_bands_follow_the_surface(tmp_path):
     # A 1° tile, 100 pixels a side: 3 m in the west, 12 m in the east, nothing in the
     # north-east corner but one sounding the surface didn't reach.
@@ -222,7 +215,7 @@ def test_surface_bands_follow_the_surface(tmp_path):
     depth[:20, 80:] = surface.NODATA
     count = np.zeros_like(depth)
     count[5, 95] = 1
-    surface.write(tmp_path / "t.tif", -78, 33, depth, np.zeros_like(depth), count)
+    write_surface(tmp_path / "t.tif", -78, 33, depth, np.zeros_like(depth), count)
     bands, footprint, surfaced = overlay.surface_bands(tmp_path / "t.tif")
     # The surface is interpolated between pixels, so 3 m beside 12 m crosses the 5 m band.
     assert sorted(overlay.LEVELS[b] for b in bands) == [2, 5, 10]
@@ -273,6 +266,34 @@ def test_surface_fills_between_tracks_but_not_past_their_ends(env):  # noqa: F81
     # sounding on every side, so the surface doesn't run on beyond them.
     assert at_pixel(depth, 5006, 70) == surface.NODATA
     assert at_pixel(depth, 5300, 30) == surface.NODATA  # far from both
+
+
+def test_skipping_empty_blocks_changes_no_pixel(env, monkeypatch):  # noqa: F811
+    # Two tracks about 220 m apart either side of a corner of 64-pixel blocks: pixel
+    # row 2880 starts a block, and its nearest sounding is 5 pixels north, in the
+    # block before, past the blur's reach.
+    # Varied depths, or a kilometre of one depth reads as a stuck sounder.
+    put_tracks(env, [(v, [(i, r, i, 10 + i % 7 / 5) for i in range(300)]) for v, r in
+                     (("A", 5026), ("B", 5048))])  # fmt: skip
+    test_grid.build(env)
+    tile = tile_of(test_grid.LAT0, test_grid.LON0)
+
+    def bands(block):
+        monkeypatch.setattr(surface, "BLOCK", block)
+        with open_store(env.store, write=False) as con:
+            [(partition,)] = con.execute("SELECT DISTINCT cell_id FROM lake.cells").fetchall()
+            path, _ = surface.build_tile(con, tile, partition, env.store.root / str(block))
+        with rasterio.open(path) as src:
+            return src.read()
+
+    # One block the size of the tile (rounded up to GeoTIFF's 16) is the whole raster.
+    whole, blocked = bands(-(-surface.ROWS // 16) * 16), bands(64)
+    data = (whole[0] != surface.NODATA) | (whole[2] > 0)
+    assert data[2860:2900, 60:70].any() and data[2860:2900, 120:130].any()
+    assert (blocked[:, data] == whole[:, data]).all()
+    # Elsewhere, nothing: the skipped blocks aren't in the file at all.
+    assert (blocked[0][~data] == surface.NODATA).all() and (blocked[2][~data] <= 0).all()
+    assert (blocked[2] == surface.NODATA).any()
 
 
 def test_surface_holds_a_confirmed_shoal_among_deeper_soundings(env):  # noqa: F811
@@ -397,7 +418,7 @@ def test_a_one_pixel_shoal_covers_its_whole_pixel_in_the_areas(tmp_path):
     shoalest = np.full(depth.shape, np.inf, dtype=np.float32)
     shoalest[50, 50] = 3.0
     out = surface.finish(depth, shoalest, np.zeros(depth.shape, dtype=bool))
-    surface.write(tmp_path / "t.tif", -78, 33, out, np.zeros_like(out), np.zeros_like(out))
+    write_surface(tmp_path / "t.tif", -78, 33, out, np.zeros_like(out), np.zeros_like(out))
     bands, _, _ = overlay.surface_bands(tmp_path / "t.tif")
     shoal = shapely.union_all([a for b, a in bands.items() if overlay.LEVELS[b] < 5])
     # The pixel spans 0.01°; a sounding anywhere in it is inside the shoal's band.

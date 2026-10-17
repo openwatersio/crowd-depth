@@ -190,6 +190,47 @@ def test_track_shoal_spike_confirmed_by_another_vessel(env):  # noqa: F811
     assert ("confirmed", "cell_confirmed", 3) in flags(env)
 
 
+def test_cells_keep_the_shoals_still_unconfirmed(env):  # noqa: F811
+    # A's 20 m spike is rejected and its 3 m one stays unconfirmed; B's 3 m spike is
+    # confirmed by C reading 3.4 m beside it.
+    put(env, 1, line([10, 10, 10, 20, 10, 10, 3, 10, 10, 10]))
+    put(env, 2, line([10, 10, 10, 10, 3, 10, 10, 10, 10], r=6000), "B")
+    put(env, 3, [(100, *at(6000, 4, 0.2), 3.4)], "C")
+    build(env)
+    assert ("confirmed", "cell_confirmed", 3) in flags(env)
+    shoals = env.query('SELECT tile_id, "row", lon, lat, depth FROM lake.shoals')
+    assert shoals == [((LAT0 + 90) * 360 + LON0 + 180, 5000, *at(5000, 6), 3.0)]
+
+
+def test_shoals_are_the_soundings_nothing_confirmed_or_rejected():
+    con = duckdb.connect()
+    con.execute("ATTACH ':memory:' AS lake")
+    con.execute(
+        """CREATE TABLE lake.qc_flags (
+          point_id INTEGER, flag VARCHAR, reason VARCHAR, qc_version INTEGER, cell_id SMALLINT)"""
+    )
+    tile = (LAT0 + 90) * 360 + LON0 + 180
+    con.execute(
+        "CREATE TABLE tile_points AS SELECT unnest(range(1, 6)) AS point_id, ? AS tile_id,"
+        " 5000 AS r, ? AS lon, ? AS lat, 3.0 AS depth_raw",
+        [tile, *at(5000, 7)],
+    )
+    v = qc.QC_VERSION
+    con.executemany(
+        "INSERT INTO lake.qc_flags VALUES (?, ?, ?, ?, 1)",
+        [
+            (1, "unconfirmed", "spike", v),  # still a shoal
+            (2, "unconfirmed", "spike", v),
+            (2, "confirmed", "cell_confirmed", v),
+            (3, "unconfirmed", "spike", v),
+            (3, "reject", "consensus_shoal", v),
+            (4, "unconfirmed", "spike", v - 1),  # an older QC's
+        ],
+    )
+    con.execute(cells.SHOALS, {"partition": 1})
+    assert con.execute("SELECT tile_id, r, c FROM shoals").fetchall() == [(tile, 5000, 7)]
+
+
 def holes(cells_):
     """Run the hole query over cells (row, col, depth, level) in one tile."""
     t = 123 * 360 + 102
@@ -201,7 +242,7 @@ def holes(cells_):
     )
     con = duckdb.connect()
     con.register("measured", table)
-    con.execute("CREATE TABLE shoal_cells (tile_id INTEGER, r INTEGER, c INTEGER)")
+    con.execute("CREATE TABLE shoals (tile_id INTEGER, r INTEGER, c INTEGER)")
     query = f'SELECT "row", col, depth, kind FROM ({cells.HOLES})'
     return sorted(con.execute(query, {"rlo": 0, "rhi": cells.BASE}).fetchall())
 
@@ -297,14 +338,17 @@ def test_bands_build_the_same_cells_as_whole_tiles(env, monkeypatch):  # noqa: F
     # Two tracks crossing several 3″ rows, with holes along them and across band edges.
     put(env, 1, apart([(0, *at(4990 + i, 3 + i % 2 * 2), 10 + i % 3) for i in range(40)]))
     put(env, 2, apart([(0, *at(4990 + i, 4), 11) for i in range(0, 40, 2)]), "B")
+    put(env, 3, line([10, 10, 10, 3, 10, 10, 10], r=4999), "C")  # a shoal on a band edge
     build(env)
     whole = grid(env)
+    shoals = env.query("SELECT * FROM lake.shoals")
+    assert shoals
     monkeypatch.setattr(cells, "BATCH_POINTS", 5)
     with open_store(env.store) as con:
         [(partition,)] = con.execute("SELECT DISTINCT cell_id FROM lake.points").fetchall()
         assert len(cells.units(con, partition, [])) > 2
         cells.build(con)
-    assert grid(env) == whole
+    assert grid(env) == whole and env.query("SELECT * FROM lake.shoals") == shoals
     assert any(row[7] == "filled" for row in whole)
 
 
@@ -465,7 +509,7 @@ def test_a_cells_sounding_sits_at_the_same_tie_whichever_file_came_first(env, fi
 
 def test_rebuilds_expire_old_snapshots_files_and_catalogs(env, monkeypatch):  # noqa: F811
     monkeypatch.setattr(catalog, "RETAIN", timedelta(0))
-    put(env, 1, line([10.0] * 6))
+    put(env, 1, line([10.0, 10.0, 3.0, 10.0, 10.0, 10.0]))  # an unconfirmed shoal too
     put(env, 2, line([10.0] * 6, start=1), unique_id="AQM-2")
     build(env)
     lake = env.store.root / "lake"
@@ -525,6 +569,16 @@ def test_a_shoal_dedupe_dropped_doesnt_hold_a_hole_open(env):  # noqa: F811
     assert ("unconfirmed", "spike", 3) in flags(env)
     [hole] = [row for row in grid(env) if row[:3] == (1, 5000, 1)]
     assert hole[7] == "filled"
+
+
+def test_cells_count_a_soundings_twins_once(env):  # noqa: F811
+    # Two uploads from one vessel overlap by three soundings, so neither covers the other.
+    rows = line([10.0, 10.2, 10.1, 10.3, 10.0, 10.2, 10.1, 10.3, 10.0])
+    put(env, 1, rows[:6])
+    put(env, 2, rows[3:])
+    build(env)
+    assert [s for (s,) in env.query("SELECT status FROM lake.files")] == ["active"] * 2
+    assert sum(row[5] for row in grid(env) if row[7] != "filled") == 9
 
 
 def test_a_depth_held_over_a_kilometre_is_a_stuck_sounder(env):  # noqa: F811

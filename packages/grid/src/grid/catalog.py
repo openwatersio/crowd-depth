@@ -55,6 +55,11 @@ CREATE TABLE IF NOT EXISTS lake.cells (
   first DATE, last DATE, tvu FLOAT, kind VARCHAR, zoc TINYINT,
   depth_lon DOUBLE, depth_lat DOUBLE, cell_id SMALLINT, grid_version INTEGER
 );
+-- Active soundings still unconfirmed shoals after the cells build, which SOUNDG
+-- publishes flagged; "row" is the base row within the tile.
+CREATE TABLE IF NOT EXISTS lake.shoals (
+  tile_id INTEGER, "row" INTEGER, lon DOUBLE, lat DOUBLE, depth FLOAT, cell_id SMALLINT
+);
 """
 
 # A point's base row (1/3″ of latitude) within its 1° tile. The cells build bands and
@@ -62,7 +67,7 @@ CREATE TABLE IF NOT EXISTS lake.cells (
 BASE_ROW = "least(floor((p.lat - (p.tile_id // 360 - 90)) * 10800)::INTEGER, 10799)"
 
 # Partitioned by the 10° cell, so the cells build reads only its partition's rows.
-PARTITIONED = {"points": "cell_id", "cells": "cell_id", "qc_flags": "cell_id"}
+PARTITIONED = {"points": "cell_id", "cells": "cell_id", "qc_flags": "cell_id", "shoals": "cell_id"}
 
 # Points of active files, with the cross-source and same-vessel duplicates of
 # dedupe rules 4 and 5 removed. Rule 5: a noaa sounding inside the time span of
@@ -338,11 +343,11 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
                 # Moves rows inlined so far to Parquet, so the catalog each run downloads stays small.
                 con.execute("CALL ducklake_flush_inlined_data('lake')")
                 if final:
-                    # Rebuilds delete and reinsert cells, their flags and the cells'
-                    # marker, and DuckLake deletes by writing delete files, so the
+                    # Rebuilds delete and reinsert cells, their flags and shoals and the
+                    # cells' marker, and DuckLake deletes by writing delete files, so the
                     # replaced files stay live until rewritten.
                     # ponytail: points are rewritten by the weekly compaction, not here
-                    for table in ("cells", "qc_flags", "store_meta"):
+                    for table in ("cells", "qc_flags", "shoals", "store_meta"):
                         con.execute(f"CALL ducklake_rewrite_data_files('lake', '{table}')")
                     # A reader may still hold a catalog up to RETAIN old, so snapshots, the
                     # files only they reference, and old catalogs go once they pass it.

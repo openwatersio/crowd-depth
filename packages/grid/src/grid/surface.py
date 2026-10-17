@@ -9,7 +9,10 @@ sounding in every quadrant around a pixel, so it fills between tracks and never 
 past their ends. Depth areas and contours are cut from it; soundings never are.
 
 Each tile is a cloud-optimized GeoTIFF with three bands: depth (positive down), the
-distance in metres to the nearest sounding, and the soundings in the pixel.
+distance in metres to the nearest sounding, and the soundings in the pixel. The whole
+tile is interpolated, but only blocks with a sounding within the search radius are
+blurred, guarded, measured and written; the rest are left out of the file, and read
+as no data in every band.
 """
 
 import math
@@ -20,7 +23,9 @@ from pathlib import Path
 
 import numpy as np
 import rasterio
+import rasterio.shutil
 from rasterio.transform import from_bounds
+from rasterio.windows import Window
 from scipy.ndimage import distance_transform_edt, gaussian_filter, minimum_filter
 
 from .cells import BASE, CELL_SAMPLE, k_for
@@ -39,6 +44,9 @@ SIGMA_PX = 1.0
 # Base rows per pixel row and per pixel column.
 PIXEL_BASE = 2
 EARTH_M = 6378137.0
+# Pixels a side of the blocks a tile is worked and stored in; blocks with no sounding
+# within reach are skipped, and left out of the file.
+BLOCK = 512
 
 # Each surface pixel's soundings, from those QC accepted (not rejected, and not an
 # unconfirmed shoal unless something confirmed it), within the depths cells trust:
@@ -49,23 +57,28 @@ EARTH_M = 6378137.0
 # this tile's grid from its south-west corner; a neighboring tile's soundings get
 # numbers outside it, which interpolation reads as a margin.
 PIXELS = f"""
-WITH flags AS (
-  SELECT point_id, bool_or(flag = 'reject') AS rejected,
-    bool_or(flag = 'unconfirmed') AND NOT bool_or(flag = 'confirmed') AS unconfirmed
-  FROM lake.qc_flags WHERE cell_id = $partition AND qc_version = {QC_VERSION}
-  GROUP BY point_id
-),
-pts AS (
+WITH wanted AS MATERIALIZED (
   SELECT * FROM (
     SELECT p.point_id, p.lon, p.lat, p.depth_raw AS d,
       floor((p.lat - $lat0) * {BASE} / 2)::INTEGER AS py,
-      floor((p.lon - $lon0) * {BASE} / $k / 2)::INTEGER AS px,
-      coalesce(f.unconfirmed, false) AS unconfirmed
-    FROM active_points_in($partition, [$tile], $rlo, $rhi) p LEFT JOIN flags f USING (point_id)
-    WHERE p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M} AND NOT coalesce(f.rejected, false)
+      floor((p.lon - $lon0) * {BASE} / $k / 2)::INTEGER AS px
+    FROM active_points_in($partition, [$tile], $rlo, $rhi) p
+    WHERE p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M}
   )
   -- Only the pixels wanted: a neighbor's strip within the search radius, say.
   WHERE py BETWEEN $pylo AND $pyhi AND px BETWEEN $pxlo AND $pxhi
+),
+-- Only these points' flags, so memory follows the tile, not its whole partition.
+flags AS (
+  SELECT point_id, bool_or(flag = 'reject') AS rejected,
+    bool_or(flag = 'unconfirmed') AND NOT bool_or(flag = 'confirmed') AS unconfirmed
+  FROM lake.qc_flags WHERE cell_id = $partition AND qc_version = {QC_VERSION}
+    AND point_id IN (SELECT point_id FROM wanted)
+  GROUP BY point_id
+),
+pts AS (
+  SELECT w.*, coalesce(f.unconfirmed, false) AS unconfirmed
+  FROM wanted w LEFT JOIN flags f USING (point_id) WHERE NOT coalesce(f.rejected, false)
 ),
 sampled AS (
   SELECT a.*, hash(a.point_id) % greatest(1, ceil(n.n / {CELL_SAMPLE}))::UBIGINT = 0 AS keep
@@ -185,22 +198,55 @@ def build_tile(con, tile_id: int, partition: int, out: Path):
             ],
             check=True,
         )  # fmt: skip
-        with rasterio.open(grid) as src:
-            depth = src.read(1)
-    # Accumulated, not assigned: a sounding on the tile's north or east edge is its own
-    # group in SQL but shares the last pixel, and must not overwrite that pixel's values.
-    shoal = np.asarray(px["shoalest"], dtype=np.float64)
-    has_shoalest = ~np.isnan(shoal)
-    shoalest = np.full(depth.shape, np.inf, dtype=np.float32)
-    np.minimum.at(shoalest, (rows[has_shoalest], columns[has_shoalest]), shoal[has_shoalest])
-    count = np.zeros(depth.shape, dtype=np.float32)
-    np.add.at(count, (rows, columns), np.asarray(px["n"], dtype=np.float32))
-    unconfirmed = np.zeros(depth.shape, dtype=bool)
-    np.logical_or.at(unconfirmed, (rows, columns), np.asarray(px["unconfirmed"], dtype=bool))
-    depth = finish(depth, shoalest, unconfirmed)
-    distance = distance_m(count > 0, scale_x / cols, scale_y / ROWS)
-    distance[depth == NODATA] = NODATA
-    write(path, lon0, lat0, depth, distance, count)
+        # Accumulated, not assigned: a sounding on the tile's north or east edge is its
+        # own group in SQL but shares the last pixel, and must not overwrite its values.
+        shape = (ROWS, cols)
+        shoal = np.asarray(px["shoalest"], dtype=np.float64)
+        has_shoalest = ~np.isnan(shoal)
+        shoalest = np.full(shape, np.inf, dtype=np.float32)
+        np.minimum.at(shoalest, (rows[has_shoalest], columns[has_shoalest]), shoal[has_shoalest])
+        count = np.zeros(shape, dtype=np.float32)
+        np.add.at(count, (rows, columns), np.asarray(px["n"], dtype=np.float32))
+        unconfirmed = np.zeros(shape, dtype=bool)
+        np.logical_or.at(unconfirmed, (rows, columns), np.asarray(px["unconfirmed"], dtype=bool))
+        dx, dy = scale_x / cols, scale_y / ROWS
+        # A pixel has a depth only within the search radius of a point, and then has one
+        # of the tile's own soundings within it too: the quadrant facing into the tile
+        # needs one. So only blocks within that reach of a point have data, and a block's
+        # depths and distances depend only on pixels within that reach of it, or within
+        # the blur's (4σ), whichever is wider.
+        reach = (math.ceil(RADIUS_M / dy) + 1, math.ceil(RADIUS_M / dx) + 1)
+        blur = math.ceil(4 * SIGMA_PX)
+        halo = (max(reach[0], blur), max(reach[1], blur))
+        at = (np.concatenate([rows, ROWS - 1 - my.astype(np.int64)]),
+              np.concatenate([columns, mx.astype(np.int64)]))  # fmt: skip
+        # A point's reach touches at most two blocks each way, so its four corners'
+        # blocks are every block it reaches.
+        assert 2 * max(reach) < BLOCK, "the search radius reaches past a block"
+        blocks = set()
+        for sr in (-1, 1):
+            for sc in (-1, 1):
+                r = np.clip(at[0] + sr * reach[0], 0, ROWS - 1) // BLOCK
+                c = np.clip(at[1] + sc * reach[1], 0, cols - 1) // BLOCK
+                blocks |= set(zip(r.tolist(), c.tolist()))
+        sparse = Path(tmp) / "sparse.tif"
+        with rasterio.open(grid) as src, open_sparse(sparse, lon0, lat0, shape) as dst:
+            for br, bc in sorted(blocks):
+                r0, c0 = br * BLOCK, bc * BLOCK
+                r1, c1 = min(r0 + BLOCK, ROWS), min(c0 + BLOCK, cols)
+                wr0, wc0 = max(r0 - halo[0], 0), max(c0 - halo[1], 0)
+                wr1, wc1 = min(r1 + halo[0], ROWS), min(c1 + halo[1], cols)
+                win = np.s_[wr0:wr1, wc0:wc1]
+                depth = src.read(1, window=Window(wc0, wr0, wc1 - wc0, wr1 - wr0))
+                depth = finish(depth, shoalest[win], unconfirmed[win])
+                distance = distance_m(count[win] > 0, dx, dy)
+                distance[depth == NODATA] = NODATA
+                inner = np.s_[r0 - wr0 : r1 - wr0, c0 - wc0 : c1 - wc0]
+                dst.write(
+                    np.stack([depth[inner], distance[inner], count[r0:r1, c0:c1]]),
+                    window=Window(c0, r0, c1 - c0, r1 - r0),
+                )
+        rasterio.shutil.copy(sparse, path, driver="COG", compress="deflate", sparse_ok=True)
     candidates = tuple(
         np.asarray(px[c], dtype=np.float64)[has_shoalest]
         for c in ("shoalest_lon", "shoalest_lat", "shoalest")
@@ -236,16 +282,14 @@ def distance_m(sounded, dx, dy):
     return distance_transform_edt(~sounded, sampling=(dy, dx)).astype(np.float32)
 
 
-def write(path, lon0, lat0, depth, distance, count):
-    """A 1° tile's bands as a cloud-optimized GeoTIFF, at whatever size they are."""
-    rows, cols = depth.shape
-    transform = from_bounds(lon0, lat0, lon0 + 1, lat0 + 1, cols, rows)
-    profile = {
-        "driver": "COG", "width": cols, "height": rows, "count": 3, "dtype": "float32",
-        "crs": "EPSG:4326", "transform": transform, "nodata": NODATA, "compress": "deflate",
-    }  # fmt: skip
-    with rasterio.open(path, "w", **profile) as dst:
-        dst.write(np.stack([depth, distance, count]))
-        dst.set_band_description(1, "depth")
-        dst.set_band_description(2, "distance_m")
-        dst.set_band_description(3, "soundings")
+def open_sparse(path, lon0, lat0, shape):
+    """A tiled GeoTIFF for a 1° tile's bands, which leaves out blocks never written."""
+    rows, cols = shape
+    dst = rasterio.open(
+        path, "w", driver="GTiff", width=cols, height=rows, count=3, dtype="float32",
+        crs="EPSG:4326", transform=from_bounds(lon0, lat0, lon0 + 1, lat0 + 1, cols, rows),
+        nodata=NODATA, tiled=True, blockxsize=BLOCK, blockysize=BLOCK, sparse_ok=True,
+    )  # fmt: skip
+    for band, name in enumerate(("depth", "distance_m", "soundings"), start=1):
+        dst.set_band_description(band, name)
+    return dst
