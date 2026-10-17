@@ -223,11 +223,7 @@ def connect(catalog_path: str, data_url: str, temp_dir: str) -> duckdb.DuckDBPyC
                 os.environ.get("S3_REGION", "auto"),
             ],
         )
-    # Inlining keeps the small per-file writes to files and submission_meta in the
-    # catalog instead of a Parquet file each.
-    con.execute(
-        f"ATTACH 'ducklake:{catalog_path}' AS lake (DATA_PATH '{data_url}', DATA_INLINING_ROW_LIMIT 1000)"
-    )
+    attach(con, catalog_path, data_url)
     existing = {
         name
         for (name,) in con.execute(
@@ -241,6 +237,14 @@ def connect(catalog_path: str, data_url: str, temp_dir: str) -> duckdb.DuckDBPyC
         con.execute(f"ALTER TABLE lake.{table} SET PARTITIONED BY ({PARTITIONED[table]})")
     con.execute(ACTIVE_POINTS)
     return con
+
+
+def attach(con, catalog_path: str, data_url: str):
+    # Inlining keeps the small per-file writes to files and submission_meta in the
+    # catalog instead of a Parquet file each.
+    con.execute(
+        f"ATTACH 'ducklake:{catalog_path}' AS lake (DATA_PATH '{data_url}', DATA_INLINING_ROW_LIMIT 1000)"
+    )
 
 
 # Content hashes and the point ids derived from them must all come from one scheme, or
@@ -259,14 +263,27 @@ def check_hash_scheme(con):
         raise RuntimeError(f"store hashes with {scheme[0]}, this build with {HASH_SCHEME}")
 
 
+class Session:
+    """The connection open_store yields, which can also publish the catalog partway through a run."""
+
+    def __init__(self, con, publish):
+        self.con = con
+        self.publish = publish
+
+    def __getattr__(self, name):
+        return getattr(self.con, name)
+
+
 @contextmanager
 def open_store(store, write=True, ttl=timedelta(minutes=10)):
     """Yield a connection to the catalog the pointer names, and publish its result on success.
 
     The result is uploaded under a new key, and the pointer moves with a conditional
-    write against the version this run started from, so a run that lost its lock
-    can't overwrite a newer catalog and a crashed run leaves the last good one.
-    A read-only open takes no lock and publishes nothing.
+    write against the version this run last published or started from, so a run that
+    lost its lock can't overwrite a newer catalog and a crashed run leaves the last good
+    one. A long run can publish partway with `publish()`, between transactions, so a
+    failure later keeps what it had done. A read-only open takes no lock and publishes
+    nothing.
     """
     lock = Lock(store, ttl)
     if write:
@@ -282,34 +299,51 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
             pointer = store.get(POINTER)
             if pointer:
                 local.write_bytes(store.get(pointer[0].decode())[0])
+            base = pointer and pointer[1]
             data_url = store.url + "lake/"
             if isinstance(store, LocalObjects):
                 Path(data_url).mkdir(parents=True, exist_ok=True)
             con = connect(str(local), data_url, spill)
-            yield con
+            cutoff = datetime.now(UTC) - RETAIN
+
+            def publish(final=False):
+                nonlocal base, cutoff
+                if not write:
+                    raise RuntimeError("a read-only store publishes nothing")
+                # Moves rows inlined so far to Parquet, so the catalog each run downloads stays small.
+                con.execute("CALL ducklake_flush_inlined_data('lake')")
+                cutoff = datetime.now(UTC) - RETAIN
+                if final:
+                    # A reader may still hold a catalog up to RETAIN old, so snapshots, the
+                    # files only they reference, and old catalogs go once they pass it.
+                    older = {"cutoff": cutoff.replace(tzinfo=None)}  # session time zone is UTC
+                    con.execute(
+                        "CALL ducklake_expire_snapshots('lake', older_than => $cutoff)", older
+                    )
+                    con.execute(
+                        "CALL ducklake_cleanup_old_files('lake', older_than => $cutoff)", older
+                    )
+                con.execute("DETACH lake")
+                lock.check()
+                stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+                key = f"catalog/{stamp}-{uuid.uuid4().hex[:8]}.ducklake"
+                store.put(key, local.read_bytes(), if_none_match=True)
+                lock.check()  # the upload can take a while
+                if base:
+                    base = store.put(POINTER, key.encode(), if_match=base)
+                else:
+                    base = store.put(POINTER, key.encode(), if_none_match=True)
+                log.info("catalog now %s", key)
+                if not final:
+                    attach(con, str(local), data_url)
+                return key
+
+            yield Session(con, publish)
             if not write:
                 con.close()
                 return
-            # Moves rows inlined during the run to Parquet, so the catalog each run downloads stays small.
-            con.execute("CALL ducklake_flush_inlined_data('lake')")
-            # A reader may still hold a catalog up to RETAIN old, so snapshots, the files
-            # only they reference, and old catalogs go once they pass it.
-            cutoff = datetime.now(UTC) - RETAIN
-            older = {"cutoff": cutoff.replace(tzinfo=None)}  # session time zone is UTC
-            con.execute("CALL ducklake_expire_snapshots('lake', older_than => $cutoff)", older)
-            con.execute("CALL ducklake_cleanup_old_files('lake', older_than => $cutoff)", older)
-            con.execute("DETACH lake")
+            key = publish(final=True)
             con.close()
-            lock.check()
-            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
-            key = f"catalog/{stamp}-{uuid.uuid4().hex[:8]}.ducklake"
-            store.put(key, local.read_bytes(), if_none_match=True)
-            lock.check()  # the upload can take a while
-            if pointer:
-                store.put(POINTER, key.encode(), if_match=pointer[1])
-            else:
-                store.put(POINTER, key.encode(), if_none_match=True)
-            log.info("catalog now %s", key)
             for obj in store.list("catalog/")[0]:
                 if obj.key.endswith(".ducklake") and obj.key != key and obj.modified < cutoff:
                     store.delete(obj.key)
