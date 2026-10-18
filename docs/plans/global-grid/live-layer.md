@@ -28,9 +28,9 @@ Unconfirmed shoals are handled as in the grid: they publish as soundings with a 
 
 ### Corrections
 
-The plugin applies the grid's [corrections](README.md#3-corrections) in the same order:
+The layer is a chart, so it shows charted depths: depth below the waterline reduced to chart datum, never depth below the keel or transducer. The plugin applies the grid's [corrections](README.md#3-corrections) in the same order:
 
-- **Offsets:** the plugin's depth reference and transducer offsets.
+- **Offsets:** the plugin's depth reference and transducer offsets, which bring every sounding to depth below the waterline.
 - **Vessel calibration:** the vessel's own offset, scale and uncertainty, fetched from the grid's calibration ([Vessel calibration](README.md#vessel-calibration)). It needs the plugin's `SIGNALK-<uuid>` to match the vessel's `UNIQUE_ID` in the grid. A vessel without a calibration is marked uncalibrated, as the grid marks it.
 - **Tide:** the water level at each sounding's own time and place, from the same Slackwater engine the grid uses, which the plugin reaches through signalk-tides. The correction is applied when cells are built, so the log keeps raw depths and a better prediction or observed level can be applied later.
 - **Datum:** the grid's low-water chart datum, from the same separation source.
@@ -44,6 +44,8 @@ Cells use the grid's [resolution](README.md#resolution) and [statistic](README.m
 The statistic needs the soundings, not a running minimum. Accepted soundings are kept indexed by grid cell in the plugin's SQLite database, and a cell's statistic is recomputed from its own soundings when a new one lands in it. Interpolated cells within the radius of a changed cell are recomputed with it. A cell holds few soundings, so this stays cheap on a Raspberry Pi. A month of one boat's soundings, about 2.6M, is roughly 50–100 MB.
 
 ### Portrayal
+
+The live layer and the global overlay are each a chart the user turns on and off on their own. The plugin lists the global overlay as a chart resource pointing at its published PMTiles archive, alongside the live layer, so a user can show either, both, or neither.
 
 The live layer has the overlay's schema: S-57 `DEPARE`, `DEPCNT`, `SOUNDG` and `M_QUAL` vector tiles, built with the grid's band levels, contour tiers and rounding toward shoal. The portrayal code shared with Seascape ([#146](https://github.com/openwatersio/crowd-depth/issues/146)) covers the live layer too.
 
