@@ -26,6 +26,7 @@ from pmtiles.convert import mbtiles_to_pmtiles
 from scipy.ndimage import binary_dilation
 
 from . import cells, surface
+from .catalog import MIN_DEPTH_M
 from .cells import GRID_VERSION
 from .qc import MAX_DEPTH_M
 
@@ -183,9 +184,12 @@ def feature(lon, lat, d, unconfirmed, display, prime=False):
 
 
 # S-4 B-411 isobaths in metres, positive down, as Seascape charts them. Each is also a
-# depth-area band edge: a band holds depths from its level to the next.
-LEVELS = [0, 2, 5, 10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 3000, 4000, 5000, 6000]
-LEVELS += [8000, 10000]
+# depth-area band edge: a band holds depths from its level to the next. Tide-reduced
+# depths can be negative, drying heights, so the first band holds everything that dries,
+# and 0 m is the drying line.
+DRYING_M = MIN_DEPTH_M
+LEVELS = [DRYING_M, 0, 2, 5, 10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 3000, 4000]
+LEVELS += [5000, 6000, 8000, 10000]
 # Isobaths drawn below each zoom ceiling (Seascape's CONTOUR_TIERS); every one from the last on.
 CONTOUR_TIERS = [
     (6, [10, 20, 50, 100, 200, 1000, 2000, 4000]),
@@ -199,8 +203,9 @@ PRIME_MAX_DEPTH_M = 200
 # Crowd positions are good to about 10 m.
 POSACC_M = 10
 INFORM = (
-    "Crowdsourced soundings from Open Waters and NOAA's CSB archive, not corrected for tide, "
-    "datum or sound speed."
+    "Crowdsourced soundings from Open Waters and NOAA's CSB archive. Where tide levels and "
+    "vessel calibrations are available, depths are reduced for tide and corrected for vessel "
+    "offsets; they are not corrected for sound speed."
 )
 
 
@@ -405,6 +410,35 @@ def write(features, path):
     return count
 
 
+def attribution(con):
+    """The tiles' credit line: the soundings' sources, plus the tide stations and surveyed
+    references the corrections used, whose licenses ask for credit."""
+    credits = ["Crowd Depth, NOAA DCDB crowdsourced bathymetry"]
+    if con.execute("SELECT count(*) FROM lake.tide_levels").fetchone()[0]:
+        credits.append("tides from Slackwater (https://openwaters.io/tides/slackwater/)")
+        credits += [
+            a
+            for (a,) in con.execute(
+                """SELECT DISTINCT attribution FROM lake.tide_stations
+                WHERE license <> 'public domain' AND attribution IS NOT NULL
+                  AND station_id IN (SELECT DISTINCT station_id FROM lake.tide_levels)
+                ORDER BY 1"""
+            ).fetchall()
+        ]
+    if con.execute("SELECT count(*) FROM lake.calibration WHERE status = 'anchored'").fetchone()[0]:
+        names = {"s102": "NOAA S-102", "bluetopo": "NOAA BlueTopo"}
+        used = sorted(
+            {
+                names.get(source, "surveyed references")
+                for (source,) in con.execute(
+                    "SELECT DISTINCT source FROM lake.reference_pixels WHERE depth IS NOT NULL"
+                ).fetchall()
+            }
+        )
+        credits.append("vessels calibrated against " + " and ".join(used))
+    return "; ".join(credits)
+
+
 def build(con, out):
     """Write the layers as line-delimited GeoJSON in `out`, then tile them into
     `out/overlay.pmtiles`. Returns the feature counts.
@@ -417,6 +451,13 @@ def build(con, out):
     built = con.execute("SELECT value FROM lake.store_meta WHERE key = 'cells'").fetchone()
     if built is None or built[0] != cells.inputs(con):
         raise RuntimeError("cells aren't current with the store; run `grid cells` first")
+    # Offsets solved against other tide levels would leave a tide in, or take one out twice.
+    solved = con.execute(
+        "SELECT value FROM lake.store_meta WHERE key = 'calibration_tide'"
+    ).fetchone()
+    applied = con.execute("SELECT count(*) FROM lake.file_offsets").fetchone()[0]
+    if applied and (solved is None or solved[0] != cells.tides(con)):
+        raise RuntimeError("tide levels changed since calibration; run `grid calibrate` first")
     out.mkdir(parents=True, exist_ok=True)
     surfaces = out / "surface"
     # Only last build's tiles: a tile with no soundings now must not linger.
@@ -452,7 +493,7 @@ def build(con, out):
             "--detect-shared-borders",
             "--no-tiny-polygon-reduction",
             *("-n", "Crowd Depth", "-N", f"Crowd Depth grid {GRID_VERSION}, built {built}"),
-            *("-A", "Crowd Depth, NOAA DCDB crowdsourced bathymetry"),
+            *("-A", attribution(con)),
             str(out / "soundings.geojsons"),
             str(out / "areas.geojsons"),
         ],
