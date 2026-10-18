@@ -232,7 +232,7 @@ pts AS (
     -- QC rejects these too; cells never trust that QC saw every point. Judged on the raw
     -- depth: a corrected one may honestly be negative, a drying height.
     AND a.depth_raw > 0 AND a.depth_raw <= {MAX_DEPTH_M} AND a.depth >= {MIN_DEPTH_M}
-    AND NOT a.excluded
+    AND NOT a.excluded AND NOT a.awaiting_tide
 ),
 idx AS (
   SELECT *,
@@ -362,7 +362,7 @@ WHERE from_track AND (outlier IS NULL OR point_id IN (SELECT point_id FROM confi
 # so its row.
 TILE_POINTS = f"""
 SELECT point_id, tile_id, cell_id, unique_id, time, lon, lat, depth_raw, depth, tide, offset_m,
-  sigma, excluded, {BASE_ROW} AS r
+  sigma, excluded, awaiting_tide, {BASE_ROW} AS r
 FROM corrected_points_in($partition, $tiles, $rlo, $rhi) p
 """
 
@@ -376,7 +376,8 @@ SELECT p.tile_id, p.r,
     ::INTEGER, {BASE} // {K_LIST}[p.tile_id // 360 - 90 + 91] - 1) AS c,
   p.lon, p.lat, p.depth_raw, p.depth
 FROM tile_points p
-WHERE p.point_id IN (
+-- A segment too deep to correct publishes nothing, its shoals included.
+WHERE NOT p.excluded AND NOT p.awaiting_tide AND p.point_id IN (
   SELECT point_id FROM lake.qc_flags
   WHERE cell_id = $partition AND flag = 'unconfirmed' AND qc_version = {QC_VERSION}
   EXCEPT

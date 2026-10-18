@@ -26,7 +26,7 @@ from pmtiles.convert import mbtiles_to_pmtiles
 from scipy.ndimage import binary_dilation
 
 from . import cells, surface
-from .catalog import MIN_DEPTH_M
+from .catalog import MIN_DEPTH_M, TIDE_CELL
 from .cells import GRID_VERSION
 from .qc import MAX_DEPTH_M
 
@@ -420,7 +420,7 @@ def attribution(con):
             a
             for (a,) in con.execute(
                 """SELECT DISTINCT attribution FROM lake.tide_stations
-                WHERE license <> 'public domain' AND attribution IS NOT NULL
+                WHERE lower(coalesce(license, '')) <> 'public domain' AND attribution IS NOT NULL
                   AND station_id IN (SELECT DISTINCT station_id FROM lake.tide_levels)
                 ORDER BY 1"""
             ).fetchall()
@@ -451,6 +451,16 @@ def build(con, out):
     built = con.execute("SELECT value FROM lake.store_meta WHERE key = 'cells'").fetchone()
     if built is None or built[0] != cells.inputs(con):
         raise RuntimeError("cells aren't current with the store; run `grid cells` first")
+    # Once a store reduces tide, every area must have been seen by `grid tide`: a sounding
+    # in one it hasn't would publish raw, deeper than chart datum.
+    if (
+        con.execute("SELECT count(*) FROM lake.tide_stations").fetchone()[0]
+        and con.execute(
+            f"""SELECT count(*) FROM lake.points p
+        WHERE {TIDE_CELL} NOT IN (SELECT tide_cell FROM lake.tide_cells)"""
+        ).fetchone()[0]
+    ):
+        raise RuntimeError("soundings in areas `grid tide` hasn't seen; run `grid tide` first")
     # Offsets solved against other tide levels would leave a tide in, or take one out twice.
     solved = con.execute(
         "SELECT value FROM lake.store_meta WHERE key = 'calibration_tide'"

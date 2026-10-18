@@ -36,12 +36,19 @@ if (process.argv[2] === "stations") {
 } else if (process.argv[2] === "levels") {
   for await (const line of createInterface({ input: process.stdin })) {
     const { station, start, end, step } = JSON.parse(line);
-    const { timeline } = findStation(station).getTimelinePrediction({
-      start: new Date(start * 1000),
-      end: new Date(end * 1000),
-      timeFidelity: step,
-    });
-    console.log(JSON.stringify([station, timeline.map((p) => [p.time.getTime() / 1000, p.level])]));
+    // A station the engine can't predict gives an empty series: that day goes without.
+    let series = [];
+    try {
+      const { timeline } = findStation(station).getTimelinePrediction({
+        start: new Date(start * 1000),
+        end: new Date(end * 1000),
+        timeFidelity: step,
+      });
+      series = timeline.map((p) => [p.time.getTime() / 1000, p.level]);
+    } catch (error) {
+      console.error(`${station}: ${error.message}`);
+    }
+    console.log(JSON.stringify([station, series]));
   }
 } else {
   console.error("usage: node predict.mjs stations|levels");

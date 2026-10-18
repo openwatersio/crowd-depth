@@ -65,7 +65,7 @@ WITH wanted AS MATERIALIZED (
       floor((p.lon - $lon0) * {BASE} / $k / 2)::INTEGER AS px
     FROM corrected_points_in($partition, [$tile], $rlo, $rhi) p
     WHERE p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M} AND p.depth >= {MIN_DEPTH_M}
-      AND NOT p.excluded
+      AND NOT p.excluded AND NOT p.awaiting_tide
   )
   -- Only the pixels wanted: a neighbor's strip within the search radius, say.
   WHERE py BETWEEN $pylo AND $pyhi AND px BETWEEN $pxlo AND $pxhi

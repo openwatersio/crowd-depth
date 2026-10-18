@@ -22,6 +22,7 @@ import math
 import os
 import subprocess
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -33,6 +34,7 @@ from scipy.spatial import cKDTree
 
 from . import cells
 from .catalog import TIDE_CELL
+from .sources import EARLIEST
 
 log = logging.getLogger(__name__)
 
@@ -51,9 +53,9 @@ PREDICT = Path(
     or Path(__file__).resolve().parents[2] / "slackwater" / "predict.mjs"
 )
 COOPS = "https://api.tidesandcurrents.noaa.gov"
-FETCHERS = 4
+FETCHERS = 1
 # CO-OPS errors that mean a gauge has no residual to give, rather than a failed request.
-NO_RESIDUAL = ("no data", "no mllw", "don't have predictions")
+NO_RESIDUAL = ("no data", "data was found", "no mllw", "don't have predictions")
 # CO-OPS lists about 300 water level gauges.
 MIN_GAUGES = 100
 # Storm surges reach about 4 m (Sandy, 2012); a larger residual is a faulty reading.
@@ -77,14 +79,17 @@ EARTH_KM = 6371.0
 
 def node(mode: str, lines=()) -> list:
     """Run the Slackwater helper in `mode`, sending `lines` as JSON; its JSON lines back."""
-    out = subprocess.run(
+    run = subprocess.run(
         ["node", str(PREDICT), mode],
         input="".join(json.dumps(x) + "\n" for x in lines),
         capture_output=True,
         text=True,
-        check=True,
         timeout=NODE_TIMEOUT_S,
-    ).stdout
+        check=False,
+    )
+    if run.returncode:
+        raise RuntimeError(f"Slackwater helper failed: {run.stderr.strip()[-2000:]}")
+    out = run.stdout
     return [json.loads(x) for x in out.splitlines()]
 
 
@@ -109,6 +114,11 @@ def _get(url: str, params: dict) -> dict:
         try:
             with urllib.request.urlopen(url, timeout=60) as r:
                 return json.load(r)
+        except urllib.error.HTTPError as e:
+            if attempt == 3:
+                raise
+            # CO-OPS refuses bursts with 403 or 429 for a while; back off well past that.
+            time.sleep(15 * 2**attempt if e.code in (403, 429) else 2**attempt)
         except OSError:
             if attempt == 3:
                 raise
@@ -183,9 +193,9 @@ def eligible(station) -> bool:
     """A station levels may come from: openly licensed, harmonics Slackwater accepts, and
     levels on a chart datum. A lake gauge's lowest low water comes from its level record,
     not the tide, so a lake (LLWLT with almost no diurnal range) isn't tidal."""
-    lake = station.get("chart_datum") == "LLWLT" and not (
-        (station.get("diurnal_range") or 0) >= LAKE_RANGE_M
-    )
+    # A station without the range to judge by is taken as tidal.
+    span = station.get("diurnal_range")
+    lake = station.get("chart_datum") == "LLWLT" and span is not None and span < LAKE_RANGE_M
     return bool(
         station["commercial_use"]
         and station["accepted"]
@@ -195,7 +205,9 @@ def eligible(station) -> bool:
     )
 
 
-def load_stations(con, stations=slackwater_stations, gauges=coops_gauges, version=None):
+def load_stations(
+    con, stations=slackwater_stations, gauges=coops_gauges, version=None, accept_departures=False
+):
     """Bring `tide_stations` up to Slackwater's current list. New eligible stations join
     with new ids; a station gone from the list or no longer eligible leaves, with its
     levels. When the engine or database `version` changes, every station's details and
@@ -207,9 +219,14 @@ def load_stations(con, stations=slackwater_stations, gauges=coops_gauges, versio
     have = dict(con.execute("SELECT station, station_id FROM lake.tide_stations").fetchall())
     gone = [sid for st, sid in have.items() if st not in rows]
     # A changed filter or a broken release, not stations retired one by one.
-    if len(have) >= GUARDED_STATIONS and len(gone) > MAX_LEAVING * len(have):
+    if (
+        not accept_departures
+        and len(have) >= GUARDED_STATIONS
+        and len(gone) > MAX_LEAVING * len(have)
+    ):
         raise RuntimeError(
-            f"{len(gone)} of {len(have)} tide stations would leave at once; check the release"
+            f"{len(gone)} of {len(have)} tide stations would leave at once; check the release,"
+            " and run `grid tide --accept-departures` if they should"
         )
     stored = con.execute("SELECT value FROM lake.store_meta WHERE key = 'slackwater'").fetchone()
     refresh = bool(have) and version is not None and (stored is None or stored[0] != version)
@@ -266,6 +283,7 @@ def assign_cells(con):
         f"SELECT DISTINCT {TIDE_CELL} AS tide_cell, tile_id FROM lake.points p"
     ).fetchnumpy()
     con.execute("CREATE OR REPLACE TEMP TABLE moved_cells (tide_cell BIGINT, tile_id INTEGER)")
+    con.execute("CREATE OR REPLACE TEMP TABLE new_cells (tide_cell BIGINT)")
     if not len(cells_["tide_cell"]):
         return
     lat = (cells_["tide_cell"] // 18000 + 0.5) / 50 - 90
@@ -291,7 +309,7 @@ def assign_cells(con):
     )
     # A cell new to the table had no levels to change; its days' levels mark it if it gets any.
     con.execute(
-        """CREATE OR REPLACE TEMP TABLE new_cells AS SELECT tide_cell FROM moved_cells
+        """INSERT INTO new_cells SELECT tide_cell FROM moved_cells
         WHERE tide_cell NOT IN (SELECT tide_cell FROM lake.tide_cells)"""
     )
     con.execute(
@@ -306,20 +324,64 @@ def assign_cells(con):
     )
     con.unregister("assign_np")
     con.execute("DELETE FROM moved_cells WHERE tide_cell IN (SELECT tide_cell FROM new_cells)")
-    con.execute("DROP TABLE new_cells")
 
 
 def month_end(month: date) -> date:
     return (month.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
 
 
-def fetch_residuals(con, days, today, residuals=coops_residuals):
-    """Fetch the gauge months that `days` (gauge, day) need and don't have."""
-    have = set(con.execute("SELECT gauge, month FROM lake.tide_residual_months").fetchall())
-    months = sorted({(g, d.replace(day=1)) for g, d in days if g} - have)
-    # A few at a time: each month is two requests of a few seconds.
+def fetch_residuals(con, months, today, residuals=coops_residuals):
+    """Fetch gauge `months` (gauge, first day), replacing what is kept for each. A month
+    CO-OPS can't give now keeps what it had, or is recorded open if it had nothing, so its
+    days take predictions alone until a later run gets it. Returns the months fetched."""
+
+    def fetch(m):
+        try:
+            return residuals(*m)
+        except (OSError, ValueError, RuntimeError) as e:
+            log.warning("tide: gauge %s %s not fetched (%s); kept as it was", *m, e)
+            return None
+
+    fetched = []
+    # One at a time: CO-OPS refuses bursts.
     with ThreadPoolExecutor(FETCHERS) as pool:
-        for (gauge, month), rows in zip(months, pool.map(lambda m: residuals(*m), months)):
+        for (gauge, month), rows in zip(months, pool.map(fetch, months)):
+            key = {"gauge": gauge, "month": month}
+            stored = con.execute(
+                """SELECT count(*) FROM lake.tide_residuals
+                WHERE gauge = $gauge AND date_trunc('month', time)::DATE = $month""",
+                key,
+            ).fetchone()[0]
+            # An empty answer where data was kept is an outage, not the gauge's record.
+            if rows is None or (not rows and stored):
+                con.execute(
+                    """INSERT INTO lake.tide_residual_months SELECT $gauge, $month, DATE '1900-01-01'
+                    WHERE NOT EXISTS (SELECT 1 FROM lake.tide_residual_months
+                      WHERE gauge = $gauge AND month = $month)""",
+                    key,
+                )
+                continue
+            con.execute("BEGIN")
+            # The month's levels are done again with the new residuals; moved aside in the
+            # same transaction, so a run that stops after it can't leave the month final
+            # with levels from the old ones.
+            con.execute(
+                """INSERT INTO old_levels SELECT l.* FROM lake.tide_levels l
+                JOIN lake.tide_stations s USING (station_id)
+                WHERE s.gauge = $gauge AND date_trunc('month', l.slot)::DATE = $month""",
+                key,
+            )
+            con.execute(
+                """DELETE FROM lake.tide_levels WHERE station_id IN (
+                  SELECT station_id FROM lake.tide_stations WHERE gauge = $gauge)
+                AND date_trunc('month', slot)::DATE = $month""",
+                key,
+            )
+            con.execute(
+                """DELETE FROM lake.tide_residuals
+                WHERE gauge = $gauge AND date_trunc('month', time)::DATE = $month""",
+                key,
+            )
             if rows:
                 times, values = zip(*rows)
                 insert(
@@ -332,10 +394,18 @@ def fetch_residuals(con, days, today, residuals=coops_residuals):
                     },
                 )
             con.execute(
+                "DELETE FROM lake.tide_residual_months WHERE gauge = $gauge AND month = $month",
+                key,
+            )
+            con.execute(
                 "INSERT INTO lake.tide_residual_months VALUES (?, ?, ?)", [gauge, month, today]
             )
+            con.execute("COMMIT")
+            fetched.append((gauge, month))
+            con.checkpoint()
     if months:
-        log.info("tide: fetched %d gauge months", len(months))
+        log.info("tide: fetched %d gauge months of %d", len(fetched), len(months))
+    return fetched
 
 
 def build(
@@ -347,6 +417,7 @@ def build(
     version=None,
     batch_days=2000,
     today=None,
+    accept_departures=False,
 ):
     """Tide levels for every station day soundings need and don't have yet; returns how
     many days.
@@ -370,42 +441,32 @@ def build(
             or [None]
         )[0]
     ):
+        probe(con, levels)
         con.execute("INSERT INTO old_levels SELECT * FROM lake.tide_levels")
-    load_stations(con, stations, gauges, version)
+    load_stations(con, stations, gauges, version, accept_departures)
     assign_cells(con)
-    # Gauge months that aren't final are fetched again, and their levels done again.
-    con.execute(
-        f"""CREATE OR REPLACE TEMP TABLE open_months AS SELECT gauge, month
-        FROM lake.tide_residual_months
-        WHERE fetched < last_day(month) + INTERVAL {RECENT_DAYS} DAY"""
-    )
-    con.execute(
-        """INSERT INTO old_levels SELECT l.* FROM lake.tide_levels l
-        JOIN lake.tide_stations s USING (station_id)
-        JOIN open_months m ON m.gauge = s.gauge AND m.month = date_trunc('month', l.slot)::DATE"""
-    )
-    con.execute(
-        """DELETE FROM lake.tide_levels WHERE (station_id, slot) IN (
-          SELECT station_id, slot FROM old_levels)"""
-    )
-    con.execute(
-        """DELETE FROM lake.tide_residuals WHERE (gauge, date_trunc('month', time)::DATE) IN (
-          SELECT gauge, month FROM open_months)"""
-    )
-    con.execute(
-        """DELETE FROM lake.tide_residual_months WHERE (gauge, month) IN (
-          SELECT gauge, month FROM open_months)"""
-    )
+    # Gauge months that aren't final are fetched again, and the levels of those that came
+    # back are done again; one CO-OPS can't give now keeps its levels.
+    open_ = con.execute(
+        f"""SELECT gauge, month FROM lake.tide_residual_months
+        WHERE fetched < last_day(month) + INTERVAL {RECENT_DAYS} DAY ORDER BY ALL"""
+    ).fetchall()
+    fetch_residuals(con, open_, today, residuals)
     need = con.execute(
         f"""SELECT DISTINCT c.station_id, s.station, s.gauge,
           date_trunc('day', p.time)::DATE AS day
         FROM lake.points p JOIN lake.tide_cells c ON c.tide_cell = {TIDE_CELL}
         JOIN lake.tide_stations s USING (station_id)
-        WHERE p.time IS NOT NULL AND (c.station_id, date_trunc('day', p.time)::DATE) NOT IN (
+        -- Only times QC can accept: a file's 1601 or next-year timestamps get no level.
+        WHERE p.time >= TIMESTAMP '{EARLIEST}' AND p.time <= now()::TIMESTAMP + INTERVAL 1 DAY
+          AND (c.station_id, date_trunc('day', p.time)::DATE) NOT IN (
           SELECT DISTINCT station_id, slot::DATE FROM lake.tide_levels)
         ORDER BY ALL"""
     ).fetchall()
-    fetch_residuals(con, [(g, d) for _, _, g, d in need], today, residuals)
+    have = set(con.execute("SELECT gauge, month FROM lake.tide_residual_months").fetchall())
+    fetch_residuals(
+        con, sorted({(g, d.replace(day=1)) for _, _, g, d in need if g} - have), today, residuals
+    )
     for i in range(0, len(need), batch_days):
         chunk = need[i : i + batch_days]
         starts = [int(datetime.combine(d, datetime.min.time(), UTC).timestamp()) for *_, d in chunk]
@@ -415,12 +476,14 @@ def build(
                 for (_, station, _, _), t0 in zip(chunk, starts)
             ]
         )
-        # A level the engine couldn't give (null, NaN) leaves its day without levels.
+        # A day the engine couldn't give whole (a null or NaN level, missing points) gets
+        # no levels, so it is asked for again rather than kept with holes.
         rows = [
             (sid, day, t, h)
             for (sid, _, _, day), s in zip(chunk, series)
+            if len(s) == 86400 // SLOT_S + 1
+            and all(h is not None and math.isfinite(h) for _, h in s)
             for t, h in s
-            if h is not None and math.isfinite(h)
         ]
         if not rows:
             continue
@@ -466,17 +529,46 @@ def build(
         LEFT JOIN lake.tide_cells c ON c.tide_cell = {TIDE_CELL}
         WHERE p.tile_id IN (SELECT tile_id FROM moved_cells)
           OR (c.station_id, date_trunc('day', p.time)::DATE) IN (SELECT station_id, day FROM days)
-          -- Days a station that left had levels for: its cells moved, and are in moved_cells.
+          -- A new cell whose station already had levels for its days.
+          OR (c.tide_cell IN (SELECT tide_cell FROM new_cells)
+            AND (c.station_id, date_trunc('day', p.time)::DATE) IN (
+              SELECT DISTINCT station_id, slot::DATE FROM lake.tide_levels))
         """,
         {},
         "tide",
         was_settled,
     )
     con.unregister("need_np")
-    for table in ("predicted", "old_levels", "moved_cells", "open_months"):
+    for table in ("predicted", "old_levels", "moved_cells", "new_cells"):
         con.execute(f"DROP TABLE IF EXISTS {table}")
     log.info("tide: %d station days, %d tiles changed", len(need), changed)
     return len(need)
+
+
+def probe(con, levels, n=20):
+    """Before a new engine replaces every level, check it predicts a sample of the days
+    already levelled; a release that can't would otherwise leave the whole store untided."""
+    days = con.execute(
+        f"""SELECT DISTINCT s.station, l.slot::DATE FROM lake.tide_levels l
+        JOIN lake.tide_stations s USING (station_id) USING SAMPLE {n} ROWS"""
+    ).fetchall()
+    if not days:
+        return
+    starts = [int(datetime.combine(d, datetime.min.time(), UTC).timestamp()) for _, d in days]
+    series = levels(
+        [
+            {"station": st, "start": t0, "end": t0 + 86400, "step": SLOT_S}
+            for (st, _), t0 in zip(days, starts)
+        ]
+    )
+    whole = sum(
+        len(s) == 86400 // SLOT_S + 1 and all(h is not None and math.isfinite(h) for _, h in s)
+        for s in series
+    )
+    if whole < len(days) / 2:
+        raise RuntimeError(
+            f"the new Slackwater engine predicts {whole} of {len(days)} sample days; levels kept"
+        )
 
 
 # Each predicted half hour of a station day, plus its gauge's residual where the gauge

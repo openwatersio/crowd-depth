@@ -212,7 +212,7 @@ def test_shoals_are_the_soundings_nothing_confirmed_or_rejected():
     tile = (LAT0 + 90) * 360 + LON0 + 180
     con.execute(
         "CREATE TABLE tile_points AS SELECT unnest(range(1, 6)) AS point_id, ? AS tile_id,"
-        " 5000 AS r, ? AS lon, ? AS lat, 3.0 AS depth_raw, 3.0 AS depth",
+        " 5000 AS r, ? AS lon, ? AS lat, 3.0 AS depth_raw, 3.0 AS depth, false AS excluded, false AS awaiting_tide",
         [tile, *at(5000, 7)],
     )
     v = qc.QC_VERSION

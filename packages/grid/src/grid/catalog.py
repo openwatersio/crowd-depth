@@ -91,6 +91,10 @@ CREATE TABLE IF NOT EXISTS lake.calibration (
   se_m FLOAT, status VARCHAR, anchor_pixels INTEGER, anchor_transits INTEGER,
   crossing_transits INTEGER
 );
+-- Transits that disagree with their segment by more than a step, left uncalibrated.
+CREATE TABLE IF NOT EXISTS lake.calibration_outliers (
+  file_id BIGINT, vessel VARCHAR, transit_m FLOAT, segment_m FLOAT, content_hash VARCHAR
+);
 CREATE TABLE IF NOT EXISTS lake.file_offsets (
   file_id BIGINT, vessel VARCHAR, offset_m FLOAT, se_m FLOAT, excluded BOOLEAN
 );
@@ -102,6 +106,7 @@ CREATE TABLE IF NOT EXISTS lake.tile_changes (tile_id INTEGER, reason VARCHAR, c
 MIGRATIONS = """
 ALTER TABLE lake.cells ADD COLUMN IF NOT EXISTS tided INTEGER;
 ALTER TABLE lake.cells ADD COLUMN IF NOT EXISTS calibrated INTEGER;
+ALTER TABLE lake.calibration_outliers ADD COLUMN IF NOT EXISTS content_hash VARCHAR;
 """
 
 # A corrected depth past this is no drying height but a correction gone wrong; cells, the
@@ -213,6 +218,9 @@ p AS (
   LEFT JOIN lake.file_offsets o ON o.file_id = p.file_id AND o.vessel = p.unique_id
 )
 SELECT * EXCLUDE (tide_sigma, se_m),
+  -- A station is in reach but its level for this day isn't made yet: the raw depth would
+  -- read deeper than chart datum whenever the tide is above it.
+  tide IS NULL AND tide_station IS NOT NULL AS awaiting_tide,
   (depth_raw - coalesce(tide, 0) - coalesce(offset_m, 0))::FLOAT AS depth,
   sqrt(coalesce(tide_sigma, {UNTIDED_SIGMA}) ^ 2 + coalesce(se_m, {UNCALIBRATED_SIGMA}) ^ 2)
     AS sigma
@@ -466,6 +474,7 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
                         "shoals",
                         "store_meta",
                         "calibration",
+                        "calibration_outliers",
                         "file_offsets",
                         "tile_changes",
                         "tide_cells",

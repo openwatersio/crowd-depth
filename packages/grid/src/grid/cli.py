@@ -83,8 +83,13 @@ def main(argv=None):
     )
     c.add_argument("source", choices=SOURCES)
     sub.add_parser("qc", help="Flag impossible values, jumps and spikes along each track")
-    sub.add_parser(
+    td = sub.add_parser(
         "tide", help="Tide levels for the soundings' station days, from Slackwater and CO-OPS"
+    )
+    td.add_argument(
+        "--accept-departures",
+        action="store_true",
+        help="Let more than a tenth of the store's stations leave in one run",
     )
     ca = sub.add_parser("calibrate", help="Solve each vessel step segment's vertical offset")
     ca.add_argument(
@@ -93,6 +98,11 @@ def main(argv=None):
         default=[],
         help="Sample this surveyed reference at new pixels first: s102, bluetopo, or a file or"
         " directory of their rasters; repeat for more, and the least uncertain at a pixel wins",
+    )
+    ca.add_argument(
+        "--accept-losses",
+        action="store_true",
+        help="Let a run drop more than half of the store's calibrated segments",
     )
     cl = sub.add_parser("cells", help="Run QC, then rebuild every grid cell, or a region's")
     where = cl.add_mutually_exclusive_group()
@@ -135,11 +145,11 @@ def main(argv=None):
         elif args.command == "qc":
             qc.run(con)
         elif args.command == "tide":
-            tide.build(con)
+            tide.build(con, accept_departures=args.accept_departures)
         elif args.command == "calibrate":
             # Calibration reads track QC's flags and tide-reduced depths.
             qc.run(con, missing_only=True)
-            calibrate.run(con, args.reference)
+            calibrate.run(con, args.reference, args.accept_losses)
         elif args.command == "cells":
             # Cells read QC's flags: QC any batch that hasn't been at this version.
             qc.run(con, missing_only=True)

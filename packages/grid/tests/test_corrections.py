@@ -190,11 +190,11 @@ def test_steps_split_where_offsets_move_and_not_on_noise():
     assert calibrate.steps(np.concatenate([np.full(10, -1.0), np.full(10, -1.2)])) == []
 
 
-def reference(path, cols, res=4, elevation=-10.0):
+def reference(path, cols, res=4, elevation=-10.0, rows=(4990, 5010)):
     """A flat surveyed seabed 10 m deep (NAVD88, separation 0) over base columns `cols`
     of rows 4990-5010, in UTM metres as BlueTopo is."""
-    w, s = at(4990, cols[0], 0, 0)
-    e, n = at(5010, cols[1], 0, 0)
+    w, s = at(rows[0], cols[0], 0, 0)
+    e, n = at(rows[1], cols[1], 0, 0)
     crs = "EPSG:32618"
     left, bottom, right, top = transform_bounds("EPSG:4326", crs, w, s, e, n)
     width, height = round((right - left) / res), round((top - bottom) / res)
@@ -655,9 +655,9 @@ def test_a_catalog_tile_with_no_link_yet_is_tried_again(tmp_path):
 
 
 def test_a_segment_reading_too_deep_to_correct_is_left_out(env, tmp_path, monkeypatch):  # noqa: F811
-    # With the bound set below A's -0.5 m, A reads deeper than any offset allowed.
-    monkeypatch.setattr(calibrate, "OFFSET_RANGE_M", (-10.0, -0.6))
-    calibrated(env, FLEET, reference(tmp_path / "ref.tif", (0, 110)), monkeypatch)
+    # A reads 4 m deep: past any plausible offset, and in the unsafe direction.
+    deep = [transit(1 + i, "AQM-A", 14.0, (0, 240), i) for i in range(3)]
+    calibrated(env, [*deep, *FLEET[3:]], reference(tmp_path / "ref.tif", (0, 110)), monkeypatch)
     assert segments(env)[("AQM-A", 0)][1] == "rejected"
     excluded = {u for u, *_, x in corrected(env, "excluded") if x}
     assert excluded == {"AQM-A"}
@@ -702,7 +702,7 @@ def test_soundings_tide_hasnt_seen_stay_out_of_calibration(env, tmp_path, monkey
 
 def test_a_gauges_weather_holds_through_the_months_last_half_hour(env):  # noqa: F811
     lon, lat = at(5000, 0)
-    last = (datetime(2026, 10, 31, 23, 45) - T0).total_seconds()
+    last = (datetime(2026, 9, 30, 23, 45) - T0).total_seconds()
     put(env, 1, [(last, lon, lat, 5.0)])
     env.run("noaa")
     gauges = [{"id": "g1", "lon": lon + 0.2, "lat": lat + 0.1}]
@@ -712,3 +712,338 @@ def test_a_gauges_weather_holds_through_the_months_last_half_hour(env):  # noqa:
         )
     [(*_, h, _, _)] = corrected(env)
     assert h == pytest.approx(1 + (23.75 / 24) + 0.1, abs=1e-6)
+
+
+def test_a_gauge_that_cant_be_reached_falls_back_to_predictions_and_retries(env):  # noqa: F811
+    lon, lat = at(5000, 0)
+    put(env, 1, [(0, lon, lat, 5.0)])
+    env.run("noaa")
+    gauges = [{"id": "g1", "lon": lon + 0.2, "lat": lat + 0.1}]
+    later = date(2027, 1, 1)
+
+    def refused(gauge, month):
+        raise OSError("HTTP Error 403: Forbidden")
+
+    with open_store(env.store) as con:
+        tide.build(con, stations, lambda: gauges, refused, levels, version="v1", today=later)
+        assert con.execute("SELECT DISTINCT method FROM lake.tide_levels").fetchall() == [
+            ("predicted",)
+        ]
+        # Reachable again: the month is fetched and its days levelled with the weather.
+        tide.build(con, stations, lambda: gauges, residuals, levels, version="v1", today=later)
+        assert con.execute("SELECT DISTINCT method FROM lake.tide_levels").fetchall() == [
+            ("observed",)
+        ]
+
+
+def test_a_step_too_few_transits_show_leaves_them_alone(env, tmp_path, monkeypatch):  # noqa: F811
+    # The Chesapeake's articulated tug-barge: two transits reading 0.3 m deep, then its
+    # sounder moved, and ten reading 4.6 m shallow. Two transits can't make a step, so
+    # the segment's offset is the ten's; the two early ones mustn't take it.
+    ref = reference(tmp_path / "ref.tif", (0, 240), rows=(4990, 5110))
+    tug = [
+        *(transit(1 + i, "AQM-T", 10.3, (0, 110), i, r=5100) for i in range(2)),
+        *(transit(10 + i, "AQM-T", 5.4, (0, 240), 10 + i) for i in range(10)),
+        *(transit(30 + i, "AQM-A", 9.5, (0, 240), 30 + i) for i in range(3)),
+    ]
+    calibrated(env, tug, ref, monkeypatch)
+    [(offset, status)] = env.query(
+        "SELECT offset_m, status FROM lake.calibration WHERE vessel = 'AQM-T'"
+    )
+    assert status == "anchored" and offset == pytest.approx(-4.6, abs=0.1)
+    early = {f for (f,) in env.query("SELECT file_id FROM lake.calibration_outliers")}
+    assert len(early) == 2
+    for u, _, raw, _, ofs, depth in corrected(env):
+        if u == "AQM-T" and raw > 10:
+            assert ofs is None and depth == raw  # read as logged, uncalibrated
+    with open_store(env.store) as con:
+        cells.build(con)
+    # No cell over the early transits is drawn deeper than they read.
+    deepest = env.query(
+        """SELECT max(depth) FROM lake.cells
+        WHERE kind <> 'filled' AND "row" * level <= 5100 AND ("row" + 1) * level > 5100"""
+    )[0][0]
+    assert deepest is not None and deepest <= 10.35 + 1e-4
+
+
+def test_a_too_deep_segment_publishes_no_shoals(env, tmp_path, monkeypatch):  # noqa: F811
+    # A reads 4 m deep, and one of its soundings is a spike shoaler than its track: an
+    # unconfirmed shoal, at a depth that is 4 m too deep.
+    deep = [transit(1 + i, "AQM-A", 14.0, (0, 240), i) for i in range(3)]
+    n, rows, v = deep[0]
+    t, lon, lat, _ = rows[20]
+    rows = [*rows[:20], (t, lon, lat, 7.0), *rows[21:]]
+    fleet = [(n, rows, v), *deep[1:], *FLEET[3:]]
+    calibrated(env, fleet, reference(tmp_path / "r.tif", (0, 110)), monkeypatch)
+    assert segments(env)[("AQM-A", 0)][1] == "rejected"
+    with open_store(env.store) as con:
+        cells.build(con)
+    assert env.query("SELECT count(*) FROM lake.shoals WHERE abs(lon - ?) < 1e-9", [lon]) == [(0,)]
+
+
+def test_a_stray_transit_stays_uncalibrated_in_a_copy(env, tmp_path, monkeypatch):  # noqa: F811
+    ref = reference(tmp_path / "ref.tif", (0, 240), rows=(4990, 5110))
+    tug = [
+        *(transit(1 + i, "AQM-T", 10.3, (0, 110), i, r=5100) for i in range(2)),
+        *(transit(10 + i, "AQM-T", 5.4, (0, 240), 10 + i) for i in range(10)),
+        *(transit(30 + i, "AQM-A", 9.5, (0, 240), 30 + i) for i in range(3)),
+    ]
+    calibrated(env, tug, ref, monkeypatch)
+    [(old,)] = env.query("SELECT min(file_id) FROM lake.calibration_outliers")
+    # Ingest moves a withdrawn file's soundings to an identical copy under a new file id.
+    with open_store(env.store) as con:
+        new = con.execute("SELECT max(file_id) + 1 FROM lake.files").fetchone()[0]
+        con.execute(
+            "INSERT INTO lake.files SELECT * REPLACE ($new AS file_id, key || '.copy' AS key)"
+            " FROM lake.files WHERE file_id = $old",
+            {"new": new, "old": old},
+        )
+        con.execute("UPDATE lake.files SET status = 'withdrawn' WHERE file_id = $old", {"old": old})
+        con.execute(
+            "UPDATE lake.points SET file_id = $new WHERE file_id = $old", {"new": new, "old": old}
+        )
+        calibrate.assign(con)
+    for u, _, raw, _, ofs, depth in corrected(env):
+        if u == "AQM-T" and raw > 10:
+            assert ofs is None and depth == raw
+
+
+def test_a_day_with_a_missing_prediction_is_asked_for_again(env):  # noqa: F811
+    lon, lat = at(5000, 0)
+    put(env, 1, [(0, lon, lat, 5.0)])
+    env.run("noaa")
+
+    def holed(requests):
+        return [
+            [[t, None if i == 24 else h] for i, (t, h) in enumerate(s)] for s in levels(requests)
+        ]
+
+    later = date(2027, 1, 1)
+    with open_store(env.store) as con:
+        tide.build(con, stations, list, residuals, holed, version="v1", today=later)
+        assert con.execute("SELECT count(*) FROM lake.tide_levels").fetchone() == (0,)
+        assert tide.build(con, stations, list, residuals, levels, version="v1", today=later) == 1
+        assert con.execute("SELECT count(*) FROM lake.tide_levels").fetchone() == (48,)
+
+
+def test_an_outage_keeps_a_months_observed_levels(env):  # noqa: F811
+    lon, lat = at(5000, 0)
+    put(env, 1, [(0, lon, lat, 5.0)])
+    env.run("noaa")
+    gauges = [{"id": "g1", "lon": lon + 0.2, "lat": lat + 0.1}]
+    soon = date(2026, 10, 20)
+
+    def refused(gauge, month):
+        raise OSError("HTTP Error 403: Forbidden")
+
+    with open_store(env.store) as con:
+        tide.build(con, stations, lambda: gauges, residuals, levels, version="v1", today=soon)
+        tide.build(con, stations, lambda: gauges, refused, levels, version="v1", today=soon)
+        assert con.execute("SELECT DISTINCT method FROM lake.tide_levels").fetchall() == [
+            ("observed",)
+        ]
+
+
+def test_a_new_cell_that_takes_levels_already_made_marks_its_tile(env):  # noqa: F811
+    lon, lat = at(5000, 0)
+    put(env, 1, [(0, lon, lat, 5.0)])
+    env.run("noaa")
+    later = date(2027, 1, 1)
+    with open_store(env.store) as con:
+        tide.build(con, stations, list, residuals, levels, version="v1", today=later)
+    # The same day, 3 km away: a new tide cell of the same station.
+    put(env, 2, [(60, lon + 0.03, lat, 6.0)], "AQM-2")
+    env.run("noaa")
+    with open_store(env.store) as con:
+        cells.build(con)
+        assert tide.build(con, stations, list, residuals, levels, version="v1", today=later) == 0
+        assert cells.changed(con) == [TILE]
+
+
+def test_a_failed_fine_raster_keeps_no_coarse_samples(env, tmp_path, monkeypatch):  # noqa: F811
+    refs = tmp_path / "refs"
+    refs.mkdir()
+    reference(refs / "a_coarse.tif", (0, 110), res=16, elevation=-11.0)
+    (refs / "b_fine.tif").write_bytes(b"not a raster")
+    calibrated(env, FLEET, str(refs), monkeypatch)
+    assert env.query("SELECT count(*) FROM lake.reference_pixels") == [(0,)]
+
+
+def test_a_reference_path_with_no_rasters_is_an_error(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        reference_mod.rasters(str(tmp_path / "unmounted"), (0, 0, 1, 1), {}, tmp_path)
+
+
+def test_a_station_with_no_license_type_is_still_credited(env):  # noqa: F811
+    lon, lat = at(5000, 0)
+    put(env, 1, [(0, lon, lat, 5.0)])
+    env.run("noaa")
+    unknown = [
+        {**s, "license": None, "attribution": "Unlabelled station"} if s["id"] == "far" else s
+        for s in stations()
+    ]
+    with open_store(env.store) as con:
+        tide.build(con, lambda: unknown, list, residuals, levels, version="v1")
+        assert "Unlabelled station" in overlay.attribution(con)
+
+
+@pytest.mark.parametrize(
+    "status, offset, se, transit, excluded",
+    [
+        ("rejected", 3.4, 0.3, None, True),  # past the bound, however uncertain
+        ("rejected", 2.5, 0.6, None, True),  # too uncertain to apply, but surely deep
+        ("uncalibrated", 0.3, 0.2, None, False),  # within noise of zero
+        ("uncalibrated", -2.0, 0.2, None, False),  # reads shallow: errs safe
+        ("anchored", -1.0, 0.05, 2.0, True),  # a stray transit measured 2 m deep
+        ("anchored", -1.0, 0.05, -4.0, False),  # a stray transit reading shallow
+    ],
+)
+def test_files_known_to_read_deep_are_left_out(env, status, offset, se, transit, excluded):  # noqa: F811
+    lon, lat = at(5000, 0)
+    put(env, 1, [(0, lon, lat, 5.0)])
+    env.run("noaa")
+    with open_store(env.store) as con:
+        con.execute(
+            "INSERT INTO lake.calibration VALUES ('AQM-1', 0, NULL, NULL, ?, ?, ?, 0, 0, 0)",
+            [offset, se, status],
+        )
+        if transit is not None:
+            con.execute(
+                "INSERT INTO lake.calibration_outliers SELECT file_id, vessel, ?, ?, content_hash"
+                " FROM lake.files",
+                [transit, offset],
+            )
+        calibrate.assign(con)
+    [(x,)] = env.query(
+        "SELECT DISTINCT excluded FROM corrected_points_in("
+        "(SELECT any_value(cell_id) FROM lake.points), [], 0, 10800)"
+    )
+    assert x == excluded
+
+
+def test_an_empty_refetch_keeps_a_months_residuals(env):  # noqa: F811
+    lon, lat = at(5000, 0)
+    put(env, 1, [(0, lon, lat, 5.0)])
+    env.run("noaa")
+    gauges = [{"id": "g1", "lon": lon + 0.2, "lat": lat + 0.1}]
+    soon = date(2026, 10, 20)
+    with open_store(env.store) as con:
+        tide.build(con, stations, lambda: gauges, residuals, levels, version="v1", today=soon)
+        # CO-OPS answers "No data was found" during an outage.
+        tide.build(con, stations, lambda: gauges, lambda g, m: [], levels, version="v1", today=soon)
+        assert con.execute("SELECT DISTINCT method FROM lake.tide_levels").fetchall() == [
+            ("observed",)
+        ]
+
+
+def test_a_new_engine_that_cant_predict_keeps_the_levels(env):  # noqa: F811
+    lon, lat = at(5000, 0)
+    put(env, 1, [(0, lon, lat, 5.0)])
+    env.run("noaa")
+
+    def broken(requests):
+        return [[] for _ in requests]
+
+    with open_store(env.store) as con:
+        tide.build(con, stations, list, residuals, levels, version="v1", today=date(2027, 1, 1))
+        with pytest.raises(RuntimeError, match="sample days"):
+            tide.build(con, stations, list, residuals, broken, version="v2")
+        assert con.execute("SELECT count(*) FROM lake.tide_levels").fetchone() == (48,)
+
+
+def test_a_raster_on_a_datum_never_read_doesnt_hold_its_tile(env, tmp_path, monkeypatch):  # noqa: F811
+    refs = tmp_path / "refs"
+    refs.mkdir()
+    reference(refs / "a_navd88.tif", (0, 110))
+    with rasterio.open(
+        refs / "b_other.tif",
+        "w",
+        driver="GTiff",
+        width=4,
+        height=4,
+        count=2,
+        dtype="float32",
+        crs="EPSG:4326",
+        transform=from_bounds(*at(4990, 0, 0, 0), *at(5010, 110, 0, 0), 4, 4),
+    ) as d:
+        d.write(np.zeros((2, 4, 4), dtype="float32"))
+        d.update_tags(VERTICALDATUMWKT='VERTCRS["prvd02"]')
+    calibrated(env, FLEET, str(refs), monkeypatch)
+    assert env.query("SELECT count(depth) > 0 FROM lake.reference_pixels") == [(True,)]
+
+
+def test_soundings_awaiting_their_tide_stay_out_of_the_grid(env):  # noqa: F811
+    lon, lat = at(5000, 0)
+    put(env, 1, [(0, lon, lat, 5.0)])
+    env.run("noaa")
+
+    def blank(requests):
+        return [[] for _ in requests]
+
+    with open_store(env.store) as con:
+        tide.build(con, stations, list, residuals, blank, version="v1", today=date(2027, 1, 1))
+        cells.build(con)
+    # Its station is in reach but has no level for the day: no cell, rather than a raw depth
+    # deeper than chart datum.
+    assert env.query("SELECT count(*) FROM lake.cells WHERE kind <> 'filled'") == [(0,)]
+    [(awaiting,)] = env.query(
+        "SELECT awaiting_tide FROM corrected_points_in((SELECT any_value(cell_id) FROM lake.points), [], 0, 10800)"
+    )
+    assert awaiting
+
+
+def test_the_overlay_waits_for_tide_to_see_every_area(env, tmp_path):  # noqa: F811
+    lon, lat = at(5000, 0)
+    put(env, 1, [(0, lon, lat, 5.0)])
+    env.run("noaa")
+    with open_store(env.store) as con:
+        tide.build(con, stations, list, residuals, levels, version="v1", today=date(2027, 1, 1))
+    put(env, 2, [(60, lon + 0.5, lat, 6.0)], "AQM-2")
+    env.run("noaa")
+    with open_store(env.store) as con:
+        cells.build(con)
+        with pytest.raises(RuntimeError, match="hasn't seen"):
+            overlay.build(con, tmp_path / "out")
+
+
+def test_a_reference_in_degrees_measures_flatness_in_metres(env, tmp_path, monkeypatch):  # noqa: F811
+    w, s = at(4990, 0, 0, 0)
+    e, n = at(5010, 220, 0, 0)
+    width, height = 800, 80  # cells of about 3 m
+    path = tmp_path / "geo.tif"
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        width=width,
+        height=height,
+        count=2,
+        dtype="float32",
+        crs="EPSG:4326",
+        transform=from_bounds(w, s, e, n, width, height),
+        nodata=np.nan,
+    ) as d:
+        depth = np.full((height, width), -10.0)
+        depth[:, -100:] = -30.0  # a trench far east of A's flat survey: relief, if seen
+        d.write(np.stack([depth, np.full((height, width), 0.5)]).astype("float32"))
+        d.update_tags(VERTICALDATUMWKT='VERTCRS["navd88"]')
+    calibrated(env, FLEET, str(path), monkeypatch)
+    assert segments(env)[("AQM-A", 0)][1] == "anchored"
+
+
+def test_a_reference_that_cant_anchor_doesnt_hide_one_that_can(env, tmp_path, monkeypatch):  # noqa: F811
+    good = reference(tmp_path / "good.tif", (0, 110))
+    steep = tmp_path / "steep"
+    steep.mkdir()
+    reference(steep / "steep.tif", (0, 110), elevation=-25.0)  # too deep to anchor
+    for n, rows, v in FLEET:
+        put(env, n, rows, v)
+    env.run("noaa")
+    monkeypatch.setattr("grid.reference.coops_separation", lambda: lambda lon, lat: 0.0)
+    with open_store(env.store) as con:
+        untided(con)
+        calibrate.run(con, [good, str(steep)])
+        # The deep one is as certain; it would win the pixel if picked before the filters.
+        con.execute("UPDATE lake.reference_pixels SET uncertainty = 0.1 WHERE depth > 20")
+        calibrate.run(con)
+    assert segments(env)[("AQM-A", 0)][1] == "anchored"

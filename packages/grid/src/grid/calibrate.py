@@ -27,6 +27,7 @@ an anchor counts as calibrated from CROSSING_TRANSITS crossing transits, when it
 crossings link it to an anchored one. Only calibrated offsets are applied, and only plausible ones
 (OFFSET_RANGE_M, MAX_SE_M): an uncalibrated vessel reads as it was logged, usually shoal,
 which errs safe, while a wrong negative offset would deepen every sounding it corrects.
+Anything known to read deep that isn't corrected is left out (see `assign`).
 
 No depth scale factor is fitted: at 2–20 m it barely narrows the spread.
 """
@@ -36,7 +37,7 @@ import logging
 import math
 
 import numpy as np
-from scipy.sparse import csc_matrix, csr_matrix, diags
+from scipy.sparse import coo_matrix, csc_matrix, csr_matrix, diags
 from scipy.sparse.csgraph import connected_components
 from scipy.sparse.linalg import splu
 
@@ -73,6 +74,8 @@ SE_FLOOR_M = 0.02
 OFFSET_RANGE_M = (-10.0, 3.0)
 MAX_SE_M = 0.5
 APPLIED = ("anchored", "crossover")
+# A file reading deeper than this, known but not corrected, is left out of the grid.
+DEEP_M = 0.5
 # Of a store's calibrated segments, more than this share lost in one run is refused.
 MAX_LOST = 0.5
 GUARDED_SEGMENTS = 20
@@ -103,12 +106,14 @@ GROUP BY ALL
 ANCHOR_ROWS = f"""
 SELECT o.vessel, o.file_id, o.t, o.tile_id, o.py, o.px, o.m - r.depth AS e
 FROM cal_obs o JOIN (
-  SELECT * FROM lake.reference_pixels WHERE depth IS NOT NULL
+  -- Among the references that would anchor here, so one that wouldn't can't hide one
+  -- that would.
+  SELECT * FROM lake.reference_pixels
+  WHERE depth BETWEEN {ANCHOR_DEPTH_M[0]} AND {ANCHOR_DEPTH_M[1]}
+    AND uncertainty < {ANCHOR_UNCERTAINTY_M} AND relief < {ANCHOR_RELIEF_M}
   QUALIFY row_number() OVER (PARTITION BY tile_id, py, px ORDER BY uncertainty, source) = 1
 ) r USING (tile_id, py, px)
-WHERE r.depth BETWEEN {ANCHOR_DEPTH_M[0]} AND {ANCHOR_DEPTH_M[1]}
-  AND r.uncertainty < {ANCHOR_UNCERTAINTY_M} AND r.relief < {ANCHOR_RELIEF_M}
-  AND abs(o.m - r.depth) < {ANCHOR_DIFF_M}
+WHERE abs(o.m - r.depth) < {ANCHOR_DIFF_M}
 """
 
 
@@ -222,7 +227,7 @@ def solve(con, n_units, anchor, anchor_se):
     o = np.where(has, anchor, 0.0)
     scale = TRANSIT_SIGMA_M
     for it in range(ITERATIONS):
-        normal = csr_matrix((n_units, n_units))
+        terms = []
         rhs = np.zeros(n_units)
         hist = np.zeros(4000)
         for tile in tiles:
@@ -231,13 +236,17 @@ def solve(con, n_units, anchor, anchor_se):
             hist += np.histogram(np.abs(r), bins=4000, range=(0, 20))[0]
             w = b * np.minimum(1, HUBER * scale / np.maximum(np.abs(r), 1e-9)) / TRANSIT_SIGMA_M**2
             n, y = pixel_terms(p, u, m, w, n_units)
-            normal = normal + n
+            terms.append(n.tocoo())
             rhs += y
         # The robust spread of row residuals sets where Huber weights start to fall.
         if hist.sum():
             half = np.searchsorted(np.cumsum(hist), hist.sum() / 2)
             scale = max(1.4826 * (half + 0.5) * 20 / 4000, 0.05)
-        system = (normal + diags(prior)).tocsc()
+        # Every tile's terms summed at once, rather than copying the sum per tile.
+        rows = np.concatenate([t.row for t in terms] + [np.arange(n_units)])
+        cols = np.concatenate([t.col for t in terms] + [np.arange(n_units)])
+        vals = np.concatenate([t.data for t in terms] + [prior])
+        system = coo_matrix((vals, (rows, cols)), shape=(n_units, n_units)).tocsc()
         anchored = reaches(system, has)
         # A unit no anchor reaches has no absolute offset; a small ridge keeps the
         # system solvable, and it's marked uncalibrated.
@@ -291,8 +300,9 @@ def inverse_diagonal(lu, n, batch=256):
 
 
 def transit_offsets(con, offset):
-    """Each vessel's per-transit offsets, in time order, against the reference where it
-    has one and elsewhere against the other units' pixel depths."""
+    """Each transit's offset, as rows (vessel, file_id, start, offset) in time order:
+    against the reference where it has one, elsewhere against the pixel depths of the
+    units other than its own."""
     con.register("offsets_np", {"unit": np.arange(len(offset)), "o": offset})
     rows = con.execute(
         f"""WITH x AS (SELECT x.*, o.o FROM xrows x JOIN offsets_np o USING (unit)),
@@ -314,12 +324,37 @@ def transit_offsets(con, offset):
         HAVING count(*) >= {STEP_PIXELS} ORDER BY e.vessel, t, e.file_id"""
     ).fetchall()
     con.unregister("offsets_np")
-    series = {}
+    return rows
+
+
+def series(rows):
+    """{vessel: ([start times], [offsets])} from transit_offsets' rows."""
+    out = {}
     for vessel, _, t, e in rows:
-        series.setdefault(vessel, ([], []))
-        series[vessel][0].append(t)
-        series[vessel][1].append(e)
-    return series
+        out.setdefault(vessel, ([], []))
+        out[vessel][0].append(t)
+        out[vessel][1].append(e)
+    return out
+
+
+def outliers(con, rows, offset, se):
+    """Transits that disagree with their segment by more than a step: a step with too
+    few transits on one side to be found. They don't take the segment's offset, which
+    would correct them by another sounder's error, and are left uncalibrated. Returns
+    rows (file_id, vessel, transit offset, segment offset, content hash), the hash so
+    another file holding the same soundings, as ingest moves them on a takeover, keeps
+    the exemption."""
+    unit_of = {(v, f): u for v, f, u in con.execute("SELECT * FROM file_units").fetchall()}
+    hashes = dict(con.execute("SELECT file_id, content_hash FROM lake.files").fetchall())
+    out = []
+    for vessel, file_id, _, e in rows:
+        u = unit_of.get((vessel, file_id))
+        if u is None or np.isnan(offset[u]):
+            continue
+        d = abs(e - offset[u])
+        if d > STEP_M and d > STEP_SE * math.hypot(se[u], TRANSIT_SIGMA_M):
+            out.append((file_id, vessel, float(e), float(offset[u]), hashes.get(file_id)))
+    return out
 
 
 def steps(x):
@@ -367,7 +402,7 @@ def crossing_transits(con, n_units):
     return n
 
 
-def run(con, references=()) -> dict:
+def run(con, references=(), accept_losses=False) -> dict:
     """Calibrate every vessel segment and publish the offsets that moved, after sampling
     `references` (see reference.py) at pixels they haven't been sampled at."""
     if not con.execute("SELECT count(*) FROM lake.tide_stations").fetchone()[0]:
@@ -377,16 +412,20 @@ def run(con, references=()) -> dict:
         reference.sample(con, references)
     # Pass 1: a unit per vessel, for pixel depths to find steps against.
     names = units_for(con, {})
+    if not names:
+        log.info("calibrate: no tide-reduced soundings to calibrate")
+        return {"tiles": tiles, "segments": 0}
     crossings(con)
     anchor, anchor_se, *_ = anchors(con, len(names))
     first, _, _ = solve(con, len(names), anchor, anchor_se)
-    segments = segments_from(transit_offsets(con, first))
+    segments = segments_from(series(transit_offsets(con, first)))
     # Pass 2: a unit per segment.
     names = units_for(con, segments)
     crossings(con)
     anchor, anchor_se, pixels, transits = anchors(con, len(names))
     offset, se, anchored = solve(con, len(names), anchor, anchor_se)
     crossed = crossing_transits(con, len(names))
+    stray = outliers(con, transit_offsets(con, offset), offset, se)
     status = np.where(
         ~np.isnan(anchor),
         "anchored",
@@ -415,7 +454,7 @@ def run(con, references=()) -> dict:
                 int(crossed[unit]),
             )
         )
-    dirty = publish(con, rows)
+    dirty = publish(con, rows, stray, accept_losses)
     # The tide the offsets were solved against: once it changes, they are stale.
     con.execute("DELETE FROM lake.store_meta WHERE key = 'calibration_tide'")
     con.execute("INSERT INTO lake.store_meta VALUES ('calibration_tide', ?)", [cells.tides(con)])
@@ -427,6 +466,7 @@ def run(con, references=()) -> dict:
             s: int((status == s).sum())
             for s in ("anchored", "crossover", "uncalibrated", "rejected")
         },
+        "stray_transits": len(stray),
         "dirty_tiles": dirty,
     }
     for table in ("cal_obs", "file_units", "xobs", "xrows"):
@@ -435,10 +475,10 @@ def run(con, references=()) -> dict:
     return totals
 
 
-def publish(con, rows):
-    """Replace the calibration with `rows`, keeping a segment's published offset unless
-    it moved by more than its standard error, then give each file its segment's offset.
-    Returns how many tiles that made stale."""
+def publish(con, rows, stray=(), accept_losses=False):
+    """Replace the calibration with `rows` and its stray transits with `stray`, keeping a
+    segment's published offset unless it moved by more than its standard error, then
+    give each file its segment's offset. Returns how many tiles that made stale."""
     old = {
         (v, s0, s1, st): (off, se)
         for v, s0, s1, off, se, st in con.execute(
@@ -455,9 +495,10 @@ def publish(con, rows):
     # (tide levels mid-rebuild, a reference outage), not a fleet that changed overnight.
     before = sum(st in APPLIED for *_, st in old)
     after = sum(r[6] in APPLIED for r in kept)
-    if before >= GUARDED_SEGMENTS and after < (1 - MAX_LOST) * before:
+    if not accept_losses and before >= GUARDED_SEGMENTS and after < (1 - MAX_LOST) * before:
         raise RuntimeError(
-            f"calibration would apply {after} segments, down from {before}; check tide and references"
+            f"calibration would apply {after} segments, down from {before}; check tide and"
+            " references, and run `grid calibrate --accept-losses` if it should"
         )
     con.execute("BEGIN")
     try:
@@ -466,6 +507,9 @@ def publish(con, rows):
             con.executemany(
                 "INSERT INTO lake.calibration VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", kept
             )
+        con.execute("DELETE FROM lake.calibration_outliers")
+        if stray:
+            con.executemany("INSERT INTO lake.calibration_outliers VALUES (?, ?, ?, ?, ?)", stray)
         con.execute("COMMIT")
     except BaseException:
         con.execute("ROLLBACK")
@@ -476,9 +520,11 @@ def publish(con, rows):
 def assign(con):
     """Give every active file its segment's offset, by its first sounding, and mark the
     tiles of files whose offset changed. Run before every cells build too, so a file that
-    arrived since calibration takes its segment's offset. A file of a segment rejected for
-    reading deeper than any plausible offset is excluded: as logged it would publish too
-    deep. Returns how many tiles were marked."""
+    arrived since calibration takes its segment's offset. A stray transit takes no offset
+    and reads as logged, uncalibrated. A file known to read deep that can't be corrected,
+    a segment not applied whose offset is DEEP_M past zero by two standard errors or a
+    stray transit measured as deep, is excluded: as logged it would publish too deep.
+    Returns how many tiles were marked."""
     was_settled = cells.settled(con)
     con.execute("BEGIN")
     try:
@@ -486,15 +532,33 @@ def assign(con):
         con.execute("DELETE FROM lake.file_offsets")
         con.execute(
             f"""INSERT INTO lake.file_offsets
-            SELECT f.file_id, f.vessel,
-              CASE WHEN c.status IN {APPLIED} THEN c.offset_m END,
-              CASE WHEN c.status IN {APPLIED} THEN c.se_m END,
-              c.status = 'rejected' AND c.offset_m > {OFFSET_RANGE_M[1]} AS excluded
-            FROM lake.files f JOIN lake.calibration c ON c.vessel = f.vessel
-              AND (c.t_start IS NULL OR f.time_min >= c.t_start)
-              AND (c.t_end IS NULL OR f.time_min < c.t_end)
-            WHERE f.status = 'active' AND (c.status IN {APPLIED}
-              OR (c.status = 'rejected' AND c.offset_m > {OFFSET_RANGE_M[1]}))"""
+            WITH stray AS (
+              -- A stray transit, by file or by content, as ingest may move its soundings.
+              SELECT f.file_id, max(o.transit_m) AS transit_m FROM lake.files f
+              JOIN lake.calibration_outliers o
+                ON o.file_id = f.file_id OR o.content_hash = f.content_hash
+              GROUP BY f.file_id
+            ),
+            j AS (
+              SELECT f.file_id, f.vessel, c.offset_m, c.se_m, c.status IN {APPLIED} AS applied,
+                s.file_id IS NOT NULL AS strayed, s.transit_m
+              FROM lake.files f JOIN lake.calibration c ON c.vessel = f.vessel
+                AND (c.t_start IS NULL OR f.time_min >= c.t_start)
+                AND (c.t_end IS NULL OR f.time_min < c.t_end)
+              LEFT JOIN stray s USING (file_id)
+              WHERE f.status = 'active'
+            ),
+            k AS (
+              SELECT *, CASE
+                  WHEN strayed THEN transit_m > {DEEP_M + 2 * TRANSIT_SIGMA_M}
+                  ELSE NOT applied AND offset_m - 2 * se_m > {DEEP_M}
+                END AS excluded
+              FROM j
+            )
+            SELECT file_id, vessel,
+              CASE WHEN applied AND NOT strayed THEN offset_m END,
+              CASE WHEN applied AND NOT strayed THEN se_m END, coalesce(excluded, false)
+            FROM k WHERE (applied AND NOT strayed) OR excluded"""
         )
         dirty = cells.stale(
             con,

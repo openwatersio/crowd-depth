@@ -69,7 +69,11 @@ def rasters(source, box, catalogs, tmp):
     if source not in CATALOGS:
         path = Path(source)
         files = [path] if path.is_file() else sorted(path.rglob("*"))
-        return [str(p) for p in files if p.suffix.lower() in (".tif", ".tiff", ".h5")], True
+        found = [str(p) for p in files if p.suffix.lower() in (".tif", ".tiff", ".h5")]
+        # A path not mounted yet would otherwise record every pixel as uncovered for good.
+        if not found:
+            raise FileNotFoundError(f"no reference rasters at {source}")
+        return found, True
     if source not in catalogs:
         catalogs[source] = catalog(source, tmp)
     path, table, column = catalogs[source]
@@ -165,8 +169,8 @@ def sample(con, sources, separation=None):
 
 def sample_tile(con, tile, name, catalogs, tmp, shift_at):
     """Sample one source at one tile's pixels it hasn't been sampled at. Pixels it doesn't
-    cover are recorded with no depth, so they aren't tried again, unless one of its
-    rasters there was skipped."""
+    cover are recorded with no depth, so they aren't tried again; if one of its rasters
+    there was skipped, none of the tile is kept, and it is all tried again."""
     px = con.execute(
         """SELECT DISTINCT py, px FROM cal_obs WHERE tile_id = $tile
         EXCEPT SELECT py, px FROM lake.reference_pixels WHERE tile_id = $tile AND source = $name""",
@@ -185,7 +189,11 @@ def sample_tile(con, tile, name, catalogs, tmp, shift_at):
             # One unreadable tile is tried again next run, not the end of this one.
             log.warning("reference: %s unreadable (%s); skipped", path, e)
             complete = False
-    keep = np.ones(len(lat), bool) if complete else ~np.isnan(depth)
+    # If any raster that may cover the tile couldn't be read, nothing is kept: a coarse
+    # tile's value would otherwise stand for good where a finer one failed.
+    if not complete:
+        return 0, 0
+    keep = np.ones(len(lat), bool)
     con.execute("BEGIN")
     con.register(
         "ref_np",
@@ -224,13 +232,15 @@ def open_options(path):
 
 
 def sample_raster(path, lon, lat, depth, relief, unc, shift_at):
-    """Fill the pixels one raster covers that no earlier raster did. False if it was
-    skipped, so the pixels it may cover are tried again."""
+    """Fill the pixels one raster covers that no earlier raster did. A raster on a datum
+    this build doesn't read never will be, so it is left out without holding its tile
+    back. False when it can't be used now, with no gauge datums near; one that can't be
+    read raises. Either way the tile is tried again."""
     with rasterio.open(path, **open_options(path)) as src:
         how = kind(src)
         if how is None:
             log.warning("reference: %s has no vertical datum this build reads; skipped", path)
-            return False
+            return True
         w, s, e, n = transform_bounds(src.crs, "EPSG:4326", *src.bounds)
         todo = np.flatnonzero((lon >= w) & (lon < e) & (lat >= s) & (lat < n) & np.isnan(depth))
         if not len(todo):
@@ -239,6 +249,7 @@ def sample_raster(path, lon, lat, depth, relief, unc, shift_at):
         if how == "navd88":
             shift = shift_at((w + e) / 2, (s + n) / 2)
             if shift is None:
+                # The lookup can fail for now (CO-OPS down), so the tile is tried again.
                 log.warning("reference: no gauge datums near %s; skipped", path)
                 return False
         x, y = transform("EPSG:4326", src.crs, lon[todo], lat[todo])
@@ -247,6 +258,9 @@ def sample_raster(path, lon, lat, depth, relief, unc, shift_at):
         inside = (rows >= 0) & (rows < src.height) & (cols >= 0) & (cols < src.width)
         todo, rows, cols = todo[inside], rows[inside], cols[inside]
         res = abs(src.res[0])
+        # Cells of a raster in degrees, measured in metres at its middle.
+        if src.crs.is_geographic:
+            res *= 111320 * np.cos(np.radians((s + n) / 2))
         near = max(1, round(RELIEF_M / res))
         mean_size = 2 * max(1, round(MEAN_M / res)) + 1
         blocks = (rows // BLOCK) * (src.width // BLOCK + 1) + cols // BLOCK
