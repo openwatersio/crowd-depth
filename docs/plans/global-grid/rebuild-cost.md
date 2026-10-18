@@ -48,7 +48,7 @@ The last row is an estimate. It assumes dirty work follows each day's new tracks
 
 The per-sounding cost decides the planet, not the fixed cost. With 7,295 tiles, the fixed cost is 18 of 43 worker-hours, and the dense tiles hold most of the work. A day's touched tiles and their neighbors hold 84% of all soundings, so a 1° daily run costs about 55% of a full rebuild as built and about 70% with block skipping, which saves the daily run only 3–4 worker-hours. Sub-tile dirtiness is the change that makes a daily run cheap, and the per-sounding cost of cells and surfaces is what decides a full rebuild.
 
-The densest tile is a critical path of its own. Galveston and Houston (29°N 95°W) holds 67M soundings, more than twice Chesapeake's densest, and needs about 45 min of cells and surface on one M-series core at the linear rate.
+The densest tile is a critical path of its own. The Galveston and Houston tile (29°N 95°W) holds 67M soundings, more than twice Chesapeake's densest, and needs about 45 min of cells and surface on one M-series core at the linear rate.
 
 Skipping empty raster blocks has the headroom to remove most of the fixed cost. On a 5,400-pixel tile with 512-pixel blocks, blocks with a sounding within about 200 m are a median 15% of a tile's blocks, and 17% on average across the 171 Chesapeake tiles under 100k soundings. Pixels within 200 m of a sounding are 1% of a median tile. If the fixed stages scale with pixels, as profiling suggests, block skipping cuts the fixed cost by roughly 5 times, which the table assumes.
 
