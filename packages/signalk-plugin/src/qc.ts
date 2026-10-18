@@ -2,7 +2,9 @@
 // grid's definitions and checked against its test vectors (packages/grid/tests/qc_vectors.json).
 //
 // Depths are float32 in the grid's store, so depth arithmetic rounds through float32
-// (Math.fround) as numpy's does, and flags match the grid's sounding for sounding.
+// (Math.fround) as numpy's does, and flags match the grid's on every shared vector. A
+// sounding within an ulp of a threshold may still differ, since cos and sums can round
+// differently in numpy.
 
 /** The `qc` section of packages/grid/src/grid/definitions.json. */
 export interface QCDefinitions {

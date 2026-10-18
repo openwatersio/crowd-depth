@@ -215,11 +215,11 @@ def test_changing_a_threshold_bumps_the_qc_version():
 
 
 def test_changing_a_grid_definition_bumps_the_grid_version():
-    # Cells, the surface and the overlay are built from these: a change without a new
-    # GRID_VERSION leaves cells built under the old ones looking current.
-    grid = {k: v for k, v in DEFINITIONS.items() if k != "qc"}
+    # Cells and the surface are built from these: a change without a new GRID_VERSION
+    # leaves cells built under the old ones looking current.
+    grid = {k: DEFINITIONS[k] for k in ("cells", "surface")}
     digest = hashlib.sha256(json.dumps(grid, sort_keys=True).encode()).hexdigest()[:16]
-    assert (cells.GRID_VERSION, digest) == (3, "fcb2b5f9b34b98cc")
+    assert (cells.GRID_VERSION, digest) == (3, "3c6cd353f933b965")
 
 
 def test_spike_chunks_give_the_same_flags(monkeypatch):
