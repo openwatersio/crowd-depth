@@ -419,8 +419,9 @@ def attribution(con):
         credits += [
             a
             for (a,) in con.execute(
-                """SELECT DISTINCT attribution FROM lake.tide_stations
-                WHERE lower(coalesce(license, '')) <> 'public domain' AND attribution IS NOT NULL
+                """SELECT DISTINCT coalesce(attribution, concat_ws(', ', station, license))
+                FROM lake.tide_stations
+                WHERE lower(coalesce(license, '')) <> 'public domain'
                   AND station_id IN (SELECT DISTINCT station_id FROM lake.tide_levels)
                 ORDER BY 1"""
             ).fetchall()

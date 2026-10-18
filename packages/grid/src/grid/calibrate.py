@@ -187,11 +187,10 @@ def anchors(con, n_units):
           SELECT a.*, u.unit FROM ({ANCHOR_ROWS}) a JOIN file_units u USING (vessel, file_id)
         ),
         f AS (SELECT unit, file_id, median(e) AS e FROM a GROUP BY ALL),
-        g AS (
-          SELECT unit, median(e) AS offset, count(DISTINCT (tile_id, py, px)) AS pixels
-          FROM a GROUP BY unit
-        )
-        SELECT unit, g.offset, count(*) AS transits, g.pixels, list(f.e) AS per_transit
+        g AS (SELECT unit, count(DISTINCT (tile_id, py, px)) AS pixels FROM a GROUP BY unit)
+        -- The median of the transits' medians: one long transit counts once.
+        SELECT unit, median(f.e) AS offset, count(*) AS transits, g.pixels,
+          list(f.e) AS per_transit
         FROM g JOIN f USING (unit) GROUP BY ALL"""
     ).fetchall()
     offset = np.full(n_units, np.nan)
@@ -337,7 +336,7 @@ def series(rows):
     return out
 
 
-def outliers(con, rows, offset, se):
+def outliers(con, rows, offset, se, anchored):
     """Transits that disagree with their segment by more than a step: a step with too
     few transits on one side to be found. They don't take the segment's offset, which
     would correct them by another sounder's error, and are left uncalibrated. Returns
@@ -349,7 +348,8 @@ def outliers(con, rows, offset, se):
     out = []
     for vessel, file_id, _, e in rows:
         u = unit_of.get((vessel, file_id))
-        if u is None or np.isnan(offset[u]):
+        # A unit no survey reaches has an offset about an arbitrary zero: nothing to judge by.
+        if u is None or np.isnan(offset[u]) or not anchored[u]:
             continue
         d = abs(e - offset[u])
         if d > STEP_M and d > STEP_SE * math.hypot(se[u], TRANSIT_SIGMA_M):
@@ -425,7 +425,7 @@ def run(con, references=(), accept_losses=False) -> dict:
     anchor, anchor_se, pixels, transits = anchors(con, len(names))
     offset, se, anchored = solve(con, len(names), anchor, anchor_se)
     crossed = crossing_transits(con, len(names))
-    stray = outliers(con, transit_offsets(con, offset), offset, se)
+    stray = outliers(con, transit_offsets(con, offset), offset, se, anchored)
     status = np.where(
         ~np.isnan(anchor),
         "anchored",
@@ -534,10 +534,12 @@ def assign(con):
             f"""INSERT INTO lake.file_offsets
             WITH stray AS (
               -- A stray transit, by file or by content, as ingest may move its soundings.
-              SELECT f.file_id, max(o.transit_m) AS transit_m FROM lake.files f
-              JOIN lake.calibration_outliers o
-                ON o.file_id = f.file_id OR o.content_hash = f.content_hash
-              GROUP BY f.file_id
+              SELECT file_id, max(transit_m) AS transit_m FROM (
+                SELECT file_id, transit_m FROM lake.calibration_outliers
+                UNION ALL
+                SELECT f.file_id, o.transit_m FROM lake.files f
+                JOIN lake.calibration_outliers o USING (content_hash)
+              ) GROUP BY file_id
             ),
             j AS (
               SELECT f.file_id, f.vessel, c.offset_m, c.se_m, c.status IN {APPLIED} AS applied,

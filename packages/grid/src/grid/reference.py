@@ -65,8 +65,8 @@ def catalog(name, tmp):
 
 
 def rasters(source, box, catalogs, tmp):
-    """The rasters of `source` that may cover a (west, south, east, north) box, and whether
-    that's all of them: a catalog row with no link yet is a tile still to come."""
+    """The rasters of `source` that may cover a (west, south, east, north) box, and the
+    boxes of catalog rows with no link yet: tiles still to come."""
     if source not in CATALOGS:
         path = Path(source)
         files = [path] if path.is_file() else sorted(path.rglob("*"))
@@ -74,21 +74,20 @@ def rasters(source, box, catalogs, tmp):
         # A path not mounted yet would otherwise record every pixel as uncovered for good.
         if not found:
             raise FileNotFoundError(f"no reference rasters at {source}")
-        return found, True
+        return found, []
     if source not in catalogs:
         catalogs[source] = catalog(source, tmp)
     path, table, column = catalogs[source]
     w, s, e, n = box
     with contextlib.closing(sqlite3.connect(path)) as db:
         links = db.execute(
-            f"""SELECT "{column}" FROM "{table}" WHERE fid IN (
-              SELECT id FROM "rtree_{table}_geom"
-              WHERE minx < ? AND maxx > ? AND miny < ? AND maxy > ?)
-            ORDER BY 1""",
+            f"""SELECT t."{column}", r.minx, r.miny, r.maxx, r.maxy FROM "{table}" t
+            JOIN "rtree_{table}_geom" r ON r.id = t.fid
+            WHERE r.minx < ? AND r.maxx > ? AND r.miny < ? AND r.maxy > ? ORDER BY 1""",
             [e, w, n, s],
         ).fetchall()
-    found = [f"/vsicurl/{link}" for (link,) in links if link]
-    return found, len(found) == len(links)
+    found = [f"/vsicurl/{link}" for link, *_ in links if link]
+    return found, [bounds for link, *bounds in links if not link]
 
 
 def coops_separation(gauges=None, datums=None):
@@ -181,7 +180,8 @@ def sample_tile(con, tile, name, catalogs, tmp, shift_at):
     lat = lat0 + (px["py"] + 0.5) * 2 / BASE
     lon = lon0 + (px["px"] + 0.5) * 2 * k_for(lat0) / BASE
     depth, relief, unc = (np.full(len(lat), np.nan) for _ in range(3))
-    paths, complete = rasters(name, (lon0, lat0, lon0 + 1, lat0 + 1), catalogs, tmp)
+    paths, pending = rasters(name, (lon0, lat0, lon0 + 1, lat0 + 1), catalogs, tmp)
+    complete = True
     # Finest first, so a 4 m harbour tile wins over the 16 m tile around it.
     for path in sorted(paths, key=resolution):
         try:
@@ -194,7 +194,10 @@ def sample_tile(con, tile, name, catalogs, tmp, shift_at):
     # tile's value would otherwise stand for good where a finer one failed.
     if not complete:
         return 0, 0
+    # A tile still to come holds back only the pixels it covers that nothing else did.
     keep = np.ones(len(lat), bool)
+    for w, s, e, n in pending:
+        keep &= ~((lon >= w) & (lon < e) & (lat >= s) & (lat < n) & np.isnan(depth))
     con.execute("BEGIN")
     con.register(
         "ref_np",

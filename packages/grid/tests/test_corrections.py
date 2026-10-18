@@ -650,8 +650,8 @@ def test_a_catalog_tile_with_no_link_yet_is_tried_again(tmp_path):
         db.executemany('INSERT INTO "rtree_t_geom" VALUES (?, 0, 1, 0, 1)', [(1,), (2,)])
         db.commit()
     catalogs = {"bluetopo": (path, "t", "link")}
-    paths, complete = reference_mod.rasters("bluetopo", (0, 0, 1, 1), catalogs, tmp_path)
-    assert paths == ["/vsicurl/https://x/a.tif"] and not complete
+    paths, pending = reference_mod.rasters("bluetopo", (0, 0, 1, 1), catalogs, tmp_path)
+    assert paths == ["/vsicurl/https://x/a.tif"] and pending == [[0, 0, 1, 1]]
 
 
 def test_a_segment_reading_too_deep_to_correct_is_left_out(env, tmp_path, monkeypatch):  # noqa: F811
@@ -1094,3 +1094,69 @@ def test_a_station_moves_to_a_nearer_gauge_when_one_is_listed(env):  # noqa: F81
         assert gauge == "g2"
         assert con.execute("SELECT count(*) FROM lake.tide_levels").fetchone() == (48,)
         assert cells.changed(con) == [TILE]
+
+
+def test_a_station_the_engine_cant_predict_hands_its_cells_on(env):  # noqa: F811
+    lon, lat = at(5000, 0)
+    day = 86400
+    put(env, 1, [(0, lon, lat, 5.0), (day, lon, lat, 5.1), (-day, lon, lat, 5.2)])
+    env.run("noaa")
+    near = {
+        "id": "near",
+        "lon": lon + 0.05,
+        "lat": lat,
+        "commercial_use": True,
+        "accepted": True,
+        "has_datums": True,
+        "chart_datum": "MLLW",
+    }
+
+    def only_far(requests):
+        return [s if r["station"] == "far" else [] for r, s in zip(requests, levels(requests))]
+
+    later = date(2027, 1, 1)
+    with open_store(env.store) as con:
+        tide.build(
+            con, lambda: [*stations(), near], list, residuals, only_far, version="v1", today=later
+        )
+        assert con.execute(
+            "SELECT unpredictable FROM lake.tide_stations WHERE station = 'near'"
+        ).fetchone() == (True,)
+        tide.build(
+            con, lambda: [*stations(), near], list, residuals, only_far, version="v1", today=later
+        )
+    [(station,)] = env.query(
+        "SELECT s.station FROM lake.tide_cells JOIN lake.tide_stations s USING (station_id)"
+    )
+    assert station == "far"
+    assert all(h is not None for *_, h, _, _ in corrected(env))
+
+
+def test_a_gauge_missing_from_a_short_listing_keeps_its_stations(env):  # noqa: F811
+    lon, lat = at(5000, 0)
+    put(env, 1, [(0, lon, lat, 5.0)])
+    env.run("noaa")
+    both = [{"id": "g1", "lon": lon + 0.2, "lat": lat}, {"id": "g2", "lon": lon + 0.6, "lat": lat}]
+    later = date(2027, 1, 1)
+    with open_store(env.store) as con:
+        tide.build(con, stations, lambda: both, residuals, levels, version="v1", today=later)
+        tide.build(con, stations, lambda: both[1:], residuals, levels, version="v1", today=later)
+        assert con.execute(
+            "SELECT gauge FROM lake.tide_stations WHERE station = 'far'"
+        ).fetchone() == ("g1",)
+
+
+def test_a_past_months_first_empty_answer_leaves_it_open(env):  # noqa: F811
+    lon, lat = at(5000, 0)
+    put(env, 1, [(0, lon, lat, 5.0)])
+    env.run("noaa")
+    gauges = [{"id": "g1", "lon": lon + 0.2, "lat": lat}]
+    later = date(2027, 1, 1)
+    with open_store(env.store) as con:
+        tide.build(
+            con, stations, lambda: gauges, lambda g, m: [], levels, version="v1", today=later
+        )
+        tide.build(con, stations, lambda: gauges, residuals, levels, version="v1", today=later)
+        assert con.execute("SELECT DISTINCT method FROM lake.tide_levels").fetchall() == [
+            ("observed",)
+        ]

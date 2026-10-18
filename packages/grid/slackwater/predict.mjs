@@ -24,7 +24,8 @@ if (process.argv[2] === "stations") {
       commercial_use: s.license?.commercial_use === true,
       license: s.license?.type ?? null,
       attribution: s.attribution ?? null,
-      accepted: s.quality?.accepted === true,
+      // A station with no quality record is accepted, as the database itself treats it.
+      accepted: s.quality?.accepted !== false,
     };
     console.log(JSON.stringify(row));
   }

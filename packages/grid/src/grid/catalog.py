@@ -120,6 +120,7 @@ MIGRATIONS = """
 ALTER TABLE lake.cells ADD COLUMN IF NOT EXISTS tided INTEGER;
 ALTER TABLE lake.cells ADD COLUMN IF NOT EXISTS calibrated INTEGER;
 ALTER TABLE lake.calibration_outliers ADD COLUMN IF NOT EXISTS content_hash VARCHAR;
+ALTER TABLE lake.tide_stations ADD COLUMN IF NOT EXISTS unpredictable BOOLEAN;
 """
 
 # A corrected depth past this is no drying height but a correction gone wrong; cells, the

@@ -74,6 +74,8 @@ RECENT_DAYS = 45
 # Of the stations a store uses, more than this share leaving in one run is refused.
 MAX_LEAVING = 0.1
 GUARDED_STATIONS = 100
+# Days a station must fail in one run, with none predicted, to be given up on.
+UNPREDICTABLE_DAYS = 3
 EARTH_KM = 6371.0
 
 
@@ -266,6 +268,7 @@ def load_stations(
                 "gauge_km": np.where(gi >= 0, gkm, np.nan).astype(np.float32),
                 "license": np.array([s.get("license") for s in write], dtype=object),
                 "attribution": np.array([s.get("attribution") for s in write], dtype=object),
+                "unpredictable": np.zeros(len(write), dtype=bool),
             },
         )
         con.execute("UPDATE lake.tide_stations SET gauge_km = NULL WHERE isnan(gauge_km)")
@@ -279,8 +282,10 @@ def load_stations(
 
 
 def regauge(con, g):
-    """Give every station the nearest gauge in listing `g`; a station whose gauge changed
-    has its levels moved to the temp table `old_levels`, to be done again."""
+    """Move a station to a gauge in listing `g` nearer than its own, or give one to a station
+    without; a station whose gauge changed has its levels moved to the temp table
+    `old_levels`, to be done again. A gauge missing from today's listing isn't a reason to
+    move: a cut-off listing would otherwise shuffle every station."""
     st = con.execute("SELECT station_id, lon, lat FROM lake.tide_stations").fetchnumpy()
     if not len(st["station_id"]):
         return
@@ -295,7 +300,9 @@ def regauge(con, g):
     )
     con.execute(
         """CREATE OR REPLACE TEMP TABLE regauged AS SELECT n.* FROM gauges_np n
-        JOIN lake.tide_stations s USING (station_id) WHERE s.gauge IS DISTINCT FROM n.gauge"""
+        JOIN lake.tide_stations s USING (station_id)
+        WHERE n.gauge IS NOT NULL AND s.gauge IS DISTINCT FROM n.gauge
+          AND (s.gauge IS NULL OR n.gauge_km < s.gauge_km)"""
     )
     con.unregister("gauges_np")
     con.execute(
@@ -326,14 +333,21 @@ def assign_cells(con):
         return
     lat = (cells_["tide_cell"] // 18000 + 0.5) / 50 - 90
     lon = (cells_["tide_cell"] % 18000 + 0.5) / 50 - 180
-    st = con.execute("SELECT station_id, lon, lat FROM lake.tide_stations").fetchnumpy()
+    # A station the engine couldn't predict gives its cells to the next one.
+    st = con.execute(
+        "SELECT station_id, lon, lat FROM lake.tide_stations WHERE NOT coalesce(unpredictable, false)"
+    ).fetchnumpy()
     i, km = nearest(lon, lat, st["lon"], st["lat"], STATION_KM)
     con.register(
         "assign_np",
         {
             "tide_cell": cells_["tide_cell"],
             "tile_id": cells_["tile_id"],
-            "station_id": np.where(i >= 0, st["station_id"][np.maximum(i, 0)], -1),
+            "station_id": (
+                np.where(i >= 0, st["station_id"][np.maximum(i, 0)], -1)
+                if len(st["station_id"])
+                else np.full(len(i), -1)
+            ),
             "km": np.where(i >= 0, km, np.nan),
         },
     )
@@ -390,8 +404,13 @@ def fetch_residuals(con, months, today, residuals=coops_residuals):
                 WHERE gauge = $gauge AND date_trunc('month', time)::DATE = $month""",
                 key,
             ).fetchone()[0]
-            # An empty answer where data was kept is an outage, not the gauge's record.
-            if rows is None or (not rows and stored):
+            prior = con.execute(
+                "SELECT fetched FROM lake.tide_residual_months WHERE gauge = $gauge AND month = $month",
+                key,
+            ).fetchone()
+            # An empty answer where data was kept is an outage, not the gauge's record; a
+            # first empty answer is taken as final only once a second agrees.
+            if rows is None or (not rows and (stored or prior is None)):
                 con.execute(
                     """INSERT INTO lake.tide_residual_months SELECT $gauge, $month, DATE '1900-01-01'
                     WHERE NOT EXISTS (SELECT 1 FROM lake.tide_residual_months
@@ -544,6 +563,30 @@ def build(
         con.execute(LEVELS)
         con.execute("COMMIT")
         checkpoint(con)
+    # A station none of whose days the engine could predict, of several asked, is marked, so its cells go to
+    # the next station on the next run rather than waiting for a tide that won't come.
+    con.register(
+        "asked_np",
+        {
+            "station_id": np.array([sid for sid, *_ in need], dtype=np.int32),
+            "day": np.array([d for *_, d in need], dtype="datetime64[D]").astype("datetime64[us]"),
+        },
+    )
+    con.execute(
+        f"""UPDATE lake.tide_stations SET unpredictable = true WHERE station_id IN (
+          SELECT station_id FROM asked_np GROUP BY station_id
+          HAVING count(*) >= {UNPREDICTABLE_DAYS} AND count(*) FILTER (WHERE (station_id, day::DATE) IN (
+            SELECT DISTINCT station_id, slot::DATE FROM lake.tide_levels)) = 0)"""
+    )
+    con.unregister("asked_np")
+    waiting = con.execute(
+        f"""SELECT count(*) FROM lake.points p JOIN lake.tide_cells c ON c.tide_cell = {TIDE_CELL}
+        WHERE c.station_id IS NOT NULL AND p.time >= TIMESTAMP '{EARLIEST}'
+          AND (c.station_id, date_trunc('day', p.time)::DATE) NOT IN (
+            SELECT DISTINCT station_id, slot::DATE FROM lake.tide_levels)"""
+    ).fetchone()[0]
+    if waiting:
+        log.warning("tide: %d soundings wait for a level and stay out of the grid", waiting)
     # Station days whose levels were gained, changed or lost, and cells that changed
     # station, make their soundings' tiles stale.
     con.register(
