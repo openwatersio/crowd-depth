@@ -621,6 +621,26 @@ def test_a_store_path_with_a_quote(tmp_path):
         assert con.execute("SELECT count(*) FROM lake.withdrawal_holds").fetchone() == (1,)
 
 
+def test_a_lock_that_expired_while_renewals_failed_is_lost(tmp_path, monkeypatch):
+    # Renewals fail, and the lock object still names this run but has expired: another
+    # run may take it over, so this one must stop treating it as held.
+    store = LocalObjects(tmp_path)
+    lock = Lock(store, ttl=timedelta(seconds=0.4))
+    lock.acquire()
+    put = store.put
+    body = {"owner": lock.owner, "expires": "2000-01-01T00:00:00+00:00"}
+    put(LOCK, json.dumps(body).encode())
+
+    def failing(key, data, **kw):
+        if key == LOCK:
+            raise ConnectionError("R2 unreachable")
+        return put(key, data, **kw)
+
+    monkeypatch.setattr(store, "put", failing)
+    assert lock.lost.wait(2)
+    lock.release()
+
+
 def test_release_never_clobbers_a_lock_taken_over(tmp_path):
     store = LocalObjects(tmp_path)
     lock = Lock(store)
