@@ -24,6 +24,7 @@ from datetime import UTC, datetime
 
 import numpy as np
 
+from .catalog import checkpoint
 from .definitions import QC
 
 log = logging.getLogger(__name__)
@@ -290,9 +291,12 @@ def run(con, missing_only=False) -> int:
             {"missing_only": missing_only},
         ).fetchall()
     ]
+    # A batch's qc_batches row records it done, so a run that stops partway resumes,
+    # with missing_only, from its last checkpoint.
     for batch_id in batches:
         con.execute("BEGIN")
         run_batch(con, batch_id)
         con.execute("COMMIT")
+        checkpoint(con)
     log.info("qc: %d batches", len(batches))
     return len(batches)

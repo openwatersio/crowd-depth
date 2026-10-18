@@ -11,7 +11,7 @@ from datetime import datetime
 
 import duckdb
 
-from .qc import ARRIVAL_SLACK_S, EARLIEST
+from .definitions import QC
 
 NOAA_PREFIX = "csb/csv/"
 # RFC 4180, every field read as text and checked after. A row with an extra field
@@ -260,8 +260,8 @@ def validate(con, arrived: datetime) -> tuple[int, datetime, datetime]:
           count(*) FILTER (WHERE time IS NULL OR NOT coalesce(zoned, false)
             OR NOT (year(time) BETWEEN 1 AND 9999)),
           min(time) FILTER (WHERE plausible), max(time) FILTER (WHERE plausible)
-        FROM (SELECT *, time >= TIMESTAMP '{EARLIEST}'
-            AND time <= $arrived + INTERVAL {ARRIVAL_SLACK_S} SECOND AS plausible FROM file_points)""",
+        FROM (SELECT *, time >= TIMESTAMP '{QC["earliest"]}'
+            AND time <= $arrived + INTERVAL {QC["arrival_slack_s"]} SECOND AS plausible FROM file_points)""",
         {"arrived": arrived},
     ).fetchone()
     if n == 0:

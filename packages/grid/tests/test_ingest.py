@@ -1,5 +1,6 @@
 import json
 import random
+import shutil
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -342,7 +343,7 @@ def test_a_run_that_fails_keeps_what_it_published(env, monkeypatch):
     # Every file is a checkpoint; the third file can't be downloaded, as an R2 error
     # late in a long import.
     # Batches stay under FLUSH_POINTS, so checkpoints fall between them.
-    monkeypatch.setattr(ingest, "CHECKPOINT_SECONDS", 0)
+    monkeypatch.setattr(catalog, "CHECKPOINT_SECONDS", 0)
     monkeypatch.setattr(ingest, "FETCH_BYTES", 1)
     env.ow.put(ow_key(1), geojson(ROWS[:2]))
     env.ow.put(ow_key(2), geojson(ROWS))  # covers the first
@@ -619,6 +620,62 @@ def test_a_store_path_with_a_quote(tmp_path):
         con.execute("INSERT INTO lake.withdrawal_holds VALUES ('noaa', 'k', 1, false)")
     with open_store(store, write=False) as con:
         assert con.execute("SELECT count(*) FROM lake.withdrawal_holds").fetchone() == (1,)
+
+
+def test_a_lock_that_expired_while_renewals_failed_is_lost(tmp_path, monkeypatch):
+    # Renewals fail, and the lock object still names this run but has expired: another
+    # run may take it over, so this one must stop treating it as held.
+    store = LocalObjects(tmp_path)
+    lock = Lock(store, ttl=timedelta(seconds=0.4))
+    lock.acquire()
+    put = store.put
+    body = {"owner": lock.owner, "expires": "2000-01-01T00:00:00+00:00"}
+    put(LOCK, json.dumps(body).encode())
+
+    def failing(key, data, **kw):
+        if key == LOCK:
+            raise ConnectionError("R2 unreachable")
+        return put(key, data, **kw)
+
+    monkeypatch.setattr(store, "put", failing)
+    assert lock.lost.wait(2)
+    lock.release()
+
+
+def test_a_local_listing_walks_only_its_prefix(tmp_path, monkeypatch):
+    store = LocalObjects(tmp_path)
+    for key in ("a/1/x.csv", "a/12/y.csv", "a/2/z.csv", "b/w.csv"):
+        store.put(key, b"data")
+    walked = []
+    rglob = type(tmp_path).rglob
+    monkeypatch.setattr(
+        type(tmp_path), "rglob", lambda self, p: walked.append(self) or rglob(self, p)
+    )
+    assert [o.key for o in store.list("a/1/")[0]] == ["a/1/x.csv"]
+    assert [o.key for o in store.list("a/1")[0]] == ["a/1/x.csv", "a/12/y.csv"]
+    assert [o.key for o in store.list("")[0]] == ["a/1/x.csv", "a/12/y.csv", "a/2/z.csv", "b/w.csv"]
+    assert store.list("c/")[0] == []
+    assert walked[:3] == [tmp_path / "a/1", tmp_path / "a", tmp_path]
+
+
+def test_the_r2_retry_settings_are_ones_duckdb_knows():
+    con = duckdb.connect()
+    con.execute("INSTALL httpfs; LOAD httpfs")
+    for setting in catalog.HTTP_RETRIES:
+        con.execute(setting)
+    assert con.execute("SELECT current_setting('http_retries')").fetchone() == (8,)
+
+
+def test_a_copied_store_reads_and_writes_its_own_files(env, tmp_path):
+    env.noaa.put(noaa_key(1), noaa_csv(ROWS))
+    env.run("noaa")
+    copy = LocalObjects(tmp_path / "copy")
+    shutil.copytree(env.store.root, copy.root)
+    with open_store(copy) as con:
+        assert con.execute("SELECT count(*) FROM lake.points").fetchone() == (3,)
+        con.execute("INSERT INTO lake.withdrawal_holds VALUES ('noaa', 'k', 1, false)")
+    with open_store(env.store, write=False) as con:  # the original is untouched
+        assert con.execute("SELECT count(*) FROM lake.withdrawal_holds").fetchone() == (0,)
 
 
 def test_release_never_clobbers_a_lock_taken_over(tmp_path):
