@@ -80,7 +80,10 @@ def main(argv=None):
         "confirm-withdrawals", help="Let held withdrawals apply once two listings agree"
     )
     c.add_argument("source", choices=SOURCES)
-    sub.add_parser("qc", help="Flag impossible values, jumps and spikes along each track")
+    sub.add_parser(
+        "qc",
+        help="Rerun QC on every batch; `grid cells` QCs only batches not yet done at this version",
+    )
     cl = sub.add_parser("cells", help="Run QC, then rebuild every grid cell, or a region's")
     cl.add_argument(
         "--bbox",
