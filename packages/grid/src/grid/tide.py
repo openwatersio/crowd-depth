@@ -211,11 +211,14 @@ def load_stations(
     """Bring `tide_stations` up to Slackwater's current list. New eligible stations join
     with new ids; a station gone from the list or no longer eligible leaves, with its
     levels. When the engine or database `version` changes, every station's details and
-    gauge are taken again and every level is dropped, to be predicted again. Returns
-    whether levels were dropped for that."""
+    gauge are taken again and every level is dropped, to be predicted again. Every station
+    takes the nearest gauge in today's listing, and one whose gauge changed has its levels
+    done again. Both lists are read before anything changes, so a failed listing leaves the
+    store as it was. Returns whether levels were dropped for a new version."""
     rows = {s["id"]: s for s in stations() if eligible(s)}
     if not rows:
         raise RuntimeError("no tide station passes the license, quality and datum filter")
+    g = gauges()
     have = dict(con.execute("SELECT station, station_id FROM lake.tide_stations").fetchall())
     gone = [sid for st, sid in have.items() if st not in rows]
     # A changed filter or a broken release, not stations retired one by one.
@@ -240,7 +243,6 @@ def load_stations(
         con.execute("DELETE FROM lake.tide_stations")
     write = [s for st, s in rows.items() if refresh or st not in have]
     if write:
-        g = gauges()
         lon, lat = np.array([s["lon"] for s in write]), np.array([s["lat"] for s in write])
         gi, gkm = nearest(lon, lat, [x["lon"] for x in g], [x["lat"] for x in g], GAUGE_KM)
         next_id = max(have.values(), default=-1) + 1
@@ -267,12 +269,48 @@ def load_stations(
             },
         )
         con.execute("UPDATE lake.tide_stations SET gauge_km = NULL WHERE isnan(gauge_km)")
+    regauge(con, g)
     if version is not None:
         con.execute("DELETE FROM lake.store_meta WHERE key = 'slackwater'")
         con.execute("INSERT INTO lake.store_meta VALUES ('slackwater', ?)", [version])
     if gone or write:
         log.info("tide: %d stations written, %d left", len(write), len(gone))
     return refresh
+
+
+def regauge(con, g):
+    """Give every station the nearest gauge in listing `g`; a station whose gauge changed
+    has its levels moved to the temp table `old_levels`, to be done again."""
+    st = con.execute("SELECT station_id, lon, lat FROM lake.tide_stations").fetchnumpy()
+    if not len(st["station_id"]):
+        return
+    gi, gkm = nearest(st["lon"], st["lat"], [x["lon"] for x in g], [x["lat"] for x in g], GAUGE_KM)
+    con.register(
+        "gauges_np",
+        {
+            "station_id": st["station_id"],
+            "gauge": np.array([g[i]["id"] if i >= 0 else None for i in gi], dtype=object),
+            "gauge_km": np.where(gi >= 0, gkm, np.nan),
+        },
+    )
+    con.execute(
+        """CREATE OR REPLACE TEMP TABLE regauged AS SELECT n.* FROM gauges_np n
+        JOIN lake.tide_stations s USING (station_id) WHERE s.gauge IS DISTINCT FROM n.gauge"""
+    )
+    con.unregister("gauges_np")
+    con.execute(
+        """UPDATE lake.tide_stations s SET gauge = r.gauge,
+          gauge_km = CASE WHEN isnan(r.gauge_km) THEN NULL ELSE r.gauge_km END
+        FROM regauged r WHERE s.station_id = r.station_id"""
+    )
+    con.execute(
+        """INSERT INTO old_levels SELECT * FROM lake.tide_levels
+        WHERE station_id IN (SELECT station_id FROM regauged)"""
+    )
+    con.execute(
+        "DELETE FROM lake.tide_levels WHERE station_id IN (SELECT station_id FROM regauged)"
+    )
+    con.execute("DROP TABLE regauged")
 
 
 def assign_cells(con):

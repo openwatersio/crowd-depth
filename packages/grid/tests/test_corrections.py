@@ -1047,3 +1047,50 @@ def test_a_reference_that_cant_anchor_doesnt_hide_one_that_can(env, tmp_path, mo
         con.execute("UPDATE lake.reference_pixels SET uncertainty = 0.1 WHERE depth > 20")
         calibrate.run(con)
     assert segments(env)[("AQM-A", 0)][1] == "anchored"
+
+
+def test_a_failed_gauge_listing_leaves_the_stations_as_they_were(env):  # noqa: F811
+    lon, lat = at(5000, 0)
+    put(env, 1, [(0, lon, lat, 5.0)])
+    env.run("noaa")
+    near = {
+        "id": "near",
+        "lon": lon + 0.05,
+        "lat": lat,
+        "commercial_use": True,
+        "accepted": True,
+        "has_datums": True,
+        "chart_datum": "MLLW",
+    }
+
+    def down():
+        raise RuntimeError("CO-OPS listed only 0 water level gauges")
+
+    with open_store(env.store) as con:
+        tide.build(con, lambda: [*stations(), near], list, residuals, levels, version="v1")
+        before = con.execute("SELECT count(*) FROM lake.tide_levels").fetchone()
+        with pytest.raises(RuntimeError, match="listed only"):
+            tide.build(con, stations, down, residuals, levels, version="v2")
+        assert con.execute(
+            "SELECT count(*) FROM lake.tide_stations WHERE station = 'near'"
+        ).fetchone() == (1,)
+        assert con.execute("SELECT count(*) FROM lake.tide_levels").fetchone() == before
+
+
+def test_a_station_moves_to_a_nearer_gauge_when_one_is_listed(env):  # noqa: F811
+    lon, lat = at(5000, 0)
+    put(env, 1, [(0, lon, lat, 5.0)])
+    env.run("noaa")
+    far = [{"id": "g1", "lon": lon + 0.9, "lat": lat}]
+    later = date(2027, 1, 1)
+    with open_store(env.store) as con:
+        tide.build(con, stations, lambda: far, residuals, levels, version="v1", today=later)
+        cells.build(con)
+        nearer = [*far, {"id": "g2", "lon": lon + 0.2, "lat": lat}]
+        tide.build(con, stations, lambda: nearer, residuals, levels, version="v1", today=later)
+        [(gauge,)] = con.execute(
+            "SELECT gauge FROM lake.tide_stations WHERE station = 'far'"
+        ).fetchall()
+        assert gauge == "g2"
+        assert con.execute("SELECT count(*) FROM lake.tide_levels").fetchone() == (48,)
+        assert cells.changed(con) == [TILE]
