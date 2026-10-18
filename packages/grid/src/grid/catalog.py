@@ -6,6 +6,7 @@ import os
 import socket
 import tempfile
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -22,6 +23,17 @@ log = logging.getLogger(__name__)
 LOCK = "catalog/lock"
 MEMORY_LIMIT = "4GB"
 RETAIN = timedelta(days=7)
+# A long run publishes its catalog at the first break between units of work past this
+# many seconds since it last did, so a failure later keeps what it had done.
+CHECKPOINT_SECONDS = 15 * 60
+# R2 drops the odd connection over a run of hours: retry eight times, waiting 1 s and
+# doubling (about four minutes of waits, more with timeouts), rather than DuckDB's
+# default of three tries over two seconds.
+HTTP_RETRIES = [
+    "SET http_retries = 8",
+    "SET http_retry_wait_ms = 1000",
+    "SET http_retry_backoff = 2",
+]
 POINTER = "catalog/current"
 
 SCHEMA = """
@@ -46,6 +58,9 @@ CREATE TABLE IF NOT EXISTS lake.withdrawal_holds (
 );
 CREATE TABLE IF NOT EXISTS lake.qc_batches (batch_id BIGINT, qc_version INTEGER);
 CREATE TABLE IF NOT EXISTS lake.store_meta (key VARCHAR, value VARCHAR);
+-- Tiles whose cells are built, the inputs fingerprint they were built from and a digest
+-- of the cells, so a build that stopped partway resumes where it was.
+CREATE TABLE IF NOT EXISTS lake.cells_built (tile_id INTEGER, inputs VARCHAR, digest VARCHAR);
 CREATE TABLE IF NOT EXISTS lake.qc_flags (
   point_id BLOB, flag VARCHAR, reason VARCHAR, qc_version INTEGER, cell_id SMALLINT
 );
@@ -264,6 +279,8 @@ def connect(catalog_path: str, data_url: str, temp_dir: str) -> duckdb.DuckDBPyC
     con.execute("INSTALL ducklake; LOAD ducklake")
     if data_url.startswith("s3://"):
         con.execute("INSTALL httpfs; LOAD httpfs")
+        for setting in HTTP_RETRIES:
+            con.execute(setting)
         con.execute(
             "CREATE SECRET (TYPE s3, KEY_ID ?, SECRET ?, ENDPOINT ?, REGION ?, URL_STYLE 'path')",
             [
@@ -317,12 +334,30 @@ def check_hash_scheme(con):
 class Session:
     """The connection open_store yields, which can also publish the catalog partway through a run."""
 
-    def __init__(self, con, publish):
+    def __init__(self, con, publish, write=True):
         self.con = con
-        self.publish = publish
+        self._publish = publish
+        # When it last published; None for a read-only session, which never does.
+        self.published = time.monotonic() if write else None
+
+    def publish(self):
+        key = self._publish()
+        self.published = time.monotonic()
+        return key
 
     def __getattr__(self, name):
         return getattr(self.con, name)
+
+
+def checkpoint(con):
+    """Publish a session's catalog if CHECKPOINT_SECONDS have passed since it last did.
+
+    Call it only between units of work, with no transaction open. A plain connection
+    or a read-only session, with no catalog to publish, is left alone.
+    """
+    published = getattr(con, "published", None)
+    if published is not None and time.monotonic() - published >= CHECKPOINT_SECONDS:
+        con.publish()
 
 
 @contextmanager
@@ -368,7 +403,7 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
                     # cells' marker, and DuckLake deletes by writing delete files, so the
                     # replaced files stay live until rewritten.
                     # ponytail: points' delete files wait for compaction, which is still to come
-                    for table in ("cells", "qc_flags", "shoals", "store_meta"):
+                    for table in ("cells", "qc_flags", "shoals", "store_meta", "cells_built"):
                         con.execute(f"CALL ducklake_rewrite_data_files('lake', '{table}')")
                     # A reader may still hold a catalog up to RETAIN old, so snapshots, the
                     # files only they reference, and old catalogs go once they pass it.
@@ -409,7 +444,7 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
                     attach(con, str(local), data_url)
                 return key
 
-            yield Session(con, publish)
+            yield Session(con, publish, write)
             if not write:
                 con.close()
                 return

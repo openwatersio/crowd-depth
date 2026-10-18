@@ -342,7 +342,7 @@ def test_a_run_that_fails_keeps_what_it_published(env, monkeypatch):
     # Every file is a checkpoint; the third file can't be downloaded, as an R2 error
     # late in a long import.
     # Batches stay under FLUSH_POINTS, so checkpoints fall between them.
-    monkeypatch.setattr(ingest, "CHECKPOINT_SECONDS", 0)
+    monkeypatch.setattr(catalog, "CHECKPOINT_SECONDS", 0)
     monkeypatch.setattr(ingest, "FETCH_BYTES", 1)
     env.ow.put(ow_key(1), geojson(ROWS[:2]))
     env.ow.put(ow_key(2), geojson(ROWS))  # covers the first
@@ -639,6 +639,14 @@ def test_a_lock_that_expired_while_renewals_failed_is_lost(tmp_path, monkeypatch
     monkeypatch.setattr(store, "put", failing)
     assert lock.lost.wait(2)
     lock.release()
+
+
+def test_the_r2_retry_settings_are_ones_duckdb_knows():
+    con = duckdb.connect()
+    con.execute("INSTALL httpfs; LOAD httpfs")
+    for setting in catalog.HTTP_RETRIES:
+        con.execute(setting)
+    assert con.execute("SELECT current_setting('http_retries')").fetchone() == (8,)
 
 
 def test_release_never_clobbers_a_lock_taken_over(tmp_path):

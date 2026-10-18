@@ -29,7 +29,7 @@ from pathlib import Path
 from boto3.exceptions import Boto3Error
 from botocore.exceptions import BotoCoreError, ClientError
 
-from . import qc
+from . import catalog, qc
 from .sources import NOAA_PREFIX, Invalid, Parsed, arrival, is_submission, load
 
 log = logging.getLogger(__name__)
@@ -40,9 +40,6 @@ WITHDRAWAL_LIMIT = 0.01
 # DuckDB, whose memory is capped; points wait in a DuckDB table until a flush.
 FETCH_BYTES = 512 * 2**20
 FLUSH_POINTS = 500_000
-# A run publishes its catalog after the first file past this many seconds since it last
-# did, so a failure later keeps what it had done, and a rerun skips the files it published.
-CHECKPOINT_SECONDS = 15 * 60
 # Rule 4 checks files for coverage in groups holding at most this many points.
 COVER_POINTS = 5_000_000
 FETCHERS = 16
@@ -520,7 +517,7 @@ class Ingest:
         )
 
     def checkpoint_due(self) -> bool:
-        return time.monotonic() - self.published >= CHECKPOINT_SECONDS
+        return time.monotonic() - self.published >= catalog.CHECKPOINT_SECONDS
 
     def flush(self):
         if self.pending:
