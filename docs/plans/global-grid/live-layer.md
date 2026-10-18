@@ -45,7 +45,7 @@ The statistic needs the soundings, not a running minimum. Accepted soundings are
 
 ### Portrayal
 
-The live layer and the global overlay are each a chart the user turns on and off on their own. The plugin lists the global overlay as a chart resource pointing at its published PMTiles archive, alongside the live layer, so a user can show either, both, or neither.
+The live layer and the global overlay are two plugin layers, which Freeboard lists under "Plugin layers" with their own on/off toggles, so a user can show either, both, or neither. The global overlay is a data overlay over the published PMTiles archive, drawn with the same style as the live layer, so the two match where they meet.
 
 The live layer has the overlay's schema: S-57 `DEPARE`, `DEPCNT`, `SOUNDG` and `M_QUAL` vector tiles, built with the grid's band levels, contour tiers and rounding toward shoal. The portrayal code shared with Seascape ([#146](https://github.com/openwatersio/crowd-depth/issues/146)) covers the live layer too.
 
@@ -69,7 +69,6 @@ The plugin also lists the tiles as a `type=S-57` chart resource, for plotters wi
 
 ## Open questions
 
-- Whether a MapLibre port of S-52 is close enough, or Freeboard should refresh S-57 chart resources so both layers share its S-52 engine. That needs the [upstream change](#upstream-change-for-live-chart-resources) below.
 - What the layer shows where there's no tide station or datum separation: raw depths, flagged, or nothing on top of the overlay.
 
 ## Freeboard refresh

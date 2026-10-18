@@ -251,7 +251,7 @@ Files removed from NOAA or deleted from R2 leave every product through `files`, 
 
 Offline charts belong to chart providers, not the crowd-depth plugin. [signalk-charts-provider-simple](https://github.com/dirkwa/signalk-charts-provider-simple) is adding PMTiles support, so it can serve the overlay directly and cut an extract for a box the user draws, the way it handles NOAA ENCs, and use the build version to tell the user when the extract is out of date.
 
-The crowd-depth plugin also lists the global overlay as a chart the user can turn on and off, and draws the boat's own soundings as a second chart on top of it, in charted depths with the grid's QC, corrections and portrayal ([live-layer.md](live-layer.md)). Its other part is feedback to the contributor:
+The crowd-depth plugin also offers the global overlay and the boat's own soundings as two plugin layers the user turns on and off, the boat's on top, in charted depths with the grid's QC, corrections and portrayal ([live-layer.md](live-layer.md)). Its other part is feedback to the contributor:
 
 - The vessel's own fitted offsets and reputation, shown in the plugin's status, which tells a contributor whether their setup reads true and gives them a reason to keep sharing.
 
