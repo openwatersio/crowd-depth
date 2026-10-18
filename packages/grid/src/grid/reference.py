@@ -28,6 +28,7 @@ from rasterio.windows import Window
 from scipy.ndimage import maximum_filter, minimum_filter, uniform_filter
 
 from . import tide
+from .catalog import checkpoint
 from .cells import BASE, k_for
 
 log = logging.getLogger(__name__)
@@ -162,7 +163,7 @@ def sample(con, sources, separation=None):
             for (tile,) in tiles:
                 n, got = sample_tile(con, tile, name, catalogs, tmp, shift_at)
                 total, found = total + n, found + got
-                con.checkpoint()
+                checkpoint(con)
     log.info("reference: %d pixel samples, %d with a depth", total, found)
     return total
 

@@ -33,7 +33,7 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 from . import cells
-from .catalog import TIDE_CELL
+from .catalog import TIDE_CELL, checkpoint
 from .sources import EARLIEST
 
 log = logging.getLogger(__name__)
@@ -440,7 +440,7 @@ def fetch_residuals(con, months, today, residuals=coops_residuals):
             )
             con.execute("COMMIT")
             fetched.append((gauge, month))
-            con.checkpoint()
+            checkpoint(con)
     if months:
         log.info("tide: fetched %d gauge months of %d", len(fetched), len(months))
     return fetched
@@ -543,7 +543,7 @@ def build(
         con.execute("BEGIN")
         con.execute(LEVELS)
         con.execute("COMMIT")
-        con.checkpoint()
+        checkpoint(con)
     # Station days whose levels were gained, changed or lost, and cells that changed
     # station, make their soundings' tiles stale.
     con.register(

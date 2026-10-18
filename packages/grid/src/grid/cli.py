@@ -82,7 +82,10 @@ def main(argv=None):
         "confirm-withdrawals", help="Let held withdrawals apply once two listings agree"
     )
     c.add_argument("source", choices=SOURCES)
-    sub.add_parser("qc", help="Flag impossible values, jumps and spikes along each track")
+    sub.add_parser(
+        "qc",
+        help="Rerun QC on every batch; `grid cells` QCs only batches not yet done at this version",
+    )
     td = sub.add_parser(
         "tide", help="Tide levels for the soundings' station days, from Slackwater and CO-OPS"
     )

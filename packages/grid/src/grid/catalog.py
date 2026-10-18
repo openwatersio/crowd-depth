@@ -23,7 +23,17 @@ log = logging.getLogger(__name__)
 LOCK = "catalog/lock"
 MEMORY_LIMIT = "4GB"
 RETAIN = timedelta(days=7)
+# A long run publishes its catalog at the first break between units of work past this
+# many seconds since it last did, so a failure later keeps what it had done.
 CHECKPOINT_SECONDS = 15 * 60
+# R2 drops the odd connection over a run of hours: retry eight times, waiting 1 s and
+# doubling (about four minutes of waits, more with timeouts), rather than DuckDB's
+# default of three tries over two seconds.
+HTTP_RETRIES = [
+    "SET http_retries = 8",
+    "SET http_retry_wait_ms = 1000",
+    "SET http_retry_backoff = 2",
+]
 POINTER = "catalog/current"
 
 SCHEMA = """
@@ -48,6 +58,9 @@ CREATE TABLE IF NOT EXISTS lake.withdrawal_holds (
 );
 CREATE TABLE IF NOT EXISTS lake.qc_batches (batch_id BIGINT, qc_version INTEGER);
 CREATE TABLE IF NOT EXISTS lake.store_meta (key VARCHAR, value VARCHAR);
+-- Tiles whose cells are built, the inputs fingerprint they were built from and a digest
+-- of the cells, so a build that stopped partway resumes where it was.
+CREATE TABLE IF NOT EXISTS lake.cells_built (tile_id INTEGER, inputs VARCHAR, digest VARCHAR);
 CREATE TABLE IF NOT EXISTS lake.qc_flags (
   point_id BLOB, flag VARCHAR, reason VARCHAR, qc_version INTEGER, cell_id SMALLINT
 );
@@ -294,9 +307,15 @@ class Lock:
             except Exception:
                 log.warning("renewing the catalog lock failed", exc_info=True)
             # A renewal that succeeded but whose response was lost fails its retry
-            # with a 412; the lock is still ours if it still names this run.
+            # with a 412; the lock is still ours if it still names this run and hasn't
+            # expired, since another run may take over an expired lock at any moment.
             current = self._held()
-            if current and json.loads(current[0])["owner"] == self.owner:
+            held = current and json.loads(current[0])
+            if (
+                held
+                and held["owner"] == self.owner
+                and datetime.fromisoformat(held["expires"]) > datetime.now(UTC)
+            ):
                 self.etag = current[1]
             elif current or datetime.now(UTC) - self.renewed >= self.ttl:
                 # Another run holds it, or it may have expired while unreachable.
@@ -355,6 +374,8 @@ def connect(catalog_path: str, data_url: str, temp_dir: str) -> duckdb.DuckDBPyC
     con.execute("INSTALL ducklake; LOAD ducklake")
     if data_url.startswith("s3://"):
         con.execute("INSTALL httpfs; LOAD httpfs")
+        for setting in HTTP_RETRIES:
+            con.execute(setting)
         con.execute(
             "CREATE SECRET (TYPE s3, KEY_ID ?, SECRET ?, ENDPOINT ?, REGION ?, URL_STYLE 'path')",
             [
@@ -383,10 +404,13 @@ def connect(catalog_path: str, data_url: str, temp_dir: str) -> duckdb.DuckDBPyC
 
 def attach(con, catalog_path: str, data_url: str):
     # Inlining keeps the small per-file writes to files and submission_meta in the
-    # catalog instead of a Parquet file each.
+    # catalog instead of a Parquet file each. A local store's data is its own folder
+    # wherever that is, so a copied or cloned store reads its own files rather than
+    # refusing the path the catalog was built at; data files are stored relative to it.
+    local = "" if data_url.startswith("s3://") else ", OVERRIDE_DATA_PATH true"
     con.execute(
         f"ATTACH {literal('ducklake:' + catalog_path)} AS lake"
-        f" (DATA_PATH {literal(data_url)}, DATA_INLINING_ROW_LIMIT 1000)"
+        f" (DATA_PATH {literal(data_url)}, DATA_INLINING_ROW_LIMIT 1000{local})"
     )
 
 
@@ -409,20 +433,30 @@ def check_hash_scheme(con):
 class Session:
     """The connection open_store yields, which can also publish the catalog partway through a run."""
 
-    def __init__(self, con, publish):
+    def __init__(self, con, publish, write=True):
         self.con = con
-        self.publish = publish
-        self.published = time.monotonic()
+        self._publish = publish
+        # When it last published; None for a read-only session, which never does.
+        self.published = time.monotonic() if write else None
 
-    def checkpoint(self, every=CHECKPOINT_SECONDS):
-        """Publish, between transactions, if `every` seconds have passed since the last
-        checkpoint, so a long run that fails later keeps what it had done."""
-        if time.monotonic() - self.published >= every:
-            self.publish()
-            self.published = time.monotonic()
+    def publish(self):
+        key = self._publish()
+        self.published = time.monotonic()
+        return key
 
     def __getattr__(self, name):
         return getattr(self.con, name)
+
+
+def checkpoint(con):
+    """Publish a session's catalog if CHECKPOINT_SECONDS have passed since it last did.
+
+    Call it only between units of work, with no transaction open. A plain connection
+    or a read-only session, with no catalog to publish, is left alone.
+    """
+    published = getattr(con, "published", None)
+    if published is not None and time.monotonic() - published >= CHECKPOINT_SECONDS:
+        con.publish()
 
 
 @contextmanager
@@ -473,6 +507,7 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
                         "qc_flags",
                         "shoals",
                         "store_meta",
+                        "cells_built",
                         "calibration",
                         "calibration_outliers",
                         "file_offsets",
@@ -523,7 +558,7 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
                     attach(con, str(local), data_url)
                 return key
 
-            yield Session(con, publish)
+            yield Session(con, publish, write)
             if not write:
                 con.close()
                 return
