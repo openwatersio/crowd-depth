@@ -29,12 +29,13 @@ from rasterio.windows import Window
 from scipy.ndimage import distance_transform_edt, gaussian_filter, minimum_filter
 
 from .cells import BASE, CELL_SAMPLE, k_for
+from .definitions import SURFACE
 from .qc import MAX_DEPTH_M, QC_VERSION
 
 NODATA = -9999.0
 # Rows per tile: 2/3″ of latitude, two base rows.
 ROWS = BASE // 2
-RADIUS_M = 200
+RADIUS_M = SURFACE["interpolation_radius_m"]
 ALGORITHM = (
     f"invdistnn:power=2:radius={RADIUS_M}:max_points=12:min_points=3"
     f":min_points_per_quadrant=1:nodata={NODATA}"

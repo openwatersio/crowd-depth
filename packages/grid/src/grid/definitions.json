@@ -1,0 +1,43 @@
+{
+  "qc": {
+    "version": 4,
+    "earliest": "2000-01-01",
+    "arrival_slack_s": 86400,
+    "max_depth_m": 11000,
+    "shallow_m": 0.5,
+    "transit_gap_s": 14400,
+    "transit_span_s": 604800,
+    "max_speed_kn": 20,
+    "spike_window": 5,
+    "spike_abs_m": 2.0,
+    "spike_rel": 0.1,
+    "spike_min_soundings": 3,
+    "flat_m": 1000,
+    "flat_min_soundings": 3,
+    "flat_span_m": 200,
+    "hazard_m": 30
+  },
+  "cells": {
+    "rows_per_degree": 10800,
+    "column_steps_divide": 1200
+  },
+  "surface": {
+    "interpolation_radius_m": 200
+  },
+  "portrayal": {
+    "isobaths_m": [0, 2, 5, 10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 3000, 4000, 5000, 6000, 8000, 10000],
+    "contour_tiers": [
+      { "below_zoom": 6, "isobaths_m": [10, 20, 50, 100, 200, 1000, 2000, 4000] },
+      { "below_zoom": 7, "isobaths_m": [10, 20, 50, 100, 200, 500, 1000, 2000, 3000, 4000] },
+      { "below_zoom": 9, "isobaths_m": [10, 20, 50, 100, 200, 300, 500, 1000, 2000, 3000, 4000, 5000, 6000, 8000, 10000] },
+      { "below_zoom": 11, "isobaths_m": [10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 3000, 4000, 5000, 6000, 8000, 10000] }
+    ],
+    "sounding_rounding": [
+      { "below_m": 21, "per_m": 10 },
+      { "below_m": 31, "per_m": 2 },
+      { "per_m": 1 }
+    ],
+    "m_per_ft": 0.3048,
+    "m_per_fathom": 1.8288
+  }
+}

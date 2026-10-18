@@ -11,6 +11,8 @@ from datetime import datetime
 
 import duckdb
 
+from .qc import ARRIVAL_SLACK_S, EARLIEST
+
 NOAA_PREFIX = "csb/csv/"
 # RFC 4180, every field read as text and checked after. A row with an extra field
 # still reads (the field is ignored); a short row reads with NULLs, which fail checks.
@@ -77,10 +79,6 @@ def is_submission(source: str, key: str) -> bool:
         return True
     except (AttributeError, TypeError, ValueError):
         return False
-
-
-# Soundings before this, or more than a day after their file arrived, are rejected by QC.
-EARLIEST = "2000-01-01"
 
 
 def arrival(source: str, key: str) -> datetime:
@@ -263,7 +261,7 @@ def validate(con, arrived: datetime) -> tuple[int, datetime, datetime]:
             OR NOT (year(time) BETWEEN 1 AND 9999)),
           min(time) FILTER (WHERE plausible), max(time) FILTER (WHERE plausible)
         FROM (SELECT *, time >= TIMESTAMP '{EARLIEST}'
-            AND time <= $arrived + INTERVAL 1 DAY AS plausible FROM file_points)""",
+            AND time <= $arrived + INTERVAL {ARRIVAL_SLACK_S} SECOND AS plausible FROM file_points)""",
         {"arrived": arrived},
     ).fetchone()
     if n == 0:

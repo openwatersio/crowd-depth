@@ -1,24 +1,34 @@
-"""Track QC: flag impossible values, position jumps and depth spikes along each track.
+"""Track QC: flag impossible values, position jumps, stuck sounders and depth spikes along each track.
 
 QC runs on each ingest batch as it lands, along each file's soundings: a submitted
-file is a contiguous piece of one vessel's track. Its windows run one day of a file at
-a time, with the adjacent days' soundings as context, so memory follows a day of one
-logger, not the size of a file. A transit's first and last few soundings are judged
-against one side only.
+file is a contiguous piece of one vessel's track. The checks are pure functions over
+one file's soundings held whole, with thresholds from definitions.json. The plugin has
+a port of them, checked against the same definitions and test vectors
+(tests/qc_vectors.json), for its live layer. A transit's first and last few soundings are judged against
+one side only.
 
 Follows NOAA Office of Coast Survey's CSB processing tool, with its thresholds as
 starting values. Rejection is one-sided: a spike deeper than the track around it is
 rejected, a shoaler one is kept as `unconfirmed`, because it may be a rock or a
 new shoal. QC writes flags and never deletes points.
+
+Times are int64 microseconds since the epoch, UTC, and depths float32, as the store
+holds them. Depth arithmetic rounds through float32 and position arithmetic is
+float64, so flags match those DuckDB computes from the same columns (the reference SQL
+in tests/reference_qc.py).
 """
 
+import itertools
 import logging
+from datetime import UTC, datetime
 
-from .sources import EARLIEST
+import numpy as np
+
+from .definitions import QC
 
 log = logging.getLogger(__name__)
 
-QC_VERSION = 3
+QC_VERSION = QC["version"]
 
 # Flags: reject (left out of everything), review (kept, looked at later),
 # unconfirmed (a shoal kept out of cell depths, areas and contours, and published by
@@ -28,212 +38,195 @@ QC_VERSION = 3
 # point can carry both an unconfirmed and a confirmed flag: confirmed wins. A reject
 # flag wins over both.
 TRACK_REASONS = ["sentinel", "time", "very_shallow", "jump", "flatline", "spike"]
+# What track_qc returns, in order: each check's flag and reason.
+CHECKS = [
+    ("reject", "sentinel"),
+    ("reject", "time"),
+    ("review", "very_shallow"),
+    ("reject", "jump"),
+    ("unconfirmed", "flatline"),
+    ("reject", "flatline"),
+    ("reject", "spike"),
+    ("unconfirmed", "spike"),
+]
 
-MAX_DEPTH_M = 11_000
-SHALLOW_M = 0.5
-TRANSIT_GAP = "4 hours"
-TRANSIT_SPAN_S = 7 * 86_400
-MAX_SPEED_KN = 20
-SPIKE_WINDOW = 5  # soundings either side
-SPIKE_ABS_M = 2.0
-SPIKE_REL = 0.10
+US = 1_000_000
+MAX_DEPTH_M = QC["max_depth_m"]
+SHALLOW_M = QC["shallow_m"]
+# Soundings before this, or more than ARRIVAL_SLACK_S after their file arrived, are rejected.
+EARLIEST = QC["earliest"]
+EARLIEST_US = int(datetime.fromisoformat(EARLIEST).replace(tzinfo=UTC).timestamp()) * US
+ARRIVAL_SLACK_S = QC["arrival_slack_s"]
+TRANSIT_GAP_S = QC["transit_gap_s"]
+TRANSIT_SPAN_S = QC["transit_span_s"]
+MAX_SPEED_KN = QC["max_speed_kn"]
+SPIKE_WINDOW = QC["spike_window"]  # soundings either side
+SPIKE_ABS_M = QC["spike_abs_m"]
+SPIKE_REL = QC["spike_rel"]
+SPIKE_MIN_SOUNDINGS = QC["spike_min_soundings"]  # in a transit, to judge spikes at all
 # A sounder that has lost bottom often holds its last depth: the same value over this
 # far is a stuck reading, not a flat seabed. On the Lynn Canal sample, runs this long
 # were a median 17% off the other vessels' depths there, against 5% for shorter ones.
-FLAT_M = 1000
-FLAT_MIN_SOUNDINGS = 3
+FLAT_M = QC["flat_m"]
+FLAT_MIN_SOUNDINGS = QC["flat_min_soundings"]
 # A reading shallower than this may be a hazard, so a rule that can't tell it from noise
 # keeps it as an unconfirmed shoal rather than rejecting it: a stuck run there may be a
 # flat shoal read by a coarse sounder.
-HAZARD_M = 30
+HAZARD_M = QC["hazard_m"]
 # Shallower than HAZARD_M, a stuck run must also span this far. A boat sitting at its
 # mooring adds a kilometre of GPS jitter in minutes while its depth honestly holds; and a
 # sounder stuck while the boat stays this close still holds a reading from within this
 # distance, so its error is at most the depth change across it. Deeper, a sounder that
 # loses bottom holds anything, so the path alone decides.
-FLAT_SPAN_M = 200
+FLAT_SPAN_M = QC["flat_span_m"]
+# Spike windows sorted at once, to bound memory on the largest files.
+SPIKE_CHUNK = 65_536
 
 
-def _at(a: str, column: str) -> str:
-    return f"{a}({column}) OVER w" if a else column
+def distance(lon_a, lat_a, lon_b, lat_b):
+    """Metres from a to b, equirectangular at a's latitude: well under 1% off at these
+    spacings. Longitude wraps at the antimeridian."""
+    dx = (np.fmod(lon_b - lon_a + 540, 360) - 180) * np.cos(np.radians(lat_a)) * 111320
+    dy = (lat_b - lat_a) * 110540
+    return np.sqrt(dx**2 + dy**2)
 
 
-def _distance(a: str, b: str) -> str:
-    """Metres between soundings `a` and `b`, each "" (this one), "lag" or "lead" along the transit."""
-    # Equirectangular, well under 1% off at these spacings; longitude wraps at the antimeridian.
-    dx = f"((({_at(b, 'lon')} - {_at(a, 'lon')} + 540) % 360) - 180) * cos(radians({_at(a, 'lat')})) * 111320"
-    dy = f"({_at(b, 'lat')} - {_at(a, 'lat')}) * 110540"
-    return f"sqrt(({dx}) ^ 2 + ({dy}) ^ 2)"
+def speed(t_a, lon_a, lat_a, t_b, lon_b, lat_b):
+    """Knots from a to b. Pairs less than a second apart count as one second, since most
+    providers write whole seconds; it hides jumps of under about 10 m between them."""
+    dt = np.maximum(np.abs(t_b / US - t_a / US), 1)
+    return distance(lon_a, lat_a, lon_b, lat_b) / dt * 1.943844
 
 
-def _extent(w: str) -> str:
-    """Metres across the bounding box of window `w`'s soundings; longitude wraps at the antimeridian."""
-    span = f"(max(lon) OVER {w} - min(lon) OVER {w})"
-    dx = f"least({span}, 360 - {span}) * cos(radians(avg(lat) OVER {w})) * 111320"
-    dy = f"(max(lat) OVER {w} - min(lat) OVER {w}) * 110540"
-    return f"sqrt(({dx}) ^ 2 + ({dy}) ^ 2)"
+def transits(time):
+    """Transit id per sounding of a time-sorted track: a new one after a gap of more than
+    TRANSIT_GAP_S, and every TRANSIT_SPAN_S from the start of each unbroken stretch."""
+    starts = np.empty(len(time), bool)
+    starts[:1] = True
+    starts[1:] = np.diff(time) > TRANSIT_GAP_S * US
+    seg = np.cumsum(starts)
+    t0 = time[starts][seg - 1]
+    return seg * 100_000 + (time - t0) // (TRANSIT_SPAN_S * US)
 
 
-def _speed(a: str, b: str) -> str:
-    """Knots between soundings `a` and `b`, each "" (this one), "lag" or "lead" along the transit."""
-    # Pairs less than a second apart count as one second, since most providers write
-    # whole seconds; it hides jumps of under about 10 m between them.
-    dt = f"greatest(abs(epoch({_at(b, 'time')}) - epoch({_at(a, 'time')})), 1)"
-    return f"{_distance(a, b)} / {dt} * 1.943844"
+def _continues(transit):
+    """True where a sounding is in the same transit as the one before it."""
+    same = np.zeros(len(transit), bool)
+    same[1:] = transit[1:] == transit[:-1]
+    return same
 
 
-# Order along a file's track: time, then the order soundings were written in.
-ORDER = 'time, "row"'
-TRACK_COLUMNS = ["point_id", "row", "time", "lon", "lat", "d", "transit", "cell_id"]
+def jumps(time, lon, lat, transit):
+    """Positions off the line through their neighbors: both legs faster than MAX_SPEED_KN
+    and than twice the speed straight past, so a fast ship's track isn't a jump. A
+    transit's first and last soundings have one leg and can't be judged this way."""
+    out = np.zeros(len(time), bool)
+    if len(time) < 3:
+        return out
+    a, b, c = slice(0, -2), slice(1, -1), slice(2, None)
+    inner = (transit[a] == transit[b]) & (transit[b] == transit[c])
+    s_in = speed(time[a], lon[a], lat[a], time[b], lon[b], lat[b])
+    s_out = speed(time[b], lon[b], lat[b], time[c], lon[c], lat[c])
+    s_past = speed(time[a], lon[a], lat[a], time[c], lon[c], lat[c])
+    out[1:-1] = inner & (np.minimum(s_in, s_out) > np.maximum(MAX_SPEED_KN, 2 * s_past))
+    return out
 
 
-def with_context(source: str, k: int) -> str:
-    """CTEs giving `windowed`: `source`'s soundings, each day of each file with the last `k`
-    soundings of the file's previous day and the first `k` of its next, marked `context`.
+def flatlines(depth, lon, lat, transit):
+    """Runs of one depth along a transit held over FLAT_M of path and at least
+    FLAT_MIN_SOUNDINGS soundings, and, shallower than HAZARD_M, spanning FLAT_SPAN_M."""
+    n = len(depth)
+    if n == 0:
+        return np.zeros(0, bool)
+    cont = _continues(transit)
+    cont[1:] &= depth[1:] == depth[:-1]
+    step = np.zeros(n)
+    step[1:] = distance(lon[:-1], lat[:-1], lon[1:], lat[1:])
+    step[~cont] = 0
+    starts = np.flatnonzero(~cont)
+    count = np.diff(np.append(starts, n))
+    stuck = (np.add.reduceat(step, starts) >= FLAT_M) & (count >= FLAT_MIN_SOUNDINGS)
+    # Across the run's bounding box, at its mean latitude; longitude wraps at the antimeridian.
+    span = np.maximum.reduceat(lon, starts) - np.minimum.reduceat(lon, starts)
+    mean_lat = np.add.reduceat(lat, starts) / count
+    dx = np.minimum(span, 360 - span) * np.cos(np.radians(mean_lat)) * 111320
+    dy = (np.maximum.reduceat(lat, starts) - np.minimum.reduceat(lat, starts)) * 110540
+    stuck &= (depth[starts] >= HAZARD_M) | (np.sqrt(dx**2 + dy**2) >= FLAT_SPAN_M)
+    return stuck[np.cumsum(~cont) - 1]
 
-    Windows then run per file and day, so their memory is a day of one logger's soundings,
-    not a file's. `k` from the adjacent day is enough: a transit that runs through a whole
-    day has a fix at least every 4 hours, so at least 6 that day, and a day with fewer
-    than `k` soundings can only start or end a transit. Spikes take their context after
-    jumps are removed, so a day of 5 or 6 soundings with jumps among them can leave the
-    next day's first windows a sounding or two short.
+
+def rolling_median(depth, transit, k=SPIKE_WINDOW):
+    """Median of each sounding's window of k either side within its transit, as DuckDB's
+    float median: the mean of the middle two, with the difference rounded to float32."""
+    n = len(depth)
+    med = np.empty(n, np.float32)
+    if n == 0:
+        return med
+    first = ~_continues(transit)
+    bounds = np.append(np.flatnonzero(first), n)
+    run = np.cumsum(first) - 1
+    lo_b, hi_b = bounds[run], bounds[run + 1] - 1
+    offsets = np.arange(-k, k + 1)
+    for s in range(0, n, SPIKE_CHUNK):
+        i = np.arange(s, min(s + SPIKE_CHUNK, n))
+        idx = i[:, None] + offsets
+        valid = (idx >= lo_b[i, None]) & (idx <= hi_b[i, None])
+        w = np.where(valid, depth[np.clip(idx, 0, n - 1)], np.float32(np.nan))
+        w.sort(axis=1)  # NaN sorts last
+        m = valid.sum(axis=1)
+        rows = np.arange(len(i))
+        lo, hi = w[rows, (m - 1) // 2], w[rows, m // 2]
+        med[i] = (lo + (hi - lo).astype(np.float64) * 0.5).astype(np.float32)
+    return med
+
+
+def spikes(depth, transit):
+    """(deeper, shoaler) masks: soundings off their window's median by more than
+    SPIKE_ABS_M + SPIKE_REL of it, in transits of at least SPIKE_MIN_SOUNDINGS."""
+    med = rolling_median(depth, transit)
+    first = ~_continues(transit)
+    starts = np.flatnonzero(first)
+    size = np.diff(np.append(starts, len(depth)))[np.cumsum(first) - 1]
+    off = np.abs(depth - med) > np.float32(SPIKE_ABS_M) + np.float32(SPIKE_REL) * med
+    off &= size >= SPIKE_MIN_SOUNDINGS
+    deeper = depth > med
+    return off & deeper, off & ~deeper
+
+
+def track_qc(time, lon, lat, depth, arrival):
+    """QC one file's soundings, given in the order they were written (their `row`).
+
+    `time` and `arrival` (when the file arrived) are microseconds since the epoch.
+    Returns [(flag, reason, indices)], each a check's soundings by index into the inputs.
     """
-    fields = ", ".join(f"'{c}': \"{c}\"" for c in TRACK_COLUMNS)
-    return f"""edges AS (
-  SELECT file_id, day,
-    lag(last_k) OVER (PARTITION BY file_id ORDER BY day) AS before,
-    lead(first_k) OVER (PARTITION BY file_id ORDER BY day) AS after
-  FROM (
-    SELECT file_id, day, max_by(s, o, {k}) AS last_k, min_by(s, o, {k}) AS first_k
-    FROM (SELECT file_id, day, {{'t': time, 'r': "row"}} AS o, {{{fields}}} AS s FROM {source})
-    GROUP BY ALL
-  )
-),
-windowed AS (
-  SELECT file_id, day, {", ".join(f'"{c}"' for c in TRACK_COLUMNS)}, false AS context
-  FROM {source}
-  UNION ALL BY NAME
-  SELECT file_id, day, unnest(list_concat(coalesce(before, []), coalesce(after, [])),
-    recursive := true), true AS context
-  FROM edges
-)"""
+    time, lon, lat = np.asarray(time, np.int64), np.asarray(lon, float), np.asarray(lat, float)
+    depth = np.asarray(depth, np.float32)
+    sentinel = (depth <= 0) | (depth > MAX_DEPTH_M)
+    bad_time = ~sentinel & ((time < EARLIEST_US) | (time > arrival + ARRIVAL_SLACK_S * US))
+    # Along the track: by time, then the order soundings were written in.
+    order = np.flatnonzero(~(sentinel | bad_time))
+    order = order[np.argsort(time[order], kind="stable")]
+    tt, lo, la, d = time[order], lon[order], lat[order], depth[order]
+    transit = transits(tt)
 
-
-# Each step is a temp table, which spills past the memory limit, and every window runs
-# per file and day, or per transit within that.
-TRACK_QC = [
-    f"""
-CREATE OR REPLACE TEMP TABLE qc_points AS
-SELECT p.point_id, p.file_id, p."row", p.time, p.lon, p.lat, p.depth_raw AS d, p.cell_id,
-  date_trunc('day', p.time) AS day,
-  CASE
-    WHEN p.depth_raw <= 0 OR p.depth_raw > {MAX_DEPTH_M} THEN 'sentinel'
-    WHEN p.time < TIMESTAMP '{EARLIEST}' OR p.time > f.arrival + INTERVAL 1 DAY THEN 'time'
-  END AS reason
-FROM lake.points p JOIN lake.files f USING (file_id) WHERE p.batch_id = $batch""",
-    f"""
--- A transit ends at a gap of more than 4 hours, and every 7 days. The gap before a day's
--- first sounding is measured from the file's previous day, and transits are numbered
--- across days by a running total of each day's starts.
-CREATE OR REPLACE TEMP TABLE qc_track AS
-WITH track AS (SELECT * EXCLUDE (reason) FROM qc_points WHERE reason IS NULL),
-days AS (
-  SELECT file_id, day, lag(last_t) OVER (PARTITION BY file_id ORDER BY day) AS prev_t
-  FROM (SELECT file_id, day, max(time) AS last_t FROM track GROUP BY ALL)
-),
-gaps AS (
-  SELECT t.*, (coalesce(t.time - lag(t.time) OVER w, t.time - d.prev_t) IS NULL
-      OR coalesce(t.time - lag(t.time) OVER w, t.time - d.prev_t) > INTERVAL '{TRANSIT_GAP}'
-    )::INTEGER AS starts
-  FROM track t JOIN days d USING (file_id, day)
-  WINDOW w AS (PARTITION BY t.file_id, t.day ORDER BY t.time, t."row")
-),
-within AS (
-  SELECT *, sum(starts) OVER (PARTITION BY file_id, day ORDER BY {ORDER}
-    ROWS UNBOUNDED PRECEDING) AS seg_in_day
-  FROM gaps
-),
-offsets AS (
-  SELECT file_id, day, coalesce(sum(n) OVER (PARTITION BY file_id ORDER BY day
-    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS before
-  FROM (SELECT file_id, day, sum(starts) AS n FROM gaps GROUP BY ALL)
-),
-segs AS (
-  SELECT w.* EXCLUDE (starts, seg_in_day), o.before + w.seg_in_day AS seg
-  FROM within w JOIN offsets o USING (file_id, day)
-),
-seg_starts AS (SELECT file_id, seg, min(time) AS t0 FROM segs GROUP BY ALL)
-SELECT s.* EXCLUDE (seg),
-  s.seg * 100000 + floor(epoch(s.time - a.t0) / {TRANSIT_SPAN_S})::BIGINT AS transit
-FROM segs s JOIN seg_starts a USING (file_id, seg)""",
-    f"""
-CREATE OR REPLACE TEMP TABLE qc_jumps AS
-WITH {with_context("qc_track", 1)},
-legs AS (
-  SELECT *, {_speed("lag", "")} AS speed_in, {_speed("", "lead")} AS speed_out,
-    {_speed("lag", "lead")} AS speed_past
-  FROM windowed
-  WINDOW w AS (PARTITION BY file_id, day, transit ORDER BY {ORDER})
-)
--- A position off the line through its neighbors: both legs faster than 20 kn and than
--- twice the speed straight past it, so a fast ship's track isn't a jump. A transit's
--- first and last soundings have one leg and can't be judged this way. (least and
--- greatest skip NULLs, so the ends are excluded explicitly.)
-SELECT point_id FROM legs
-WHERE NOT context AND speed_past IS NOT NULL
-  AND least(speed_in, speed_out) > greatest({MAX_SPEED_KN}, 2 * speed_past)""",
-    f"""
--- A run of one depth along a transit, held over {FLAT_M} m or more.
--- ponytail: a run crossing midnight is measured a day at a time, so one that's long only
--- in total is missed; carry runs across days if stuck sounders slip through that way
-CREATE OR REPLACE TEMP TABLE qc_flat AS
-WITH steps AS (
-  SELECT point_id, file_id, day, transit, "row", time, lon, lat, d,
-    d IS DISTINCT FROM lag(d) OVER w AS starts, {_distance("lag", "")} AS step
-  FROM qc_track WHERE point_id NOT IN (SELECT point_id FROM qc_jumps)
-  WINDOW w AS (PARTITION BY file_id, day, transit ORDER BY {ORDER})
-),
-runs AS (
-  SELECT *, sum(starts::INTEGER) OVER (PARTITION BY file_id, day, transit ORDER BY {ORDER}
-    ROWS UNBOUNDED PRECEDING) AS run
-  FROM steps
-)
-SELECT point_id FROM runs
-WINDOW r AS (PARTITION BY file_id, day, transit, run)
-QUALIFY sum(CASE WHEN NOT starts THEN step END) OVER r >= {FLAT_M}
-  AND count(*) OVER r >= {FLAT_MIN_SOUNDINGS}
-  AND (d >= {HAZARD_M} OR {_extent("r")} >= {FLAT_SPAN_M})""",
-    f"""
-CREATE OR REPLACE TEMP TABLE qc_spikes AS
-WITH clean AS (SELECT * FROM qc_track WHERE point_id NOT IN (
-  SELECT point_id FROM qc_jumps UNION ALL SELECT point_id FROM qc_flat)),
-{with_context("clean", SPIKE_WINDOW)},
-sizes AS (SELECT file_id, transit, count(*) AS n FROM clean GROUP BY ALL),
-medians AS (
-  SELECT point_id, file_id, transit, d, context,
-    median(d) OVER (PARTITION BY file_id, day, transit ORDER BY {ORDER}
-      ROWS BETWEEN {SPIKE_WINDOW} PRECEDING AND {SPIKE_WINDOW} FOLLOWING) AS med
-  FROM windowed
-)
-SELECT m.point_id, m.d, m.med, s.n FROM medians m JOIN sizes s USING (file_id, transit)
-WHERE NOT m.context""",
-]
-
-TRACK_FLAGS = f"""
-SELECT point_id, cell_id, 'reject' AS flag, reason FROM qc_points WHERE reason IS NOT NULL
-UNION ALL
-SELECT point_id, cell_id, 'review', 'very_shallow' FROM qc_points WHERE d > 0 AND d < {SHALLOW_M}
-UNION ALL
-SELECT point_id, cell_id, 'reject', 'jump' FROM qc_jumps JOIN qc_points USING (point_id)
-UNION ALL
-SELECT point_id, cell_id, CASE WHEN d < {HAZARD_M} THEN 'unconfirmed' ELSE 'reject' END,
-  'flatline'
-FROM qc_flat JOIN qc_points USING (point_id)
-UNION ALL
-SELECT s.point_id, p.cell_id, CASE WHEN s.d > s.med THEN 'reject' ELSE 'unconfirmed' END, 'spike'
-FROM qc_spikes s JOIN qc_points p USING (point_id)
-WHERE s.n >= 3 AND abs(s.d - s.med) > {SPIKE_ABS_M} + {SPIKE_REL} * s.med
-"""
+    jump = jumps(tt, lo, la, transit)
+    kept = order[~jump]
+    flat = flatlines(d[~jump], lo[~jump], la[~jump], transit[~jump])
+    clean = ~jump
+    clean[clean] = ~flat
+    deeper, shoaler = spikes(d[clean], transit[clean])
+    flat_shoal = depth[kept[flat]] < HAZARD_M
+    found = [
+        np.flatnonzero(sentinel),
+        np.flatnonzero(bad_time),
+        np.flatnonzero((depth > 0) & (depth < SHALLOW_M)),
+        order[jump],
+        kept[flat][flat_shoal],
+        kept[flat][~flat_shoal],
+        order[clean][deeper],
+        order[clean][shoaler],
+    ]
+    return [(flag, reason, idx) for (flag, reason), idx in zip(CHECKS, found, strict=True)]
 
 
 def run_batch(con, batch_id: int, fresh=False):
@@ -247,16 +240,40 @@ def run_batch(con, batch_id: int, fresh=False):
             AND point_id IN (SELECT point_id FROM lake.points WHERE batch_id = $batch)""",
             params,
         )
-    for statement in TRACK_QC:
-        con.execute(statement, params if "$batch" in statement else None)
     con.execute(
-        f"""INSERT INTO lake.qc_flags BY NAME
-        SELECT *, {QC_VERSION} AS qc_version FROM ({TRACK_FLAGS})"""
+        """CREATE OR REPLACE TEMP TABLE qc_points AS
+        SELECT p.point_id, p.cell_id, p.file_id, p."row", epoch_us(p.time) AS t, p.lon, p.lat,
+          p.depth_raw AS d, epoch_us(f.arrival) AS arrival
+        FROM lake.points p JOIN lake.files f USING (file_id) WHERE p.batch_id = $batch""",
+        params,
     )
-    con.execute(
-        "DROP TABLE qc_points; DROP TABLE qc_track; DROP TABLE qc_jumps; DROP TABLE qc_flat;"
-        " DROP TABLE qc_spikes"
-    )
+    # ponytail: holds a batch's columns and one file's working arrays, about 170 bytes a
+    # sounding, so memory follows the largest file; judge a huge file a few transits at a
+    # time if one outgrows a worker
+    a = con.execute(
+        """SELECT file_id, "row", t, lon, lat, d, arrival FROM qc_points
+        ORDER BY file_id, "row" """
+    ).fetchnumpy()
+    bounds = np.flatnonzero(np.diff(a["file_id"], prepend=-1, append=-1))
+    # Each flag as its check's position in CHECKS: numbers, since DuckDB reads a numpy
+    # array of strings one Python object at a time.
+    found = {"file_id": [], "row": [], "check": []}
+    for s, e in itertools.pairwise(bounds):
+        flags = track_qc(a["t"][s:e], a["lon"][s:e], a["lat"][s:e], a["d"][s:e], a["arrival"][s])
+        for check, (_, _, idx) in enumerate(flags):
+            found["file_id"].append(a["file_id"][s + idx])
+            found["row"].append(a["row"][s + idx])
+            found["check"].append(np.full(len(idx), check + 1, np.int8))
+    if found["row"]:
+        con.register("qc_found", {k: np.concatenate(v) for k, v in found.items()})
+        con.execute(
+            f"""INSERT INTO lake.qc_flags BY NAME
+            SELECT q.point_id, q.cell_id, {[f for f, _ in CHECKS]}[f."check"] AS flag,
+              {[r for _, r in CHECKS]}[f."check"] AS reason, {QC_VERSION} AS qc_version
+            FROM qc_found f JOIN qc_points q USING (file_id, "row")"""
+        )
+        con.unregister("qc_found")
+    con.execute("DROP TABLE qc_points")
     con.execute("DELETE FROM lake.qc_batches WHERE batch_id = $batch", params)
     con.execute(f"INSERT INTO lake.qc_batches VALUES ($batch, {QC_VERSION})", params)
 

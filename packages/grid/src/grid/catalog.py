@@ -14,6 +14,7 @@ from pathlib import Path
 import duckdb
 from botocore.exceptions import BotoCoreError, ClientError
 
+from .definitions import CELLS
 from .objects import Conflict, LocalObjects
 from .sources import literal
 
@@ -65,7 +66,8 @@ CREATE TABLE IF NOT EXISTS lake.shoals (
 
 # A point's base row (1/3″ of latitude) within its 1° tile. The cells build bands and
 # rows by this one expression, so a point can't land between two bands.
-BASE_ROW = "least(floor((p.lat - (p.tile_id // 360 - 90)) * 10800)::INTEGER, 10799)"
+_ROWS = CELLS["rows_per_degree"]
+BASE_ROW = f"least(floor((p.lat - (p.tile_id // 360 - 90)) * {_ROWS})::INTEGER, {_ROWS - 1})"
 
 # Partitioned by the 10° cell, so the cells build reads only its partition's rows.
 PARTITIONED = {"points": "cell_id", "cells": "cell_id", "qc_flags": "cell_id", "shoals": "cell_id"}

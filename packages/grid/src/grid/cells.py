@@ -13,19 +13,21 @@ import logging
 import math
 
 from .catalog import BASE_ROW
+from .definitions import CELLS
 from .qc import HAZARD_M, MAX_DEPTH_M, QC_VERSION, TRACK_REASONS
 
 log = logging.getLogger(__name__)
 
 GRID_VERSION = 3
 BATCH_POINTS = 5_000_000
-BASE = 10_800  # base rows per 1° tile
+BASE = CELLS["rows_per_degree"]  # base rows per 1° tile
 SHOAL_QUANTILE = 0.10
 MIN_VESSELS = 2
 CELL_REASONS = ["cell_deep", "cell_shoal", "cell_confirmed", "consensus_deep", "consensus_shoal"]
 # A sounding of the same vessel this far apart in time is another pass.
 OTHER_PASS = "4 hours"
-DIVISORS = [d for d in range(1, 1201) if 1200 % d == 0]
+STEPS = CELLS["column_steps_divide"]
+DIVISORS = [d for d in range(1, STEPS + 1) if STEPS % d == 0]
 
 
 def k_for(lat0: int) -> int:

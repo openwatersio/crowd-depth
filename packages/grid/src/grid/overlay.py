@@ -27,15 +27,16 @@ from scipy.ndimage import binary_dilation
 
 from . import cells, surface
 from .cells import GRID_VERSION
+from .definitions import PORTRAYAL
 from .qc import MAX_DEPTH_M
 
-M_PER_FT = 0.3048
-M_PER_FATHOM = 1.8288
+M_PER_FT = PORTRAYAL["m_per_ft"]
+M_PER_FATHOM = PORTRAYAL["m_per_fathom"]
 
 # S-4, Ed 4.10.0, B-412 rounds by depth band, always toward shoal: decimetres to 21 m,
-# half metres from 21 to 31, whole metres beyond.
-DECIMETRE_MAX_M = 21.0
-HALF_METRE_MAX_M = 31.0
+# half metres from 21 to 31, whole metres beyond. Each rule rounds to 1/per_m of a metre
+# below its below_m; the last has none.
+ROUNDING = PORTRAYAL["sounding_rounding"]
 
 # Soundings per tile side at every zoom: Seascape's 64 px cells of a 512 px tile.
 CELLS_PER_TILE = 8
@@ -68,12 +69,8 @@ def _floor(x):
 def depths(d):
     """Depth (metres, positive down) to chart labels, each floored toward shoal so the
     printed number is never deeper than measured (S-4 B-412)."""
-    if d < DECIMETRE_MAX_M:
-        m = _floor(d * 10) / 10
-    elif d < HALF_METRE_MAX_M:
-        m = _floor(d * 2) / 2
-    else:
-        m = _floor(d)
+    per = next((r for r in ROUNDING if d < r.get("below_m", math.inf)), ROUNDING[-1])["per_m"]
+    m = _floor(d * per) / per
     return {
         "depth_m": int(m) if m == int(m) else m,  # integral values stay ints in the tiles
         "depth_ft": _floor(d / M_PER_FT),
@@ -184,15 +181,9 @@ def feature(lon, lat, d, unconfirmed, display, prime=False):
 
 # S-4 B-411 isobaths in metres, positive down, as Seascape charts them. Each is also a
 # depth-area band edge: a band holds depths from its level to the next.
-LEVELS = [0, 2, 5, 10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 3000, 4000, 5000, 6000]
-LEVELS += [8000, 10000]
+LEVELS = PORTRAYAL["isobaths_m"]
 # Isobaths drawn below each zoom ceiling (Seascape's CONTOUR_TIERS); every one from the last on.
-CONTOUR_TIERS = [
-    (6, [10, 20, 50, 100, 200, 1000, 2000, 4000]),
-    (7, [10, 20, 50, 100, 200, 500, 1000, 2000, 3000, 4000]),
-    (9, [10, 20, 50, 100, 200, 300, 500, 1000, 2000, 3000, 4000, 5000, 6000, 8000, 10000]),
-    (11, [10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 3000, 4000, 5000, 6000, 8000, 10000]),
-]
+CONTOUR_TIERS = [(t["below_zoom"], t["isobaths_m"]) for t in PORTRAYAL["contour_tiers"]]
 FIRST_AREA_ZOOM = 4
 # Past this an enclosed rise is a seabed feature, not a least depth a vessel can touch.
 PRIME_MAX_DEPTH_M = 200
