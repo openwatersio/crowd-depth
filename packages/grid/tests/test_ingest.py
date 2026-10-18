@@ -1,5 +1,6 @@
 import json
 import random
+import shutil
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -655,6 +656,18 @@ def test_a_local_listing_walks_only_its_prefix(tmp_path, monkeypatch):
     assert [o.key for o in store.list("")[0]] == ["a/1/x.csv", "a/12/y.csv", "a/2/z.csv", "b/w.csv"]
     assert store.list("c/")[0] == []
     assert walked[:3] == [tmp_path / "a/1", tmp_path / "a", tmp_path]
+
+
+def test_a_copied_store_reads_and_writes_its_own_files(env, tmp_path):
+    env.noaa.put(noaa_key(1), noaa_csv(ROWS))
+    env.run("noaa")
+    copy = LocalObjects(tmp_path / "copy")
+    shutil.copytree(env.store.root, copy.root)
+    with open_store(copy) as con:
+        assert con.execute("SELECT count(*) FROM lake.points").fetchone() == (3,)
+        con.execute("INSERT INTO lake.withdrawal_holds VALUES ('noaa', 'k', 1, false)")
+    with open_store(env.store, write=False) as con:  # the original is untouched
+        assert con.execute("SELECT count(*) FROM lake.withdrawal_holds").fetchone() == (0,)
 
 
 def test_release_never_clobbers_a_lock_taken_over(tmp_path):
