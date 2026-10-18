@@ -192,9 +192,15 @@ class Lock:
             except Exception:
                 log.warning("renewing the catalog lock failed", exc_info=True)
             # A renewal that succeeded but whose response was lost fails its retry
-            # with a 412; the lock is still ours if it still names this run.
+            # with a 412; the lock is still ours if it still names this run and hasn't
+            # expired, since another run may take over an expired lock at any moment.
             current = self._held()
-            if current and json.loads(current[0])["owner"] == self.owner:
+            held = current and json.loads(current[0])
+            if (
+                held
+                and held["owner"] == self.owner
+                and datetime.fromisoformat(held["expires"]) > datetime.now(UTC)
+            ):
                 self.etag = current[1]
             elif current or datetime.now(UTC) - self.renewed >= self.ttl:
                 # Another run holds it, or it may have expired while unreachable.
