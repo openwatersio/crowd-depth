@@ -308,10 +308,13 @@ def connect(catalog_path: str, data_url: str, temp_dir: str) -> duckdb.DuckDBPyC
 
 def attach(con, catalog_path: str, data_url: str):
     # Inlining keeps the small per-file writes to files and submission_meta in the
-    # catalog instead of a Parquet file each.
+    # catalog instead of a Parquet file each. A local store's data is its own folder
+    # wherever that is, so a copied or cloned store reads its own files rather than
+    # refusing the path the catalog was built at; data files are stored relative to it.
+    local = "" if data_url.startswith("s3://") else ", OVERRIDE_DATA_PATH true"
     con.execute(
         f"ATTACH {literal('ducklake:' + catalog_path)} AS lake"
-        f" (DATA_PATH {literal(data_url)}, DATA_INLINING_ROW_LIMIT 1000)"
+        f" (DATA_PATH {literal(data_url)}, DATA_INLINING_ROW_LIMIT 1000{local})"
     )
 
 
