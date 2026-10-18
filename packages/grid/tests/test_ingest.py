@@ -641,6 +641,22 @@ def test_a_lock_that_expired_while_renewals_failed_is_lost(tmp_path, monkeypatch
     lock.release()
 
 
+def test_a_local_listing_walks_only_its_prefix(tmp_path, monkeypatch):
+    store = LocalObjects(tmp_path)
+    for key in ("a/1/x.csv", "a/12/y.csv", "a/2/z.csv", "b/w.csv"):
+        store.put(key, b"data")
+    walked = []
+    rglob = type(tmp_path).rglob
+    monkeypatch.setattr(
+        type(tmp_path), "rglob", lambda self, p: walked.append(self) or rglob(self, p)
+    )
+    assert [o.key for o in store.list("a/1/")[0]] == ["a/1/x.csv"]
+    assert [o.key for o in store.list("a/1")[0]] == ["a/1/x.csv", "a/12/y.csv"]
+    assert [o.key for o in store.list("")[0]] == ["a/1/x.csv", "a/12/y.csv", "a/2/z.csv", "b/w.csv"]
+    assert store.list("c/")[0] == []
+    assert walked[:3] == [tmp_path / "a/1", tmp_path / "a", tmp_path]
+
+
 def test_release_never_clobbers_a_lock_taken_over(tmp_path):
     store = LocalObjects(tmp_path)
     lock = Lock(store)

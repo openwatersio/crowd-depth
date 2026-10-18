@@ -176,7 +176,9 @@ class LocalObjects:
 
     def list(self, prefix: str = "") -> tuple[list[Obj], bool]:
         objs = []
-        for path in sorted(self.root.rglob("*")):
+        # Walk only the prefix's own directory: a key list lists thousands of day folders.
+        base = self.root / prefix.rsplit("/", 1)[0] if "/" in prefix else self.root
+        for path in sorted(base.rglob("*")):
             key = path.relative_to(self.root).as_posix()
             # Files starting with "." are puts still being written.
             if path.is_file() and key.startswith(prefix) and not path.name.startswith("."):
