@@ -8,6 +8,8 @@
     grid --store DIR_OR_S3_URL calibrate [--reference s102|bluetopo|PATH]...
     grid --store DIR_OR_S3_URL cells [--bbox=W,S,E,N | --changed]
     grid --store DIR_OR_S3_URL overlay --out DIR
+    grid --store DIR_OR_S3_URL benchmark --surface DIR --out DIR [--bbox=W,S,E,N | --tiles=ID,...]
+                                          [--source NAME]... [--cells] [--qc-version N]
     grid --store DIR_OR_S3_URL stats
     grid cache [--prune]
 
@@ -17,12 +19,13 @@ GRID_CACHE_DIR, shared by every store on the machine (see cache.py).
 """
 
 import argparse
+import json
 import logging
 import math
 import sys
 from pathlib import Path
 
-from . import cache, calibrate, cells, overlay, qc, reference, tide
+from . import benchmark, cache, calibrate, cells, overlay, qc, reference, tide
 from .catalog import open_store
 from .ingest import Ingest, confirm_withdrawals
 from .objects import open_objects
@@ -122,6 +125,28 @@ def main(argv=None):
     )
     o = sub.add_parser("overlay", help="Build the overlay layers and their PMTiles from the cells")
     o.add_argument("--out", required=True, type=Path, help="Directory for the layers and PMTiles")
+    b = sub.add_parser(
+        "benchmark", help="Score a render's depth surface against the surveyed references"
+    )
+    b.add_argument("--surface", required=True, type=Path, help="The render's surface COGs")
+    b.add_argument("--out", required=True, type=Path, help="Directory for benchmark.json and .md")
+    which = b.add_mutually_exclusive_group()
+    which.add_argument(
+        "--bbox", type=bbox, help="Only the 1° tiles this box touches: --bbox=W,S,E,N"
+    )
+    which.add_argument(
+        "--tiles", type=lambda t: [int(x) for x in t.split(",")], help="Only these tile ids"
+    )
+    b.add_argument(
+        "--source", action="append", default=[], help="Only this reference source; repeatable"
+    )
+    b.add_argument("--cells", action="store_true", help="Score the cells' depths too")
+    b.add_argument(
+        "--qc-version",
+        type=int,
+        default=qc.QC_VERSION,
+        help="The QC flags that pick accepted soundings and confirmed shoals; default: this code's",
+    )
     sub.add_parser("stats", help="Count files by source and status")
     k = sub.add_parser("cache", help="Show the download cache's size by kind")
     k.add_argument(
@@ -144,7 +169,7 @@ def main(argv=None):
     )
     alert = False
     with open_store(
-        open_objects(args.store), write=args.command not in ("stats", "overlay")
+        open_objects(args.store), write=args.command not in ("stats", "overlay", "benchmark")
     ) as con:
         if args.command == "ingest":
             for name in args.source or SOURCES:
@@ -179,6 +204,16 @@ def main(argv=None):
                 cells.build(con, args.bbox)
         elif args.command == "overlay":
             print(overlay.build(con, args.out))
+        elif args.command == "benchmark":
+            result = benchmark.run(
+                con, args.surface, args.bbox or args.tiles, args.source, args.qc_version, args.cells
+            )
+            result = {"store": args.store, **result}
+            args.out.mkdir(parents=True, exist_ok=True)
+            (args.out / "benchmark.json").write_text(json.dumps(result, indent=1) + "\n")
+            table = benchmark.markdown(result)
+            (args.out / "benchmark.md").write_text(table)
+            print(table)
         elif args.command == "confirm-withdrawals":
             print(f"confirmed {confirm_withdrawals(con, args.source)} held withdrawals")
         else:

@@ -248,6 +248,16 @@ Hold out surveyed areas (BlueTopo and S-102 multibeam) from calibration and comp
 
 Validation runs on every grid version, and its results decide whether a correction method or threshold change ships.
 
+#### Benchmark
+
+`grid --store S benchmark --surface DIR --out DIR` scores a render's depth surface, and with `--cells` the cells that have a depth position (hole-filled cells have none), against the store's `lake.reference_pixels`. Truth at each 2/3″ pixel is the least uncertain reference there, at chart datum. Each COG is read on its own pixel grid, the grid the references were sampled on, so nothing is resampled. A COG on any other grid is refused, since even a fraction of a pixel's offset doubles the share that reads too deep. The command writes `benchmark.json`, which is comparable between runs, and `benchmark.md`, a table of the same numbers. `--bbox` or `--tiles` limits the tiles, `--source` the references, and `--qc-version` picks the QC flags that decide accepted soundings and confirmed shoals.
+
+The metrics, overall and per class: bias (median of estimate − reference, positive reads deep), the share more than 1 m deeper than the reference's shoalest (depth − relief, which on a slope is shoaler than the surveyed minimum, so the share there errs high), the share of false shoals more than 2 m shoaler, the share under 1 m where the reference is 2 m or deeper, and roughness (median |difference| to the 4 neighbours). Shares are of the pixels the estimate covers (the under-1 m share of those with a reference of 2 m or more), and coverage is reported beside them. Where the COGs have a σ band, its median is reported too. The classes are reference depth (<2, 2–5, 5–12, ≥12 m, each from its lower bound up to but not including the next), slope (relief over 0.5 m) or flat, measured or interpolated pixels, vessels with an accepted sounding in the pixel (0, 1, 2–3, 4–9, 10+), within one pixel of a confirmed shoal (flagged `confirmed` for `cell_shoal`) or not, calibration anchor or held out, and reference source.
+
+Calibration anchors vessel offsets on these same references, so the benchmark flatters any pixel calibration could anchor on. The `anchor` class marks pixels where any source's sample is within calibration's anchor limits (2–20 m, uncertainty under 2 m, relief under 0.5 m), whether or not a vessel anchored there, and `held out` is the fairer number. Held-out pixels are mostly the water calibration won't anchor on, though, so the comparison is not like for like. A true holdout means calibrating without an area's references and benchmarking that area. The surface is what the render wrote, but vessels, shoals and cells are read from the store as it is now, so benchmark a render against the store it was rendered from.
+
+References are sampled only at pixels where calibration had soundings. So `interpolated` mostly means a pixel whose soundings the surface didn't take, such as rejected or excluded ones, or whose file has since been withdrawn. It rarely means water between tracks, which the benchmark can't score until references are sampled there too.
+
 ## Open Waters data
 
 The plugin's submissions carry richer metadata than NOAA's files, but how much of it can be trusted depends on when it was sent. These are preconditions for using it, and follow-ups outside this pipeline.
