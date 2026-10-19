@@ -11,11 +11,12 @@ Supporting notes:
 - [Standards](standards.md): what the IHO standards say about data quality, survey accuracy, and deriving depth areas, contours and soundings.
 - [References](references.md): primary sources, research, and reusable code, with links.
 - [Backlog](backlog.md): the prioritized work, from what the spikes below found.
+- [Planet size](planet-size.md): how many 1° tiles the archive covers, how skewed they are, and how a day's arrivals spread.
 - [Rebuild cost](rebuild-cost.md): what a daily planet rebuild costs, and what brings it within a day on cheap hardware.
 - [Point store layout](store-layout.md), [Track QC as pure functions](qc-functions.md) and [Per-tile pipeline](per-tile-pipeline.md): spikes on the Chesapeake set.
 - [Live layer](live-layer.md): the plugin's own-boat layer, drawn on top of the overlay with the same QC, corrections and portrayal.
 - [Vessel calibration](vessel-calibration.md): per-vessel offsets against BlueTopo and from crossings, on the Chesapeake set.
-- [Surface statistic](surface-statistic.md) and [Speckle in busy channels](channel-speckle.md): the grid against NOAA BlueTopo in Thimble Shoal Channel.
+- [Surface statistic](surface-statistic.md) and [Speckle in busy channels](channel-speckle.md): the grid against NOAA BlueTopo in Thimble Shoal Channel, Tangier Sound and Pocomoke Sound.
 
 ## Goals
 
@@ -117,6 +118,7 @@ QC runs on each ingest batch as it lands, with its windows along each file: a su
 - Split each vessel's soundings into transits, starting a new one after a gap of more than 4 hours or after 7 days.
 - Per transit: compute speed and flag soundings above about 20 kn as position jumps. Flag depth spikes by their residual from a rolling median along track, with an absolute threshold. The NOAA tool flags a fixed top percentile instead, which rejects some soundings even on clean transits. Treat a depth held unchanged over a kilometre or more as a stuck sounder: one that loses bottom often repeats its last reading, and on the Lynn Canal sample such runs were a median 17% off the other vessels' depths, against 5% for shorter runs. A run 30 m or deeper is rejected. A shallower one counts only if it also spans 200 m: a boat at its mooring piles up a kilometre of GPS jitter in minutes while its depth honestly holds, and a sounder stuck on a boat that stays that close still holds a reading from within 200 m. Such a run may be a flat shoal read by a coarse sounder, so it is kept as `unconfirmed`, and as a stuck run it never sets a depth, even where nothing else was sounded.
 - Per cell: robust outlier detection (median absolute deviation) across all soundings and vessels.
+- Where a sounding carries position quality, flag one without a GNSS fix (dead reckoning, simulator or no fix) and reject or down-weight one whose dilution or accuracy is past a threshold. Its horizontal accuracy sets the sounding's horizontal uncertainty, which feeds `M_QUAL`, and weights its position where positions are combined, such as placing a cell's sounding. A sounding without position quality takes the default of about 10 m.
 - Where a reference survey exists, compare soundings with it using 3.5 times their vertical uncertainty as the limit.
 
 Rejection is one-sided. An outlier deeper than its neighbors or the survey is rejected. An outlier shoaler than them is never dropped in water where it could be a hazard, because it may be a rock, a pinnacle or a new shoal, which is what crowd data is best at finding; a shoal QC can't confirm is rejected only at 30 m or deeper, where it can't be one. It is marked `unconfirmed`: it stays out of depth areas and contours, but publishes as a sounding with a low-reliability flag. A shoal needs confirming only when it stands out from the rest of its cell, and only readings that also stand out can confirm it: a second vessel or transit sounding it within its uncertainty, or three such soundings agreeing, so a feature a single track crosses, such as a channel edge, isn't taken for noise.
@@ -242,6 +244,7 @@ The plugin's submissions carry richer metadata than NOAA's files, but how much o
 
 - **The plugin's own metadata shows why metadata can't be trusted.** Released versions up to 1.2.6, which the API still accepts, label every submission `Waterline`. They prefer depth below the surface when the boat provides it, so many of those labels are right, but a vessel logging `belowKeel` or `belowTransducer` through a history provider is labeled `Waterline` with no offset added, and its sensor positions are the raw settings rather than offsets from the transducer. Later versions report the reference more carefully (07d227f), but still only from the owner's settings. Files stored before 2026-01-14 have no CSB metadata at all. Ingest stores the metadata and the `providerLoggerVersion` that produced it, and calibration treats both as a starting estimate, the same as for any other source.
 - **The API should check the vessel id in the body.** It verifies the id in the form metadata against the vessel's token, but stores and forwards the GeoJSON body unchecked. Ingest takes identity from the R2 key, but a body naming another vessel still reaches NOAA's archive and comes back as a `noaa` file under that vessel's id. The API should reject a body whose ids disagree with the authenticated vessel, before storing or forwarding it.
+- **Submissions should carry position quality.** Neither source records how good each position is: NOAA's CSVs have no field for it, and the plugin doesn't send it. The plugin can read it per sounding from Signal K (`navigation.gnss.methodQuality`, `navigation.gnss.horizontalDilution` and `navigation.gnss.satellites`, plus a horizontal accuracy estimate where the receiver reports one) and send it as optional properties on each feature. The API accepts them, and ingest stores them as nullable columns on `points`, so older files and NOAA files simply have none.
 - **Removing a vessel means suppressing both sources.** Deleting a vessel's R2 files would end rule 5's suppression of the matching NOAA soundings, which would then be published. A request to remove a contributor's data is handled by vessel id across both sources, built when the first request arrives.
 
 ## Removing data
@@ -252,7 +255,7 @@ Files removed from NOAA or deleted from R2 leave every product through `files`, 
 
 Offline charts belong to chart providers, not the crowd-depth plugin. [signalk-charts-provider-simple](https://github.com/dirkwa/signalk-charts-provider-simple) is adding PMTiles support, so it can serve the overlay directly and cut an extract for a box the user draws, the way it handles NOAA ENCs, and use the build version to tell the user when the extract is out of date.
 
-The crowd-depth plugin also draws the boat's own soundings on top of the overlay, with the grid's QC, corrections and portrayal ([live-layer.md](live-layer.md)). Its other part is feedback to the contributor:
+The crowd-depth plugin also offers the global overlay and the boat's own soundings as two plugin layers the user turns on and off, the boat's on top, in charted depths with the grid's QC, corrections and portrayal ([live-layer.md](live-layer.md)). Its other part is feedback to the contributor:
 
 - The vessel's own fitted offsets and reputation, shown in the plugin's status, which tells a contributor whether their setup reads true and gives them a reason to keep sharing.
 
@@ -276,7 +279,7 @@ CI gets a separate job for it, filtered to changes under `packages/grid`, so plu
 
 ## Open questions
 
-- The value of k in `median − kσ` ([surface-statistic.md](surface-statistic.md)), and how many independent vessels a cell needs before it publishes at full resolution.
+- How many independent vessels a cell needs before it publishes at full resolution. k in `median − kσ` is 1.75 ([surface-statistic.md](surface-statistic.md)).
 - The sound speed each provider's loggers assume, if any provider documents it.
 - Whether the AVISO license asks anything of grids derived from FES2022 predictions, such as attribution.
 - What evidence moves a cell from CATZOC D to C, following the IHO Data Quality Working Group's proposal.
