@@ -1,6 +1,6 @@
 # Live layer
 
-The crowd-depth plugin draws the boat's own soundings on the chart as they're recorded, on top of the global grid overlay. The live layer is the grid pipeline run on one vessel's soundings, incrementally: the same QC, corrections, statistic, interpolation and portrayal, from the same definitions. A depth the boat just measured looks the way the grid will publish it from the same soundings, only sooner, so where the two layers meet they agree.
+The crowd-depth plugin draws the boat's own soundings on the chart as they're recorded, on top of the global grid overlay. The live layer is the grid pipeline run on one vessel's soundings, incrementally: the same QC, corrections, interpolation and portrayal, from the same definitions, and a one-vessel version of the grid's statistic. A depth the boat just measured is drawn with the grid's bands and contours, only sooner. The two layers can differ by the spread between vessels, which one boat can't see (see [Cells and surface](#cells-and-surface)).
 
 Every number below comes from the grid's design and changes with it. This note covers only what's different about running that design live, on one boat.
 
@@ -39,10 +39,11 @@ Each cell records which corrections it has, as in the grid. A cell without tide 
 
 ### Cells and surface
 
-Cells use the grid's [resolution](README.md#resolution) and the grid's [statistic](surface-statistic.md) in spirit, `depth − kσ` with σ published, but the plugin keeps no soundings. Each cell holds a running estimate, updated once per pass:
+Cells use the grid's [resolution](README.md#resolution) and the form of the grid's [statistic](surface-statistic.md), `depth − kσ` with the same k and σ published, but the plugin keeps no soundings. Each cell holds a running estimate, updated once per pass:
 
 - **A pass** is one transit through a cell. The plugin holds only the soundings of the cells under the boat, and when the boat leaves a cell, the pass's median goes into that cell's estimate.
-- **The estimate** is an exponential moving average of pass medians, m ← m + α(x − m), with an exponential moving average of their absolute deviation, d ← d + α(|x − m| − d), at α = 0.2. Depth is m − k × 1.25d, combined with the vessel's correction uncertainty as the grid combines it. The two values fit in 4 bytes as centimetres.
+- **The estimate** is an exponential moving average of pass medians, m ← m + α(x − m), with an exponential moving average of their absolute deviation, d ← d + α(|x − m| − d), at α = 0.2. σ is √(σ_c² + (1.25d)²), where σ_c is the vessel's correction uncertainty (tide and calibration) and 1.25d estimates the spread of its passes, and depth is m − kσ. The two values fit in 4 bytes as centimetres.
+- **Against the grid:** the grid's σ_b also counts how far other vessels spread around a local plane, which one boat can't measure. Where vessels disagree, the grid draws shoaler than the live layer by k times that spread. Where the overlay covers the water, the plugin can draw the shoaler of the two.
 - **A vessel's offset changing** shifts its cells by the difference, since the average is linear. A new tide level for past passes doesn't reach the live layer; the grid's next build carries it.
 
 The surface follows the grid's [interpolation](README.md#interpolation): bounded, marked, with σ widening with distance from the nearest track. Interpolated cells within the radius of a changed cell are recomputed from the stored cells.

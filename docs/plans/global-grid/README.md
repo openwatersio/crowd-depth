@@ -16,7 +16,7 @@ Supporting notes:
 - [Point store layout](store-layout.md), [Track QC as pure functions](qc-functions.md) and [Per-tile pipeline](per-tile-pipeline.md): spikes on the Chesapeake set.
 - [Live layer](live-layer.md): the plugin's own-boat layer, drawn on top of the overlay with the same QC, corrections and portrayal.
 - [Vessel calibration](vessel-calibration.md): per-vessel offsets against BlueTopo and from crossings, on the Chesapeake set.
-- [Surface statistic](surface-statistic.md) and [Speckle in busy channels](channel-speckle.md): the grid against NOAA BlueTopo in Thimble Shoal Channel.
+- [Surface statistic](surface-statistic.md) and [Speckle in busy channels](channel-speckle.md): the grid against NOAA BlueTopo in Thimble Shoal Channel, Tangier Sound and Pocomoke Sound.
 
 ## Goals
 
@@ -275,7 +275,7 @@ CI gets a separate job for it, filtered to changes under `packages/grid`, so plu
 
 ## Open questions
 
-- The value of k in `median − kσ` ([surface-statistic.md](surface-statistic.md)), and how many independent vessels a cell needs before it publishes at full resolution.
+- How many independent vessels a cell needs before it publishes at full resolution. k in `median − kσ` is 1.75 ([surface-statistic.md](surface-statistic.md)).
 - Whether NOAA's `UNIQUE_ID` for a plugin vessel is the `SIGNALK-<uuid>` the plugin sends, which cross-source matching depends on.
 - The sound speed each provider's loggers assume, if any provider documents it.
 - Whether the AVISO license asks anything of grids derived from FES2022 predictions, such as attribution.
