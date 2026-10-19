@@ -12,16 +12,17 @@ import hashlib
 import itertools
 import logging
 import math
+from datetime import UTC, datetime
 from pathlib import Path
 
-from . import definitions, qc
-from .catalog import BASE_ROW, checkpoint
+from . import catalog, definitions, qc
+from .catalog import BASE_ROW, MIN_DEPTH_M, checkpoint
 from .definitions import CELLS
 from .qc import HAZARD_M, MAX_DEPTH_M, QC_VERSION, TRACK_REASONS
 
 log = logging.getLogger(__name__)
 
-GRID_VERSION = 3
+GRID_VERSION = 4
 BATCH_POINTS = 5_000_000
 BASE = CELLS["rows_per_degree"]  # base rows per 1° tile
 SHOAL_QUANTILE = 0.10
@@ -44,7 +45,8 @@ K_LIST = "[" + ",".join(str(k_for(lat0)) for lat0 in range(-90, 90)) + "]"
 
 
 def tolerance(d: str) -> str:
-    """CATZOC C depth tolerance: provisional vertical uncertainty until corrections exist."""
+    """CATZOC C depth tolerance: the least vertical uncertainty a cell is published with, until
+    validation supports a tighter one."""
     return f"(2 + 0.05 * {d})"
 
 
@@ -225,14 +227,17 @@ WITH flags AS (
 ),
 pts AS (
   SELECT a.point_id, a.tile_id, a.cell_id, a.unique_id AS vessel, a.time, a.lon, a.lat,
-    a.depth_raw AS d, f.flag,
+    a.depth AS d, a.tide IS NOT NULL AS tided, a.offset_m IS NOT NULL AS calibrated, a.sigma,
+    f.flag,
     a.tile_id // 360 - 90 AS lat0, a.tile_id % 360 - 180 AS lon0,
     {K_LIST}[a.tile_id // 360 - 90 + 91] AS k
   FROM tile_points a LEFT JOIN flags f USING (point_id)
   -- The unit's rows and a 3″ row either side, which consensus reads.
   WHERE a.r BETWEEN $rlo - 9 AND $rhi + 8 AND f.flag IS DISTINCT FROM 'reject'
-    -- QC rejects these too; cells never trust that QC saw every point.
-    AND a.depth_raw > 0 AND a.depth_raw <= {MAX_DEPTH_M}
+    -- QC rejects these too; cells never trust that QC saw every point. Judged on the raw
+    -- depth: a corrected one may honestly be negative, a drying height.
+    AND a.depth_raw > 0 AND a.depth_raw <= {MAX_DEPTH_M} AND a.depth >= {MIN_DEPTH_M}
+    AND NOT a.excluded AND NOT a.awaiting_tide
 ),
 idx AS (
   SELECT *,
@@ -307,7 +312,9 @@ SELECT * FROM (
   SELECT tile_id, level, cr, cc, any_value(cell_id) AS cell_id, any_value(lat0) AS lat0,
     any_value(lon0) AS lon0, any_value(k) AS k, median(d) FILTER (WHERE keep_cell) AS median,
     coalesce(mad(d) FILTER (WHERE keep_cell), 0) AS mad, min(d) AS min, max(d) AS max,
-    count(*) AS count, count(DISTINCT vessel) AS vessels, min(time) AS first, max(time) AS last
+    count(*) AS count, count(DISTINCT vessel) AS vessels, min(time) AS first, max(time) AS last,
+    count(*) FILTER (WHERE tided) AS tided, count(*) FILTER (WHERE calibrated) AS calibrated,
+    coalesce(median(sigma) FILTER (WHERE keep_cell), 0) AS sigma
   FROM accepted GROUP BY tile_id, level, cr, cc
 ) JOIN (SELECT tile_id, level, cr, cc, min(depth) AS depth FROM children GROUP BY ALL)
   USING (tile_id, level, cr, cc);
@@ -332,9 +339,11 @@ SELECT s.tile_id, s.level, s.cr AS "row", s.cc AS col,
   -- One vessel's cells carry only the year, so a chain of them can't date one boat's track.
   date_trunc(CASE WHEN s.vessels <= 1 THEN 'year' ELSE 'month' END, s.first)::DATE AS first,
   date_trunc(CASE WHEN s.vessels <= 1 THEN 'year' ELSE 'month' END, s.last)::DATE AS last,
-  greatest({tolerance("s.depth")}, 1.96 * 1.4826 * s.mad) AS tvu,
+  -- Corrections' own uncertainty widens the spread's.
+  greatest({tolerance("s.depth")}, 1.96 * sqrt((1.4826 * s.mad) ^ 2 + s.sigma ^ 2)) AS tvu,
   CASE WHEN s.vessels >= {MIN_VESSELS} THEN 'multi' ELSE 'single' END AS kind, 5 AS zoc,
-  p.at.lon AS depth_lon, p.at.lat AS depth_lat, s.cell_id, {GRID_VERSION} AS grid_version
+  p.at.lon AS depth_lon, p.at.lat AS depth_lat, s.cell_id, {GRID_VERSION} AS grid_version,
+  s.tided, s.calibrated
 FROM stats s JOIN placed p USING (tile_id, level, cr, cc)
 """
 
@@ -351,14 +360,15 @@ WHERE from_track AND (outlier IS NULL OR point_id IN (SELECT point_id FROM confi
 """
 
 
-# One band's active points, with each point's base row. Each band of a dense tile is
-# read from the store once and kept, for its neighbors' consensus and for shoals, so
-# the dedupe's memory follows the band. A band alone gives the same points as the
+# One band's active points, with their corrections and each point's base row. Each
+# band of a dense tile is read from the store once and kept, for its neighbors'
+# consensus and for shoals, so the dedupe's memory follows the band. A band alone gives the same points as the
 # whole tile, since dedupe only drops a sounding's twins, which share its position and
 # so its row.
 TILE_POINTS = f"""
-SELECT point_id, tile_id, cell_id, unique_id, time, lon, lat, depth_raw, {BASE_ROW} AS r
-FROM active_points_in($partition, $tiles, $rlo, $rhi) p
+SELECT point_id, tile_id, cell_id, unique_id, time, lon, lat, depth_raw, depth, tide, offset_m,
+  sigma, excluded, awaiting_tide, {BASE_ROW} AS r
+FROM corrected_points_in($partition, $tiles, $rlo, $rhi) p
 """
 
 # Active soundings that are still unconfirmed shoals: neither confirmed nor rejected
@@ -369,9 +379,10 @@ CREATE OR REPLACE TEMP TABLE shoals AS
 SELECT p.tile_id, p.r,
   least(floor((p.lon - (p.tile_id % 360 - 180)) * {BASE} / {K_LIST}[p.tile_id // 360 - 90 + 91])
     ::INTEGER, {BASE} // {K_LIST}[p.tile_id // 360 - 90 + 91] - 1) AS c,
-  p.lon, p.lat, p.depth_raw
+  p.lon, p.lat, p.depth_raw, p.depth
 FROM tile_points p
-WHERE p.point_id IN (
+-- A segment too deep to correct publishes nothing, its shoals included.
+WHERE NOT p.excluded AND NOT p.awaiting_tide AND p.point_id IN (
   SELECT point_id FROM lake.qc_flags
   WHERE cell_id = $partition AND flag = 'unconfirmed' AND qc_version = {QC_VERSION}
   EXCEPT
@@ -483,16 +494,94 @@ def units(con, partition: int, tiles: list[int]) -> list[tuple[list[int], int, i
 
 def inputs(con) -> str:
     """A fingerprint of what cells are built from: every file's version, content and
-    status, every batch's QC version, and the QC and grid versions of this build. Points
-    and flags change only with these, so cells built from the same fingerprint are
-    current; a new ETag on the same content changes none of them."""
-    [(files, batches)] = con.execute(
+    status, every batch's QC version, the corrections, and the QC and grid versions of
+    this build. Points and flags change only with these, so cells built from the same
+    fingerprint are current; a new ETag on the same content changes none of them."""
+    [(files, batches, offsets)] = con.execute(
         """SELECT
           (SELECT coalesce(sum(hash(file_id, key, version, status, content_hash)::HUGEINT), 0)
             FROM lake.files),
-          (SELECT coalesce(sum(hash(batch_id, qc_version)::HUGEINT), 0) FROM lake.qc_batches)"""
+          (SELECT coalesce(sum(hash(batch_id, qc_version)::HUGEINT), 0) FROM lake.qc_batches),
+          (SELECT coalesce(sum(hash(file_id, vessel, offset_m, se_m, excluded)::HUGEINT), 0)
+            FROM lake.file_offsets)"""
     ).fetchall()
-    return f"{files}:{batches}:{QC_VERSION}:{GRID_VERSION}"
+    return f"{files}:{batches}:{offsets}:{tides(con)}:{QC_VERSION}:{GRID_VERSION}"
+
+
+def tides(con) -> str:
+    """A fingerprint of every sounding's tide level: the levels and each cell's station."""
+    [(value,)] = con.execute(
+        """SELECT
+          (SELECT coalesce(sum(hash(station_id, slot, level, slope, sigma)::HUGEINT), 0)
+            FROM lake.tide_levels)
+          || '/' || (SELECT coalesce(sum(hash(tide_cell, station_id)::HUGEINT), 0)
+            FROM lake.tide_cells)"""
+    ).fetchall()
+    return value
+
+
+def settled(con) -> bool:
+    """Whether the cells are current, or would be once the tiles in `tile_changes` are
+    rebuilt. Cells an older build wrote, after a rollback, never are: the marker says what
+    the cells were built from, not which code built them."""
+    if old_cells(con):
+        return False
+    now = inputs(con)
+    return any(
+        value == now
+        for (value,) in con.execute(
+            "SELECT value FROM lake.store_meta WHERE key IN ('cells', 'cells_pending')"
+        ).fetchall()
+    )
+
+
+def stale(con, tiles_query, params, reason, was_settled):
+    """Record the tiles `tiles_query` selects as stale after a correction change. If the
+    cells were settled before it, rebuilding those tiles settles them again."""
+    params = params | {"reason": reason, "now": datetime.now(UTC).replace(tzinfo=None)}
+    [(n,)] = con.execute(
+        f"""INSERT INTO lake.tile_changes
+        SELECT DISTINCT tile_id, $reason, $now FROM ({tiles_query})""",
+        params,
+    ).fetchall()
+    con.execute("DELETE FROM lake.store_meta WHERE key = 'cells_pending'")
+    if was_settled:
+        con.execute("INSERT INTO lake.store_meta VALUES ('cells_pending', ?)", [inputs(con)])
+    return n
+
+
+def old_cells(con) -> bool:
+    return bool(
+        con.execute(
+            f"SELECT count(*) FROM lake.cells WHERE grid_version <> {GRID_VERSION}"
+        ).fetchone()[0]
+    )
+
+
+def changed(con) -> list[int]:
+    """Tiles a correction change has made stale."""
+    return [
+        t
+        for (t,) in con.execute(
+            "SELECT DISTINCT tile_id FROM lake.tile_changes ORDER BY 1"
+        ).fetchall()
+    ]
+
+
+def done(con, tiles):
+    """Clear rebuilt tiles' changes; once none are left, cells that were settled are current."""
+    con.execute(
+        "DELETE FROM lake.tile_changes WHERE list_contains($tiles, tile_id)", {"tiles": tiles}
+    )
+    if con.execute("SELECT count(*) FROM lake.tile_changes").fetchone()[0]:
+        return
+    pending = con.execute(
+        "SELECT value FROM lake.store_meta WHERE key = 'cells_pending'"
+    ).fetchone()
+    con.execute("DELETE FROM lake.store_meta WHERE key = 'cells_pending'")
+    if pending and pending[0] == inputs(con) and not old_cells(con):
+        con.execute("DELETE FROM lake.store_meta WHERE key = 'cells'")
+        con.execute("INSERT INTO lake.store_meta VALUES ('cells', ?)", pending)
 
 
 def clear(con, partition, tiles):
@@ -561,10 +650,16 @@ GROUP BY tile_id
 
 # The code that builds cells, the QC they read and their definitions: a build resumes
 # only work this same code did, since cell logic can change without a GRID_VERSION bump.
+# The cells read corrected depths through catalog's macros, so its code counts too.
 CODE = hashlib.sha256(
     b"".join(
         Path(f).read_bytes()
-        for f in (__file__, qc.__file__, Path(definitions.__file__).with_suffix(".json"))
+        for f in (
+            __file__,
+            qc.__file__,
+            catalog.__file__,
+            Path(definitions.__file__).with_suffix(".json"),
+        )
     )
 ).hexdigest()[:16]
 
@@ -646,8 +741,9 @@ def build(con, tiles: list[int] | None = None) -> dict:
         con.execute(SHOALS, {"partition": partition})
         con.execute(
             f"""INSERT INTO lake.shoals
-            SELECT tile_id, r, lon, lat, depth_raw, $partition FROM shoals
-            WHERE depth_raw > 0 AND depth_raw <= {MAX_DEPTH_M} ORDER BY tile_id, r, lon""",
+            SELECT tile_id, r, lon, lat, depth, $partition FROM shoals
+            WHERE depth_raw > 0 AND depth_raw <= {MAX_DEPTH_M} AND depth >= {MIN_DEPTH_M}
+            ORDER BY tile_id, r, lon""",
             {"partition": partition},
         )
         for rlo, rhi in bands:
@@ -673,6 +769,9 @@ def build(con, tiles: list[int] | None = None) -> dict:
         {"tiles": tiles},
     )
     if not tiles:
+        # Every tile is rebuilt, so nothing a correction marked is stale any more.
+        con.execute("DELETE FROM lake.tile_changes")
+        con.execute("DELETE FROM lake.store_meta WHERE key = 'cells_pending'")
         con.execute("INSERT INTO lake.store_meta VALUES ('cells', ?)", [built_from])
     con.execute("COMMIT")
     return totals

@@ -26,3 +26,10 @@ jobs:
           git diff --exit-code -- package-lock.json
       - name: Check every package resolves from the npm registry
         run: npx -y lockfile-lint@5.0.1 --path package-lock.json --allowed-hosts npm --validate-https --validate-integrity --validate-package-names
+      - name: Check the grid's Slackwater helper lockfile the same ways
+        working-directory: packages/grid/slackwater
+        run: |
+          git ls-files --error-unmatch package-lock.json
+          npm install --package-lock-only --ignore-scripts
+          git diff --exit-code -- package-lock.json
+          npx -y lockfile-lint@5.0.1 --path package-lock.json --allowed-hosts npm --validate-https --validate-integrity --validate-package-names

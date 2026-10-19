@@ -146,12 +146,17 @@ uv run pytest                          # tests on the host; those that need tipp
 uv run ruff check && uv run ruff format --check
 uv run grid --store /tmp/grid ingest --prefix 2026/10/14   # one day of both sources into a local store
 uv run grid --store /tmp/grid qc       # rerun QC on every ingest batch (ingest runs it as it goes)
+uv run grid --store /tmp/grid tide     # tide levels for the soundings' station days (Node, Slackwater and CO-OPS)
+uv run grid --store /tmp/grid calibrate --reference s102 --reference bluetopo   # vessel offsets, after sampling references at new pixels
 uv run grid --store /tmp/grid cells    # rebuild every grid cell
+uv run grid --store /tmp/grid cells --changed   # only the tiles a calibration or tide change made stale
 uv run grid --store /tmp/grid ingest --source noaa --keys keys.txt   # only these keys (a region's, from NOAA's track index); withdraws nothing
 uv run grid --store /tmp/grid cells --bbox=-77.5,36.8,-75.5,39.7      # only the 1° tiles a box touches, with = as a west longitude starts with -; overlay then waits for a full cells run
 ./docker.sh uv run grid --store .preview/store overlay --out .preview/out   # overlay layers and PMTiles, in the image; it mounts only packages/grid, so the store must be in it
 uv run grid --store /tmp/grid stats
 ```
+
+`grid tide` runs the Slackwater engine through Node 24: run `npm ci` in `packages/grid/slackwater` once on the host (the image has it installed already). It fetches CO-OPS gauge data per gauge and month, again on each run until a month is final 45 days after it ends, and `calibrate --reference s102` or `bluetopo` reads NOAA's tiles over HTTP; a local file or directory of their rasters works too. `tide` refuses a run in which more than a tenth of the store's stations would leave (once it has 100), and `calibrate` one that would drop more than half its calibrated segments (once it has 20); `--accept-departures` and `--accept-losses` let them through once checked.
 
 Listing the Open Waters bucket needs `S3_ENDPOINT`, `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` in the environment; NOAA's bucket is public. Each run caps DuckDB at `GRID_MEMORY_LIMIT` (default `4GB`) and spills past it, into a directory of its own under `GRID_TEMP_DIR` (default: the system temp directory), where downloads also wait. A store records the scheme it hashes content with, and a build with another scheme refuses it; rebuild such a store by deleting its directory or R2 prefix and ingesting again. Give it at least 500 MB; ingest peaks at about the limit plus 0.6 GB, plus track QC's arrays (below), plus about 1 GB for a run that lists all of NOAA's million files rather than one `--prefix`, since the listing and the store's file and hash indexes are held in Python. Give `grid overlay` at least 1 GB: the surface's query for a dense tile's pixels runs out of memory at 500 MB. A local `--store` directory is for one process at a time: its lock is atomic only within a process. At 500 MB, a day of NOAA and Open Waters files ingested, and the cells of a synthetic mooring cell of 80M soundings built, each under 1.1 GB. On the Chesapeake at the default 4 GB, ingesting 18,000 files peaked at 1.7 GB, and building their cells at 5.0 GB, with DuckDB itself at 3.5 GB: size a cells worker for a dense region at the limit plus about 1.1 GB. Spill uses up to about 240 bytes of disk per sounding of the largest unit of work, plus a copy of the densest tile's active points, which cells keep while they work its bands. Track QC holds each batch's soundings and one file's working arrays in Python, outside that limit, at about 170 bytes a sounding: NOAA's largest Chesapeake CSV (3.5M soundings) ingests at 1.7 GB with a 500 MB limit, and one file of 80M soundings would need about 14 GB. `grid qc` of the whole Chesapeake store (98.5M soundings) peaked at 2.0 GB at the default limit, and `grid cells` runs it first for any batch not yet QC'd at the current version. `grid overlay` also holds one tile's rasters, its pixels' aggregates and its depth areas in Python, outside that limit: the rasters alone are about 2 GB for a fully covered tile at the equator (5,400 by 5,400 pixels), and the densest Chesapeake tiles peaked at the limit plus 3.3 GB, so size an overlay worker at the limit plus about 3.5 GB. `--source noaa` limits a run to one source, and `--max-files N` bounds a run so a backfill publishes its progress as it goes. An ingest exits with status 2 when it holds withdrawals, a listing was incomplete, a file couldn't be fetched, or a key matches no known layout; `grid confirm-withdrawals SOURCE` lets held withdrawals apply once two listings agree.
 
@@ -174,9 +179,10 @@ Releases are cut from GitHub:
 
 1. Go to [Releases](https://github.com/openwatersio/crowd-depth/releases) →
    _Draft a new release_.
-2. Create a tag `vX.Y.Z` (semver) targeting `main`, write release notes, and
-   publish.
-3. The [release workflow](.github/workflows/release.yml) sets the package
+2. Create a tag `vX.Y.Z` (semver) targeting `main`.
+3. Set the release title to a short headline of what changed, in sentence case with no version or closing period, and put any new requirement in it ("Requires Node 24"). Patch releases get a headline too.
+4. Write the notes for boaters running the plugin, following the [release notes guidance](https://github.com/openwatersio/.github/blob/main/docs/agents/releases.md#release-notes): open with what is new and for whom, list breaking changes and upgrade steps first, then the changes people will notice with a link to each pull request. Leave out chores, CI, and dependency bumps unless they change a runtime requirement.
+5. Publish. The [release workflow](.github/workflows/release.yml) sets the package
    version from the tag, publishes to npm via trusted publishing (OIDC — no
    tokens to manage), commits the version bump back to `main`, and re-points
    the tag at that commit.

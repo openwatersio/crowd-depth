@@ -4,7 +4,9 @@
                                        [--keys FILE]
     grid --store DIR_OR_S3_URL confirm-withdrawals SOURCE
     grid --store DIR_OR_S3_URL qc
-    grid --store DIR_OR_S3_URL cells [--bbox=W,S,E,N]
+    grid --store DIR_OR_S3_URL tide
+    grid --store DIR_OR_S3_URL calibrate [--reference s102|bluetopo|PATH]...
+    grid --store DIR_OR_S3_URL cells [--bbox=W,S,E,N | --changed]
     grid --store DIR_OR_S3_URL overlay --out DIR
     grid --store DIR_OR_S3_URL stats
 
@@ -18,7 +20,7 @@ import math
 import sys
 from pathlib import Path
 
-from . import cells, overlay, qc
+from . import calibrate, cells, overlay, qc, tide
 from .catalog import open_store
 from .ingest import Ingest, confirm_withdrawals
 from .objects import open_objects
@@ -84,8 +86,35 @@ def main(argv=None):
         "qc",
         help="Rerun QC on every batch; `grid cells` QCs only batches not yet done at this version",
     )
+    td = sub.add_parser(
+        "tide", help="Tide levels for the soundings' station days, from Slackwater and CO-OPS"
+    )
+    td.add_argument(
+        "--accept-departures",
+        action="store_true",
+        help="Let more than a tenth of the store's stations leave in one run",
+    )
+    ca = sub.add_parser("calibrate", help="Solve each vessel step segment's vertical offset")
+    ca.add_argument(
+        "--reference",
+        action="append",
+        default=[],
+        help="Sample this surveyed reference at new pixels first: s102, bluetopo, or a file or"
+        " directory of their rasters; repeat for more, and the least uncertain at a pixel wins",
+    )
+    ca.add_argument(
+        "--accept-losses",
+        action="store_true",
+        help="Let a run drop more than half of the store's calibrated segments",
+    )
     cl = sub.add_parser("cells", help="Run QC, then rebuild every grid cell, or a region's")
-    cl.add_argument(
+    where = cl.add_mutually_exclusive_group()
+    where.add_argument(
+        "--changed",
+        action="store_true",
+        help="Only the tiles a calibration or tide change made stale",
+    )
+    where.add_argument(
         "--bbox",
         type=bbox,
         help="Only the 1° tiles this box touches: west,south,east,north in degrees, given as"
@@ -118,10 +147,25 @@ def main(argv=None):
                 )
         elif args.command == "qc":
             qc.run(con)
+        elif args.command == "tide":
+            tide.build(con, accept_departures=args.accept_departures)
+        elif args.command == "calibrate":
+            # Calibration reads track QC's flags and tide-reduced depths.
+            qc.run(con, missing_only=True)
+            calibrate.run(con, args.reference, args.accept_losses)
         elif args.command == "cells":
             # Cells read QC's flags: QC any batch that hasn't been at this version.
             qc.run(con, missing_only=True)
-            cells.build(con, args.bbox)
+            # Files that arrived since calibration take their segment's offset.
+            calibrate.assign(con)
+            if args.changed:
+                changed = cells.changed(con)
+                if changed:
+                    cells.build(con, changed)
+                # With every marked tile rebuilt, or none marked, settled cells are current.
+                cells.done(con, changed)
+            else:
+                cells.build(con, args.bbox)
         elif args.command == "overlay":
             print(overlay.build(con, args.out))
         elif args.command == "confirm-withdrawals":
