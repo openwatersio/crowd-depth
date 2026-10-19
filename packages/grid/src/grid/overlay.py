@@ -2,9 +2,9 @@
 
 SOUNDG follows Seascape's soundings (pipelines/soundings_run.py) so its sounding style
 draws the layer unchanged: the same depth labels, rounded toward shoal, and the same
-shoalest-wins pyramid. Each sounding sits at the position of the sounding that set its
-cell's depth, never at a cell center, and unconfirmed shoals publish alongside the
-cells' soundings with a flag of their own.
+shoalest-wins pyramid. Each sounding sits at the accepted sounding nearest its cell's
+depth, a confirmed shoal's own position when one set it, never at a cell center, and
+unconfirmed shoals publish alongside the cells' soundings with a flag of their own.
 """
 
 import contextlib
@@ -93,16 +93,15 @@ def zooms(display):
     return {"minzoom": display} if display == MAX_ZOOM else {"minzoom": display, "maxzoom": display}
 
 
-# What SOUNDG is made of: every measured cell (filled cells have no sounding) at the
-# position of the sounding that set its depth, and every unconfirmed shoal, which the
-# cells build keeps.
+# What SOUNDG is made of: every cell at the accepted sounding nearest its depth, and every
+# unconfirmed shoal, which the cells build keeps.
 # ponytail: reads every cell; split by 10° partition when the overlay builds by region
 # Web Mercator stops at about 85.05°; soundings past it have no tile to go in.
 MERCATOR_MAX_LAT = 85.0511
 SOURCES = f"""
 SELECT * FROM (
   SELECT depth_lon AS lon, depth_lat AS lat, depth AS d, false AS unconfirmed
-  FROM lake.cells WHERE kind <> 'filled' AND depth IS NOT NULL
+  FROM lake.cells WHERE depth IS NOT NULL
   UNION ALL
   SELECT lon, lat, depth, true FROM lake.shoals
 ) WHERE abs(lat) <= {MERCATOR_MAX_LAT}
@@ -230,6 +229,13 @@ SELECT min(first),
   sum(count), max(tvu)
 FROM lake.cells WHERE cell_id = $partition AND tile_id = $tile AND depth IS NOT NULL"""
 
+# A tile's published cell soundings shallow enough to be primes: a prime is the least
+# depth published inside its isobath, at that cell's sounding.
+PRIME_CANDIDATES = f"""
+SELECT depth_lon AS lon, depth_lat AS lat, depth FROM lake.cells
+WHERE cell_id = $partition AND tile_id = $tile AND depth <= $max
+  AND abs(depth_lat) <= {MERCATOR_MAX_LAT}"""
+
 
 def areas(con, surfaces: Path):
     """Yield DEPARE, DEPCNT and M_QUAL features, and prime SOUNDG features, tile by tile.
@@ -241,27 +247,25 @@ def areas(con, surfaces: Path):
     surface's pixels.
     """
     for tile, partition in surface.tiles(con):
-        built = surface.build_tile(con, tile, partition, surfaces)
-        if built is None:
+        path = surface.build_tile(con, tile, partition, surfaces)
+        if path is None:
             continue
-        path, (lon, lat, depth) = built
         params = {"partition": partition, "tile": tile}
         first, last, count, tvu = con.execute(TILE_QUALITY, params).fetchone()
-        # Each sounded pixel's shoalest accepted sounding: a prime is the least depth
-        # actually measured inside its isobath, the sounding that drew it.
-        # ponytail: its cell's own sounding still shows beside it from the prime's zoom
-        # when the two differ; median − kσ redefines both, so they're left apart until then
-        shallow = (depth <= PRIME_MAX_DEPTH_M) & (np.abs(lat) <= MERCATOR_MAX_LAT)
-        candidates = lon[shallow], lat[shallow], depth[shallow]
-        bands, footprint, surfaced = surface_bands(path)
+        got = con.execute(PRIME_CANDIDATES, params | {"max": PRIME_MAX_DEPTH_M}).fetchnumpy()
+        candidates = got["lon"], got["lat"], got["depth"]
+        bands, footprint, surfaced, interpolated, interpolated_tvu = surface_bands(path)
         properties = quality(first, last, count, tvu)
-        yield from tile_areas(candidates, properties, bands, footprint, surfaced)
+        estimated = (interpolated, quality(first, last, 0, interpolated_tvu))
+        yield from tile_areas(candidates, properties, bands, footprint, surfaced, estimated)
 
 
 def surface_bands(path):
     """A tile surface's depth bands, {band: polygon} indexed into LEVELS; its coverage,
     where it has a depth or a sounding, grown by a pixel all round so a lone track's
-    soundings sit inside it; and the surface itself, where it has a depth.
+    soundings sit inside it; the surface itself, where it has a depth; the part of the
+    surface interpolated, more than a pixel from any sounding; and that part's largest
+    vertical uncertainty at 95%, as cells' `tvu`.
 
     Bands come from `gdal_contour -p`, which follows the surface between pixels rather
     than around them. All water past MAX_AREA_DEPTH_M is one more band, kept for the
@@ -270,7 +274,7 @@ def surface_bands(path):
     """
     levels = [lv for lv in LEVELS if lv <= MAX_AREA_DEPTH_M] + [MAX_DEPTH_M]
     with rasterio.open(path) as src:
-        depth, count = src.read(1), src.read(3)
+        depth, count, sigma = src.read(1), src.read(3), src.read(4)
         transform = src.transform
     bands = {}
     if (depth != surface.NODATA).any():
@@ -287,8 +291,22 @@ def surface_bands(path):
             part = shapely.make_valid(shapely.from_geojson(json.dumps(f["geometry"])))
             bands[b] = shapely.union(bands[b], part) if b in bands else part
     valid = depth != surface.NODATA
-    covered = binary_dilation(valid | (count > 0), structure=np.ones((3, 3), dtype=bool))
-    return bands, polygons(covered, transform), polygons(valid, transform)
+    around = np.ones((3, 3), dtype=bool)
+    covered = binary_dilation(valid | (count > 0), structure=around)
+    interpolated = valid & ~binary_dilation(count > 0, structure=around)
+    d, s = depth[interpolated], sigma[interpolated]
+    tvu = (
+        float(np.maximum(cells.TOLERANCE_M + cells.TOLERANCE_PER_M * d, 1.96 * s).max())
+        if len(d)
+        else None
+    )
+    return (
+        bands,
+        polygons(covered, transform),
+        polygons(valid, transform),
+        polygons(interpolated, transform),
+        tvu,
+    )
 
 
 def polygons(mask, transform):
@@ -301,12 +319,14 @@ def polygons(mask, transform):
     return shapely.union_all(pieces) if pieces else shapely.Polygon()
 
 
-def tile_areas(candidates, properties, bands, footprint, surfaced=None):
+def tile_areas(candidates, properties, bands, footprint, surfaced=None, interpolated=None):
     """Features for one tile: its depth areas from the surface's `bands`, its coverage
     `footprint` with `properties`, the contours between bands, and prime soundings from
-    `candidates`, the (lon, lat, depth) arrays of the tile's shoalest measured pixels. An isobath is
-    closed when the surface, `surfaced` (the footprint if not given), has deeper water
-    all round it."""
+    `candidates`, the (lon, lat, depth) arrays of the tile's published cell soundings. An
+    isobath is closed when the surface, `surfaced` (the footprint if not given), has
+    deeper water all round it. `interpolated`, (geometry, properties), is the part of
+    the footprint drawn between tracks: its coverage is a separate M_QUAL marked
+    `interpolated`, so styles can show it, and the rest is marked `measured`."""
     surfaced = footprint if surfaced is None else surfaced
     deepest = int(np.searchsorted(LEVELS, MAX_AREA_DEPTH_M, side="right")) - 1
     for b, area in bands.items():
@@ -315,7 +335,14 @@ def tile_areas(candidates, properties, bands, footprint, surfaced=None):
             yield shape("DEPARE", area, {"DRVAL1": lo, "DRVAL2": hi}, FIRST_AREA_ZOOM)
     if footprint.is_empty:
         return
-    yield shape("M_QUAL", footprint, properties, 0)
+    if interpolated is None or interpolated[0].is_empty:
+        yield shape("M_QUAL", footprint, properties | {"kind": "measured"}, 0)
+    else:
+        between, estimated = interpolated
+        measured = shapely.difference(footprint, between)
+        if not measured.is_empty:
+            yield shape("M_QUAL", measured, properties | {"kind": "measured"}, 0)
+        yield shape("M_QUAL", between, estimated | {"kind": "interpolated"}, 0)
     shapely.prepare(surfaced)
     lon, lat, depth = (np.asarray(a, dtype=float) for a in candidates)
     points = shapely.points(lon, lat)

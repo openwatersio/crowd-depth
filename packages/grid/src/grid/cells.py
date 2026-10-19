@@ -15,17 +15,18 @@ import math
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import catalog, definitions, qc
+import numpy as np
+
+from . import catalog, definitions, qc, statistic
 from .catalog import BASE_ROW, MIN_DEPTH_M, checkpoint
 from .definitions import CELLS
 from .qc import HAZARD_M, MAX_DEPTH_M, QC_VERSION, TRACK_REASONS
 
 log = logging.getLogger(__name__)
 
-GRID_VERSION = 4
+GRID_VERSION = 5
 BATCH_POINTS = 5_000_000
 BASE = CELLS["rows_per_degree"]  # base rows per 1° tile
-SHOAL_QUANTILE = 0.10
 MIN_VESSELS = 2
 CELL_REASONS = ["cell_deep", "cell_shoal", "cell_confirmed", "consensus_deep", "consensus_shoal"]
 # A sounding of the same vessel this far apart in time is another pass.
@@ -44,10 +45,13 @@ def k_for(lat0: int) -> int:
 K_LIST = "[" + ",".join(str(k_for(lat0)) for lat0 in range(-90, 90)) + "]"
 
 
+# CATZOC C depth tolerance, 2 m + 5% of depth: the least vertical uncertainty a cell is
+# published with, until validation supports a tighter one.
+TOLERANCE_M, TOLERANCE_PER_M = 2, 0.05
+
+
 def tolerance(d: str) -> str:
-    """CATZOC C depth tolerance: the least vertical uncertainty a cell is published with, until
-    validation supports a tighter one."""
-    return f"(2 + 0.05 * {d})"
+    return f"({TOLERANCE_M} + {TOLERANCE_PER_M} * {d})"
 
 
 def levels(source: str, dest: str) -> str:
@@ -82,7 +86,7 @@ FROM {source} s JOIN levels l ON l.tile_id = s.tile_id AND l.r1 = s.r // 3 AND l
 
 
 CELL = ["tile_id", "level", "cr", "cc"]
-# About how many soundings a cell's median, spread and 10th percentile are taken from. These
+# About how many soundings a cell's median, spread and vessels' medians are taken from. These
 # aggregates hold their values in memory, and a boat logging at its mooring fills one
 # cell for as long as it logs. Larger cells are sampled by point id, the same sample
 # every run; min, max, counts and confirmed shoals still use every sounding.
@@ -106,7 +110,7 @@ SUPPORT = 3
 DISPROVE = 3
 # A disproved shoal shallower than HAZARD_M may still be a hazard one boat found and
 # the others passed beside, so it stays an unconfirmed shoal rather than a reject: out
-# of depths and areas, but published and never filled over. Deeper, it's a stray echo.
+# of depths and areas, but published and never drawn over. Deeper, it's a stray echo.
 
 # A unit's points are classified in steps, each a temp table that spills past the
 # memory limit (a MATERIALIZED CTE would hold its whole result in memory), and the cell
@@ -297,36 +301,69 @@ CREATE OR REPLACE TEMP TABLE accepted AS
 SELECT * FROM {sample("by_cell", CELL + ["r", "c"], "keep_base")};
 DROP TABLE by_cell;
 
+"""
+
+# Each vessel's median in each 2/3″ pixel, the surface's, with its median correction σ:
+# one vote per vessel however fast it logs. The statistic is worked out per pixel from
+# these (statistic.py), over every band's accepted soundings, so its window reads across
+# bands. A cell's sounding takes its pixel's statistic, as the surface does; they differ
+# only where the surface reads across a tile edge or around its interpolation.
+ENTRIES = """
+SELECT py, px, m, s FROM (
+  SELECT r // 2 AS py, c // 2 AS px, vessel, median(d) FILTER (WHERE keep_base) AS m,
+    median(sigma) FILTER (WHERE keep_base) AS s
+  FROM group_accepted WHERE tile_id = $tile GROUP BY ALL
+  HAVING count(*) FILTER (WHERE keep_base) > 0
+) ORDER BY ALL
+"""
+
+STATS = f"""
+CREATE OR REPLACE TEMP TABLE accepted AS
+SELECT * FROM group_accepted WHERE r >= $rlo AND r < $rhi;
+
 -- Aggregates first, as small tables, so the join placing each cell's sounding is built
 -- on them: DuckDB can't spill a hash join's table, so it must never be the points.
 CREATE OR REPLACE TEMP TABLE children AS
--- A confirmed shoal always sets the depth, however many deeper soundings surround it.
-SELECT tile_id, level, cr, cc,
-  least(quantile_disc(d, {SHOAL_QUANTILE}) FILTER (WHERE keep_base),
-    min(d) FILTER (WHERE outlier = 'shoal')) AS depth
-FROM accepted GROUP BY tile_id, level, cr, cc, r, c;
+WITH shoals AS (
+  SELECT tile_id, level, cr, cc, r, c, min(d) FILTER (WHERE outlier = 'shoal') AS shoal
+  FROM accepted GROUP BY ALL
+)
+-- The pixel's median of the vessels' medians less K σ. A confirmed shoal sets the depth
+-- when it's shoaler, however many deeper vessels surround it. The margin alone never
+-- makes water drying: below 0 only where the median or a confirmed shoal is. Never past
+-- the drying band's floor, MIN_DEPTH_M, which the overlay's bands start from.
+SELECT *, CASE WHEN low IS NOT NULL THEN greatest(low, dry_floor, {MIN_DEPTH_M}) END AS depth
+FROM (
+  SELECT v.tile_id, v.level, v.cr, v.cc, v.r, v.c, ps.sigma, least(ps.depth, v.shoal) AS low,
+    least(0, ps.median, v.shoal) AS dry_floor
+  FROM shoals v JOIN pixel_sigma ps
+    ON ps.tile_id = v.tile_id AND ps.py = v.r // 2 AND ps.px = v.c // 2
+);
 
 CREATE OR REPLACE TEMP TABLE stats AS
--- An aggregated cell keeps its shoalest base cell, so aggregation never hides an accepted shoal.
+-- An aggregated cell keeps its shoalest base cell, so aggregation never hides an accepted
+-- shoal, and that base cell's σ.
 SELECT * FROM (
   SELECT tile_id, level, cr, cc, any_value(cell_id) AS cell_id, any_value(lat0) AS lat0,
     any_value(lon0) AS lon0, any_value(k) AS k, median(d) FILTER (WHERE keep_cell) AS median,
     coalesce(mad(d) FILTER (WHERE keep_cell), 0) AS mad, min(d) AS min, max(d) AS max,
     count(*) AS count, count(DISTINCT vessel) AS vessels, min(time) AS first, max(time) AS last,
-    count(*) FILTER (WHERE tided) AS tided, count(*) FILTER (WHERE calibrated) AS calibrated,
-    coalesce(median(sigma) FILTER (WHERE keep_cell), 0) AS sigma
+    count(*) FILTER (WHERE tided) AS tided, count(*) FILTER (WHERE calibrated) AS calibrated
   FROM accepted GROUP BY tile_id, level, cr, cc
-) JOIN (SELECT tile_id, level, cr, cc, min(depth) AS depth FROM children GROUP BY ALL)
-  USING (tile_id, level, cr, cc);
+) JOIN (
+  SELECT tile_id, level, cr, cc, min(depth) AS depth, arg_min(sigma, depth) AS sigma
+  FROM children GROUP BY ALL
+) USING (tile_id, level, cr, cc);
 
--- The cell's depth is an actual sounding; SOUNDG sits at that sounding's position.
+-- SOUNDG sits at the accepted sounding nearest the cell's depth: a confirmed shoal's
+-- own position when one set it.
 CREATE OR REPLACE TEMP TABLE placed AS
--- Ties at one depth and time go to the least point_id, not to whichever thread saw
--- one first, so unchanged soundings always place a cell's sounding in the same spot.
+-- Ties go to the earliest and then the least point_id, not to whichever thread saw one
+-- first, so unchanged soundings always place a cell's sounding in the same spot.
 SELECT a.tile_id, a.level, a.cr, a.cc,
-  arg_min({{'lon': a.lon, 'lat': a.lat}}, (a.time, a.point_id)) FILTER (WHERE a.time IS NOT NULL)
-    AS at
-FROM accepted a JOIN stats s USING (tile_id, level, cr, cc) WHERE a.d = s.depth GROUP BY ALL;
+  arg_min({{'lon': a.lon, 'lat': a.lat}}, (abs(a.d - s.depth), a.time, a.point_id))
+    FILTER (WHERE a.time IS NOT NULL) AS at
+FROM accepted a JOIN stats s USING (tile_id, level, cr, cc) GROUP BY ALL;
 DROP TABLE accepted;
 """
 
@@ -339,8 +376,7 @@ SELECT s.tile_id, s.level, s.cr AS "row", s.cc AS col,
   -- One vessel's cells carry only the year, so a chain of them can't date one boat's track.
   date_trunc(CASE WHEN s.vessels <= 1 THEN 'year' ELSE 'month' END, s.first)::DATE AS first,
   date_trunc(CASE WHEN s.vessels <= 1 THEN 'year' ELSE 'month' END, s.last)::DATE AS last,
-  -- Corrections' own uncertainty widens the spread's.
-  greatest({tolerance("s.depth")}, 1.96 * sqrt((1.4826 * s.mad) ^ 2 + s.sigma ^ 2)) AS tvu,
+  s.sigma, greatest({tolerance("s.depth")}, 1.96 * s.sigma) AS tvu,
   CASE WHEN s.vessels >= {MIN_VESSELS} THEN 'multi' ELSE 'single' END AS kind, 5 AS zoc,
   p.at.lon AS depth_lon, p.at.lat AS depth_lat, s.cell_id, {GRID_VERSION} AS grid_version,
   s.tided, s.calibrated
@@ -355,8 +391,13 @@ UNION ALL
 SELECT point_id, 'unconfirmed', 'cell_shoal' FROM classed
 WHERE outlier = 'shoal' AND NOT from_track AND point_id NOT IN (SELECT point_id FROM confirmed)
 UNION ALL
-SELECT point_id, 'confirmed', 'cell_confirmed' FROM classed
-WHERE from_track AND (outlier IS NULL OR point_id IN (SELECT point_id FROM confirmed))
+-- A track spike its cell agrees with.
+SELECT point_id, 'confirmed', 'cell_confirmed' FROM classed WHERE from_track AND outlier IS NULL
+UNION ALL
+-- A confirmed shoal, track spike or not: the surface is never drawn deeper than one. Its
+-- reason is a cell's shoal, as an unconfirmed one's is, so every build clears it.
+SELECT point_id, 'confirmed', 'cell_shoal' FROM classed
+WHERE outlier = 'shoal' AND point_id IN (SELECT point_id FROM confirmed)
 """
 
 
@@ -388,68 +429,6 @@ WHERE NOT p.excluded AND NOT p.awaiting_tide AND p.point_id IN (
   EXCEPT
   SELECT point_id FROM lake.qc_flags
   WHERE cell_id = $partition AND flag IN ('confirmed', 'reject') AND qc_version = {QC_VERSION})
-"""
-
-# Base cells bracketed by published cells on opposite sides (row, column or diagonal),
-# filled with the shoalest bracketing cell. Coarse cells cover their whole area.
-# Filled cells never fill others, so nothing grows outward from a track. Within a
-# tile only. Reads the temp tables `measured` and `shoals`.
-HOLES = f"""
-WITH ring AS (
-  -- Holes can only be in the ring of base cells around a published cell.
-  SELECT DISTINCT m.tile_id, m.cell_id, m."row" * m.level + dr AS r, m.col * m.level + dc AS c,
-    {K_LIST}[m.tile_id // 360 - 90 + 91] AS k
-  FROM measured m, range(-1, 10) a(dr), range(-1, 10) b(dc)
-  WHERE dr <= m.level AND dc <= m.level AND (dr IN (-1, m.level) OR dc IN (-1, m.level))
-),
-inside AS (
-  -- A base cell holding an unconfirmed shoal isn't empty: filling it would show the
-  -- water over that shoal as deeper than it was measured.
-  SELECT * FROM ring WHERE r >= $rlo AND r < $rhi AND c >= 0 AND c < {BASE} // k
-    AND NOT EXISTS (SELECT 1 FROM shoals s
-      WHERE s.tile_id = ring.tile_id AND s.r = ring.r AND s.c = ring.c)
-),
-offsets AS (
-  -- Pair 0 is the candidate itself; pairs 1 to 4 are opposite neighbors.
-  SELECT * FROM (VALUES (0, 0, 0), (1, -1, 0), (1, 1, 0), (2, 0, -1), (2, 0, 1),
-    (3, -1, -1), (3, 1, 1), (4, -1, 1), (4, 1, -1)) o(pair, dr, dc)
-),
-looks AS (
-  SELECT i.*, o.pair, i.r + o.dr AS nr, i.c + o.dc AS nc FROM inside i, offsets o
-),
-found AS (
-  SELECT l.*, coalesce(m1.depth, m3.depth, m9.depth) AS depth,
-    coalesce(m1.tvu, m3.tvu, m9.tvu) AS tvu
-  FROM looks l
-  LEFT JOIN measured m1 ON m1.tile_id = l.tile_id AND m1.level = 1
-    AND m1."row" = l.nr AND m1.col = l.nc
-  LEFT JOIN measured m3 ON m3.tile_id = l.tile_id AND m3.level = 3
-    AND m3."row" = l.nr // 3 AND m3.col = l.nc // 3
-  LEFT JOIN measured m9 ON m9.tile_id = l.tile_id AND m9.level = 9
-    AND m9."row" = l.nr // 9 AND m9.col = l.nc // 9
-  -- Integer division truncates toward zero, so a negative index would find row 0.
-  WHERE l.nr >= 0 AND l.nc >= 0
-),
-bracketed AS (
-  SELECT tile_id, cell_id, r, c, k, pair, min(depth) AS depth, max(tvu) AS tvu
-  FROM found WHERE pair > 0 AND depth IS NOT NULL
-  GROUP BY ALL HAVING count(*) = 2
-),
-filled AS (
-  SELECT tile_id, any_value(cell_id) AS cell_id, r, c, any_value(k) AS k,
-    min(depth) AS depth, max(tvu) AS tvu
-  FROM bracketed b
-  WHERE NOT EXISTS (SELECT 1 FROM found f WHERE f.pair = 0 AND f.depth IS NOT NULL
-    AND f.tile_id = b.tile_id AND f.r = b.r AND f.c = b.c)
-  GROUP BY tile_id, r, c
-)
-SELECT tile_id, 1 AS level, r AS "row", c AS col,
-  tile_id % 360 - 180 + c * k / {BASE} AS lon_min, tile_id // 360 - 90 + r / {BASE} AS lat_min,
-  tile_id % 360 - 180 + (c + 1) * k / {BASE} AS lon_max,
-  tile_id // 360 - 90 + (r + 1) / {BASE} AS lat_max,
-  depth, 0 AS count, 0 AS vessels, tvu, 'filled' AS kind, 5 AS zoc, cell_id,
-  {GRID_VERSION} AS grid_version
-FROM filled
 """
 
 
@@ -596,54 +575,65 @@ def clear(con, partition, tiles):
     con.execute("COMMIT")
 
 
-def measure(con, partition, rlo, rhi):
-    """Measured cells and cell-level flags for one band of `tile_points`; returns how
-    many cells."""
+def classify(con, partition, rlo, rhi, first):
+    """Cell-level flags for one band of `tile_points`, and its accepted soundings added to
+    `group_accepted`."""
     params = {"partition": partition, "rlo": rlo, "rhi": rhi}
     # Each step commits on its own, so a replaced or dropped table's space is freed
-    # at once; only the writes to the store share a transaction.
+    # at once. A group's flags and cells are complete only once `build` finishes it.
     for statement in filter(str.strip, CLASSIFY.split(";\n")):
         # DuckDB refuses parameters a statement doesn't use.
         con.execute(statement, {k: v for k, v in params.items() if f"${k}" in statement})
-    con.execute("BEGIN")
-    [(inserted,)] = con.execute(
-        f"""INSERT INTO lake.cells BY NAME
-        SELECT * FROM ({CELLS}) ORDER BY tile_id, level, "row", col"""
-    ).fetchall()
+    into = (
+        "CREATE OR REPLACE TEMP TABLE group_accepted AS" if first else "INSERT INTO group_accepted"
+    )
+    con.execute(f"{into} SELECT * FROM accepted")
+    con.execute("DROP TABLE accepted")
     con.execute(
         f"""INSERT INTO lake.qc_flags BY NAME
         SELECT q.*, $partition::SMALLINT AS cell_id, {QC_VERSION} AS qc_version
         FROM ({CELL_FLAGS}) q""",
         {"partition": partition},
     )
+
+
+def sigmas(con):
+    """`pixel_sigma`: σ and the statistic's depth at every 2/3″ pixel `group_accepted` has
+    a vote in, tile by tile."""
+    parts = []
+    for (tile,) in con.execute("SELECT DISTINCT tile_id FROM group_accepted").fetchall():
+        got = con.execute(ENTRIES, {"tile": tile}).fetchnumpy()
+        px, py = (np.asarray(got[c], dtype=np.int64) for c in ("px", "py"))
+        m, s = (np.asarray(got[c], dtype=np.float64) for c in ("m", "s"))
+        upx, upy, median, spread, csig = statistic.sigma_b(px, py, m, s)
+        sigma = statistic.sigma_at(upx, upy, spread, csig)(upx, upy)
+        parts.append(
+            (np.full(len(upx), tile), upy, upx, sigma, median - statistic.K * sigma, median)
+        )
+    columns = [np.concatenate(c) for c in zip(*parts)] if parts else [np.empty(0)] * 6
+    names = ("tile_id", "py", "px", "sigma", "depth", "median")
+    con.register("pixel_sigma", dict(zip(names, columns)))
+
+
+def measure(con, rlo, rhi):
+    """Measured cells for one band of `group_accepted`; returns how many."""
+    params = {"rlo": rlo, "rhi": rhi}
+    for statement in filter(str.strip, STATS.split(";\n")):
+        con.execute(statement, {k: v for k, v in params.items() if f"${k}" in statement})
+    con.execute("BEGIN")
+    [(inserted,)] = con.execute(
+        f"""INSERT INTO lake.cells BY NAME
+        SELECT * FROM ({CELLS}) ORDER BY tile_id, level, "row", col"""
+    ).fetchall()
     con.execute("COMMIT")
     return inserted
-
-
-def fill(con, partition, tiles, rlo, rhi):
-    """Filled cells for one band, from the measured cells and `shoals`; returns how many."""
-    params = {"partition": partition, "tiles": tiles, "rlo": rlo, "rhi": rhi}
-    con.execute("BEGIN")
-    con.execute(
-        """CREATE OR REPLACE TEMP TABLE measured AS SELECT * FROM lake.cells
-        WHERE cell_id = $partition AND list_contains($tiles, tile_id) AND kind <> 'filled'
-          AND ("row" + 1) * level >= $rlo AND "row" * level <= $rhi""",
-        params,
-    )
-    con.execute(f"CREATE OR REPLACE TEMP TABLE filled AS {HOLES}", {"rlo": rlo, "rhi": rhi})
-    con.execute(
-        """INSERT INTO lake.cells BY NAME SELECT * FROM filled ORDER BY tile_id, "row", col"""
-    )
-    [(filled,)] = con.execute("SELECT count(*) FROM filled").fetchall()
-    con.execute("COMMIT")
-    return filled
 
 
 # Each of the tiles' cells, summed: whether a tile's cells are still the ones a build
 # wrote. A tile with no cells has no row.
 DIGESTS = """
 SELECT tile_id, count(*) || ':' || sum(hash(level, "row", col, depth, median, mad, min, max,
-  count, vessels, kind, first, last, tvu, depth_lon, depth_lat, grid_version)::HUGEINT) AS digest
+  count, vessels, kind, first, last, tvu, sigma, depth_lon, depth_lat, grid_version)::HUGEINT) AS digest
 FROM lake.cells WHERE ($partition IS NULL OR cell_id = $partition) AND list_contains($tiles, tile_id)
 GROUP BY tile_id
 """
@@ -658,6 +648,7 @@ CODE = hashlib.sha256(
             __file__,
             qc.__file__,
             catalog.__file__,
+            statistic.__file__,
             Path(definitions.__file__).with_suffix(".json"),
         )
     )
@@ -668,9 +659,9 @@ def build(con, tiles: list[int] | None = None) -> dict:
     """Rebuild cells, cell-level QC flags and unconfirmed shoals for the given tiles, or
     every tile with points.
 
-    Tiles are read once, and a dense tile's bands are worked from that read: measured
-    cells first, band by band; then holes, which read the measured cells one row past
-    each band's edges, so a band's edge is filled the same as its middle.
+    Tiles are read once, and a dense tile's bands are worked from that read: each band
+    classified, then σ from every band's accepted soundings, so a band's edge gets the same
+    σ as its middle, then each band's cells.
     """
     if tiles is not None and not tiles:
         raise ValueError("no tiles to build; None builds every tile")
@@ -709,7 +700,7 @@ def build(con, tiles: list[int] | None = None) -> dict:
         ).fetchall()
     ]
     work = [(p, *unit) for p in partitions for unit in units(con, p, tiles)]
-    totals = {"units": len(work), "cells": 0, "filled": 0, "kept": 0}
+    totals = {"units": len(work), "cells": 0, "kept": 0}
     # Each band's points are read from the store once and kept for the group, and its
     # shoals found once from the flags, rather than per band with overlaps. A build
     # publishes only between groups, so the store is never seen with some of a group's
@@ -734,10 +725,15 @@ def build(con, tiles: list[int] | None = None) -> dict:
                     AND {BASE_ROW} BETWEEN $rlo AND $rhi - 1)""",
                 params,
             )
+        # Flags band by band, then σ from every band's votes, then each band's cells.
+        for i, (rlo, rhi) in enumerate(bands):
+            classify(con, partition, rlo, rhi, first=not i)
+        sigmas(con)
         for rlo, rhi in bands:
-            totals["cells"] += measure(con, partition, rlo, rhi)
-        # Shoals and holes follow every band's flags and measured cells: holes read the
-        # cells one row past each band's edges.
+            totals["cells"] += measure(con, rlo, rhi)
+        con.unregister("pixel_sigma")
+        con.execute("DROP TABLE group_accepted")
+        # Shoals follow every band's flags.
         con.execute(SHOALS, {"partition": partition})
         con.execute(
             f"""INSERT INTO lake.shoals
@@ -746,8 +742,6 @@ def build(con, tiles: list[int] | None = None) -> dict:
             ORDER BY tile_id, r, lon""",
             {"partition": partition},
         )
-        for rlo, rhi in bands:
-            totals["filled"] += fill(con, partition, unit_tiles, rlo, rhi)
         con.execute("DROP TABLE tile_points")
         con.execute("BEGIN")
         con.execute(

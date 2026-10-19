@@ -120,6 +120,7 @@ CREATE TABLE IF NOT EXISTS lake.tile_changes (tile_id INTEGER, reason VARCHAR, c
 MIGRATIONS = """
 ALTER TABLE lake.cells ADD COLUMN IF NOT EXISTS tided INTEGER;
 ALTER TABLE lake.cells ADD COLUMN IF NOT EXISTS calibrated INTEGER;
+ALTER TABLE lake.cells ADD COLUMN IF NOT EXISTS sigma FLOAT;
 ALTER TABLE lake.calibration_outliers ADD COLUMN IF NOT EXISTS content_hash VARCHAR;
 ALTER TABLE lake.tide_stations ADD COLUMN IF NOT EXISTS unpredictable BOOLEAN;
 """

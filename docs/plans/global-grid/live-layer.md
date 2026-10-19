@@ -46,7 +46,7 @@ Cells use the grid's [resolution](README.md#resolution) and the form of the grid
 - **Against the grid:** the grid's σ_b also counts how far other vessels spread around a local plane, which one boat can't measure. Where vessels disagree, the grid draws shoaler than the live layer by k times that spread. Where the overlay covers the water, the plugin can draw the shoaler of the two.
 - **A vessel's offset changing** shifts its cells by the difference, since the average is linear. A new tide level for past passes doesn't reach the live layer; the grid's next build carries it.
 
-The surface follows the grid's [interpolation](README.md#interpolation): bounded, marked, with σ widening with distance from the nearest track. Interpolated cells within the radius of a changed cell are recomputed from the stored cells.
+The surface follows the grid's [interpolation](README.md#interpolation): bounded, marked, with σ widening with distance from the nearest track. The surface within the radius of a changed cell is interpolated again from the stored cells.
 
 Replayed per vessel in Thimble Shoal Channel (2/3″ cells, per pass), against BlueTopo and on a synthetic 1 m change with 0.3 m noise:
 

@@ -113,6 +113,24 @@ In Tangier Sound, before cleaning, every statistic drew 19 to 30% of pixels as f
 4. **Leave uncalibrated vessels out of the median** where calibrated vessels sounded the pixel, and keep them where they're the only data, marked uncalibrated.
 5. **Measure a slope floor next:** the shoalest accepted sounding as a floor only on pixels where σ_a is well above σ_b.
 
+## In the pipeline
+
+`grid cells` and the surface draw `median − 1.75σ_b` ([statistic.py](../../../packages/grid/src/grid/statistic.py)). Built from the same store, on the tiles' own pixel grid, the surface matches the measured statistic: central depth and σ_b within 0.1 m at 98% of Thimble's pixels, and the same pixels more than 1 m too deep. Two rules the pipeline keeps make it differ:
+
+- **Pixels holding an unconfirmed shoal stay empty.** In Thimble Shoal Channel that's 28% of channel pixels, the same ones the current statistic leaves empty. On those pixels the channel bias is −1.69 m and 39% are false shoals, against −1.87 m and 46% for the current statistic.
+- **No pixel is deeper than a confirmed shoal next to it.** In Tangier Sound, scored on calibrated vessels only, confirmed shoals from every vessel, the stuck sounder's included, cap 2.8% of pixels and take false shoals from 3.0% to 5.3%.
+
+On the tiles' grid, with a widening of 0.005 m per metre from the nearest sounding:
+
+| Area                  |  Bias | Too deep | On slopes | In channel | False shoals |
+| --------------------- | ----: | -------: | --------: | ---------: | -----------: |
+| Thimble Shoal Channel | −0.52 |    0.03% |      0.5% |       0.2% |         7.1% |
+| Tangier Sound         | −0.48 |     2.1% |      9.9% |            |         6.2% |
+
+`grid cells` on the densest tile, Thimble's (28M soundings), peaked at 3.55 GB resident with DuckDB at 4 GB, against 4.6 to 5.0 GB for the 10th percentile on the same tile. σ's windows are worked about 2 million entries at a time: 2 million entries at 20 vessels a pixel peak at 490 MB.
+
+The widening changes nothing in Thimble, where every pixel is within 100 m of a track, and takes Tangier from 2.7% to 2.1% too deep. The measured rates in [Results](#results) move with the grid: the same statistic on a grid 0.4 pixel off the tiles' draws 0.06% of Thimble's pixels too deep instead of 0.03%, and 0.34% of its channel instead of 0.18%, because on the channel's edges where a pixel boundary falls moves its median by up to a metre.
+
 ## Not measured
 
 - **Crossover-only offsets:** most offsets here are anchored to BlueTopo or S-102; crossover offsets were 10 of 343 segments.
