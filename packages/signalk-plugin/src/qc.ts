@@ -23,6 +23,13 @@ export interface QCDefinitions {
   flat_min_soundings: number;
   flat_span_m: number;
   hazard_m: number;
+  steep_factor: number;
+  steep_abs_m: number;
+  steep_slope: number;
+  steep_floor_m: number;
+  noise_window: number;
+  noise_rel: number;
+  noise_abs_m: number;
 }
 
 export interface Sounding {
@@ -36,8 +43,16 @@ export interface Sounding {
 
 export type Flag = [
   index: number,
-  flag: "reject" | "review" | "unconfirmed",
-  reason: "sentinel" | "time" | "very_shallow" | "jump" | "flatline" | "spike",
+  flag: "reject" | "review" | "unconfirmed" | "noisy",
+  reason:
+    | "sentinel"
+    | "time"
+    | "very_shallow"
+    | "jump"
+    | "steep"
+    | "flatline"
+    | "track_noise"
+    | "spike",
 ];
 
 const US = 1_000_000;
@@ -58,6 +73,32 @@ function speed(a: Sounding, b: Sounding): number {
     (distance(a, b) / Math.max(Math.abs(b.time / US - a.time / US), 1)) *
     1.943844
   );
+}
+
+/** Median of each sounding's window of k either side, as numpy's rolling_median. */
+function rollingMedian(values: number[], k: number): number[] {
+  return values.map((_, j) => {
+    const w = values.slice(Math.max(0, j - k), j + k + 1).sort((a, b) => a - b);
+    const lo = w[(w.length - 1) >> 1];
+    const hi = w[w.length >> 1];
+    return f32(lo + f32(hi - lo) * 0.5);
+  });
+}
+
+/** Positions in `track` deeper than the steep bound from the last one before them that wasn't. */
+function steepPass(track: Sounding[], qc: QCDefinitions): boolean[] {
+  const out = track.map(() => false);
+  let anchor = 0;
+  for (let j = 1; j < track.length; j++) {
+    const a = track[anchor];
+    const bound =
+      qc.steep_factor * Math.max(a.depth, qc.steep_floor_m) +
+      qc.steep_abs_m +
+      qc.steep_slope * distance(a, track[j]);
+    if (track[j].depth > bound) out[j] = true;
+    else anchor = j;
+  }
+  return out;
 }
 
 /**
@@ -111,17 +152,37 @@ export function trackQC(
       return !jumped;
     });
 
+    // Steep: deeper than steep_factor times the last depth before it that wasn't, plus
+    // steep_abs_m and steep_slope metres a metre, from both directions.
+    const along = kept.map((i) => pts[i]);
+    const forward = steepPass(along, qc);
+    const backward = steepPass([...along].reverse(), qc).reverse();
+    // A stretch at the transit's start or end is judged from its one side.
+    const leading = backward.findIndex((b) => !b);
+    const trailing = forward.findLastIndex((f) => !f);
+    const level = kept.filter((i, j) => {
+      const steep =
+        (forward[j] && backward[j]) ||
+        (backward[j] && (leading === -1 || j < leading)) ||
+        (forward[j] && j > trailing);
+      if (steep) flags.push([i, "reject", "steep"]);
+      return !steep;
+    });
+
     // Stuck sounders: one depth held over flat_m of path and flat_min_soundings soundings,
     // and, shallower than hazard_m, across flat_span_m.
     const clean: number[] = [];
-    for (let j = 0; j < kept.length;) {
+    for (let j = 0; j < level.length;) {
       let end = j + 1;
       let length = 0;
-      while (end < kept.length && pts[kept[end]].depth === pts[kept[j]].depth) {
-        length += distance(pts[kept[end - 1]], pts[kept[end]]);
+      while (
+        end < level.length &&
+        pts[level[end]].depth === pts[level[j]].depth
+      ) {
+        length += distance(pts[level[end - 1]], pts[level[end]]);
         end++;
       }
-      const run = kept.slice(j, end);
+      const run = level.slice(j, end);
       const d = pts[run[0]].depth;
       if (length >= qc.flat_m && run.length >= qc.flat_min_soundings) {
         // Across the run's bounding box, at its mean latitude.
@@ -159,24 +220,44 @@ export function trackQC(
       j = end;
     }
 
+    // Noise: the track's median zig-zag beyond noise_rel of its median depth and
+    // noise_abs_m. A sounding's zig-zag is the least of its distances from the middle of
+    // its neighbors and from each of them.
+    const depths = clean.map((i) => pts[i].depth);
+    const rough = depths.map((d, j) => {
+      if (j === 0 || j === depths.length - 1) return 0;
+      const [before, after] = [depths[j - 1], depths[j + 1]];
+      const mid = f32(f32(before + after) / 2);
+      return Math.min(
+        Math.abs(f32(d - mid)),
+        Math.abs(f32(d - before)),
+        Math.abs(f32(d - after)),
+      );
+    });
+    const roughness = rollingMedian(rough, qc.noise_window);
+    const typical = rollingMedian(depths, qc.noise_window);
+    const noisy = clean.map(
+      (i, j) =>
+        roughness[j] > f32(f32(qc.noise_rel) * typical[j]) &&
+        roughness[j] > f32(qc.noise_abs_m),
+    );
     // Spikes: off the median of spike_window soundings either side by more than
-    // spike_abs_m + spike_rel of it. Deeper is rejected, shoaler kept as unconfirmed.
-    if (clean.length < qc.spike_min_soundings) continue;
-    const k = qc.spike_window;
+    // spike_abs_m + spike_rel of it. Deeper is rejected, shoaler kept as unconfirmed: it
+    // may be a rock. On a noisy track a deeper one is noise, and a shoaler one is kept as
+    // unconfirmed track_noise, which neither confirms nor is confirmed.
+    const judged = clean.length >= qc.spike_min_soundings;
+    const medians = rollingMedian(depths, qc.spike_window);
     clean.forEach((i, j) => {
-      const w = clean
-        .slice(Math.max(0, j - k), j + k + 1)
-        .map((c) => pts[c].depth)
-        .sort((a, b) => a - b);
-      const lo = w[(w.length - 1) >> 1];
-      const hi = w[w.length >> 1];
-      const med = f32(lo + f32(hi - lo) * 0.5);
+      const med = medians[j];
       const d = pts[i].depth;
-      if (
+      const spike =
+        judged &&
         Math.abs(f32(d - med)) >
-        f32(f32(qc.spike_abs_m) + f32(f32(qc.spike_rel) * med))
-      )
-        flags.push([i, d > med ? "reject" : "unconfirmed", "spike"]);
+          f32(f32(qc.spike_abs_m) + f32(f32(qc.spike_rel) * med));
+      if (spike && !(d > med))
+        flags.push([i, "unconfirmed", noisy[j] ? "track_noise" : "spike"]);
+      else if (noisy[j]) flags.push([i, "noisy", "track_noise"]);
+      else if (spike) flags.push([i, "reject", "spike"]);
     });
   }
   return flags;

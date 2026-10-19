@@ -308,6 +308,21 @@ def test_offsets_per_step_segment_from_anchors_and_crossings(env, tmp_path, monk
     ]
 
 
+def test_a_noisy_tracks_soundings_dont_calibrate_its_vessel(env, tmp_path, monkeypatch):  # noqa: F811
+    # A sounder hunting between 6 and 13 m over the surveyed 10 m: its 13 m side is noise
+    # and its 6 m side unconfirmed shoals, so nothing it logged reaches calibration.
+    ref = reference(tmp_path / "ref.tif", (0, 110))
+    hunting = []
+    for n, rows, vessel in (transit(1 + i, "AQM-H", 10.0, (0, 240), i) for i in range(3)):
+        rows = [(s, lon, lat, 6.0 if j % 2 else 13.0) for j, (s, lon, lat, _) in enumerate(rows)]
+        hunting.append((n, rows, vessel))
+    calibrated(env, hunting, ref, monkeypatch)
+    assert [status for (v, _), (_, status) in segments(env).items() if v == "AQM-H"] in (
+        [],
+        ["uncalibrated"],
+    )
+
+
 def test_offsets_republish_only_past_their_standard_error(env, tmp_path, monkeypatch):  # noqa: F811
     ref = reference(tmp_path / "ref.tif", (0, 110))
     calibrated(env, FLEET, ref, monkeypatch)

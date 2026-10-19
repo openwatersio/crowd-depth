@@ -73,7 +73,8 @@ WITH wanted AS MATERIALIZED (
 ),
 -- Only these points' flags, so memory follows the tile, not its whole partition.
 flags AS (
-  SELECT point_id, bool_or(flag = 'reject') AS rejected,
+  -- A noisy track's soundings neither cap a pixel nor stop it being filled.
+  SELECT point_id, bool_or(flag IN ('reject', 'noisy')) AS rejected,
     bool_or(flag = 'unconfirmed') AND NOT bool_or(flag = 'confirmed') AS unconfirmed
   FROM lake.qc_flags WHERE cell_id = $partition AND qc_version = {QC_VERSION}
     AND point_id IN (SELECT point_id FROM wanted)
