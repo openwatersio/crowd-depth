@@ -8,19 +8,24 @@
     grid --store DIR_OR_S3_URL calibrate [--reference s102|bluetopo|PATH]...
     grid --store DIR_OR_S3_URL cells [--bbox=W,S,E,N | --changed]
     grid --store DIR_OR_S3_URL overlay --out DIR
+    grid --store DIR_OR_S3_URL benchmark --surface DIR --out DIR [--bbox=W,S,E,N | --tiles=ID,...]
+                                          [--source NAME]... [--cells] [--qc-version N]
     grid --store DIR_OR_S3_URL stats
+    grid cache [--prune]
 
 Sources default to the NOAA CSB bucket and the Open Waters R2 bucket. R2 access
-reads S3_ENDPOINT, S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY.
+reads S3_ENDPOINT, S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY. Downloads are kept in
+GRID_CACHE_DIR, shared by every store on the machine (see cache.py).
 """
 
 import argparse
+import json
 import logging
 import math
 import sys
 from pathlib import Path
 
-from . import calibrate, cells, overlay, qc, tide
+from . import benchmark, cache, calibrate, cells, overlay, qc, reference, tide
 from .catalog import open_store
 from .ingest import Ingest, confirm_withdrawals
 from .objects import open_objects
@@ -56,9 +61,7 @@ def bbox(text: str) -> list[int]:
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog="grid", description=__doc__.split("\n")[0])
-    p.add_argument(
-        "--store", required=True, help="Point store: a local directory or s3://bucket/prefix on R2"
-    )
+    p.add_argument("--store", help="Point store: a local directory or s3://bucket/prefix on R2")
     sub = p.add_subparsers(dest="command", required=True)
     i = sub.add_parser("ingest", help="List the sources and ingest new, changed and removed files")
     i.add_argument("--source", choices=SOURCES, action="append", help="Default: both")
@@ -122,8 +125,41 @@ def main(argv=None):
     )
     o = sub.add_parser("overlay", help="Build the overlay layers and their PMTiles from the cells")
     o.add_argument("--out", required=True, type=Path, help="Directory for the layers and PMTiles")
+    b = sub.add_parser(
+        "benchmark", help="Score a render's depth surface against the surveyed references"
+    )
+    b.add_argument("--surface", required=True, type=Path, help="The render's surface COGs")
+    b.add_argument("--out", required=True, type=Path, help="Directory for benchmark.json and .md")
+    which = b.add_mutually_exclusive_group()
+    which.add_argument(
+        "--bbox", type=bbox, help="Only the 1° tiles this box touches: --bbox=W,S,E,N"
+    )
+    which.add_argument(
+        "--tiles", type=lambda t: [int(x) for x in t.split(",")], help="Only these tile ids"
+    )
+    b.add_argument(
+        "--source", action="append", default=[], help="Only this reference source; repeatable"
+    )
+    b.add_argument("--cells", action="store_true", help="Score the cells' depths too")
+    b.add_argument(
+        "--qc-version",
+        type=int,
+        default=qc.QC_VERSION,
+        help="The QC flags that pick accepted soundings and confirmed shoals; default: this code's",
+    )
     sub.add_parser("stats", help="Count files by source and status")
+    k = sub.add_parser("cache", help="Show the download cache's size by kind")
+    k.add_argument(
+        "--prune",
+        action="store_true",
+        help="First remove reference rasters and tile schemes of old releases, source files"
+        " past GRID_CACHE_FILES_GB, and what dead writes left",
+    )
     args = p.parse_args(argv)
+    if args.command == "cache":
+        return show_cache(args.prune)
+    if not args.store:
+        p.error("--store is required")
     if args.command == "ingest" and args.keys and len(set(args.source or SOURCES)) != 1:
         # Keys name one source's files; listed in the other's bucket, they're all missing.
         p.error("--keys needs exactly one --source")
@@ -133,7 +169,7 @@ def main(argv=None):
     )
     alert = False
     with open_store(
-        open_objects(args.store), write=args.command not in ("stats", "overlay")
+        open_objects(args.store), write=args.command not in ("stats", "overlay", "benchmark")
     ) as con:
         if args.command == "ingest":
             for name in args.source or SOURCES:
@@ -168,6 +204,16 @@ def main(argv=None):
                 cells.build(con, args.bbox)
         elif args.command == "overlay":
             print(overlay.build(con, args.out))
+        elif args.command == "benchmark":
+            result = benchmark.run(
+                con, args.surface, args.bbox or args.tiles, args.source, args.qc_version, args.cells
+            )
+            result = {"store": args.store, **result}
+            args.out.mkdir(parents=True, exist_ok=True)
+            (args.out / "benchmark.json").write_text(json.dumps(result, indent=1) + "\n")
+            table = benchmark.markdown(result)
+            (args.out / "benchmark.md").write_text(table)
+            print(table)
         elif args.command == "confirm-withdrawals":
             print(f"confirmed {confirm_withdrawals(con, args.source)} held withdrawals")
         else:
@@ -178,6 +224,17 @@ def main(argv=None):
                 print(*row, sep="\t")
     # Held withdrawals, incomplete listings, unreadable files and unknown keys need an operator.
     return 2 if alert else 0
+
+
+def show_cache(prune):
+    if prune:
+        reference.prune()
+        cache.trim("files", cache.files_cap())
+        cache.remove_stale_parts()
+    print(cache.root())
+    for kind, (n, size) in cache.sizes().items():
+        print(f"{kind}\t{n} entries\t{size / 2**30:.2f} GB")
+    return 0
 
 
 if __name__ == "__main__":
