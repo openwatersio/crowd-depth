@@ -1,0 +1,48 @@
+name: Grid
+
+on:
+  pull_request:
+    # Also what ingest parses: the API's R2 keys and sidecars, and the plugin's uploads.
+    paths:
+      - "packages/grid/**"
+      - ".github/workflows/grid.yml"
+      - "packages/api/src/r2.ts"
+      - "packages/signalk-plugin/src/reporters/noaa.ts"
+  push:
+    branches: [main]
+    paths:
+      - "packages/grid/**"
+      - ".github/workflows/grid.yml"
+      - "packages/api/src/r2.ts"
+      - "packages/signalk-plugin/src/reporters/noaa.ts"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Grid tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        # The oldest version pyproject.toml allows, and the newest.
+        python: ["3.12", "3.14"]
+    defaults:
+      run:
+        working-directory: packages/grid
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v10.3.0
+        with:
+          working-directory: packages/grid
+          python-version: ${{ matrix.python }}
+
+      - name: Lint
+        run: uv run --locked ruff check && uv run --locked ruff format --check
+
+      - name: Run tests
+        run: uv run --locked pytest

@@ -1,0 +1,26 @@
+[project]
+name = "grid"
+version = "0.1.0"
+description = "Crowd Depth global depth grid pipeline"
+requires-python = ">=3.12"
+dependencies = [
+  "boto3>=1.38",
+  # A newer DuckLake migrates the catalog it attaches, which an older build then can't read.
+  "duckdb>=1.5,<1.6",
+]
+
+[project.scripts]
+grid = "grid.cli:main"
+
+[dependency-groups]
+dev = ["pyarrow>=20", "pytest>=8", "ruff>=0.12"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
