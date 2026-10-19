@@ -4,41 +4,118 @@ on:
   release:
     types: [published]
 
-permissions:
-  contents: write
-  # required for npm trusted publishing (OIDC)
-  id-token: write
+# Each job gets only the permissions it needs. Dependency install scripts and
+# the build run in `build`, which holds no token that can publish or push;
+# `publish` and `version` run no project code. This keeps the tokens from
+# install scripts, not the tarball: `publish` ships whatever `build` packed.
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ github.event.release.tag_name }}
 
 jobs:
-  publish:
+  build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
+      # The release's commit, which npm provenance names as the source.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
+          persist-credentials: false
 
-      - uses: actions/setup-node@v7
+      - name: Check the tag is the tip of main
+        run: |
+          main=$(git ls-remote origin refs/heads/main | cut -f1)
+          [ "$main" = "$GITHUB_SHA" ] || { echo "::error::$TAG is $GITHUB_SHA but main is $main. Release from the tip of main."; exit 1; }
+
+      # No dependency cache: a poisoned cache would reach the release.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          # npm >= 11.5.1 required for trusted publishing
           node-version-file: mise.toml
-          registry-url: https://registry.npmjs.org/
+          package-manager-cache: false
 
-      - run: npm install
+      - run: npm ci
 
       - name: Set version from release tag
         run: npm pkg set version="${TAG#v}" -w crowd-depth
-        env:
-          TAG: ${{ github.event.release.tag_name }}
 
-      - run: npm publish -w crowd-depth
+      - name: Lint the package
+        run: npm run lint -w crowd-depth
 
+      # prepack builds the plugin.
+      - name: Pack
+        run: |
+          mkdir -p "$RUNNER_TEMP/pack"
+          npm pack -w crowd-depth --pack-destination "$RUNNER_TEMP/pack"
+
+      - name: Check the tarball holds every listed file
+        run: |
+          tar -tzf "$RUNNER_TEMP"/pack/*.tgz > "$RUNNER_TEMP/contents.txt"
+          for f in $(jq -r '.files[]' packages/signalk-plugin/package.json); do
+            awk -v p="package/$f" '$0 == p || index($0, p "/") == 1 { found = 1 } END { exit !found }' "$RUNNER_TEMP/contents.txt" \
+              || { echo "::error::$f is missing from the tarball"; exit 1; }
+          done
+          grep -qx package/dist/index.js "$RUNNER_TEMP/contents.txt"
+          jq -e --arg v "${TAG#v}" '.version == $v' <(tar -xzOf "$RUNNER_TEMP"/pack/*.tgz package/package.json)
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: package
+          path: ${{ runner.temp }}/pack/*.tgz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      # npm trusted publishing (OIDC)
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: package
+
+      # Only npm's version matters here, and this job has no checkout to read
+      # mise.toml from.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org/
+
+      - name: Check npm supports trusted publishing
+        run: |
+          v=$(npm --version)
+          node -e 'const [a, b, c] = process.argv[1].split(".").map(Number); process.exit(a > 11 || (a === 11 && (b > 5 || (b === 5 && c >= 1))) ? 0 : 1)' "$v" \
+            || { echo "::error::npm $v is older than 11.5.1, which trusted publishing needs"; exit 1; }
+
+      - run: npm publish ./*.tgz --provenance --ignore-scripts
+
+  version:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: mise.toml
+          package-manager-cache: false
+
+      # Pushing fails, leaving main and the tag alone, if main moved since the
+      # build.
       - name: Commit version bump
         run: |
+          npm pkg set version="${TAG#v}" -w crowd-depth
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit --no-verify -m "Bump version to ${TAG#v}" packages/signalk-plugin/package.json
+          git diff --quiet || git commit --no-verify -m "Bump version to ${TAG#v}" packages/signalk-plugin/package.json package-lock.json
           git tag -f "$TAG"
-          git push origin main
-          git push -f origin "$TAG"
-        env:
-          TAG: ${{ github.event.release.tag_name }}
+          git push --atomic origin HEAD:main "+refs/tags/$TAG"
