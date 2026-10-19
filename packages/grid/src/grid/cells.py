@@ -24,11 +24,18 @@ from .qc import HAZARD_M, MAX_DEPTH_M, QC_VERSION, TRACK_REASONS
 
 log = logging.getLogger(__name__)
 
-GRID_VERSION = 6
+GRID_VERSION = 7
 BATCH_POINTS = 5_000_000
 BASE = CELLS["rows_per_degree"]  # base rows per 1° tile
 MIN_VESSELS = 2
-CELL_REASONS = ["cell_deep", "cell_shoal", "cell_confirmed", "consensus_deep", "consensus_shoal"]
+CELL_REASONS = [
+    "cell_deep",
+    "cell_shoal",
+    "cell_unjudged",
+    "cell_confirmed",
+    "consensus_deep",
+    "consensus_shoal",
+]
 # A sounding of the same vessel this far apart in time is another pass.
 OTHER_PASS = "4 hours"
 STEPS = CELLS["column_steps_divide"]
@@ -48,6 +55,10 @@ K_LIST = "[" + ",".join(str(k_for(lat0)) for lat0 in range(-90, 90)) + "]"
 # CATZOC C depth tolerance, 2 m + 5% of depth: the least vertical uncertainty a cell is
 # published with, until validation supports a tighter one.
 TOLERANCE_M, TOLERANCE_PER_M = 2, 0.05
+# A confirmed shoal stays confirmed only within the tolerance of the other vessels' median
+# for its pixel, where at least this many other vessels sounded the pixel, or failing that
+# its 3x3: echoes off piers and moored hulls that many vessels read confirm each other.
+SHOAL_CHECK_VESSELS = CELLS["shoal_check_vessels"]
 
 
 def tolerance(d: str) -> str:
@@ -276,7 +287,9 @@ classified AS (
       WHEN k.d > r.med + r.bound THEN 'deep'
       WHEN r.med IS NULL OR k.d < r.med - r.bound THEN 'shoal'
     END AS outlier,
-    k.flag IS NOT DISTINCT FROM 'unconfirmed' AS from_track
+    k.flag IS NOT DISTINCT FROM 'unconfirmed' AS from_track,
+    -- Whether the cell had accepted soundings to judge a candidate against.
+    r.med IS NOT NULL AS judged
   FROM keyed k LEFT JOIN robust r USING (tile_id, level, cr, cc)
 )
 SELECT * FROM classified;
@@ -320,7 +333,7 @@ FROM {
         "keep_v",
     )
 }
-GROUP BY py, px, vessel ORDER BY py, px, v, m
+GROUP BY py, px, vessel HAVING count(*) FILTER (WHERE keep_v) > 0 ORDER BY py, px, v, m
 """
 
 STATS = f"""
@@ -403,7 +416,10 @@ SELECT point_id, 'reject' AS flag, 'cell_deep' AS reason FROM classed WHERE outl
 UNION ALL
 SELECT point_id, flag, reason FROM consensus_rejects
 UNION ALL
-SELECT point_id, 'unconfirmed', 'cell_shoal' FROM classed
+-- A shoal its cell's accepted soundings contradict, or, in a cell with none to judge it
+-- against, one nobody has confirmed yet.
+SELECT point_id, 'unconfirmed', CASE WHEN judged THEN 'cell_shoal' ELSE 'cell_unjudged' END
+FROM classed
 WHERE outlier = 'shoal' AND NOT from_track AND point_id NOT IN (SELECT point_id FROM confirmed)
 UNION ALL
 -- A track spike its cell agrees with.
@@ -612,6 +628,82 @@ def classify(con, partition, rlo, rhi, first):
     )
 
 
+# Confirmed shoals the other vessels outvote: the lower median of the other vessels'
+# votes (their median depths) in the shoal's pixel, or its 3x3 where the pixel has too
+# few, is more than the tolerance deeper than the shoal. The lower median, so where at
+# least half the other vessels read the shoal too it stands; the shoal's own vessel
+# doesn't vote, so two vessels reading a rock among two deeper ones are outvoted.
+OUTVOTED = f"""
+CREATE OR REPLACE TEMP TABLE outvoted AS
+WITH votes AS (
+  SELECT tile_id, py, px, vessel, median(d) FILTER (WHERE keep_v) AS m
+  FROM {
+    sample(
+        "(SELECT *, r // 2 AS py, c // 2 AS px FROM group_accepted)",
+        ["tile_id", "py", "px", "vessel"],
+        "keep_v",
+    )
+}
+  GROUP BY ALL
+),
+-- Judged once per pixel and vessel, however many of its soundings are confirmed shoals.
+keys AS (
+  SELECT DISTINCT tile_id, r // 2 AS py, c // 2 AS px, vessel FROM group_accepted
+  WHERE outlier = 'shoal'
+),
+reach AS (
+  SELECT k.*, k.py + dy AS py2, k.px + dx AS px2, dy = 0 AND dx = 0 AS own
+  FROM keys k, range(-1, 2) a(dy), range(-1, 2) b(dx)
+),
+-- Each other vessel votes once: its vote in the pixel, and its median vote across the
+-- 3x3, so a vessel that crossed more of the neighbours counts no more.
+each AS (
+  SELECT r.tile_id, r.py, r.px, r.vessel, v.vessel AS other,
+    any_value(v.m) FILTER (WHERE r.own) AS m1, median(v.m) AS m3
+  FROM reach r JOIN votes v
+    ON v.tile_id = r.tile_id AND v.py = r.py2 AND v.px = r.px2 AND v.vessel <> r.vessel
+  GROUP BY ALL
+),
+others AS (
+  SELECT tile_id, py, px, vessel, count(m1) AS n1, quantile_disc(m1, 0.5) AS m1,
+    count(*) AS n3, quantile_disc(m3, 0.5) AS m3
+  FROM each GROUP BY ALL
+),
+judged AS (
+  SELECT tile_id, py, px, vessel, CASE WHEN n1 >= {SHOAL_CHECK_VESSELS} THEN m1
+    WHEN n3 >= {SHOAL_CHECK_VESSELS} THEN m3 END AS m
+  FROM others
+)
+SELECT a.point_id, a.d FROM group_accepted a JOIN judged j
+  ON j.tile_id = a.tile_id AND j.py = a.r // 2 AND j.px = a.c // 2 AND j.vessel = a.vessel
+WHERE a.outlier = 'shoal' AND a.d < j.m - {tolerance("j.m")};
+"""
+
+
+def check_shoals(con, partition):
+    """Confirmed shoals the other vessels outvote are flagged as consensus disproves a
+    shoal: out of the cells' depths and the surface's cap, published as unconfirmed
+    soundings shallower than HAZARD_M and rejected as stray echoes deeper. The reason is
+    one every build clears."""
+    con.execute(OUTVOTED)
+    params = {"partition": partition}
+    con.execute(
+        f"""DELETE FROM lake.qc_flags WHERE cell_id = $partition AND qc_version = {QC_VERSION}
+        AND flag = 'confirmed' AND reason = 'cell_shoal'
+        AND point_id IN (SELECT point_id FROM outvoted)""",
+        params,
+    )
+    con.execute(
+        f"""INSERT INTO lake.qc_flags BY NAME
+        SELECT point_id, CASE WHEN d < {HAZARD_M} THEN 'unconfirmed' ELSE 'reject' END AS flag,
+          'consensus_shoal' AS reason,
+          $partition::SMALLINT AS cell_id, {QC_VERSION} AS qc_version FROM outvoted""",
+        params,
+    )
+    con.execute("DELETE FROM group_accepted WHERE point_id IN (SELECT point_id FROM outvoted)")
+    con.execute("DROP TABLE outvoted")
+
+
 def sigmas(con):
     """`pixel_sigma`: σ and the statistic's depth at every 2/3″ pixel `group_accepted` has
     a vote in, tile by tile."""
@@ -745,6 +837,7 @@ def build(con, tiles: list[int] | None = None) -> dict:
         # Flags band by band, then σ from every band's votes, then each band's cells.
         for i, (rlo, rhi) in enumerate(bands):
             classify(con, partition, rlo, rhi, first=not i)
+        check_shoals(con, partition)
         sigmas(con)
         for rlo, rhi in bands:
             totals["cells"] += measure(con, rlo, rhi)

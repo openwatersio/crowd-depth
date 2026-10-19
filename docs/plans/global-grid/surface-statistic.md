@@ -123,17 +123,19 @@ Interpolated pixels widen σ by 0.005 m per metre from the nearest sounding. Tha
 
 ### Legibility
 
-The surface also smooths each vessel along its own coverage, adds 40 m of smoothing to `gdal_grid`, blurs over 2 pixels, and lets only unconfirmed shoals QC couldn't judge keep it off a pixel. Rebuilt on eight Chesapeake tiles and scored against `reference_pixels` (BlueTopo and S-102 at MLLW) on every pixel a vessel sounded, before and after:
+The surface also smooths each vessel along its own coverage, adds 40 m of smoothing to `gdal_grid` and blurs over 2 pixels. Unconfirmed shoals QC judged improbable don't affect it, and a confirmed shoal caps it only within 2 m + 5% of the other vessels' median. Rebuilt on Thimble's tile, which holds Norfolk, and the tile north of it, and scored against `reference_pixels` (BlueTopo and S-102 at MLLW) on every pixel a vessel sounded, from the published render to now:
 
 | Vessels in the pixel |         Empty | Roughness, m | More than 1 m too deep | False shoals over 2 m | Under 1 m where the survey is 2 m or more |
 | -------------------- | ------------: | -----------: | ---------------------: | --------------------: | ----------------------------------------: |
-| 1                    | 26.6% → 25.0% |  0.08 → 0.05 |            4.9% → 4.4% |           6.3% → 6.8% |                               1.5% → 1.1% |
-| 2–3                  |  13.8% → 9.7% |  0.09 → 0.05 |            4.9% → 4.0% |           3.7% → 4.7% |                               0.5% → 0.5% |
-| 4–9                  | 22.7% → 11.8% |  0.10 → 0.06 |            8.0% → 6.1% |           6.1% → 9.2% |                               0.4% → 0.7% |
-| 10 or more           | 71.1% → 52.9% |  0.10 → 0.06 |          20.6% → 12.6% |         26.8% → 48.1% |                              4.8% → 18.4% |
-| All                  | 23.9% → 21.3% |  0.08 → 0.05 |            5.0% → 4.4% |           5.7% → 6.5% |                               1.3% → 1.0% |
+| 1                    | 15.5% → 12.5% |  0.08 → 0.05 |            3.7% → 3.5% |           7.2% → 7.6% |                               1.9% → 1.3% |
+| 2–3                  |  13.9% → 4.3% |  0.09 → 0.05 |            4.3% → 4.3% |           4.1% → 5.6% |                               0.4% → 0.3% |
+| 4–9                  |  29.9% → 1.4% |  0.11 → 0.07 |            9.2% → 9.0% |          9.6% → 12.8% |                               0.5% → 0.0% |
+| 10 or more           |  77.2% → 2.9% |  0.10 → 0.08 |          23.2% → 13.0% |         32.7% → 54.7% |                               5.0% → 0.0% |
+| All                  |  16.8% → 9.8% |  0.08 → 0.05 |            4.2% → 4.2% |           6.6% → 8.1% |                               1.5% → 0.9% |
 
-In water over 12 m on Thimble's tile, the share more than 1 m too deep goes from 8.6% to 7.0%, so the smoothing doesn't spend the margin k was chosen for. Before, disproved readings and stuck runs left 80% of Thimble's busiest pixels empty. The busiest pixels' false shoals come from Norfolk's piers and berths: echoes off piers and moored hulls that many vessels read are confirmed as shoals, and pixels that were empty now draw at pier depth, a median 15 m shoaler than the survey. Pixels the surface drew before are unchanged there.
+Holes fall as traffic rises. Among pixels mostly surrounded by drawn surface on Thimble's tile, by soundings within about 5 pixels, the share left empty goes from 5.1% to 0.0% over 1,000 soundings, 2.1% to 0.2% at 200 to 1,000, 1.1% to 0.7% at 50 to 200, and 1.0% to 0.9% under 50. Before, every pixel holding an unconfirmed shoal stayed empty, and in busy water some vessel almost always logs one.
+
+In Norfolk's harbour (−76.36 to −76.30, 36.83 to 36.97), echoes off piers and moored hulls that many vessels read are confirmed as shoals. Capping the surface at all of them drew 10.1% of the harbour's surface as drying and 9.7% at 0 to 2 m, in a channel dredged to about 15 m. Capping only near the other vessels' median draws 0.1% drying and 2.9% at 0 to 2 m. It outvotes 339,522 of Thimble's tile's 780,149 confirmed-shoal soundings, 264,690 of them in the harbour, and 28,098 of 128,259 on the tile north. Of those outvoted, 5.6% and 2.0% sit where the survey also reads within 1 m as shallow, so some may be real; they publish as unconfirmed soundings, not as capping shoals. Busy water's false shoals stay high: echoes within the tolerance and channel edges.
 
 ## Not measured
 

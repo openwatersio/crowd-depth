@@ -328,25 +328,27 @@ def test_skipping_empty_blocks_changes_no_pixel(env, monkeypatch):  # noqa: F811
 
 
 def test_surface_holds_every_confirmed_shoal_among_deeper_soundings(env):  # noqa: F811
-    # Between two tracks, 20 vessels read 10 m in two base cells 60 m apart, and two
-    # vessels read a shoal in each: 2 m in one and 3 m in the other. Under 60 files, as a
-    # file's number is a seconds field in its key.
-    tracks = parallel()
-    for col, shoal in ((30, 2.0), (36, 3.0)):
-        tracks += [(f"V{col}-{i}", [(100 + i, 5006, col, 10.0)]) for i in range(20)]
-        tracks += [(f"R{col}-{i}", [(200 + i, 5006, col, shoal + 0.3 * i)]) for i in range(2)]
+    # Between two tracks at 12 m, 20 vessels read 12 m in two base cells 60 m apart, and
+    # two vessels read a shoal within the tolerance in each: 9.6 m and 9.9 m. Under 60
+    # files, as a file's number is a seconds field in its key.
+    tracks = [(v, [(i, r, i, 12.0) for i in range(60)]) for v, r in zip("AB", (5000, 5012))]
+    for col, shoal in ((30, 9.6), (36, 9.9)):
+        tracks += [(f"V{col}-{i}", [(100 + i, 5006, col, 12.0)]) for i in range(20)]
+        tracks += [(f"R{col}-{i}", [(200 + i, 5006, col, shoal + 0.1 * i)]) for i in range(2)]
     depth = surface_from(env, tracks)
-    assert at_pixel(depth, 5006, 30) <= 2.0 and at_pixel(depth, 5006, 36) <= 3.0
+    assert at_pixel(depth, 5006, 30) <= 9.6 and at_pixel(depth, 5006, 36) <= 9.9
 
 
-def test_surface_leaves_an_unconfirmed_shoal_empty(env, monkeypatch):  # noqa: F811
+def test_a_contradicted_shoal_is_drawn_over_from_the_votes(env, monkeypatch):  # noqa: F811
     monkeypatch.setattr(statistic, "SIGMA_PER_M", 0.0)  # σ without widening
-    # A third track between the two reads a 3 m spike nobody else saw.
+    # A third track between the two reads a 3 m spike its own track contradicts: the
+    # surface is drawn from the other votes, and the spike publishes as a sounding.
     tracks = parallel()
     tracks.append(("C", [(i, 5006, i, 3.0 if i == 30 else 10.0) for i in range(60)]))
     depth = surface_from(env, tracks)
-    assert at_pixel(depth, 5006, 30) == surface.NODATA
-    assert at_pixel(depth, 5006, 20) == pytest.approx(10.0 - statistic.K * CSIG, abs=0.05)
+    assert ("unconfirmed", "spike", 3.0) in test_grid.flags(env)
+    assert at_pixel(depth, 5006, 30) == pytest.approx(10.0 - statistic.K * CSIG, abs=0.05)
+    assert (3.0,) in env.query("SELECT depth FROM lake.shoals")
 
 
 def test_a_disproved_shoal_publishes_without_holding_the_surface_open(env, monkeypatch):  # noqa: F811
@@ -363,50 +365,50 @@ def test_a_disproved_shoal_publishes_without_holding_the_surface_open(env, monke
 
 
 def test_surface_is_the_median_less_k_sigma_and_never_deeper_than_a_confirmed_shoal():
-    # A pixel at 7 m less K σ holds a 4 m confirmed shoal; another an unconfirmed shoal.
-    # Shoaler soundings that aren't confirmed shoals don't cap anything.
+    # A pixel at 7 m less K σ holds a 4 m confirmed shoal. Shoaler soundings that aren't
+    # confirmed shoals don't cap anything.
     surface_ = np.full((10, 4), 10.0, dtype=np.float32)
     surface_[5, 1] = 7.0
     sigma = np.full(surface_.shape, 0.5, dtype=np.float32)
     confirmed = np.full(surface_.shape, np.inf, dtype=np.float32)
     confirmed[5, 1] = 4.0
-    unconfirmed = np.zeros(surface_.shape, dtype=bool)
-    unconfirmed[2, 2] = True
-    out = surface.finish(surface_, sigma, surface.around(confirmed), unconfirmed)
-    assert out[5, 1] == 4.0 and out[2, 2] == surface.NODATA
+    out = surface.finish(surface_, sigma, surface.around(confirmed))
+    assert out[5, 1] == 4.0
     # Carried to the pixels around it, never past them.
     assert out[4, 0] == 4.0 and out[7, 1] == pytest.approx(10.0 - statistic.K * 0.5)
-    assert (out[~unconfirmed] <= surface_[~unconfirmed] - statistic.K * 0.5 + 1e-6).all()
+    assert (out <= surface_ - statistic.K * 0.5 + 1e-6).all()
     # The blur never makes a pixel deeper than it was interpolated.
     assert (surface.blur(surface_) <= surface_).all()
     # The margin alone never makes wet water drying: a wide σ stops at 0 m.
     wide = np.full(surface_.shape, 50.0, dtype=np.float32)
-    nothing, dry = np.full(surface_.shape, np.inf), np.zeros_like(unconfirmed)
-    assert (surface.finish(surface_, wide, nothing, dry) == 0).all()
+    nothing = np.full(surface_.shape, np.inf)
+    assert (surface.finish(surface_, wide, nothing) == 0).all()
     # Drying water stays drying, never past its median; a drying confirmed shoal stays put.
     drying = np.full(surface_.shape, -1.0, dtype=np.float32)
-    assert (surface.finish(drying, wide, nothing, dry) == -1).all()
+    assert (surface.finish(drying, wide, nothing) == -1).all()
     shoal = np.full(surface_.shape, -0.5, dtype=np.float32)
-    assert (surface.finish(surface_, wide, shoal, dry) == -0.5).all()
+    assert (surface.finish(surface_, wide, shoal) == -0.5).all()
 
 
-def test_a_tile_of_unconfirmed_shoals_only_draws_no_surface(env, tmp_path):  # noqa: F811
+@pytest.mark.parametrize("reason, drawn", [("cell_shoal", False), ("cell_unjudged", True)])
+def test_contradicted_shoals_dont_vote_and_unjudged_ones_do(env, tmp_path, reason, drawn):  # noqa: F811
     put_tracks(env, parallel())
     test_grid.build(env)
     tile = tile_of(test_grid.LAT0, test_grid.LON0)
     with open_store(env.store) as con:
-        # As if every sounding were an unconfirmed shoal nothing confirmed.
+        # As if every sounding were an unconfirmed shoal: contradicted by its cell, or in
+        # a cell with no accepted median to judge it against.
         con.execute(
-            "INSERT INTO lake.qc_flags SELECT point_id, 'unconfirmed', 'spike', ?, cell_id"
+            "INSERT INTO lake.qc_flags SELECT point_id, 'unconfirmed', ?, ?, cell_id"
             " FROM lake.points",
-            [qc.QC_VERSION],
+            [reason, qc.QC_VERSION],
         )
         con.execute("DELETE FROM lake.qc_flags WHERE flag <> 'unconfirmed'")
         [(partition,)] = con.execute("SELECT DISTINCT cell_id FROM lake.cells").fetchall()
         path = surface.build_tile(con, tile, partition, tmp_path)
     with rasterio.open(path) as src:
         depth, count = src.read(1), src.read(3)
-    assert (depth == surface.NODATA).all() and count[count > 0].sum() == 120
+    assert (depth != surface.NODATA).any() == drawn and count[count > 0].sum() == 120
 
 
 def test_interpolated_pixels_widen_with_distance_and_are_marked(env, monkeypatch, tmp_path):  # noqa: F811
@@ -560,7 +562,7 @@ def test_a_one_pixel_shoal_covers_its_whole_pixel_in_the_areas(tmp_path):
     confirmed = np.full(depth.shape, np.inf, dtype=np.float32)
     confirmed[50, 50] = 3.0
     nothing = np.zeros(depth.shape, dtype=np.float32)
-    out = surface.finish(depth, nothing, surface.around(confirmed), nothing.astype(bool))
+    out = surface.finish(depth, nothing, surface.around(confirmed))
     write_surface(tmp_path / "t.tif", -78, 33, out, np.zeros_like(out), np.zeros_like(out))
     bands, *_ = overlay.surface_bands(tmp_path / "t.tif")
     shoal = shapely.union_all([a for b, a in bands.items() if overlay.LEVELS[b] < 5])

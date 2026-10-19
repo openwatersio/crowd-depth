@@ -104,7 +104,7 @@ Measured on the full build's depth areas and contours, along all 204 shared edge
 - **Band mismatch across the seam**: 9.4% of samples where both sides have areas (558 of 5,915), up to 20% on 45463/45823.
 - **Contours**: 371 contour ends near an edge found a same-depth end across it, with a median distance of 23 m (median of the per-pair medians). 84 had none. Some pairs' 90th percentile is over 1 km, meaning the nearest partner end is somewhere else entirely.
 
-These seams come from the package's per-tile surface, not from the split. A global tippecanoe run draws the same ones. Interpolation sees 200 m of the neighbors, but the blur, the shoal guard (`minimum_filter`), the unconfirmed-shoal holes and consensus QC (whose votes stop at tile edges, the existing `ponytail` in `cells.py`) don't. Gridding each tile with a margin of a few pixels and cropping after the guard would remove most of the mismatch. Consensus would also need to read across edges, which makes the cells stage depend on its neighbors too.
+These seams come from the package's per-tile surface, not from the split. A global tippecanoe run draws the same ones. Interpolation sees 200 m of the neighbors, but the blur, the confirmed-shoal cap (`minimum_filter`) and consensus QC (whose votes stop at tile edges, the existing `ponytail` in `cells.py`) don't. Gridding each tile with a margin of a few pixels and cropping after the guard would remove most of the mismatch. Consensus would also need to read across edges, which makes the cells stage depend on its neighbors too.
 
 ## Planet extrapolation (8 cores, 32 GB)
 

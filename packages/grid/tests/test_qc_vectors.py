@@ -219,7 +219,7 @@ def test_changing_a_grid_definition_bumps_the_grid_version():
     # leaves cells built under the old ones looking current.
     grid = {k: DEFINITIONS[k] for k in ("cells", "statistic", "surface")}
     digest = hashlib.sha256(json.dumps(grid, sort_keys=True).encode()).hexdigest()[:16]
-    assert (cells.GRID_VERSION, digest) == (6, "efcdf755f3ef5914")
+    assert (cells.GRID_VERSION, digest) == (7, "61dc2992d70b2244")
 
 
 def test_spike_chunks_give_the_same_flags(monkeypatch):

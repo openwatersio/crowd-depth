@@ -258,6 +258,19 @@ def test_cells_keep_the_shoals_still_unconfirmed(env):  # noqa: F811
     assert shoals == [((LAT0 + 90) * 360 + LON0 + 180, 5000, *at(5000, 6), 3.0)]
 
 
+@pytest.mark.parametrize("judged, reason", [(True, "cell_shoal"), (False, "cell_unjudged")])
+def test_a_cell_shoal_is_unjudged_without_a_median_to_judge_it(judged, reason):
+    con = duckdb.connect()
+    con.execute(
+        """CREATE TABLE classed AS SELECT 1 AS point_id, 'shoal' AS outlier,
+        false AS from_track, ? AS judged""",
+        [judged],
+    )
+    con.execute("CREATE TABLE confirmed (point_id INTEGER)")
+    con.execute("CREATE TABLE consensus_rejects (point_id INTEGER, flag VARCHAR, reason VARCHAR)")
+    assert con.execute(cells.CELL_FLAGS).fetchall() == [(1, "unconfirmed", reason)]
+
+
 def test_shoals_are_the_soundings_nothing_confirmed_or_rejected():
     con = duckdb.connect()
     con.execute("ATTACH ':memory:' AS lake")
@@ -341,17 +354,63 @@ def test_levels_count_only_vessels_with_accepted_soundings(env):  # noqa: F811
     assert ("reject", "cell_deep", 60) in flags(env)
 
 
-def test_confirmed_shoals_set_the_depth_however_many_soundings(env):  # noqa: F811
+@pytest.mark.parametrize("shoal, kept", [(8.0, True), (2.0, False)])
+def test_a_confirmed_shoal_stands_only_near_the_other_vessels(env, shoal, kept):  # noqa: F811
+    # 30 vessels read 10 m; two others read a shoal and confirm each other. Within 2 m + 5%
+    # of the others' 10 m it sets the depth; far shoaler, it's an echo they outvote.
     for i in range(30):
         put(env, i + 1, [(i, *at(5000, 0, 0.02 + i * 0.03), 10.0)], f"V{i}")
-    put(env, 31, [(40, *at(5000, 0, 0.95), 2.0)], "R1")
-    put(env, 32, [(41, *at(5000, 0, 0.97), 2.3)], "R2")
+    put(env, 31, [(40, *at(5000, 0, 0.95), shoal)], "R1")
+    put(env, 32, [(41, *at(5000, 0, 0.97), shoal + 0.3)], "R2")
     build(env)
     [row] = grid(env)
-    # The 30 vessels' median, less K σ, would be far deeper.
-    assert row[3] == 2.0 and ("confirmed", "cell_shoal", 2.0) in flags(env)
-    [(lon, lat)] = env.query("SELECT depth_lon, depth_lat FROM lake.cells")
-    assert (lon, lat) == at(5000, 0, 0.95)
+    got = flags(env)
+    if kept:
+        # However many deeper soundings surround it, it sets the depth.
+        assert row[3] == pytest.approx(shoal) and ("confirmed", "cell_shoal", shoal) in got
+        [(lon, lat)] = env.query("SELECT depth_lon, depth_lat FROM lake.cells")
+        assert (lon, lat) == at(5000, 0, 0.95)
+    else:
+        assert ("unconfirmed", "consensus_shoal", shoal) in got
+        assert ("confirmed", "cell_shoal", shoal) not in got and row[3] > 7
+        assert (shoal,) in env.query("SELECT depth FROM lake.shoals")
+
+
+def test_each_other_vessel_votes_once_around_a_shoal():
+    # R's confirmed 2 m shoal shares its pixel with A only, so the pixels around it judge.
+    # A read 10 m across three of them and B 2.2 m in one: each votes once, half of them
+    # read the shoal, and it stands.
+    rows = [(1, 10, 10, "R", 2.0, "shoal")]
+    rows += [
+        (2 + i, r, c, "A", 10.0, None)
+        for i, (r, c) in enumerate(((10, 11), (12, 10), (12, 12), (10, 12)))
+    ]
+    rows.append((9, 8, 10, "B", 2.2, None))
+    con = duckdb.connect()
+    con.execute(
+        """CREATE TABLE group_accepted (point_id INTEGER, r INTEGER, c INTEGER, vessel VARCHAR,
+        d DOUBLE, outlier VARCHAR, tile_id INTEGER DEFAULT 1)"""
+    )
+    con.executemany(
+        "INSERT INTO group_accepted (point_id, r, c, vessel, d, outlier) VALUES (?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    con.execute(cells.OUTVOTED)
+    assert con.execute("SELECT * FROM outvoted").fetchall() == []
+    # With B reading 10 m too, both other vessels are deeper by far, and it's outvoted.
+    con.execute("UPDATE group_accepted SET d = 10.0, vessel = 'C' WHERE vessel = 'B'")
+    con.execute(cells.OUTVOTED)
+    assert con.execute("SELECT point_id FROM outvoted").fetchall() == [(1,)]
+
+
+def test_a_confirmed_shoal_too_few_others_can_judge_stands(env):  # noqa: F811
+    # One other vessel reads 10 m; R reads 2 m on two passes five hours apart, which
+    # confirm each other. One vessel is too few to outvote it.
+    put(env, 1, [(i, *at(5000, 0, 0.1 + i * 0.1), 10.0) for i in range(5)], "V")
+    put(env, 2, [(0, *at(5000, 0, 0.8), 2.0), (5 * 3600, *at(5000, 0, 0.9), 2.2)], "R")
+    build(env)
+    assert ("confirmed", "cell_shoal", 2.0) in flags(env)
+    assert grid(env)[0][3] == pytest.approx(2.0)
 
 
 def test_units_group_small_tiles_and_band_dense_ones(env, monkeypatch):  # noqa: F811

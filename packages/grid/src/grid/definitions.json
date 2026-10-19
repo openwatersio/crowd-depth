@@ -19,7 +19,8 @@
   },
   "cells": {
     "rows_per_degree": 10800,
-    "column_steps_divide": 1200
+    "column_steps_divide": 1200,
+    "shoal_check_vessels": 2
   },
   "surface": {
     "interpolation_radius_m": 200,

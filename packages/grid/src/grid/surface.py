@@ -61,14 +61,16 @@ EARTH_M = 6378137.0
 # within reach are skipped, and left out of the file.
 BLOCK = 512
 
-# Unconfirmed shoals QC couldn't judge keep the surface off their pixel. One QC disproved,
-# deeper than three or more other vessels agreed, and a stuck run publish as unconfirmed
-# soundings without holding the surface open: in busy water nearly every pixel has one.
-BLOCKING = ["cell_shoal", "spike", "track_noise"]
-JUDGED = ["consensus_shoal", "flatline"]
+# An unconfirmed shoal QC judged improbable against its context (its track, its cell's
+# median, other vessels nearby) doesn't affect the surface: it publishes as an unconfirmed
+# sounding, the chart's warning there, and the surface is drawn from the other votes. One
+# with no context to judge against, a cell shoal in a cell with no accepted median,
+# votes like any accepted sounding.
+UNJUDGED = "cell_unjudged"
 
 # Each surface pixel's corrected soundings, from those QC accepted (not rejected, and not an
-# unconfirmed shoal unless something confirmed it), within the depths cells trust, with
+# unconfirmed shoal QC judged improbable, unless something confirmed it), within the depths
+# cells trust, with
 # the pixel numbered on this tile's grid from its south-west corner; a neighboring tile's
 # soundings get numbers outside it, which interpolation reads as a margin. A fixed sample
 # per pixel and vessel is marked `keep`, so a moored boat costs fixed memory and can't
@@ -91,17 +93,15 @@ WITH wanted AS MATERIALIZED (
 flags AS (
   SELECT point_id, bool_or(flag = 'reject') AS rejected,
     bool_or(flag = 'confirmed' AND reason = 'cell_shoal') AS confirmed,
-    bool_or(flag = 'unconfirmed') AND NOT bool_or(flag = 'confirmed') AS unconfirmed,
-    bool_or(flag = 'unconfirmed' AND list_contains({BLOCKING}, reason))
-      AND NOT bool_or(list_contains({JUDGED}, reason)) AND NOT bool_or(flag = 'confirmed')
-      AS blocks
+    bool_or(flag = 'unconfirmed' AND reason <> '{UNJUDGED}') AND NOT bool_or(flag = 'confirmed')
+      AS unconfirmed
   FROM lake.qc_flags WHERE cell_id = $partition AND qc_version = {QC_VERSION}
     AND point_id IN (SELECT point_id FROM wanted)
   GROUP BY point_id
 ),
 pts AS (
   SELECT w.*, coalesce(f.unconfirmed, false) AS unconfirmed,
-    coalesce(f.blocks, false) AS blocks, coalesce(f.confirmed, false) AS confirmed
+    coalesce(f.confirmed, false) AS confirmed
   FROM wanted w LEFT JOIN flags f USING (point_id) WHERE NOT coalesce(f.rejected, false)
 )
 SELECT a.*, NOT a.unconfirmed
@@ -118,10 +118,10 @@ SELECT py, px, hash(vessel) AS v, median(d) AS m, median(sigma) AS s
 FROM surface_points WHERE keep GROUP BY py, px, vessel ORDER BY py, px, v, m
 """
 
-# Each sounded pixel's soundings, whether an unconfirmed shoal that blocks the surface is
-# there, and its shoalest confirmed shoal, which no pixel may be deeper than.
+# Each sounded pixel's soundings, those of them that vote, and its shoalest confirmed
+# shoal, which no pixel may be deeper than.
 COUNTS = """
-SELECT py, px, count(*) AS n, bool_or(blocks) AS unconfirmed,
+SELECT py, px, count(*) AS n, count(*) FILTER (WHERE NOT unconfirmed) AS votes,
   min(d) FILTER (WHERE confirmed) AS confirmed
 FROM surface_points GROUP BY ALL
 """
@@ -222,24 +222,24 @@ def build_tile(con, tile_id: int, partition: int, out: Path):
     cpx = np.clip(counted["px"].astype(np.int64), 0, cols - 1)
     count = np.zeros(shape, dtype=np.float32)
     np.add.at(count, (ROWS - 1 - cpy, cpx), np.asarray(counted["n"], dtype=np.float32))
-    unconfirmed = np.zeros(shape, dtype=bool)
-    np.logical_or.at(
-        unconfirmed, (ROWS - 1 - cpy, cpx), np.asarray(counted["unconfirmed"], dtype=bool)
-    )
     confirmed = np.full(shape, np.inf, dtype=np.float32)
     # NULL, a pixel without one, comes back masked: as NaN, never as its 0 fill.
     shoal = np.ma.filled(np.ma.asarray(counted["confirmed"], dtype=np.float32), np.nan)
     has = ~np.isnan(shoal)
     np.minimum.at(confirmed, (ROWS - 1 - cpy[has], cpx[has]), shoal[has])
-    # Every sounded pixel, this tile's and its neighbors', in metres: distance is to the
-    # nearest, wherever it is.
+    # Every pixel with a vote, this tile's and its neighbors', in metres: distance is to
+    # the nearest, wherever it is, and a pixel holding only shoals the surface ignores
+    # isn't sounded for it.
+    voted = np.asarray(counted["votes"]) > 0
     sounded = cKDTree(
-        np.column_stack([np.concatenate([cpx, mx]) * dx, np.concatenate([cpy, my]) * dy])
+        np.column_stack(
+            [np.concatenate([cpx[voted], mx]) * dx, np.concatenate([cpy[voted], my]) * dy]
+        )
     )
     out.mkdir(parents=True, exist_ok=True)
     path = out / f"{tile_id}.tif"
     with tempfile.TemporaryDirectory(dir=os.environ.get("GRID_TEMP_DIR") or None) as tmp:
-        # A tile whose soundings are all unconfirmed shoals has no votes: nothing to draw.
+        # A tile whose soundings are all contradicted shoals has no votes: nothing to draw.
         grid = (
             interpolate(Path(tmp), upx, upy, medians, scale_x, scale_y, cols) if len(upx) else None
         )
@@ -312,7 +312,7 @@ def build_tile(con, tile_id: int, partition: int, out: Path):
                 qx, qy = cc + c0, ROWS - 1 - (rr + r0)
                 distance[rr, cc] = sounded.query(np.column_stack([qx * dx, qy * dy]))[0]
                 sigma[rr, cc] = sigma_of(qx, qy, distance[rr, cc])
-                depth = finish(surface, sigma, around(confirmed[win])[inner], unconfirmed[block])
+                depth = finish(surface, sigma, around(confirmed[win])[inner])
                 distance[depth == NODATA] = NODATA
                 sigma[depth == NODATA] = NODATA
                 dst.write(
@@ -365,10 +365,9 @@ def around(confirmed):
     return minimum_filter(confirmed, size=3, mode="constant", cval=np.inf)
 
 
-def finish(surface, sigma, around, unconfirmed):
-    """The depth: the blurred `surface` less K `sigma`; never deeper in any pixel than a
-    confirmed shoal `around` it (in it or a pixel next to it); and a pixel holding an
-    unconfirmed shoal left empty rather than draw deeper water over it.
+def finish(surface, sigma, around):
+    """The depth: the blurred `surface` less K `sigma`, never deeper in any pixel than a
+    confirmed shoal `around` it (in it or a pixel next to it).
 
     Depth areas follow the surface between pixel centres, so a shoal held at its own
     pixel's centre alone would cover only part of that pixel; carried to the pixels
@@ -382,7 +381,7 @@ def finish(surface, sigma, around, unconfirmed):
     # start from.
     floor = np.maximum(np.minimum(np.minimum(surface, around), 0), MIN_DEPTH_M)
     depth = np.maximum(np.minimum(surface - statistic.K * sigma, around), floor)
-    return np.where(valid & ~unconfirmed, depth, NODATA).astype(np.float32)
+    return np.where(valid, depth, NODATA).astype(np.float32)
 
 
 def open_sparse(path, lon0, lat0, shape):

@@ -8,7 +8,7 @@ Every number below comes from the grid's design and changes with it. This note c
 
 The grid is Python and the plugin is TypeScript, so both read one set of definitions instead of porting by hand:
 
-- **Constants as JSON:** QC thresholds, cell resolution, the statistic's k, the interpolation radius, band levels, contour tiers and sounding rounding, in [definitions.json](../../../packages/grid/src/grid/definitions.json), which the grid's modules read and the plugin will import at build time once the port is in its data flow. The statistic's k joins it with the statistic.
+- **Constants as JSON:** QC thresholds, cell resolution, the statistic's k, the interpolation radius, band levels, contour tiers and sounding rounding, in [definitions.json](../../../packages/grid/src/grid/definitions.json), which the grid's modules read and the plugin will import at build time once the port is in its data flow.
 - **Test vectors as JSON:** inputs and expected outputs for QC, the statistic, interpolation and rounding, run by both pytest and vitest. A change on either side fails the other's tests until both agree. QC's are in [qc_vectors.json](../../../packages/grid/tests/qc_vectors.json), with flags from the reference SQL, which pytest checks the reference and `grid.qc` against.
 - **QC as pure functions:** the grid's track QC as numpy functions ([qc.py](../../../packages/grid/src/grid/qc.py)), ported once to TypeScript as plain loops ([qc.ts](../../../packages/signalk-plugin/src/qc.ts)) and checked against the shared vectors with vitest ([qc-functions.md](qc-functions.md)). The port isn't in the plugin's data flow yet.
 
@@ -24,7 +24,7 @@ Cell QC runs across the boat's own passes, as the grid's does across vessels. Co
 
 The plugin reads GNSS quality from the same Signal K data it sends to the grid, so its position checks and horizontal uncertainty match the grid's for the same soundings.
 
-Unconfirmed shoals are handled as in the grid: they publish as soundings with a low-reliability flag, and the surface is never drawn over one QC couldn't judge.
+Unconfirmed shoals are handled as in the grid: they publish as soundings with a low-reliability flag, and the surface is drawn as if those QC judged improbable weren't there.
 
 ### Corrections
 
