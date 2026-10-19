@@ -1,6 +1,6 @@
 {
   "qc": {
-    "version": 4,
+    "version": 6,
     "earliest": "2000-01-01",
     "arrival_slack_s": 86400,
     "max_depth_m": 11000,
@@ -15,7 +15,17 @@
     "flat_m": 1000,
     "flat_min_soundings": 3,
     "flat_span_m": 200,
-    "hazard_m": 30
+    "hazard_m": 30,
+    "steep_factor": 2,
+    "steep_abs_m": 5,
+    "steep_slope": 0.25,
+    "steep_floor_m": 10,
+    "noise_window": 10,
+    "noise_rel": 0.1,
+    "noise_abs_m": 0.3,
+    "lone_deep_factor": 2,
+    "lone_deep_abs_m": 10,
+    "lone_deep_floor_m": 10
   },
   "cells": {
     "rows_per_degree": 10800,
