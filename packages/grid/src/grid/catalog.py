@@ -44,11 +44,26 @@ CREATE TABLE IF NOT EXISTS lake.submission_meta (
 CREATE TABLE IF NOT EXISTS lake.withdrawal_holds (
   source VARCHAR, key VARCHAR, seen INTEGER, confirmed BOOLEAN
 );
+CREATE TABLE IF NOT EXISTS lake.qc_batches (batch_id BIGINT, qc_version INTEGER);
 CREATE TABLE IF NOT EXISTS lake.store_meta (key VARCHAR, value VARCHAR);
+CREATE TABLE IF NOT EXISTS lake.qc_flags (
+  point_id BLOB, flag VARCHAR, reason VARCHAR, qc_version INTEGER, cell_id SMALLINT
+);
+CREATE TABLE IF NOT EXISTS lake.cells (
+  tile_id INTEGER, level TINYINT, "row" INTEGER, col INTEGER,
+  lon_min DOUBLE, lat_min DOUBLE, lon_max DOUBLE, lat_max DOUBLE,
+  depth FLOAT, median FLOAT, mad FLOAT, min FLOAT, max FLOAT, count INTEGER, vessels INTEGER,
+  first DATE, last DATE, tvu FLOAT, kind VARCHAR, zoc TINYINT,
+  depth_lon DOUBLE, depth_lat DOUBLE, cell_id SMALLINT, grid_version INTEGER
+);
 """
 
-# Partitioned by the 10° cell, so a build reads only its partition's rows.
-PARTITIONED = {"points": "cell_id"}
+# A point's base row (1/3″ of latitude) within its 1° tile. The cells build bands and
+# rows by this one expression, so a point can't land between two bands.
+BASE_ROW = "least(floor((p.lat - (p.tile_id // 360 - 90)) * 10800)::INTEGER, 10799)"
+
+# Partitioned by the 10° cell, so the cells build reads only its partition's rows.
+PARTITIONED = {"points": "cell_id", "cells": "cell_id", "qc_flags": "cell_id"}
 
 # Points of active files, with the cross-source and same-vessel duplicates of
 # dedupe rules 4 and 5 removed. Rule 5: a noaa sounding inside the time span of
@@ -69,7 +84,7 @@ WITH f AS (
 ),
 ow AS (SELECT vessel, time_min, time_max FROM f WHERE source = 'openwaters'),
 ends AS (
-  -- A file with no plausible times has no span; QC will reject all its soundings.
+  -- A file with no plausible times has no span; QC rejects all its soundings.
   SELECT source, vessel, time_min AS t, 1 AS d FROM f WHERE time_min IS NOT NULL
   UNION ALL SELECT source, vessel, time_max, -1 FROM f WHERE time_max IS NOT NULL
 ),
@@ -98,7 +113,17 @@ SELECT * EXCLUDE (twinned, r) FROM (
   FROM p WHERE twinned
 ) WHERE r = 1
 """
-ACTIVE_POINTS = f"CREATE OR REPLACE TEMP VIEW active_points AS {ACTIVE.format(where='true')}"
+ACTIVE_POINTS = f"""
+CREATE OR REPLACE TEMP VIEW active_points AS {ACTIVE.format(where="true")};
+-- The same for one unit of cell work: a 10° partition, optionally some of its tiles
+-- and a band of base rows, filtered before the dedupe so the work is the unit's alone.
+CREATE OR REPLACE TEMP MACRO active_points_in(cell, tiles, rlo, rhi) AS TABLE {
+    ACTIVE.format(
+        where="p.cell_id = cell AND (len(tiles) = 0 OR list_contains(tiles, p.tile_id))"
+        f" AND {BASE_ROW} BETWEEN rlo AND rhi - 1"
+    )
+};
+"""
 
 
 class Locked(Exception):
@@ -336,10 +361,17 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
                     raise RuntimeError("a read-only store publishes nothing")
                 # Moves rows inlined so far to Parquet, so the catalog each run downloads stays small.
                 con.execute("CALL ducklake_flush_inlined_data('lake')")
-                cutoff = datetime.now(UTC) - RETAIN
                 if final:
+                    # Rebuilds delete and reinsert cells and their flags, and DuckLake
+                    # deletes by writing delete files, so the replaced files stay live
+                    # until rewritten.
+                    # ponytail: points' delete files wait for compaction, which is still to come
+                    for table in ("cells", "qc_flags"):
+                        con.execute(f"CALL ducklake_rewrite_data_files('lake', '{table}')")
                     # A reader may still hold a catalog up to RETAIN old, so snapshots, the
                     # files only they reference, and old catalogs go once they pass it.
+                    # Taken after the rewrite, so this run's rewrite doesn't count toward it.
+                    cutoff = datetime.now(UTC) - RETAIN
                     older = {"cutoff": cutoff.replace(tzinfo=None)}  # session time zone is UTC
                     con.execute(
                         "CALL ducklake_expire_snapshots('lake', older_than => $cutoff)", older

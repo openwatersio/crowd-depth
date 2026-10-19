@@ -909,6 +909,58 @@ def test_only_content_errors_make_a_file_invalid(tmp_path, monkeypatch, error, i
         parse("noaa", noaa_key(1), noaa_csv(ROWS), tmp_path)
 
 
+def test_a_key_list_whose_folders_cant_all_be_listed_alerts(env, monkeypatch):
+    env.noaa.put(noaa_key(1), noaa_csv(ROWS, file_uuid="1"))
+    listing = env.noaa.list
+    monkeypatch.setattr(env.noaa, "list", lambda prefix="": (listing(prefix)[0], False))
+    with open_store(env.store) as con:
+        assert Ingest(con, "noaa", env.noaa, keys={noaa_key(1)}).run().alert
+
+
+def test_a_key_list_that_finds_nothing_alerts(env):
+    env.noaa.put(noaa_key(1), noaa_csv(ROWS, file_uuid="1"))
+    with open_store(env.store) as con:
+        # Keys without NOAA's prefix: listed nowhere, so all missing.
+        run = Ingest(con, "noaa", env.noaa, keys={noaa_key(1).removeprefix("csb/csv/")}).run()
+    assert run.alert and run.counts["missing"] == 1
+    with open_store(env.store) as con:
+        assert Ingest(con, "noaa", env.noaa, keys=set()).run().alert  # an empty key file
+
+
+def test_a_key_list_needs_a_source(tmp_path):
+    from grid.cli import main
+
+    keys = tmp_path / "keys.txt"
+    keys.write_text(noaa_key(1))
+    for picked in ([], ["--source", "noaa", "--source", "openwaters"]):
+        with pytest.raises(SystemExit):
+            main(["--store", str(tmp_path / "store"), "ingest", *picked, "--keys", str(keys)])
+
+
+def test_a_key_list_ingests_only_its_keys_and_withdraws_nothing(env):
+    env.noaa.put(noaa_key(1), noaa_csv(ROWS, file_uuid="1"))
+    env.noaa.put(noaa_key(2), noaa_csv(ROWS, unique_id="B", file_uuid="2"))
+    env.run("noaa")
+    env.noaa.delete(noaa_key(1))  # gone from the bucket, but not in this run's keys
+    env.noaa.put(noaa_key(3), noaa_csv(ROWS, unique_id="C", file_uuid="3"))
+    env.noaa.put(noaa_key(4), noaa_csv(ROWS, unique_id="D", file_uuid="4"))
+    keys = {noaa_key(3), noaa_key(5)}  # 5 is in the index but not the bucket
+    listed = []
+    list_ = env.noaa.list
+    env.noaa.list = lambda prefix="": listed.append(prefix) or list_(prefix)
+    with open_store(env.store) as con:
+        run = Ingest(con, "noaa", env.noaa, keys=keys).run()
+    # Only the keys' folder is listed, not the whole bucket.
+    assert listed == ["csb/csv/2026/10/14/"]
+    assert not run.alert
+    assert run.counts["missing"] == 1 and run.counts["new"] == 1
+    assert run.counts["bytes"] == len(noaa_csv(ROWS, unique_id="C", file_uuid="3"))
+    files = env.files()
+    assert files[noaa_key(1)][0] == "active"  # not withdrawn
+    assert noaa_key(4) not in files  # not in the keys
+    assert files[noaa_key(3)][0] == "active"
+
+
 def test_a_run_whose_lease_ran_low_publishes_nothing(tmp_path, monkeypatch):
     # Renewal stalls without noticing (a hung request): the lock isn't lost yet, but
     # another run could take it over before a publish that started now finished.
