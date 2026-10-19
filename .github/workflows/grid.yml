@@ -35,14 +35,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Setup uv
-        uses: astral-sh/setup-uv@v10.3.0
-        with:
-          working-directory: packages/grid
-          python-version: ${{ matrix.python }}
-
+      # Tests and lint run in the image ./docker.sh builds, the same tools as locally.
       - name: Lint
-        run: uv run --locked ruff check && uv run --locked ruff format --check
+        env:
+          UV_PYTHON: ${{ matrix.python }}
+        run: ./docker.sh sh -c 'uv run --locked ruff check && uv run --locked ruff format --check'
 
       - name: Run tests
-        run: uv run --locked pytest
+        env:
+          UV_PYTHON: ${{ matrix.python }}
+        run: ./docker.sh uv run --locked pytest

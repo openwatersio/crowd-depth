@@ -343,7 +343,7 @@ def test_a_run_that_fails_keeps_what_it_published(env, monkeypatch):
     # Every file is a checkpoint; the third file can't be downloaded, as an R2 error
     # late in a long import.
     # Batches stay under FLUSH_POINTS, so checkpoints fall between them.
-    monkeypatch.setattr(ingest, "CHECKPOINT_SECONDS", 0)
+    monkeypatch.setattr(catalog, "CHECKPOINT_SECONDS", 0)
     monkeypatch.setattr(ingest, "FETCH_BYTES", 1)
     env.ow.put(ow_key(1), geojson(ROWS[:2]))
     env.ow.put(ow_key(2), geojson(ROWS))  # covers the first
@@ -656,6 +656,14 @@ def test_a_local_listing_walks_only_its_prefix(tmp_path, monkeypatch):
     assert [o.key for o in store.list("")[0]] == ["a/1/x.csv", "a/12/y.csv", "a/2/z.csv", "b/w.csv"]
     assert store.list("c/")[0] == []
     assert walked[:3] == [tmp_path / "a/1", tmp_path / "a", tmp_path]
+
+
+def test_the_r2_retry_settings_are_ones_duckdb_knows():
+    con = duckdb.connect()
+    con.execute("INSTALL httpfs; LOAD httpfs")
+    for setting in catalog.HTTP_RETRIES:
+        con.execute(setting)
+    assert con.execute("SELECT current_setting('http_retries')").fetchone() == (8,)
 
 
 def test_a_copied_store_reads_and_writes_its_own_files(env, tmp_path):

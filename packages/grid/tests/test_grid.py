@@ -9,7 +9,7 @@ import pytest
 import reference_qc
 from test_ingest import HEADER, VESSEL, env, geojson, ow_key  # noqa: F401  (env is a fixture)
 
-from grid import catalog, cells, qc
+from grid import catalog, cells, ingest, qc
 from grid.catalog import open_store
 
 
@@ -190,6 +190,47 @@ def test_track_shoal_spike_confirmed_by_another_vessel(env):  # noqa: F811
     assert ("confirmed", "cell_confirmed", 3) in flags(env)
 
 
+def test_cells_keep_the_shoals_still_unconfirmed(env):  # noqa: F811
+    # A's 20 m spike is rejected and its 3 m one stays unconfirmed; B's 3 m spike is
+    # confirmed by C reading 3.4 m beside it.
+    put(env, 1, line([10, 10, 10, 20, 10, 10, 3, 10, 10, 10]))
+    put(env, 2, line([10, 10, 10, 10, 3, 10, 10, 10, 10], r=6000), "B")
+    put(env, 3, [(100, *at(6000, 4, 0.2), 3.4)], "C")
+    build(env)
+    assert ("confirmed", "cell_confirmed", 3) in flags(env)
+    shoals = env.query('SELECT tile_id, "row", lon, lat, depth FROM lake.shoals')
+    assert shoals == [((LAT0 + 90) * 360 + LON0 + 180, 5000, *at(5000, 6), 3.0)]
+
+
+def test_shoals_are_the_soundings_nothing_confirmed_or_rejected():
+    con = duckdb.connect()
+    con.execute("ATTACH ':memory:' AS lake")
+    con.execute(
+        """CREATE TABLE lake.qc_flags (
+          point_id INTEGER, flag VARCHAR, reason VARCHAR, qc_version INTEGER, cell_id SMALLINT)"""
+    )
+    tile = (LAT0 + 90) * 360 + LON0 + 180
+    con.execute(
+        "CREATE TABLE tile_points AS SELECT unnest(range(1, 6)) AS point_id, ? AS tile_id,"
+        " 5000 AS r, ? AS lon, ? AS lat, 3.0 AS depth_raw",
+        [tile, *at(5000, 7)],
+    )
+    v = qc.QC_VERSION
+    con.executemany(
+        "INSERT INTO lake.qc_flags VALUES (?, ?, ?, ?, 1)",
+        [
+            (1, "unconfirmed", "spike", v),  # still a shoal
+            (2, "unconfirmed", "spike", v),
+            (2, "confirmed", "cell_confirmed", v),
+            (3, "unconfirmed", "spike", v),
+            (3, "reject", "consensus_shoal", v),
+            (4, "unconfirmed", "spike", v - 1),  # an older QC's
+        ],
+    )
+    con.execute(cells.SHOALS, {"partition": 1})
+    assert con.execute("SELECT tile_id, r, c FROM shoals").fetchall() == [(tile, 5000, 7)]
+
+
 def holes(cells_):
     """Run the hole query over cells (row, col, depth, level) in one tile."""
     t = 123 * 360 + 102
@@ -201,7 +242,7 @@ def holes(cells_):
     )
     con = duckdb.connect()
     con.register("measured", table)
-    con.execute("CREATE TABLE shoal_cells (tile_id INTEGER, r INTEGER, c INTEGER)")
+    con.execute("CREATE TABLE shoals (tile_id INTEGER, r INTEGER, c INTEGER)")
     query = f'SELECT "row", col, depth, kind FROM ({cells.HOLES})'
     return sorted(con.execute(query, {"rlo": 0, "rhi": cells.BASE}).fetchall())
 
@@ -297,14 +338,17 @@ def test_bands_build_the_same_cells_as_whole_tiles(env, monkeypatch):  # noqa: F
     # Two tracks crossing several 3″ rows, with holes along them and across band edges.
     put(env, 1, apart([(0, *at(4990 + i, 3 + i % 2 * 2), 10 + i % 3) for i in range(40)]))
     put(env, 2, apart([(0, *at(4990 + i, 4), 11) for i in range(0, 40, 2)]), "B")
+    put(env, 3, line([10, 10, 10, 3, 10, 10, 10], r=4999), "C")  # a shoal on a band edge
     build(env)
     whole = grid(env)
+    shoals = env.query("SELECT * FROM lake.shoals")
+    assert shoals
     monkeypatch.setattr(cells, "BATCH_POINTS", 5)
     with open_store(env.store) as con:
         [(partition,)] = con.execute("SELECT DISTINCT cell_id FROM lake.points").fetchall()
         assert len(cells.units(con, partition, [])) > 2
-        cells.build(con)
-    assert grid(env) == whole
+        assert cells.build(con)["kept"] == 0  # a finished build is rebuilt, not kept
+    assert grid(env) == whole and env.query("SELECT * FROM lake.shoals") == shoals
     assert any(row[7] == "filled" for row in whole)
 
 
@@ -463,16 +507,129 @@ def test_a_cells_sounding_sits_at_the_same_tie_whichever_file_came_first(env, fi
     assert placed == env.query("SELECT lon, lat FROM lake.points ORDER BY point_id LIMIT 1")
 
 
+def two_tiles(env):  # noqa: F811
+    """Two vessels along a line in each of two neighboring tiles; returns their ids."""
+    for n, (dlon, vessel) in enumerate([(0, "AQM-1"), (0, "AQM-2"), (1, "AQM-1"), (1, "AQM-2")]):
+        start = n % 2
+        rows = [
+            (start + i * 10, lon + dlon, lat, 10.0)
+            for i, (_, lon, lat, _) in enumerate(line([10.0] * 6))
+        ]
+        put(env, n + 1, rows, vessel)
+    tile = (LAT0 + 90) * 360 + LON0 + 180
+    return tile, tile + 1
+
+
+def test_a_cells_build_that_stops_resumes_from_its_last_checkpoint(env, monkeypatch):  # noqa: F811
+    # Every tile is its own group and every group a checkpoint; the second group fails.
+    monkeypatch.setattr(cells, "BATCH_POINTS", 1)
+    monkeypatch.setattr(catalog, "CHECKPOINT_SECONDS", 0)
+    first, second = two_tiles(env)
+    env.run("noaa")
+    fill, filled = cells.fill, []
+
+    def failing(con, partition, tiles, rlo, rhi):
+        if second in tiles:
+            raise RuntimeError("R2 dropped the connection")
+        return fill(con, partition, tiles, rlo, rhi)
+
+    monkeypatch.setattr(cells, "fill", failing)
+    with pytest.raises(RuntimeError), open_store(env.store) as con:
+        cells.build(con)
+    # The first group was published; the marker wasn't.
+    tiles = {t for (t,) in env.query("SELECT DISTINCT tile_id FROM lake.cells")}
+    assert tiles == {first}
+    assert env.query("SELECT count(*) FROM lake.store_meta WHERE key = 'cells'") == [(0,)]
+
+    def counting(con, partition, tiles, rlo, rhi):
+        filled.extend(tiles)
+        return fill(con, partition, tiles, rlo, rhi)
+
+    monkeypatch.setattr(cells, "fill", counting)
+    with open_store(env.store) as con:
+        assert cells.build(con)["kept"] > 0
+    assert set(filled) == {second}
+    assert env.query("SELECT count(*) FROM lake.store_meta WHERE key = 'cells'") == [(1,)]
+    resumed = grid(env)
+    # Finished, it keeps nothing: the next build of the same inputs rebuilds every tile.
+    with open_store(env.store) as con:
+        assert cells.build(con)["kept"] == 0
+    assert grid(env) == resumed and {first, second} <= set(filled)
+
+
+@pytest.mark.parametrize("since", ["ingest", "cleared", "older build", "rebuilt", "new code"])
+def test_a_stopped_cells_build_keeps_nothing_that_changed_since(env, monkeypatch, since):  # noqa: F811
+    monkeypatch.setattr(cells, "BATCH_POINTS", 1)
+    monkeypatch.setattr(catalog, "CHECKPOINT_SECONDS", 0)
+    first, second = two_tiles(env)
+    env.run("noaa")
+    fill = cells.fill
+
+    def failing(con, partition, tiles, rlo, rhi):
+        if second in tiles:
+            raise RuntimeError("stopped")
+        return fill(con, partition, tiles, rlo, rhi)
+
+    monkeypatch.setattr(cells, "fill", failing)
+    with pytest.raises(RuntimeError), open_store(env.store) as con:
+        cells.build(con)
+    monkeypatch.setattr(cells, "fill", fill)
+    if since == "ingest":  # new soundings: other inputs
+        put(env, 9, line([12.0] * 6, r=5100), "AQM-3")
+        env.run("noaa")
+    with open_store(env.store) as con:
+        if since == "cleared":  # an older build cleared the tile
+            con.execute("DELETE FROM lake.cells WHERE tile_id = ?", [first])
+        if since == "older build":  # or rebuilt it with its own code
+            con.execute(
+                "UPDATE lake.cells SET grid_version = grid_version - 1 WHERE tile_id = ?", [first]
+            )
+        if since == "rebuilt":  # or, at this version, from inputs it has since lost again
+            con.execute("UPDATE lake.cells SET depth = depth + 1 WHERE tile_id = ?", [first])
+        if since == "new code":  # a cells fix shipped without a GRID_VERSION bump
+            monkeypatch.setattr(cells, "CODE", "changed")
+        assert cells.build(con)["kept"] == 0
+
+
+def test_a_qc_run_that_stops_resumes_from_its_last_checkpoint(env, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(catalog, "CHECKPOINT_SECONDS", 0)
+    monkeypatch.setattr(ingest, "FLUSH_POINTS", 1)  # a batch per file
+    two_tiles(env)
+    env.run("noaa")
+    batches = [b for (b,) in env.query("SELECT DISTINCT batch_id FROM lake.points ORDER BY 1")]
+    assert len(batches) == 4
+    with open_store(env.store) as con:
+        con.execute("DELETE FROM lake.qc_batches")  # as after a QC_VERSION bump
+    run_batch, ran = qc.run_batch, []
+
+    def failing(con, batch_id, fresh=False):
+        if batch_id == batches[2]:
+            raise RuntimeError("R2 dropped the connection")
+        ran.append(batch_id)
+        return run_batch(con, batch_id, fresh)
+
+    monkeypatch.setattr(qc, "run_batch", failing)
+    with pytest.raises(RuntimeError), open_store(env.store) as con:
+        qc.run(con, missing_only=True)
+    monkeypatch.setattr(
+        qc, "run_batch", lambda con, b, fresh=False: ran.append(b) or run_batch(con, b, fresh)
+    )
+    ran.clear()
+    with open_store(env.store) as con:
+        qc.run(con, missing_only=True)
+    assert ran == batches[2:]
+
+
 def test_rebuilds_expire_old_snapshots_files_and_catalogs(env, monkeypatch):  # noqa: F811
     monkeypatch.setattr(catalog, "RETAIN", timedelta(0))
-    put(env, 1, line([10.0] * 6))
+    put(env, 1, line([10.0, 10.0, 3.0, 10.0, 10.0, 10.0]))  # an unconfirmed shoal too
     put(env, 2, line([10.0] * 6, start=1), unique_id="AQM-2")
     build(env)
     lake = env.store.root / "lake"
     after = []
     for _ in range(3):
         with open_store(env.store) as con:
-            cells.build(con)
+            assert cells.build(con)["kept"] == 0
         after.append(sum(1 for _ in lake.rglob("*.parquet")))
         catalogs = [o.key for o in env.store.list("catalog/")[0] if o.key.endswith(".ducklake")]
         assert len(catalogs) == 2  # this run's, and the one it started from
@@ -525,6 +682,16 @@ def test_a_shoal_dedupe_dropped_doesnt_hold_a_hole_open(env):  # noqa: F811
     assert ("unconfirmed", "spike", 3) in flags(env)
     [hole] = [row for row in grid(env) if row[:3] == (1, 5000, 1)]
     assert hole[7] == "filled"
+
+
+def test_cells_count_a_soundings_twins_once(env):  # noqa: F811
+    # Two uploads from one vessel overlap by three soundings, so neither covers the other.
+    rows = line([10.0, 10.2, 10.1, 10.3, 10.0, 10.2, 10.1, 10.3, 10.0])
+    put(env, 1, rows[:6])
+    put(env, 2, rows[3:])
+    build(env)
+    assert [s for (s,) in env.query("SELECT status FROM lake.files")] == ["active"] * 2
+    assert sum(row[5] for row in grid(env) if row[7] != "filled") == 9
 
 
 def test_a_depth_held_over_a_kilometre_is_a_stuck_sounder(env):  # noqa: F811

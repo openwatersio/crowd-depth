@@ -8,15 +8,19 @@ own; a lone track is aggregated to 1″ or 3″, so one vessel's track alone nev
 publishes finer than its positions hold.
 """
 
+import hashlib
+import itertools
 import logging
 import math
+from pathlib import Path
 
-from .catalog import BASE_ROW
+from . import qc
+from .catalog import BASE_ROW, checkpoint
 from .qc import HAZARD_M, MAX_DEPTH_M, QC_VERSION, TRACK_REASONS
 
 log = logging.getLogger(__name__)
 
-GRID_VERSION = 2
+GRID_VERSION = 3
 BATCH_POINTS = 5_000_000
 BASE = 10_800  # base rows per 1° tile
 SHOAL_QUANTILE = 0.10
@@ -222,9 +226,9 @@ pts AS (
     a.depth_raw AS d, f.flag,
     a.tile_id // 360 - 90 AS lat0, a.tile_id % 360 - 180 AS lon0,
     {K_LIST}[a.tile_id // 360 - 90 + 91] AS k
+  FROM tile_points a LEFT JOIN flags f USING (point_id)
   -- The unit's rows and a 3″ row either side, which consensus reads.
-  FROM active_points_in($partition, $tiles, $rlo - 9, $rhi + 9) a LEFT JOIN flags f USING (point_id)
-  WHERE f.flag IS DISTINCT FROM 'reject'
+  WHERE a.r BETWEEN $rlo - 9 AND $rhi + 8 AND f.flag IS DISTINCT FROM 'reject'
     -- QC rejects these too; cells never trust that QC saw every point.
     AND a.depth_raw > 0 AND a.depth_raw <= {MAX_DEPTH_M}
 ),
@@ -345,25 +349,38 @@ WHERE from_track AND (outlier IS NULL OR point_id IN (SELECT point_id FROM confi
 """
 
 
-# Base cells holding an active sounding that is still an unconfirmed shoal: neither
-# confirmed nor rejected since. The soundings are the deduplicated ones the cells are
-# built from, so a copy dedupe dropped can't hold a cell open. The unit's rows and
-# one row past each edge, which holes read.
-SHOAL_CELLS = f"""
-CREATE OR REPLACE TEMP TABLE shoal_cells AS
-SELECT DISTINCT p.tile_id, {BASE_ROW} AS r,
+# One band's active points, with each point's base row. Each band of a dense tile is
+# read from the store once and kept, for its neighbors' consensus and for shoals, so
+# the dedupe's memory follows the band. A band alone gives the same points as the
+# whole tile, since dedupe only drops a sounding's twins, which share its position and
+# so its row.
+TILE_POINTS = f"""
+SELECT point_id, tile_id, cell_id, unique_id, time, lon, lat, depth_raw, {BASE_ROW} AS r
+FROM active_points_in($partition, $tiles, $rlo, $rhi) p
+"""
+
+# Active soundings that are still unconfirmed shoals: neither confirmed nor rejected
+# since, with their base cells. The soundings are the deduplicated ones the cells are
+# built from, so a copy dedupe dropped can't hold a cell open.
+SHOALS = f"""
+CREATE OR REPLACE TEMP TABLE shoals AS
+SELECT p.tile_id, p.r,
   least(floor((p.lon - (p.tile_id % 360 - 180)) * {BASE} / {K_LIST}[p.tile_id // 360 - 90 + 91])
-    ::INTEGER, {BASE} // {K_LIST}[p.tile_id // 360 - 90 + 91] - 1) AS c
-FROM active_points_in($partition, $tiles, $rlo - 1, $rhi + 1) p JOIN lake.qc_flags q USING (point_id)
-WHERE q.cell_id = $partition AND q.flag = 'unconfirmed' AND q.qc_version = {QC_VERSION}
-  AND NOT EXISTS (SELECT 1 FROM lake.qc_flags k WHERE k.cell_id = $partition
-    AND k.point_id = q.point_id AND k.flag IN ('confirmed', 'reject') AND k.qc_version = {QC_VERSION})
+    ::INTEGER, {BASE} // {K_LIST}[p.tile_id // 360 - 90 + 91] - 1) AS c,
+  p.lon, p.lat, p.depth_raw
+FROM tile_points p
+WHERE p.point_id IN (
+  SELECT point_id FROM lake.qc_flags
+  WHERE cell_id = $partition AND flag = 'unconfirmed' AND qc_version = {QC_VERSION}
+  EXCEPT
+  SELECT point_id FROM lake.qc_flags
+  WHERE cell_id = $partition AND flag IN ('confirmed', 'reject') AND qc_version = {QC_VERSION})
 """
 
 # Base cells bracketed by published cells on opposite sides (row, column or diagonal),
 # filled with the shoalest bracketing cell. Coarse cells cover their whole area.
 # Filled cells never fill others, so nothing grows outward from a track. Within a
-# tile only. Reads the temp table `measured`.
+# tile only. Reads the temp tables `measured` and `shoals`.
 HOLES = f"""
 WITH ring AS (
   -- Holes can only be in the ring of base cells around a published cell.
@@ -376,7 +393,7 @@ inside AS (
   -- A base cell holding an unconfirmed shoal isn't empty: filling it would show the
   -- water over that shoal as deeper than it was measured.
   SELECT * FROM ring WHERE r >= $rlo AND r < $rhi AND c >= 0 AND c < {BASE} // k
-    AND NOT EXISTS (SELECT 1 FROM shoal_cells s
+    AND NOT EXISTS (SELECT 1 FROM shoals s
       WHERE s.tile_id = ring.tile_id AND s.r = ring.r AND s.c = ring.c)
 ),
 offsets AS (
@@ -462,15 +479,125 @@ def units(con, partition: int, tiles: list[int]) -> list[tuple[list[int], int, i
     return result
 
 
-def build(con, tiles: list[int] | None = None) -> dict:
-    """Rebuild cells (and cell-level QC flags) for the given tiles, or every tile with points.
+def inputs(con) -> str:
+    """A fingerprint of what cells are built from: every file's version, content and
+    status, every batch's QC version, and the QC and grid versions of this build. Points
+    and flags change only with these, so cells built from the same fingerprint are
+    current; a new ETag on the same content changes none of them."""
+    [(files, batches)] = con.execute(
+        """SELECT
+          (SELECT coalesce(sum(hash(file_id, key, version, status, content_hash)::HUGEINT), 0)
+            FROM lake.files),
+          (SELECT coalesce(sum(hash(batch_id, qc_version)::HUGEINT), 0) FROM lake.qc_batches)"""
+    ).fetchall()
+    return f"{files}:{batches}:{QC_VERSION}:{GRID_VERSION}"
 
-    Measured cells first, unit by unit; then holes, which read the measured cells one
-    row past each unit's edges, so a band's edge is filled the same as its middle.
+
+def clear(con, partition, tiles):
+    """Delete the tiles' cells and unconfirmed shoals."""
+    params = {"partition": partition, "tiles": tiles}
+    con.execute("BEGIN")
+    for table in ("cells", "shoals"):
+        con.execute(
+            f"DELETE FROM lake.{table} WHERE cell_id = $partition AND list_contains($tiles, tile_id)",
+            params,
+        )
+    con.execute("COMMIT")
+
+
+def measure(con, partition, rlo, rhi):
+    """Measured cells and cell-level flags for one band of `tile_points`; returns how
+    many cells."""
+    params = {"partition": partition, "rlo": rlo, "rhi": rhi}
+    # Each step commits on its own, so a replaced or dropped table's space is freed
+    # at once; only the writes to the store share a transaction.
+    for statement in filter(str.strip, CLASSIFY.split(";\n")):
+        # DuckDB refuses parameters a statement doesn't use.
+        con.execute(statement, {k: v for k, v in params.items() if f"${k}" in statement})
+    con.execute("BEGIN")
+    [(inserted,)] = con.execute(
+        f"""INSERT INTO lake.cells BY NAME
+        SELECT * FROM ({CELLS}) ORDER BY tile_id, level, "row", col"""
+    ).fetchall()
+    con.execute(
+        f"""INSERT INTO lake.qc_flags BY NAME
+        SELECT q.*, $partition::SMALLINT AS cell_id, {QC_VERSION} AS qc_version
+        FROM ({CELL_FLAGS}) q""",
+        {"partition": partition},
+    )
+    con.execute("COMMIT")
+    return inserted
+
+
+def fill(con, partition, tiles, rlo, rhi):
+    """Filled cells for one band, from the measured cells and `shoals`; returns how many."""
+    params = {"partition": partition, "tiles": tiles, "rlo": rlo, "rhi": rhi}
+    con.execute("BEGIN")
+    con.execute(
+        """CREATE OR REPLACE TEMP TABLE measured AS SELECT * FROM lake.cells
+        WHERE cell_id = $partition AND list_contains($tiles, tile_id) AND kind <> 'filled'
+          AND ("row" + 1) * level >= $rlo AND "row" * level <= $rhi""",
+        params,
+    )
+    con.execute(f"CREATE OR REPLACE TEMP TABLE filled AS {HOLES}", {"rlo": rlo, "rhi": rhi})
+    con.execute(
+        """INSERT INTO lake.cells BY NAME SELECT * FROM filled ORDER BY tile_id, "row", col"""
+    )
+    [(filled,)] = con.execute("SELECT count(*) FROM filled").fetchall()
+    con.execute("COMMIT")
+    return filled
+
+
+# Each of the tiles' cells, summed: whether a tile's cells are still the ones a build
+# wrote. A tile with no cells has no row.
+DIGESTS = """
+SELECT tile_id, count(*) || ':' || sum(hash(level, "row", col, depth, median, mad, min, max,
+  count, vessels, kind, first, last, tvu, depth_lon, depth_lat, grid_version)::HUGEINT) AS digest
+FROM lake.cells WHERE ($partition IS NULL OR cell_id = $partition) AND list_contains($tiles, tile_id)
+GROUP BY tile_id
+"""
+
+# The code that builds cells and the QC they read: a build resumes only work this same
+# code did, since cell logic can change without a GRID_VERSION bump.
+CODE = hashlib.sha256(Path(__file__).read_bytes() + Path(qc.__file__).read_bytes()).hexdigest()[:16]
+
+
+def build(con, tiles: list[int] | None = None) -> dict:
+    """Rebuild cells, cell-level QC flags and unconfirmed shoals for the given tiles, or
+    every tile with points.
+
+    Tiles are read once, and a dense tile's bands are worked from that read: measured
+    cells first, band by band; then holes, which read the measured cells one row past
+    each band's edges, so a band's edge is filled the same as its middle.
     """
     if tiles is not None and not tiles:
         raise ValueError("no tiles to build; None builds every tile")
     tiles = tiles or []
+    # Only a build of every tile can say the cells are current, and only once it has
+    # finished: the marker goes first, so a build that stops partway leaves none. A tile
+    # group a build finished from these same inputs before it stopped is kept, while its
+    # cells are still the ones that build wrote: an older build, which knows nothing of
+    # cells_built, may have rebuilt or cleared them since. It must also be this same
+    # code. A build that finishes clears its tiles' rows, so a later build of unchanged
+    # inputs rebuilds.
+    built_from = inputs(con)
+    resume_key = f"{built_from}:{CODE}"
+    stopped = {
+        t: digest
+        for t, digest in con.execute(
+            """SELECT tile_id, digest FROM lake.cells_built WHERE inputs = $key
+            AND (len($tiles) = 0 OR list_contains($tiles, tile_id))""",
+            {"key": resume_key, "tiles": tiles},
+        ).fetchall()
+    }
+    # Digests only for what a stopped build left, so a fresh build reads no cells here.
+    current = (
+        dict(con.execute(DIGESTS, {"partition": None, "tiles": list(stopped)}).fetchall())
+        if stopped
+        else {}
+    )
+    done = {t for t, digest in stopped.items() if current.get(t, "0:0") == digest}
+    con.execute("DELETE FROM lake.store_meta WHERE key = 'cells'")
     partitions = [
         p
         for (p,) in con.execute(
@@ -480,53 +607,65 @@ def build(con, tiles: list[int] | None = None) -> dict:
         ).fetchall()
     ]
     work = [(p, *unit) for p in partitions for unit in units(con, p, tiles)]
-    totals = {"units": len(work), "cells": 0, "filled": 0}
-    scope = """cell_id = $partition AND list_contains($tiles, tile_id)
-      AND "row" * level >= $rlo AND "row" * level < $rhi"""
-    for partition, unit_tiles, rlo, rhi in work:
-        params = {"partition": partition, "tiles": unit_tiles, "rlo": rlo, "rhi": rhi}
-        # Each step commits on its own, so a replaced or dropped table's space is freed
-        # at once; only the writes to the store share a transaction.
-        for statement in filter(str.strip, CLASSIFY.split(";\n")):
-            # DuckDB refuses parameters a statement doesn't use.
-            con.execute(statement, {k: v for k, v in params.items() if f"${k}" in statement})
-        con.execute("BEGIN")
-        con.execute(f"DELETE FROM lake.cells WHERE {scope}", params)
+    totals = {"units": len(work), "cells": 0, "filled": 0, "kept": 0}
+    # Each band's points are read from the store once and kept for the group, and its
+    # shoals found once from the flags, rather than per band with overlaps. A build
+    # publishes only between groups, so the store is never seen with some of a group's
+    # bands rebuilt and not others: each group's cells, flags and shoals are complete.
+    for (partition, unit_tiles), group in itertools.groupby(work, key=lambda w: w[:2]):
+        bands = [(rlo, rhi) for *_, rlo, rhi in group]
+        if set(unit_tiles) <= done:
+            totals["kept"] += len(bands)
+            continue
+        clear(con, partition, unit_tiles)
+        for i, (rlo, rhi) in enumerate(bands):
+            params = {"partition": partition, "tiles": unit_tiles, "rlo": rlo, "rhi": rhi}
+            into = "INSERT INTO tile_points" if i else "CREATE OR REPLACE TEMP TABLE tile_points AS"
+            con.execute(f"{into} {TILE_POINTS}", params)
+            # Every point's old cell-level flags, active or not.
+            con.execute(
+                f"""DELETE FROM lake.qc_flags WHERE cell_id = $partition
+                AND qc_version = {QC_VERSION} AND list_contains({CELL_REASONS}, reason)
+                AND point_id IN (
+                  SELECT point_id FROM lake.points p
+                  WHERE cell_id = $partition AND list_contains($tiles, tile_id)
+                    AND {BASE_ROW} BETWEEN $rlo AND $rhi - 1)""",
+                params,
+            )
+        for rlo, rhi in bands:
+            totals["cells"] += measure(con, partition, rlo, rhi)
+        # Shoals and holes follow every band's flags and measured cells: holes read the
+        # cells one row past each band's edges.
+        con.execute(SHOALS, {"partition": partition})
         con.execute(
-            f"""DELETE FROM lake.qc_flags WHERE cell_id = $partition AND qc_version = {QC_VERSION}
-            AND list_contains({CELL_REASONS}, reason) AND point_id IN (
-              SELECT point_id FROM lake.points p
-              WHERE cell_id = $partition AND list_contains($tiles, tile_id)
-                AND {BASE_ROW} BETWEEN $rlo AND $rhi - 1)""",
-            params,
-        )
-        [(inserted,)] = con.execute(
-            f"""INSERT INTO lake.cells BY NAME
-            SELECT * FROM ({CELLS}) ORDER BY tile_id, level, "row", col"""
-        ).fetchall()
-        con.execute(
-            f"""INSERT INTO lake.qc_flags BY NAME
-            SELECT q.*, $partition::SMALLINT AS cell_id, {QC_VERSION} AS qc_version
-            FROM ({CELL_FLAGS}) q""",
+            f"""INSERT INTO lake.shoals
+            SELECT tile_id, r, lon, lat, depth_raw, $partition FROM shoals
+            WHERE depth_raw > 0 AND depth_raw <= {MAX_DEPTH_M} ORDER BY tile_id, r, lon""",
             {"partition": partition},
         )
-        totals["cells"] += inserted
-        con.execute("COMMIT")
-    for partition, unit_tiles, rlo, rhi in work:
-        params = {"partition": partition, "tiles": unit_tiles, "rlo": rlo, "rhi": rhi}
+        for rlo, rhi in bands:
+            totals["filled"] += fill(con, partition, unit_tiles, rlo, rhi)
+        con.execute("DROP TABLE tile_points")
         con.execute("BEGIN")
         con.execute(
-            """CREATE OR REPLACE TEMP TABLE measured AS SELECT * FROM lake.cells
-            WHERE cell_id = $partition AND list_contains($tiles, tile_id) AND kind <> 'filled'
-              AND ("row" + 1) * level >= $rlo AND "row" * level <= $rhi""",
-            params,
+            "DELETE FROM lake.cells_built WHERE list_contains($tiles, tile_id)",
+            {"tiles": unit_tiles},
         )
-        con.execute(SHOAL_CELLS, params)
-        con.execute(f"CREATE OR REPLACE TEMP TABLE filled AS {HOLES}", {"rlo": rlo, "rhi": rhi})
         con.execute(
-            """INSERT INTO lake.cells BY NAME SELECT * FROM filled ORDER BY tile_id, "row", col"""
+            f"""INSERT INTO lake.cells_built
+            SELECT t.tile_id, $key, coalesce(d.digest, '0:0')
+            FROM (SELECT unnest($tiles) AS tile_id) t LEFT JOIN ({DIGESTS}) d USING (tile_id)""",
+            {"tiles": unit_tiles, "key": resume_key, "partition": partition},
         )
-        totals["filled"] += con.execute("SELECT count(*) FROM filled").fetchone()[0]
         con.execute("COMMIT")
+        checkpoint(con)
     log.info("cells: %s", totals)
+    con.execute("BEGIN")
+    con.execute(
+        "DELETE FROM lake.cells_built WHERE len($tiles) = 0 OR list_contains($tiles, tile_id)",
+        {"tiles": tiles},
+    )
+    if not tiles:
+        con.execute("INSERT INTO lake.store_meta VALUES ('cells', ?)", [built_from])
+    con.execute("COMMIT")
     return totals

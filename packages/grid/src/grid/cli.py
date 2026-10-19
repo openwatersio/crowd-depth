@@ -5,6 +5,7 @@
     grid --store DIR_OR_S3_URL confirm-withdrawals SOURCE
     grid --store DIR_OR_S3_URL qc
     grid --store DIR_OR_S3_URL cells [--bbox=W,S,E,N]
+    grid --store DIR_OR_S3_URL overlay --out DIR
     grid --store DIR_OR_S3_URL stats
 
 Sources default to the NOAA CSB bucket and the Open Waters R2 bucket. R2 access
@@ -17,7 +18,7 @@ import math
 import sys
 from pathlib import Path
 
-from . import cells, qc
+from . import cells, overlay, qc
 from .catalog import open_store
 from .ingest import Ingest, confirm_withdrawals
 from .objects import open_objects
@@ -79,7 +80,10 @@ def main(argv=None):
         "confirm-withdrawals", help="Let held withdrawals apply once two listings agree"
     )
     c.add_argument("source", choices=SOURCES)
-    sub.add_parser("qc", help="Flag impossible values, jumps and spikes along each track")
+    sub.add_parser(
+        "qc",
+        help="Rerun QC on every batch; `grid cells` QCs only batches not yet done at this version",
+    )
     cl = sub.add_parser("cells", help="Run QC, then rebuild every grid cell, or a region's")
     cl.add_argument(
         "--bbox",
@@ -87,6 +91,8 @@ def main(argv=None):
         help="Only the 1° tiles this box touches: west,south,east,north in degrees, given as"
         " --bbox=W,S,E,N since a west longitude starts with -",
     )
+    o = sub.add_parser("overlay", help="Build the overlay layers and their PMTiles from the cells")
+    o.add_argument("--out", required=True, type=Path, help="Directory for the layers and PMTiles")
     sub.add_parser("stats", help="Count files by source and status")
     args = p.parse_args(argv)
     if args.command == "ingest" and args.keys and len(set(args.source or SOURCES)) != 1:
@@ -97,7 +103,9 @@ def main(argv=None):
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
     alert = False
-    with open_store(open_objects(args.store), write=args.command != "stats") as con:
+    with open_store(
+        open_objects(args.store), write=args.command not in ("stats", "overlay")
+    ) as con:
         if args.command == "ingest":
             for name in args.source or SOURCES:
                 url = getattr(args, f"{name}_url")
@@ -114,6 +122,8 @@ def main(argv=None):
             # Cells read QC's flags: QC any batch that hasn't been at this version.
             qc.run(con, missing_only=True)
             cells.build(con, args.bbox)
+        elif args.command == "overlay":
+            print(overlay.build(con, args.out))
         elif args.command == "confirm-withdrawals":
             print(f"confirmed {confirm_withdrawals(con, args.source)} held withdrawals")
         else:

@@ -27,7 +27,7 @@ Chesapeake takes 1 h 53 m serially and 81 min with 4 workers on a shared laptop.
 ## Current design
 
 - **Ingest.** The Chesapeake import to R2 loaded 97.2M points from 18,066 new files in 5 h 19 min, with a peak of 1.65 GB. Seconds per step: list 45, download wait 536, parse 2,644, dedupe 574, write 2,507, QC 630, coverage 9,724. Coverage, a per-file query against every other file's time range, is half the wall time. The run is one transaction, so one late R2 error discards everything; two attempts were lost that way after the machine slept.
-- **`grid cells`.** A full rebuild at about 46 min per 100M soundings, published only at the end, which puts a planet rebuild at about 16–20 h with no incremental path. With the corroboration join fixed, the bay's build on R2 (8.0M measured cells and 2.8M filled, 20 units) takes 2 h 59 min, with DuckDB at 3.5 GB of a 4 GB limit and a peak RSS of 5.0 GB. The largest costs are hole filling (3,412 s), rereading each unit's active points (3,081 s) and deleting the old `qc_flags` (2,583 s); consensus takes 692 s.
+- **`grid cells`.** A full rebuild at about 46 min per 100M soundings, which puts a planet rebuild at about 16–20 h with no incremental path. With the corroboration join fixed, the bay's build on R2 (8.0M measured cells and 2.8M filled, 20 units) takes 2 h 59 min, with DuckDB at 3.5 GB of a 4 GB limit and a peak RSS of 5.0 GB. The largest costs are hole filling (3,412 s), rereading each unit's active points (3,081 s) and deleting the old `qc_flags` (2,583 s); consensus takes 692 s.
 
 The per-tile cells stage costs about the same (36 min serially for Chesapeake). Splitting by tile doesn't make the work cheaper. It makes the work partitionable, and so incremental and parallel.
 
