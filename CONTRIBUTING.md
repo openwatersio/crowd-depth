@@ -167,9 +167,10 @@ Releases are cut from GitHub:
 
 1. Go to [Releases](https://github.com/openwatersio/crowd-depth/releases) →
    _Draft a new release_.
-2. Create a tag `vX.Y.Z` (semver) targeting `main`, write release notes, and
-   publish.
-3. The [release workflow](.github/workflows/release.yml) sets the package
+2. Create a tag `vX.Y.Z` (semver) targeting `main`.
+3. Set the release title to a short headline of what changed, in sentence case with no version or closing period, and put any new requirement in it ("Requires Node 24"). Patch releases get a headline too.
+4. Write the notes for boaters running the plugin, following the [release notes guidance](https://github.com/openwatersio/.github/blob/main/docs/agents/releases.md#release-notes): open with what is new and for whom, list breaking changes and upgrade steps first, then the changes people will notice with a link to each pull request. Leave out chores, CI, and dependency bumps unless they change a runtime requirement.
+5. Publish. The [release workflow](.github/workflows/release.yml) sets the package
    version from the tag, publishes to npm via trusted publishing (OIDC — no
    tokens to manage), commits the version bump back to `main`, and re-points
    the tag at that commit.
