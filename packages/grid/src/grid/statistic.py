@@ -7,8 +7,9 @@ slope doesn't count as noise. Each vessel counts once per pixel, however fast it
 
 A pixel's σ is measured where its window holds enough entries, and taken from the
 nearest pixel that has one elsewhere. Measured in surface-statistic.md, which this
-matches: K = 1.75 is the smallest that keeps Thimble Shoal Channel's channel under 0.5% of
-pixels more than 1 m too deep.
+matches on a pixel's own votes: K = 1.75 is the smallest that keeps Thimble Shoal Channel's
+channel under 0.5% of pixels more than 1 m too deep. Votes are smoothed along each vessel's
+coverage (`smoothed`) before the statistic sees them.
 """
 
 import itertools
@@ -42,6 +43,59 @@ def group_median(groups, values, n):
     has = counts > 0
     out[has] = (v[lo[has]] + v[hi[has]]) / 2
     return out
+
+
+def smoothed(px, py, vessel, m, s, reach=1):
+    """Each vessel's votes smoothed along its own coverage: at every pixel anyone voted
+    in, one entry per vessel with a vote within `reach` pixels, its median there and its
+    median correction σ. Which vessels sound a pixel then changes gradually along a lane
+    instead of pixel by pixel, and no entry lands where nobody sounded.
+
+    Worked in bands of pixel rows holding about CHUNK votes, each with `reach` rows of
+    halo, so memory follows the band, not the tile.
+    """
+    px, py = np.asarray(px, dtype=np.int64), np.asarray(py, dtype=np.int64)
+    m, s = np.asarray(m, dtype=np.float64), np.asarray(s, dtype=np.float64)
+    if not len(px):
+        return px, py, m, s
+    codes = np.unique(np.asarray(vessel), return_inverse=True)[1].ravel().astype(np.int64)
+    order = np.argsort(py, kind="stable")
+    px, py, codes, m, s = px[order], py[order], codes[order], m[order], s[order]
+    rows, counts = np.unique(py, return_counts=True)
+    # Band edges, in rows, every CHUNK / (2 reach + 1)^2 votes: each vote is held that
+    # many times while its band is worked.
+    per = max(1, CHUNK // (2 * reach + 1) ** 2)
+    edges = rows[np.searchsorted(np.cumsum(counts), np.arange(per, counts.sum(), per))]
+    bounds = np.unique(np.concatenate([[rows[0]], edges, [rows[-1] + 1]]))
+    out = []
+    for lo, hi in itertools.pairwise(bounds):
+        a, b = np.searchsorted(py, [lo - reach, hi + reach])
+        out.append(_smooth_band(px[a:b], py[a:b], codes[a:b], m[a:b], s[a:b], lo, hi, reach))
+    return tuple(np.concatenate(c) for c in zip(*out))
+
+
+def _smooth_band(px, py, codes, m, s, lo, hi, reach):
+    """`smoothed` for the pixels in rows [lo, hi), from the votes within `reach` of them."""
+    n = int(codes.max()) + 1
+    x0, y0 = int(px.min()) - reach, int(py.min()) - reach
+    span = int(px.max()) - x0 + reach + 1
+    pixel = (py - y0) * span + (px - x0)
+    voted = np.unique(pixel[(py >= lo) & (py < hi)])
+    owners, values, sigmas = [], [], []
+    for dy in range(-reach, reach + 1):
+        for dx in range(-reach, reach + 1):
+            # A vote at (px, py) reaches the pixel at (px - dx, py - dy).
+            at = pixel - dy * span - dx
+            hit = np.isin(at, voted)
+            owners.append(at[hit] * n + codes[hit])
+            values.append(m[hit])
+            sigmas.append(s[hit])
+    keys, group = np.unique(np.concatenate(owners), return_inverse=True)
+    group = group.ravel()
+    m2 = group_median(group, np.concatenate(values), len(keys))
+    s2 = group_median(group, np.concatenate(sigmas), len(keys))
+    at = keys // n
+    return at % span + x0, at // span + y0, m2, s2
 
 
 def pixels(px, py, m):

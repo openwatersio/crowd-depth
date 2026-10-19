@@ -44,12 +44,16 @@ NODATA = -9999.0
 # Rows per tile: 2/3″ of latitude, two base rows.
 ROWS = BASE // 2
 RADIUS_M = SURFACE["interpolation_radius_m"]
+# Smoothing, in metres, is added to every point's distance, so a sounded pixel takes its
+# neighbours' depths too and doesn't keep its own value whole.
+SMOOTHING_M = SURFACE["smoothing_m"]
 ALGORITHM = (
-    f"invdistnn:power=2:radius={RADIUS_M}:max_points=12:min_points=3"
+    f"invdistnn:power=2:smoothing={SMOOTHING_M}:radius={RADIUS_M}:max_points=12:min_points=3"
     f":min_points_per_quadrant=1:nodata={NODATA}"
 )
-# The blur, in pixels: light, about the positional accuracy of a crowd sounding.
-SIGMA_PX = 1.0
+# The blur, in pixels: never toward deeper water, wide enough that busy and quiet water both
+# read clearly.
+SIGMA_PX = SURFACE["blur_px"]
 # Base rows per pixel row and per pixel column.
 PIXEL_BASE = 2
 EARTH_M = 6378137.0
@@ -57,11 +61,18 @@ EARTH_M = 6378137.0
 # within reach are skipped, and left out of the file.
 BLOCK = 512
 
+# Unconfirmed shoals QC couldn't judge keep the surface off their pixel. One QC disproved,
+# deeper than three or more other vessels agreed, and a stuck run publish as unconfirmed
+# soundings without holding the surface open: in busy water nearly every pixel has one.
+BLOCKING = ["cell_shoal", "spike", "track_noise"]
+JUDGED = ["consensus_shoal", "flatline"]
+
 # Each surface pixel's corrected soundings, from those QC accepted (not rejected, and not an
 # unconfirmed shoal unless something confirmed it), within the depths cells trust, with
 # the pixel numbered on this tile's grid from its south-west corner; a neighboring tile's
 # soundings get numbers outside it, which interpolation reads as a margin. A fixed sample
-# per pixel is marked `keep`, so a moored boat costs fixed memory.
+# per pixel and vessel is marked `keep`, so a moored boat costs fixed memory and can't
+# sample other vessels out of the pixel.
 POINTS = f"""
 CREATE OR REPLACE TEMP TABLE surface_points AS
 WITH wanted AS MATERIALIZED (
@@ -80,35 +91,37 @@ WITH wanted AS MATERIALIZED (
 flags AS (
   SELECT point_id, bool_or(flag = 'reject') AS rejected,
     bool_or(flag = 'confirmed' AND reason = 'cell_shoal') AS confirmed,
-    bool_or(flag = 'unconfirmed') AND NOT bool_or(flag = 'confirmed') AS unconfirmed
+    bool_or(flag = 'unconfirmed') AND NOT bool_or(flag = 'confirmed') AS unconfirmed,
+    bool_or(flag = 'unconfirmed' AND list_contains({BLOCKING}, reason))
+      AND NOT bool_or(list_contains({JUDGED}, reason)) AND NOT bool_or(flag = 'confirmed')
+      AS blocks
   FROM lake.qc_flags WHERE cell_id = $partition AND qc_version = {QC_VERSION}
     AND point_id IN (SELECT point_id FROM wanted)
   GROUP BY point_id
 ),
 pts AS (
   SELECT w.*, coalesce(f.unconfirmed, false) AS unconfirmed,
-    coalesce(f.confirmed, false) AS confirmed
+    coalesce(f.blocks, false) AS blocks, coalesce(f.confirmed, false) AS confirmed
   FROM wanted w LEFT JOIN flags f USING (point_id) WHERE NOT coalesce(f.rejected, false)
 )
 SELECT a.*, NOT a.unconfirmed
   AND hash(a.point_id) % greatest(1, ceil(n.n / {CELL_SAMPLE}))::UBIGINT = 0 AS keep
-FROM pts a JOIN (SELECT py, px, count(*) AS n FROM pts GROUP BY ALL) n USING (py, px)
+FROM pts a JOIN (SELECT py, px, vessel, count(*) AS n FROM pts GROUP BY ALL) n
+  USING (py, px, vessel)
 """
 
 # Each vessel's median in each pixel, and its median correction σ: what the statistic
 # reads, one vote per vessel however fast it logs. One row per sounded pixel and vessel,
 # so what Python holds of a tile is bounded by those, not its soundings.
 ENTRIES = """
-SELECT py, px, m, s FROM (
-  SELECT py, px, vessel, median(d) AS m, median(sigma) AS s
-  FROM surface_points WHERE keep GROUP BY ALL
-) ORDER BY ALL
+SELECT py, px, hash(vessel) AS v, median(d) AS m, median(sigma) AS s
+FROM surface_points WHERE keep GROUP BY py, px, vessel ORDER BY py, px, v, m
 """
 
-# Each sounded pixel's soundings, whether an unconfirmed shoal is there, and its shoalest
-# confirmed shoal, which no pixel may be deeper than.
+# Each sounded pixel's soundings, whether an unconfirmed shoal that blocks the surface is
+# there, and its shoalest confirmed shoal, which no pixel may be deeper than.
 COUNTS = """
-SELECT py, px, count(*) AS n, bool_or(unconfirmed) AS unconfirmed,
+SELECT py, px, count(*) AS n, bool_or(blocks) AS unconfirmed,
   min(d) FILTER (WHERE confirmed) AS confirmed
 FROM surface_points GROUP BY ALL
 """
@@ -136,7 +149,7 @@ def partition_of(lat0: int, lon0: int) -> int:
 
 def margin(con, lat0, lon0, k, cols, scale_x, scale_y):
     """Entries of the eight neighboring tiles within the search radius of this tile's
-    edges, numbered on this tile's grid, as (py, px, m, s) arrays: interpolation and σ
+    edges, numbered on this tile's grid, as (py, px, vessel, m, s) arrays: interpolation and σ
     input only, so tracks either side of a whole-degree line are interpolated between
     as anywhere else."""
     rows_m = math.ceil(RADIUS_M / (scale_y / ROWS))
@@ -160,10 +173,16 @@ def margin(con, lat0, lon0, k, cols, scale_x, scale_y):
                  "pxlo": -cols_m, "pxhi": cols + cols_m - 1},
             )  # fmt: skip
             parts.append(
-                tuple(np.asarray(got[c], dtype=np.float64) for c in ("py", "px", "m", "s"))
+                (
+                    np.asarray(got["py"], dtype=np.int64),
+                    np.asarray(got["px"], dtype=np.int64),
+                    np.asarray(got["v"], dtype=np.uint64),
+                    np.asarray(got["m"], dtype=np.float64),
+                    np.asarray(got["s"], dtype=np.float64),
+                )
             )
     if not parts:
-        return tuple(np.empty(0) for _ in range(4))
+        return (np.empty(0, np.int64),) * 2 + (np.empty(0, np.uint64),) + (np.empty(0),) * 2
     return tuple(np.concatenate(c) for c in zip(*parts))
 
 
@@ -187,11 +206,15 @@ def build_tile(con, tile_id: int, partition: int, out: Path):
     dx, dy = scale_x / cols, scale_y / ROWS
     shape = (ROWS, cols)
     # A tile's own soundings always land on its pixels, even on its north or east edge.
-    my, mx, mm, ms = margin(con, lat0, lon0, k, cols, scale_x, scale_y)
-    epy = np.concatenate([np.clip(own["py"].astype(np.int64), 0, ROWS - 1), my.astype(np.int64)])
-    epx = np.concatenate([np.clip(own["px"].astype(np.int64), 0, cols - 1), mx.astype(np.int64)])
-    em = np.concatenate([np.asarray(own["m"], dtype=np.float64), mm])
-    es = np.concatenate([np.asarray(own["s"], dtype=np.float64), ms])
+    my, mx, mv, mm, ms = margin(con, lat0, lon0, k, cols, scale_x, scale_y)
+    # Each vessel smoothed along its own coverage, this tile's and the margin's together.
+    epx, epy, em, es = statistic.smoothed(
+        np.concatenate([np.clip(own["px"].astype(np.int64), 0, cols - 1), mx]),
+        np.concatenate([np.clip(own["py"].astype(np.int64), 0, ROWS - 1), my]),
+        np.concatenate([np.asarray(own["v"], dtype=np.uint64), mv]),
+        np.concatenate([np.asarray(own["m"], dtype=np.float64), mm]),
+        np.concatenate([np.asarray(own["s"], dtype=np.float64), ms]),
+    )
     upx, upy, _, medians = statistic.pixels(epx, epy, em)
     # Accumulated, not assigned: a sounding on the tile's north or east edge is its own
     # group in SQL but shares the last pixel, and must not overwrite its values.
@@ -261,10 +284,11 @@ def build_tile(con, tile_id: int, partition: int, out: Path):
         rows_at, cols_at = ROWS - 1 - upy, upx
         inside = (rows_at >= 0) & (rows_at < ROWS) & (cols_at >= 0) & (cols_at < cols)
         at_central = np.full(len(upx), np.nan)
-        for i in np.flatnonzero(inside):
-            r, c = rows_at[i], cols_at[i]
-            value = central[r // BLOCK, c // BLOCK][r % BLOCK, c % BLOCK]
-            at_central[i] = np.nan if value == NODATA else value
+        blocks_at = (rows_at // BLOCK) * (cols // BLOCK + 1) + cols_at // BLOCK
+        for key, block in central.items():
+            mine = inside & (blocks_at == key[0] * (cols // BLOCK + 1) + key[1])
+            value = block[rows_at[mine] % BLOCK, cols_at[mine] % BLOCK]
+            at_central[mine] = np.where(value == NODATA, np.nan, value)
         # Interpolation needs a sounding in every quadrant, so the outermost tracks' own
         # pixels have no surface: there, as past the tile's edge, the pixel's own median.
         at_central = np.where(np.isnan(at_central), medians, at_central)

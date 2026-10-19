@@ -115,21 +115,25 @@ In Tangier Sound, before cleaning, every statistic drew 19 to 30% of pixels as f
 
 ## In the pipeline
 
-`grid cells` and the surface draw `median − 1.75σ_b` ([statistic.py](../../../packages/grid/src/grid/statistic.py)). Built from the same store, on the tiles' own pixel grid, the surface matches the measured statistic: central depth and σ_b within 0.1 m at 98% of Thimble's pixels, and the same pixels more than 1 m too deep. Two rules the pipeline keeps make it differ:
+`grid cells` and the surface draw `median − 1.75σ_b` ([statistic.py](../../../packages/grid/src/grid/statistic.py)). On a pixel's own votes, σ_b is the one measured here: built from the same store on the tiles' own pixel grid, central depth and σ_b agree with this comparison's within 0.1 m at 98% of Thimble's pixels, and the same pixels are more than 1 m too deep. The measured rates in [Results](#results) move with the grid: the same statistic on a grid 0.4 pixel off the tiles' draws 0.06% of Thimble's pixels too deep instead of 0.03%, and 0.34% of its channel instead of 0.18%, because on the channel's edges where a pixel boundary falls moves its median by up to a metre.
 
-- **Pixels holding an unconfirmed shoal stay empty.** In Thimble Shoal Channel that's 28% of channel pixels, the same ones the current statistic leaves empty. On those pixels the channel bias is −1.69 m and 39% are false shoals, against −1.87 m and 46% for the current statistic.
-- **No pixel is deeper than a confirmed shoal next to it.** In Tangier Sound, scored on calibrated vessels only, confirmed shoals from every vessel, the stuck sounder's included, cap 2.8% of pixels and take false shoals from 3.0% to 5.3%.
+Interpolated pixels widen σ by 0.005 m per metre from the nearest sounding. That takes Tangier Sound from 2.7% to 2.1% too deep and changes nothing in Thimble, where every pixel is within 100 m of a track.
 
-On the tiles' grid, with a widening of 0.005 m per metre from the nearest sounding:
+`grid cells` on Thimble's tile, the densest (28M soundings), takes 14 minutes and peaks at 3.2 GB resident with DuckDB at 4 GB; its surface takes 3.5 minutes. Vessel smoothing and σ are worked about 2 million window entries at a time.
 
-| Area                  |  Bias | Too deep | On slopes | In channel | False shoals |
-| --------------------- | ----: | -------: | --------: | ---------: | -----------: |
-| Thimble Shoal Channel | −0.52 |    0.03% |      0.5% |       0.2% |         7.1% |
-| Tangier Sound         | −0.48 |     2.1% |      9.9% |            |         6.2% |
+### Legibility
 
-`grid cells` on the densest tile, Thimble's (28M soundings), peaked at 3.55 GB resident with DuckDB at 4 GB, against 4.6 to 5.0 GB for the 10th percentile on the same tile. σ's windows are worked about 2 million entries at a time: 2 million entries at 20 vessels a pixel peak at 490 MB.
+The surface also smooths each vessel along its own coverage, adds 40 m of smoothing to `gdal_grid`, blurs over 2 pixels, and lets only unconfirmed shoals QC couldn't judge keep it off a pixel. Rebuilt on eight Chesapeake tiles and scored against `reference_pixels` (BlueTopo and S-102 at MLLW) on every pixel a vessel sounded, before and after:
 
-The widening changes nothing in Thimble, where every pixel is within 100 m of a track, and takes Tangier from 2.7% to 2.1% too deep. The measured rates in [Results](#results) move with the grid: the same statistic on a grid 0.4 pixel off the tiles' draws 0.06% of Thimble's pixels too deep instead of 0.03%, and 0.34% of its channel instead of 0.18%, because on the channel's edges where a pixel boundary falls moves its median by up to a metre.
+| Vessels in the pixel |         Empty | Roughness, m | More than 1 m too deep | False shoals over 2 m | Under 1 m where the survey is 2 m or more |
+| -------------------- | ------------: | -----------: | ---------------------: | --------------------: | ----------------------------------------: |
+| 1                    | 26.6% → 25.0% |  0.08 → 0.05 |            4.9% → 4.4% |           6.3% → 6.8% |                               1.5% → 1.1% |
+| 2–3                  |  13.8% → 9.7% |  0.09 → 0.05 |            4.9% → 4.0% |           3.7% → 4.7% |                               0.5% → 0.5% |
+| 4–9                  | 22.7% → 11.8% |  0.10 → 0.06 |            8.0% → 6.1% |           6.1% → 9.2% |                               0.4% → 0.7% |
+| 10 or more           | 71.1% → 52.9% |  0.10 → 0.06 |          20.6% → 12.6% |         26.8% → 48.1% |                              4.8% → 18.4% |
+| All                  | 23.9% → 21.3% |  0.08 → 0.05 |            5.0% → 4.4% |           5.7% → 6.5% |                               1.3% → 1.0% |
+
+In water over 12 m on Thimble's tile, the share more than 1 m too deep goes from 8.6% to 7.0%, so the smoothing doesn't spend the margin k was chosen for. Before, disproved readings and stuck runs left 80% of Thimble's busiest pixels empty. The busiest pixels' false shoals come from Norfolk's piers and berths: echoes off piers and moored hulls that many vessels read are confirmed as shoals, and pixels that were empty now draw at pier depth, a median 15 m shoaler than the survey. Pixels the surface drew before are unchanged there.
 
 ## Not measured
 

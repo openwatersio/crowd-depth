@@ -34,8 +34,9 @@ QC_VERSION = QC["version"]
 # Flags: reject (left out of everything), review (kept, looked at later),
 # unconfirmed (a shoal kept out of cell depths, areas and contours, and published by
 # the overlay as a low-reliability sounding), and confirmed (written by the cells step
-# for a track spike that its cell agrees with, or that other shoals of another vessel
-# or pass, or enough of them, confirm; it then counts like any other sounding). A
+# for a track spike that its cell agrees with, `cell_confirmed`, and for every shoal
+# that other shoals of another vessel or pass, or enough of them, confirm, `cell_shoal`;
+# it then counts like any other sounding). A
 # point can carry both an unconfirmed and a confirmed flag: confirmed wins. A reject
 # flag wins over both.
 TRACK_REASONS = ["sentinel", "time", "very_shallow", "jump", "flatline", "spike"]

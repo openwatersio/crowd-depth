@@ -91,3 +91,42 @@ def test_chunks_give_the_same_sigma(monkeypatch):
 def test_no_entries_give_no_pixels():
     upx, *_, spread, _ = statistic.sigma_b([], [], [], [])
     assert len(upx) == len(spread) == 0
+
+
+def test_votes_are_smoothed_along_each_vessels_own_coverage():
+    # A reads 9 and 11 m alternately along a row; B sounds only pixel 2, beside A's track.
+    px = np.array([0, 1, 2, 3, 4, 2])
+    py = np.array([0, 0, 0, 0, 0, 1])
+    vessel = np.array([1, 1, 1, 1, 1, 2], dtype=np.uint64)
+    m = np.array([9.0, 11.0, 9.0, 11.0, 9.0, 10.0])
+    sx, sy, sm, _ = statistic.smoothed(px, py, vessel, m, np.full(6, 0.1))
+    got = {(x, y): [] for x, y in zip(sx.tolist(), sy.tolist())}
+    for x, y, v in zip(sx.tolist(), sy.tolist(), sm.tolist()):
+        got[(x, y)].append(v)
+    # Only pixels someone sounded get entries.
+    assert set(got) == {(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (2, 1)}
+    # A's alternation is smoothed: its median within a pixel, 10 at the ends, 9 at pixels
+    # 1 and 3, 11 at 2. B, beside the track, joins the pixels around its own, and A reaches it.
+    assert {k: sorted(v) for k, v in got.items()} == {
+        (0, 0): [10.0],
+        (1, 0): [9.0, 10.0],
+        (2, 0): [10.0, 11.0],
+        (3, 0): [9.0, 10.0],
+        (4, 0): [10.0],
+        (2, 1): [10.0, 11.0],
+    }
+
+
+def test_smoothing_in_bands_gives_the_same_entries(monkeypatch):
+    rng = np.random.default_rng(4)
+    n = 3000
+    px, py = rng.integers(0, 60, n), rng.integers(0, 60, n)
+    vessel = rng.integers(0, 8, n).astype(np.uint64)
+    m, s = rng.normal(10, 1, n), rng.uniform(0.1, 0.5, n)
+
+    def rows(out):
+        return sorted(zip(*(a.tolist() for a in out)))
+
+    whole = rows(statistic.smoothed(px, py, vessel, m, s))
+    monkeypatch.setattr(statistic, "CHUNK", 90)
+    assert rows(statistic.smoothed(px, py, vessel, m, s)) == whole

@@ -349,6 +349,19 @@ def test_surface_leaves_an_unconfirmed_shoal_empty(env, monkeypatch):  # noqa: F
     assert at_pixel(depth, 5006, 20) == pytest.approx(10.0 - statistic.K * CSIG, abs=0.05)
 
 
+def test_a_disproved_shoal_publishes_without_holding_the_surface_open(env, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(statistic, "SIGMA_PER_M", 0.0)
+    # Four vessels read 10 m around a pixel where a fifth reads 5 m: consensus disproves
+    # it, and shallower than HAZARD_M it stays an unconfirmed sounding.
+    tracks = parallel()
+    tracks += [(f"O{i}", [(100 + i, 5006, 28 + i, 10.0 + 0.1 * i)]) for i in range(4)]
+    tracks.append(("ECHO", [(200, 5006, 30, 5.0)]))
+    depth = surface_from(env, tracks)
+    assert ("unconfirmed", "consensus_shoal", 5.0) in test_grid.flags(env)
+    assert at_pixel(depth, 5006, 30) != surface.NODATA
+    assert (5.0,) in env.query("SELECT depth FROM lake.shoals")
+
+
 def test_surface_is_the_median_less_k_sigma_and_never_deeper_than_a_confirmed_shoal():
     # A pixel at 7 m less K σ holds a 4 m confirmed shoal; another an unconfirmed shoal.
     # Shoaler soundings that aren't confirmed shoals don't cap anything.

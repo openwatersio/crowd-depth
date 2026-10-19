@@ -180,6 +180,21 @@ def test_the_margin_alone_never_makes_water_drying(env):  # noqa: F811
     assert 1.5 - statistic.K * CSIG < 0 and row[3] == 0
 
 
+def test_smoothing_never_takes_a_narrow_shoal_out_of_the_soundings(env):  # noqa: F811
+    # Six vessels cross a bar one pixel (two base columns) wide at 5 m in 9 m water, four
+    # soundings to a base cell, so the bar is no track spike. Along each track the bar is
+    # one vote among its neighbours' 9s, but the cell on it is never deeper than its own
+    # vessels' median less K σ.
+    for i in range(6):
+        rows = [(i * 1000 + 3 * (4 * c + j), *at(5000, c, 0.1 + 0.15 * i, 0.1 + 0.25 * j),
+                 5.0 if c in (30, 31) else 9.0) for c in range(60) for j in range(4)]  # fmt: skip
+        put(env, i + 1, rows, f"V{i}")
+    build(env)
+    bar = [row for row in grid(env) if row[:2] == (1, 5000) and row[2] in (30, 31)]
+    assert len(bar) == 2 and all(row[3] <= 5.0 for row in bar)
+    assert all(row[3] > 6 for row in grid(env) if row[2] not in (30, 31))
+
+
 def test_a_vessel_logging_at_1_hz_counts_once(env):  # noqa: F811
     # A logs 100 soundings at 9 m in one base cell; B and C read 9.8 and 9.9 m. By
     # soundings the cell is 9 m; by vessels it's 9.8.

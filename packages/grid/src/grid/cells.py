@@ -24,7 +24,7 @@ from .qc import HAZARD_M, MAX_DEPTH_M, QC_VERSION, TRACK_REASONS
 
 log = logging.getLogger(__name__)
 
-GRID_VERSION = 5
+GRID_VERSION = 6
 BATCH_POINTS = 5_000_000
 BASE = CELLS["rows_per_degree"]  # base rows per 1° tile
 MIN_VESSELS = 2
@@ -110,7 +110,7 @@ SUPPORT = 3
 DISPROVE = 3
 # A disproved shoal shallower than HAZARD_M may still be a hazard one boat found and
 # the others passed beside, so it stays an unconfirmed shoal rather than a reject: out
-# of depths and areas, but published and never drawn over. Deeper, it's a stray echo.
+# of depths, and published, though the surface is drawn over it. Deeper, it's a stray echo.
 
 # A unit's points are classified in steps, each a temp table that spills past the
 # memory limit (a MATERIALIZED CTE would hold its whole result in memory), and the cell
@@ -308,13 +308,19 @@ DROP TABLE by_cell;
 # these (statistic.py), over every band's accepted soundings, so its window reads across
 # bands. A cell's sounding takes its pixel's statistic, as the surface does; they differ
 # only where the surface reads across a tile edge or around its interpolation.
-ENTRIES = """
-SELECT py, px, m, s FROM (
-  SELECT r // 2 AS py, c // 2 AS px, vessel, median(d) FILTER (WHERE keep_base) AS m,
-    median(sigma) FILTER (WHERE keep_base) AS s
-  FROM group_accepted WHERE tile_id = $tile GROUP BY ALL
-  HAVING count(*) FILTER (WHERE keep_base) > 0
-) ORDER BY ALL
+# Each vessel's median is taken from a fixed sample of its own soundings in the pixel,
+# so one boat logging a million soundings there can't sample the others out.
+ENTRIES = f"""
+SELECT py, px, hash(vessel) AS v, median(d) FILTER (WHERE keep_v) AS m,
+  median(sigma) FILTER (WHERE keep_v) AS s
+FROM {
+    sample(
+        "(SELECT *, r // 2 AS py, c // 2 AS px FROM group_accepted WHERE tile_id = $tile)",
+        ["py", "px", "vessel"],
+        "keep_v",
+    )
+}
+GROUP BY py, px, vessel ORDER BY py, px, v, m
 """
 
 STATS = f"""
@@ -324,19 +330,26 @@ SELECT * FROM group_accepted WHERE r >= $rlo AND r < $rhi;
 -- Aggregates first, as small tables, so the join placing each cell's sounding is built
 -- on them: DuckDB can't spill a hash join's table, so it must never be the points.
 CREATE OR REPLACE TEMP TABLE children AS
-WITH shoals AS (
-  SELECT tile_id, level, cr, cc, r, c, min(d) FILTER (WHERE outlier = 'shoal') AS shoal
-  FROM accepted GROUP BY ALL
+WITH votes AS (
+  SELECT tile_id, level, cr, cc, r, c, vessel, median(d) FILTER (WHERE keep_v) AS m,
+    min(d) FILTER (WHERE outlier = 'shoal') AS shoal
+  FROM {sample("accepted", CELL + ["r", "c", "vessel"], "keep_v")} GROUP BY ALL
+),
+own AS (
+  SELECT tile_id, level, cr, cc, r, c, median(m) AS m, min(shoal) AS shoal FROM votes GROUP BY ALL
 )
--- The pixel's median of the vessels' medians less K σ. A confirmed shoal sets the depth
--- when it's shoaler, however many deeper vessels surround it. The margin alone never
--- makes water drying: below 0 only where the median or a confirmed shoal is. Never past
--- the drying band's floor, MIN_DEPTH_M, which the overlay's bands start from.
+-- The pixel's median of the vessels' smoothed votes less K σ, and never deeper than the
+-- base cell's own vessels' median less K σ: smoothing along a track can't take a narrow
+-- shoal every vessel read out of the soundings. A confirmed shoal sets the depth when
+-- it's shoaler, however many deeper vessels surround it. The margin alone never makes
+-- water drying: below 0 only where the median or a confirmed shoal is. Never past the
+-- drying band's floor, MIN_DEPTH_M, which the overlay's bands start from.
 SELECT *, CASE WHEN low IS NOT NULL THEN greatest(low, dry_floor, {MIN_DEPTH_M}) END AS depth
 FROM (
-  SELECT v.tile_id, v.level, v.cr, v.cc, v.r, v.c, ps.sigma, least(ps.depth, v.shoal) AS low,
-    least(0, ps.median, v.shoal) AS dry_floor
-  FROM shoals v JOIN pixel_sigma ps
+  SELECT v.tile_id, v.level, v.cr, v.cc, v.r, v.c, ps.sigma,
+    least(ps.depth, v.m - {statistic.K} * ps.sigma, v.shoal) AS low,
+    least(0, ps.median, v.m, v.shoal) AS dry_floor
+  FROM own v JOIN pixel_sigma ps
     ON ps.tile_id = v.tile_id AND ps.py = v.r // 2 AND ps.px = v.c // 2
 );
 
@@ -351,17 +364,19 @@ SELECT * FROM (
     count(*) FILTER (WHERE tided) AS tided, count(*) FILTER (WHERE calibrated) AS calibrated
   FROM accepted GROUP BY tile_id, level, cr, cc
 ) JOIN (
-  SELECT tile_id, level, cr, cc, min(depth) AS depth, arg_min(sigma, depth) AS sigma
+  SELECT tile_id, level, cr, cc, min(depth) AS depth, arg_min(sigma, (depth, sigma)) AS sigma
   FROM children GROUP BY ALL
 ) USING (tile_id, level, cr, cc);
 
 -- SOUNDG sits at the accepted sounding nearest the cell's depth: a confirmed shoal's
 -- own position when one set it.
 CREATE OR REPLACE TEMP TABLE placed AS
--- Ties go to the earliest and then the least point_id, not to whichever thread saw one
--- first, so unchanged soundings always place a cell's sounding in the same spot.
+-- A sounding at least as deep as the cell's depth comes first, so the label is never
+-- deeper than what was read at its spot. Ties go to the earliest and then the least
+-- point_id, not to whichever thread saw one first, so unchanged soundings always place
+-- a cell's sounding in the same spot.
 SELECT a.tile_id, a.level, a.cr, a.cc,
-  arg_min({{'lon': a.lon, 'lat': a.lat}}, (abs(a.d - s.depth), a.time, a.point_id))
+  arg_min({{'lon': a.lon, 'lat': a.lat}}, (a.d < s.depth, abs(a.d - s.depth), a.time, a.point_id))
     FILTER (WHERE a.time IS NOT NULL) AS at
 FROM accepted a JOIN stats s USING (tile_id, level, cr, cc) GROUP BY ALL;
 DROP TABLE accepted;
@@ -605,6 +620,8 @@ def sigmas(con):
         got = con.execute(ENTRIES, {"tile": tile}).fetchnumpy()
         px, py = (np.asarray(got[c], dtype=np.int64) for c in ("px", "py"))
         m, s = (np.asarray(got[c], dtype=np.float64) for c in ("m", "s"))
+        # Each vessel smoothed along its own coverage, as the surface's are.
+        px, py, m, s = statistic.smoothed(px, py, np.asarray(got["v"], dtype=np.uint64), m, s)
         upx, upy, median, spread, csig = statistic.sigma_b(px, py, m, s)
         sigma = statistic.sigma_at(upx, upy, spread, csig)(upx, upy)
         parts.append(

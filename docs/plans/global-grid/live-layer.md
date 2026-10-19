@@ -24,7 +24,7 @@ Cell QC runs across the boat's own passes, as the grid's does across vessels. Co
 
 The plugin reads GNSS quality from the same Signal K data it sends to the grid, so its position checks and horizontal uncertainty match the grid's for the same soundings.
 
-Unconfirmed shoals are handled as in the grid: they publish as soundings with a low-reliability flag, and the surface is never drawn over them.
+Unconfirmed shoals are handled as in the grid: they publish as soundings with a low-reliability flag, and the surface is never drawn over one QC couldn't judge.
 
 ### Corrections
 
