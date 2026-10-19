@@ -252,10 +252,15 @@ def run(con, surface_dir, tiles=None, sources=(), qc_version=QC_VERSION, with_ce
     if not parts:
         raise ValueError("no reference pixels in these tiles")
     p = {k: np.concatenate([q[k] for q in parts]) for k in parts[0]}
-    partitions = sorted({partition_of(t // 360 - 90, t % 360 - 180) for t in tiles})
+    # The flags on the scored tiles' own soundings: another tile's in the same partition
+    # say nothing about these. The partitions only let both tables prune their files.
+    scored = sorted(found)
+    partitions = sorted({partition_of(t // 360 - 90, t % 360 - 180) for t in scored})
     flagged = con.execute(
-        "SELECT count(*) FROM lake.qc_flags WHERE qc_version = ? AND list_contains(?, cell_id)",
-        [qc_version, partitions],
+        """SELECT count(*) FROM lake.qc_flags q JOIN lake.points p USING (point_id)
+        WHERE q.qc_version = $v AND list_contains($parts, q.cell_id)
+          AND list_contains($parts, p.cell_id) AND list_contains($tiles, p.tile_id)""",
+        {"v": qc_version, "parts": partitions, "tiles": scored},
     ).fetchone()[0]
     sources_seen, counts = np.unique(p["source"], return_counts=True)
     result = {

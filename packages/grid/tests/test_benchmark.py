@@ -115,6 +115,13 @@ def test_known_errors_give_known_shares(store):
 
 def test_without_flags_at_the_version_every_sounding_counts(store):
     objects, surface_dir = store
+    with open_store(objects) as con:
+        # Another tile's flag in the same partition says nothing about this tile's soundings.
+        con.execute(
+            "INSERT INTO lake.points (point_id, file_id, tile_id, cell_id) VALUES ('o', 1, ?, ?)",
+            [TILE + 1, PARTITION],
+        )
+        con.execute("INSERT INTO lake.qc_flags VALUES ('o', 'reject', 'spike', 99, ?)", [PARTITION])
     with open_store(objects, write=False) as con:
         result = benchmark.run(con, surface_dir, qc_version=99)
     assert result["qc_flags_at_version"] == 0
