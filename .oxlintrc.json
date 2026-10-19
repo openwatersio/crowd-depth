@@ -7,6 +7,7 @@
   "ignorePatterns": [
     "dist",
     "packages/*/dist",
-    "packages/signalk-plugin/public"
+    "packages/signalk-plugin/public",
+    "packages/grid"
   ]
 }

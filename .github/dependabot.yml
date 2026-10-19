@@ -8,7 +8,7 @@ updates:
       actions:
         patterns: ["*"]
   - package-ecosystem: npm
-    directory: /
+    directories: [/, /packages/grid/slackwater]
     schedule:
       interval: weekly
     groups:
