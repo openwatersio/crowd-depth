@@ -192,10 +192,7 @@ Releases are cut from GitHub:
 2. Create a tag `vX.Y.Z` (semver) targeting `main`.
 3. Set the release title to a short headline of what changed, in sentence case with no version or closing period, and put any new requirement in it ("Requires Node 24"). Patch releases get a headline too.
 4. Write the notes for boaters running the plugin, following the [release notes guidance](https://github.com/openwatersio/.github/blob/main/docs/agents/releases.md#release-notes): open with what is new and for whom, list breaking changes and upgrade steps first, then the changes people will notice with a link to each pull request. Leave out chores, CI, and dependency bumps unless they change a runtime requirement.
-5. Publish. The [release workflow](.github/workflows/release.yml) sets the package
-   version from the tag, publishes to npm via trusted publishing (OIDC — no
-   tokens to manage), commits the version bump back to `main`, and re-points
-   the tag at that commit.
+5. Publish. The [release workflow](.github/workflows/release.yml) builds and packs the plugin from the tag's commit with the version from the tag, publishes that tarball to npm via trusted publishing (OIDC — no tokens to manage), commits the version bump to `package.json` and `package-lock.json` back to `main`, and re-points the tag at that commit. Each step is its own job with only the permissions it needs: the job that installs dependencies and builds holds no token that can publish or push, though what it packs is what gets published. The tag must be the tip of `main` when the release runs, or the build refuses it; delete the release and tag and cut them again. Releases run one at a time, and one published while another is running is refused or cancelled, since the first one's version bump moves `main`; cut it again once the first finishes. If `main` moves after the build, the last job fails and leaves `main` and the tag as they were; the package is already on npm, so bump the version in a pull request.
 
 There is no manual `npm publish` or local version bump — the tag is the
 version. Signal K servers pick the new version up from npm in the AppStore.
