@@ -23,7 +23,7 @@ Measured in October 2026 on the Chesapeake NOAA CSB set. The comparison's code i
 
 ## Method
 
-- **Data:** 18,434 NOAA CSB files (98.5M soundings) over the Chesapeake, through the pipeline as it runs: track QC at version 5 with the Seascape deep-side check, tide reduced with the Slackwater engine and CO-OPS residuals, offsets from `grid calibrate` against S-102 and BlueTopo, and cells built for the scored tiles so their consensus rejects and confirmed shoals are in.
+- **Data:** 18,434 NOAA CSB files (98.5M soundings) over the Chesapeake, through the pipeline as it runs: track QC at version 5 with the Seascape deep-side check, tide reduced with the Slackwater engine and CO-OPS residuals, offsets from `grid calibrate` anchored to BlueTopo over the bay (S-102 wasn't sampled), and cells built for the scored tiles so their consensus rejects and confirmed shoals are in.
 - **No offset scored on its own data:** calibration ran with every scored area left out. A rerun keeps a published offset that moved by less than its standard error, so an offset can still sit within one standard error of a fit that saw the area.
 - **Grid:** the pipeline's 2/3″ grid (about 20 m), `gdal_grid` settings and blur.
 - **Reference:** BlueTopo at 4 m, resampled to each pixel's median and shoalest 4 m cell, and taken from NAVD88 to MLLW with the nearest CO-OPS gauge's separation, as calibration does.
@@ -115,6 +115,6 @@ In Tangier Sound, before cleaning, every statistic drew 19 to 30% of pixels as f
 
 ## Not measured
 
-- **Crossover-only offsets:** most offsets here are anchored to BlueTopo or S-102; crossover offsets were 10 of 343 segments.
+- **Crossover-only offsets:** most offsets here are anchored to BlueTopo; crossover offsets were 10 of 343 segments.
 - **Rocky bottom and areas without BlueTopo.** Leaving one vessel out is the only score that works there.
 - **Survey vintage:** BlueTopo's surveys and the CSB soundings span different years, and Tangier's bottom moves. Some of what scores as too deep against BlueTopo is likely change, not error.
