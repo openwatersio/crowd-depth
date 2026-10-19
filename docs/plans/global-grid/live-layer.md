@@ -1,6 +1,6 @@
 # Live layer
 
-The crowd-depth plugin draws the boat's own soundings on the chart as they're recorded, on top of the global grid overlay. The live layer is the grid pipeline run on one vessel's soundings, incrementally: the same QC, corrections, statistic, interpolation and portrayal, from the same definitions. A depth the boat just measured looks the way the grid will publish it from the same soundings, only sooner, so where the two layers meet they agree.
+The crowd-depth plugin draws the boat's own soundings on the chart as they're recorded, on top of the global grid overlay. The live layer is the grid pipeline run on one vessel's soundings, incrementally: the same QC, corrections, interpolation and portrayal, from the same definitions, and a one-vessel version of the grid's statistic. A depth the boat just measured is drawn with the grid's bands and contours, only sooner. The two layers can differ by the spread between vessels, which one boat can't see (see [Cells and surface](#cells-and-surface)).
 
 Every number below comes from the grid's design and changes with it. This note covers only what's different about running that design live, on one boat.
 
@@ -32,16 +32,33 @@ The layer is a chart, so it shows charted depths: depth below the waterline redu
 
 - **Offsets:** the plugin's depth reference and transducer offsets, which bring every sounding to depth below the waterline.
 - **Vessel calibration:** the vessel's own offset, scale and uncertainty, fetched from the grid's calibration ([Vessel calibration](README.md#vessel-calibration)). It needs the plugin's `SIGNALK-<uuid>` to match the vessel's `UNIQUE_ID` in the grid. A vessel without a calibration is marked uncalibrated, as the grid marks it.
-- **Tide:** the water level at each sounding's own time and place, from the same Slackwater engine the grid uses, which the plugin reaches through signalk-tides. The correction is applied when cells are built, so the log keeps raw depths and a better prediction or observed level can be applied later.
+- **Tide:** the water level at each sounding's own time and place, from the same Slackwater engine the grid uses, which the plugin reaches through signalk-tides. The correction is applied as each pass enters its cell. The plugin's upload to the grid carries raw depths, so a better prediction or observed level reaches the grid; the live layer keeps the level it had.
 - **Datum:** the grid's low-water chart datum, from the same separation source.
 
 Each cell records which corrections it has, as in the grid. A cell without tide and datum isn't on the overlay's reference, and the layer says so.
 
 ### Cells and surface
 
-Cells use the grid's [resolution](README.md#resolution) and [statistic](README.md#cell-statistics), with each transit standing in for a vessel: depth is the median of per-transit medians minus kσ, and σ is published. The surface follows the grid's [interpolation](README.md#interpolation): bounded, marked, with σ widening with distance from the nearest track.
+Cells use the grid's [resolution](README.md#resolution) and the form of the grid's [statistic](surface-statistic.md), `depth − kσ` with the same k and σ published, but the plugin keeps no soundings. Each cell holds a running estimate, updated once per pass:
 
-The statistic needs the soundings, not a running minimum. Accepted soundings are kept indexed by grid cell in the plugin's SQLite database, and a cell's statistic is recomputed from its own soundings when a new one lands in it. Interpolated cells within the radius of a changed cell are recomputed with it. A cell holds few soundings, so this stays cheap on a Raspberry Pi. A month of one boat's soundings, about 2.6M, is roughly 50–100 MB.
+- **A pass** is one transit through a cell. The plugin holds only the soundings of the cells under the boat, and when the boat leaves a cell, the pass's median goes into that cell's estimate.
+- **The estimate** is an exponential moving average of pass medians, m ← m + α(x − m), with an exponential moving average of their absolute deviation, d ← d + α(|x − m| − d), at α = 0.2. σ is √(σ_c² + (1.25d)²), where σ_c is the vessel's correction uncertainty (tide and calibration) and 1.25d estimates the spread of its passes, and depth is m − kσ. The two values fit in 4 bytes as centimetres.
+- **Against the grid:** the grid's σ_b also counts how far other vessels spread around a local plane, which one boat can't measure. Where vessels disagree, the grid draws shoaler than the live layer by k times that spread. Where the overlay covers the water, the plugin can draw the shoaler of the two.
+- **A vessel's offset changing** shifts its cells by the difference, since the average is linear. A new tide level for past passes doesn't reach the live layer; the grid's next build carries it.
+
+The surface follows the grid's [interpolation](README.md#interpolation): bounded, marked, with σ widening with distance from the nearest track. Interpolated cells within the radius of a changed cell are recomputed from the stored cells.
+
+Replayed per vessel in Thimble Shoal Channel (2/3″ cells, per pass), against BlueTopo and on a synthetic 1 m change with 0.3 m noise:
+
+| Per cell               |      State | Too deep by > 1 m | Passes to show a 1 m shoal | Passes to forget it |
+| ---------------------- | ---------: | ----------------: | -------------------------: | ------------------: |
+| Shallowest             |        2 B |              2.0% |                          8 |               never |
+| Median of every pass   | all passes |              2.2% |                         33 |                  33 |
+| EMA, α = 0.2, − 1.0σ   |        4 B |              1.4% |                          3 |                  10 |
+| EMA, α = 0.2, − 1.645σ |        4 B |              1.3% |                          2 |                  12 |
+| Running mean − 1.645σ  |        8 B |              1.3% |                         11 |               never |
+
+The moving average shows a new shoal within 2 or 3 passes and lets go of one in about 10, so it errs shoal while the water changes. One vessel crosses a cell a median of once: most of the layer is a single pass, and the estimate is that pass. Across the Chesapeake set, a vessel touched a median of 10,800 cells (90th percentile 96,000, largest 1.48M). At 4 bytes of state and a 4-byte cell index, that's 87 KB for the median vessel and 12 MB for the largest.
 
 ### Portrayal
 
@@ -61,7 +78,7 @@ The plugin also lists the tiles as a `type=S-57` chart resource, for plotters wi
 
 - [ ] Shared constants and test vectors, read by both the grid and the plugin.
 - [ ] Track QC in the plugin, ported from the plain-loop functions and checked against the shared vectors.
-- [ ] Accepted soundings stored by cell, with the grid's resolution, statistic and interpolation.
+- [ ] Cells as running estimates per pass, with the grid's resolution and interpolation.
 - [ ] Tide and datum through signalk-tides, applied per sounding time.
 - [ ] S-57 vector tiles drawn as a data overlay with per-tile refresh, provisional soundings as GeoJSON, and the same tiles listed as a chart resource.
 - [ ] Vessel calibration fetched from the grid, once the grid calibrates vessels.
