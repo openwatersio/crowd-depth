@@ -9,9 +9,11 @@
     grid --store DIR_OR_S3_URL cells [--bbox=W,S,E,N | --changed]
     grid --store DIR_OR_S3_URL overlay --out DIR
     grid --store DIR_OR_S3_URL stats
+    grid cache [--prune]
 
 Sources default to the NOAA CSB bucket and the Open Waters R2 bucket. R2 access
-reads S3_ENDPOINT, S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY.
+reads S3_ENDPOINT, S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY. Downloads are kept in
+GRID_CACHE_DIR, shared by every store on the machine (see cache.py).
 """
 
 import argparse
@@ -20,7 +22,7 @@ import math
 import sys
 from pathlib import Path
 
-from . import calibrate, cells, overlay, qc, tide
+from . import cache, calibrate, cells, overlay, qc, reference, tide
 from .catalog import open_store
 from .ingest import Ingest, confirm_withdrawals
 from .objects import open_objects
@@ -56,9 +58,7 @@ def bbox(text: str) -> list[int]:
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog="grid", description=__doc__.split("\n")[0])
-    p.add_argument(
-        "--store", required=True, help="Point store: a local directory or s3://bucket/prefix on R2"
-    )
+    p.add_argument("--store", help="Point store: a local directory or s3://bucket/prefix on R2")
     sub = p.add_subparsers(dest="command", required=True)
     i = sub.add_parser("ingest", help="List the sources and ingest new, changed and removed files")
     i.add_argument("--source", choices=SOURCES, action="append", help="Default: both")
@@ -123,7 +123,18 @@ def main(argv=None):
     o = sub.add_parser("overlay", help="Build the overlay layers and their PMTiles from the cells")
     o.add_argument("--out", required=True, type=Path, help="Directory for the layers and PMTiles")
     sub.add_parser("stats", help="Count files by source and status")
+    k = sub.add_parser("cache", help="Show the download cache's size by kind")
+    k.add_argument(
+        "--prune",
+        action="store_true",
+        help="First remove reference rasters and tile schemes of old releases, source files"
+        " past GRID_CACHE_FILES_GB, and what dead writes left",
+    )
     args = p.parse_args(argv)
+    if args.command == "cache":
+        return show_cache(args.prune)
+    if not args.store:
+        p.error("--store is required")
     if args.command == "ingest" and args.keys and len(set(args.source or SOURCES)) != 1:
         # Keys name one source's files; listed in the other's bucket, they're all missing.
         p.error("--keys needs exactly one --source")
@@ -178,6 +189,17 @@ def main(argv=None):
                 print(*row, sep="\t")
     # Held withdrawals, incomplete listings, unreadable files and unknown keys need an operator.
     return 2 if alert else 0
+
+
+def show_cache(prune):
+    if prune:
+        reference.prune()
+        cache.trim("files", cache.files_cap())
+        cache.remove_stale_parts()
+    print(cache.root())
+    for kind, (n, size) in cache.sizes().items():
+        print(f"{kind}\t{n} entries\t{size / 2**30:.2f} GB")
+    return 0
 
 
 if __name__ == "__main__":

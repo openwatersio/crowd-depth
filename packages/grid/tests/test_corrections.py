@@ -644,13 +644,13 @@ def test_the_finest_raster_of_a_source_wins(env, tmp_path, monkeypatch):  # noqa
 def test_a_catalog_tile_with_no_link_yet_is_tried_again(tmp_path):
     path = tmp_path / "scheme.gpkg"
     with contextlib.closing(sqlite3.connect(path)) as db:
-        db.execute("CREATE TABLE t (fid INTEGER PRIMARY KEY, link TEXT)")
+        db.execute("CREATE TABLE t (fid INTEGER PRIMARY KEY, link TEXT, sha TEXT)")
         db.execute('CREATE VIRTUAL TABLE "rtree_t_geom" USING rtree(id, minx, maxx, miny, maxy)')
-        db.executemany("INSERT INTO t VALUES (?, ?)", [(1, "https://x/a.tif"), (2, None)])
+        db.executemany("INSERT INTO t VALUES (?, ?, NULL)", [(1, "https://x/a.tif"), (2, None)])
         db.executemany('INSERT INTO "rtree_t_geom" VALUES (?, 0, 1, 0, 1)', [(1,), (2,)])
         db.commit()
-    catalogs = {"bluetopo": (path, "t", "link")}
-    paths, pending = reference_mod.rasters("bluetopo", (0, 0, 1, 1), catalogs, tmp_path)
+    catalogs = {"bluetopo": (path, "t", "link", "sha", False)}
+    paths, pending = reference_mod.rasters("bluetopo", (0, 0, 1, 1), catalogs)
     assert paths == ["/vsicurl/https://x/a.tif"] and pending == [[0, 0, 1, 1]]
 
 
@@ -871,7 +871,7 @@ def test_a_failed_fine_raster_keeps_no_coarse_samples(env, tmp_path, monkeypatch
 
 def test_a_reference_path_with_no_rasters_is_an_error(tmp_path):
     with pytest.raises(FileNotFoundError):
-        reference_mod.rasters(str(tmp_path / "unmounted"), (0, 0, 1, 1), {}, tmp_path)
+        reference_mod.rasters(str(tmp_path / "unmounted"), (0, 0, 1, 1), {})
 
 
 def test_a_station_with_no_license_type_is_still_credited(env):  # noqa: F811
