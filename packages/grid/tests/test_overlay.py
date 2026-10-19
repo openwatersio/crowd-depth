@@ -1,6 +1,6 @@
 import json
 import subprocess
-from datetime import date
+from datetime import UTC, date, datetime
 
 import duckdb
 import numpy as np
@@ -404,7 +404,9 @@ def test_build_writes_pmtiles_with_every_layer(env, tmp_path):  # noqa: F811
     [coverage] = [geometry(f) for f in areas if f["tippecanoe"]["layer"] == "M_QUAL"]
     # Its survey ends at the end of the cells' month or year, but never after today.
     [props] = [f["properties"] for f in areas if f["tippecanoe"]["layer"] == "M_QUAL"]
-    assert props["SUREND"] == min(date(2026, 12, 31), date.today()).strftime("%Y%m%d")
+    # Capped at today in UTC, as DuckDB's current_date is in the store's UTC session.
+    today = datetime.now(UTC).date()
+    assert props["SUREND"] == min(date(2026, 12, 31), today).strftime("%Y%m%d")
     assert coverage.contains(shapely.Point(*test_grid.at(7000, 20)))
     # A prime sounding publishes once at any zoom, not again from the pyramid.
     sounds = [json.loads(ln) for ln in (tmp_path / "soundings.geojsons").read_text().splitlines()]

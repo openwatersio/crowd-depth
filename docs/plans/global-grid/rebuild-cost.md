@@ -8,7 +8,7 @@ Details are in [store-layout.md](store-layout.md), [qc-functions.md](qc-function
 
 **Store layout.** One table sorted by 10° cell and then tile, with row groups of about 123k rows, reads about as efficiently as physically separate per-tile files: 1.26× read amplification over a full rebuild, against 1.0×. In ingest order, row groups cross a median of 6 tiles, so a full rebuild reads the store 6.8 times over. `grid cells` can query one store per cell, as long as the store is compacted in tile order and daily appends are sorted. Dropping the stored `point_id` saves 47% of bytes, and putting `tile_id` on `qc_flags` lets flag reads prune by tile.
 
-**QC as pure functions.** A numpy version of QC v2 gives identical flags to the production SQL on 1,000 files, 13.4M soundings and 50,740 flags. It runs about 17 times faster per core and uses a fraction of the memory. A plain-loop version ports directly to TypeScript, with thresholds and test vectors shared as JSON. With it, QC adds about 2% to ingest, against about 40% for the SQL.
+**QC as pure functions.** Track QC runs as numpy ([qc.py](../../../packages/grid/src/grid/qc.py)), with flags matching the day-split SQL's on the whole Chesapeake store (98.5M soundings) apart from stuck runs across UTC midnight. QC of that store takes 53 s against 204 s for the SQL, about 4 times faster on this laptop's cores; on NOAA's largest Chesapeake file (3.5M soundings) ingest's QC takes 0.9 s against 5.0 s, with about 420 MB more memory. Its TypeScript port shares thresholds and test vectors as JSON.
 
 **Per-tile pipeline.** It works end to end and matches a single global run, apart from tie-breaking noise in `placed`:
 
