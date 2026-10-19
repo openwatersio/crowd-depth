@@ -84,6 +84,19 @@ def test_a_second_run_reads_cached_rasters_with_no_network(monkeypatch):
     assert catalogs["bluetopo"][-1] is True
 
 
+def test_a_cache_it_cant_write_to_still_calibrates(monkeypatch):
+    serve(monkeypatch, bucket_files(scheme()))
+    cache.root().mkdir()
+    cache.root().chmod(0o555)
+    try:
+        catalogs = {}
+        paths, _ = reference.rasters("bluetopo", (0, 0, 1, 1), catalogs)
+    finally:
+        cache.root().chmod(0o755)
+    # The scheme from the run's own directory; the raster, uncached, read remotely.
+    assert catalogs["bluetopo"][-1] is False and paths == [f"/vsicurl/{LINK}"]
+
+
 def test_a_cut_off_tile_scheme_is_never_cached(monkeypatch):
     files = bucket_files(scheme())
     serve(monkeypatch, files, cut=[url for url in files if url.endswith(".gpkg")])

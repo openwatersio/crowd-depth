@@ -15,12 +15,15 @@ scheme gives, and checked against it.
 """
 
 import contextlib
+import functools
 import hashlib
 import http.client
 import logging
+import os
 import re
 import shutil
 import sqlite3
+import tempfile
 import urllib.request
 from pathlib import Path
 
@@ -70,7 +73,13 @@ def catalog(name):
             key = max(re.findall(r"<Key>([^<]+\.gpkg)</Key>", r.read().decode()))
         path = cache.path("reference", name, "catalogs", key.rsplit("/", 1)[-1])
         if not path.exists():
-            download(f"{bucket}/{key}", path)
+            try:
+                download(f"{bucket}/{key}", path)
+            except FETCH_ERRORS:
+                # A cache this run can't write to: the scheme goes in the run's own
+                # directory. A download that failed fails again, and lands below.
+                path = Path(scratch().name, path.name)
+                download(f"{bucket}/{key}", path)
     except (*FETCH_ERRORS, ValueError) as e:
         cached = cached_catalogs(name)
         if not cached:
@@ -78,6 +87,12 @@ def catalog(name):
         path, stale = cached[-1], True
         log.warning("reference: %s tile scheme not fetched (%s); using %s", name, e, path.name)
     return path, gpkg_table(path), column, checksum, stale
+
+
+@functools.cache
+def scratch():
+    """The run's own directory, removed when it exits."""
+    return tempfile.TemporaryDirectory(dir=os.environ.get("GRID_TEMP_DIR") or None)
 
 
 def cached_catalogs(name):
