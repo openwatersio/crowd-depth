@@ -84,15 +84,13 @@ def test_a_second_run_reads_cached_rasters_with_no_network(monkeypatch):
     assert catalogs["bluetopo"][-1] is True
 
 
-def test_a_cache_it_cant_write_to_still_calibrates(monkeypatch):
+def test_a_cache_it_cant_write_to_still_calibrates(monkeypatch, tmp_path):
     serve(monkeypatch, bucket_files(scheme()))
-    cache.root().mkdir()
-    cache.root().chmod(0o555)
-    try:
-        catalogs = {}
-        paths, _ = reference.rasters("bluetopo", (0, 0, 1, 1), catalogs)
-    finally:
-        cache.root().chmod(0o755)
+    # Under a file, so even root (as in CI's container) can't create it.
+    (tmp_path / "file").touch()
+    monkeypatch.setenv("GRID_CACHE_DIR", str(tmp_path / "file" / "cache"))
+    catalogs = {}
+    paths, _ = reference.rasters("bluetopo", (0, 0, 1, 1), catalogs)
     # The scheme from the run's own directory; the raster, uncached, read remotely.
     assert catalogs["bluetopo"][-1] is False and paths == [f"/vsicurl/{LINK}"]
 
