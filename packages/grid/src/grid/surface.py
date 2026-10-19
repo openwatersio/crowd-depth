@@ -28,6 +28,7 @@ from rasterio.transform import from_bounds
 from rasterio.windows import Window
 from scipy.ndimage import distance_transform_edt, gaussian_filter, minimum_filter
 
+from .catalog import MIN_DEPTH_M
 from .cells import BASE, CELL_SAMPLE, k_for
 from .qc import MAX_DEPTH_M, QC_VERSION
 
@@ -48,7 +49,7 @@ EARTH_M = 6378137.0
 # within reach are skipped, and left out of the file.
 BLOCK = 512
 
-# Each surface pixel's soundings, from those QC accepted (not rejected, and not an
+# Each surface pixel's corrected soundings, from those QC accepted (not rejected, and not an
 # unconfirmed shoal unless something confirmed it), within the depths cells trust:
 # the 10th percentile to interpolate from, as cells take it, over a fixed sample so a
 # moored boat costs fixed memory; the shoalest, which no pixel may be deeper than;
@@ -59,11 +60,12 @@ BLOCK = 512
 PIXELS = f"""
 WITH wanted AS MATERIALIZED (
   SELECT * FROM (
-    SELECT p.point_id, p.lon, p.lat, p.depth_raw AS d,
+    SELECT p.point_id, p.lon, p.lat, p.depth AS d,
       floor((p.lat - $lat0) * {BASE} / 2)::INTEGER AS py,
       floor((p.lon - $lon0) * {BASE} / $k / 2)::INTEGER AS px
-    FROM active_points_in($partition, [$tile], $rlo, $rhi) p
-    WHERE p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M}
+    FROM corrected_points_in($partition, [$tile], $rlo, $rhi) p
+    WHERE p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M} AND p.depth >= {MIN_DEPTH_M}
+      AND NOT p.excluded AND NOT p.awaiting_tide
   )
   -- Only the pixels wanted: a neighbor's strip within the search radius, say.
   WHERE py BETWEEN $pylo AND $pyhi AND px BETWEEN $pxlo AND $pxhi

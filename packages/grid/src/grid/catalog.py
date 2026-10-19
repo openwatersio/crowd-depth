@@ -76,7 +76,73 @@ CREATE TABLE IF NOT EXISTS lake.cells (
 CREATE TABLE IF NOT EXISTS lake.shoals (
   tile_id INTEGER, "row" INTEGER, lon DOUBLE, lat DOUBLE, depth FLOAT, cell_id SMALLINT
 );
+-- Corrections, derived from the points and never written over depth_raw. Tide: the
+-- stations a tide cell (TIDE_CELL) takes its level from, and each station's level
+-- above its chart datum per half hour, with its slope to the next slot.
+CREATE TABLE IF NOT EXISTS lake.tide_stations (
+  station_id INTEGER, station VARCHAR, lon DOUBLE, lat DOUBLE, chart_datum VARCHAR,
+  gauge VARCHAR, gauge_km FLOAT, license VARCHAR, attribution VARCHAR
+);
+CREATE TABLE IF NOT EXISTS lake.tide_cells (tide_cell BIGINT, tile_id INTEGER, station_id INTEGER, km FLOAT);
+CREATE TABLE IF NOT EXISTS lake.tide_levels (
+  station_id INTEGER, slot TIMESTAMP, level FLOAT, slope FLOAT, sigma FLOAT, method VARCHAR
+);
+-- CO-OPS observed minus predicted water level per gauge, and when each gauge month was
+-- fetched: a month is final once fetched well after its end.
+CREATE TABLE IF NOT EXISTS lake.tide_residuals (gauge VARCHAR, time TIMESTAMP, residual FLOAT);
+CREATE TABLE IF NOT EXISTS lake.tide_residual_months (gauge VARCHAR, month DATE, fetched DATE);
+-- A surveyed reference sampled at a calibration pixel (two base rows by two base
+-- columns of a tile): depth below chart datum, relief within about 20 m, uncertainty.
+CREATE TABLE IF NOT EXISTS lake.reference_pixels (
+  tile_id INTEGER, py INTEGER, px INTEGER, depth FLOAT, relief FLOAT, uncertainty FLOAT,
+  source VARCHAR
+);
+-- Vertical offset per vessel step segment (negative reads shallow), and the offset of
+-- each file whose segment is calibrated, which is what the grid applies.
+CREATE TABLE IF NOT EXISTS lake.calibration (
+  vessel VARCHAR, segment INTEGER, t_start TIMESTAMP, t_end TIMESTAMP, offset_m FLOAT,
+  se_m FLOAT, status VARCHAR, anchor_pixels INTEGER, anchor_transits INTEGER,
+  crossing_transits INTEGER
+);
+-- Transits that disagree with their segment by more than a step, left uncalibrated.
+CREATE TABLE IF NOT EXISTS lake.calibration_outliers (
+  file_id BIGINT, vessel VARCHAR, transit_m FLOAT, segment_m FLOAT, content_hash VARCHAR
+);
+CREATE TABLE IF NOT EXISTS lake.file_offsets (
+  file_id BIGINT, vessel VARCHAR, offset_m FLOAT, se_m FLOAT, excluded BOOLEAN
+);
+-- Tiles whose cells a correction change has made stale, until `cells --changed` rebuilds them.
+CREATE TABLE IF NOT EXISTS lake.tile_changes (tile_id INTEGER, reason VARCHAR, changed TIMESTAMP);
 """
+
+# Columns added to tables after stores were first built with them.
+MIGRATIONS = """
+ALTER TABLE lake.cells ADD COLUMN IF NOT EXISTS tided INTEGER;
+ALTER TABLE lake.cells ADD COLUMN IF NOT EXISTS calibrated INTEGER;
+ALTER TABLE lake.calibration_outliers ADD COLUMN IF NOT EXISTS content_hash VARCHAR;
+ALTER TABLE lake.tide_stations ADD COLUMN IF NOT EXISTS unpredictable BOOLEAN;
+"""
+
+# A corrected depth past this is no drying height but a correction gone wrong; cells, the
+# surface and the overlay's drying band stop here.
+MIN_DEPTH_M = -30
+
+# The 0.02° cell (about 2 km) that picks a sounding's tide station, counted within the
+# sounding's own 1° tile, so a point on a tile's edge or the antimeridian is in a cell
+# of its tile.
+TIDE_CELL = """(((p.tile_id // 360) * 50
+    + greatest(least(floor((p.lat - (p.tile_id // 360 - 90)) * 50), 49), 0))::BIGINT * 18000
+  + (p.tile_id % 360) * 50
+  + greatest(least(floor((p.lon - (p.tile_id % 360 - 180)) * 50), 49), 0))"""
+# Metres of tide uncertainty per km between a sounding and its station: a starting
+# value, until held-out gauges measure it.
+TIDE_KM_SIGMA = 0.005
+# The uncertainty a correction that isn't made leaves in a depth, so uncorrected water
+# never reads as better known than corrected: tide left in (half a range of a metre or
+# two), and a vessel's offset left in (vessels read 0 to 3 m shallow in the Chesapeake).
+# Starting values.
+UNTIDED_SIGMA = 0.5
+UNCALIBRATED_SIGMA = 1.0
 
 # A point's base row (1/3″ of latitude) within its 1° tile. The cells build bands and
 # rows by this one expression, so a point can't land between two bands.
@@ -143,6 +209,36 @@ CREATE OR REPLACE TEMP MACRO active_points_in(cell, tiles, rlo, rhi) AS TABLE {
         f" AND {BASE_ROW} BETWEEN rlo AND rhi - 1"
     )
 };
+-- Those points with their corrections: `tide`, the level above chart datum at the
+-- sounding's time, interpolated in its half hour; `offset_m`, its calibrated segment's
+-- offset; `depth`, depth_raw reduced by both; and `sigma`, both corrections'
+-- uncertainty, the tide's widened by the station's distance. A correction that doesn't
+-- apply is NULL and leaves the depth as it is, and its uncertainty as UNTIDED_SIGMA or
+-- UNCALIBRATED_SIGMA. `excluded` marks a vessel segment known to read too deep to use.
+CREATE OR REPLACE TEMP MACRO corrected_points_in(cell, tiles, rlo, rhi) AS TABLE
+WITH c AS (
+  SELECT tide_cell, station_id, km FROM lake.tide_cells
+  WHERE len(tiles) = 0 OR list_contains(tiles, tile_id)
+),
+-- Only the stations of these tiles' cells, so the join holds their levels alone.
+l AS (SELECT * FROM lake.tide_levels WHERE station_id IN (SELECT station_id FROM c)),
+p AS (
+  SELECT p.*, c.tide_cell IS NOT NULL AS tide_assigned, c.station_id AS tide_station,
+    coalesce(o.excluded, false) AS excluded, l.level + l.slope * epoch(p.time - l.slot) AS tide,
+    sqrt(l.sigma ^ 2 + (c.km * {TIDE_KM_SIGMA}) ^ 2) AS tide_sigma, o.offset_m, o.se_m
+  FROM active_points_in(cell, tiles, rlo, rhi) p
+  LEFT JOIN c ON c.tide_cell = {TIDE_CELL}
+  LEFT JOIN l ON l.station_id = c.station_id AND l.slot = time_bucket(INTERVAL 30 MINUTE, p.time)
+  LEFT JOIN lake.file_offsets o ON o.file_id = p.file_id AND o.vessel = p.unique_id
+)
+SELECT * EXCLUDE (tide_sigma, se_m),
+  -- A station is in reach but its level for this day isn't made yet: the raw depth would
+  -- read deeper than chart datum whenever the tide is above it.
+  tide IS NULL AND tide_station IS NOT NULL AS awaiting_tide,
+  (depth_raw - coalesce(tide, 0) - coalesce(offset_m, 0))::FLOAT AS depth,
+  sqrt(coalesce(tide_sigma, {UNTIDED_SIGMA}) ^ 2 + coalesce(se_m, {UNCALIBRATED_SIGMA}) ^ 2)
+    AS sigma
+FROM p;
 """
 
 
@@ -298,6 +394,7 @@ def connect(catalog_path: str, data_url: str, temp_dir: str) -> duckdb.DuckDBPyC
         ).fetchall()
     }
     con.execute(SCHEMA)
+    con.execute(MIGRATIONS)
     check_hash_scheme(con)
     # Partitioning is set once, when a table is created.
     for table in PARTITIONED.keys() - existing:
@@ -402,11 +499,26 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
                 # Moves rows inlined so far to Parquet, so the catalog each run downloads stays small.
                 con.execute("CALL ducklake_flush_inlined_data('lake')")
                 if final:
-                    # Rebuilds delete and reinsert cells, their flags and shoals and the
-                    # cells' marker, and DuckLake deletes by writing delete files, so the
-                    # replaced files stay live until rewritten.
+                    # Rebuilds delete and reinsert cells, their flags and shoals, the
+                    # calibration and the cells' marker, and DuckLake deletes by writing
+                    # delete files, so the replaced files stay live until rewritten.
                     # ponytail: points' delete files wait for compaction, which is still to come
-                    for table in ("cells", "qc_flags", "shoals", "store_meta", "cells_built"):
+                    for table in (
+                        "cells",
+                        "qc_flags",
+                        "shoals",
+                        "store_meta",
+                        "cells_built",
+                        "calibration",
+                        "calibration_outliers",
+                        "file_offsets",
+                        "tile_changes",
+                        "tide_cells",
+                        "tide_stations",
+                        "tide_levels",
+                        "tide_residuals",
+                        "tide_residual_months",
+                    ):
                         con.execute(f"CALL ducklake_rewrite_data_files('lake', '{table}')")
                     # A reader may still hold a catalog up to RETAIN old, so snapshots, the
                     # files only they reference, and old catalogs go once they pass it.

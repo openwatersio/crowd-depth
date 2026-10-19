@@ -1,9 +1,9 @@
 #!/bin/sh
 # Usage: ./docker.sh [command...]   Runs a command in the grid's image; default: the tests.
-# The image is built on first use, tagged by the Dockerfile and lockfile it came from.
+# The image is built on first use, tagged by the Dockerfile, lockfiles and helper it came from.
 set -eu
 cd "$(dirname "$0")"
-tag="crowd-depth-grid:$(cat Dockerfile uv.lock | shasum | cut -c1-12)"
+tag="crowd-depth-grid:$(cat Dockerfile uv.lock slackwater/package.json slackwater/package-lock.json slackwater/predict.mjs | shasum | cut -c1-12)"
 docker image inspect "$tag" >/dev/null 2>&1 || docker build -q -t "$tag" . >/dev/null
 [ $# -gt 0 ] || set -- uv run --locked pytest
 # Downloads persist in a volume; S3_*, UV_PYTHON and GRID_MEMORY_LIMIT pass through when set.

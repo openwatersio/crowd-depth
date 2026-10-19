@@ -215,6 +215,21 @@ def test_a_shoal_inside_a_closed_isobath_is_prime():
     assert "SOUNDG" not in by_layer(open_)
 
 
+def test_a_drying_bank_has_its_area_drying_line_and_least_depth(tmp_path):
+    # 3 m water round a bank that dries 0.5 m at chart datum, after tide reduction.
+    depth = np.full((60, 60), 3.0, dtype=np.float32)
+    depth[20:40, 20:40] = -0.5
+    path = tmp_path / "tile.tif"
+    write_surface(path, -78, 33, depth, np.zeros_like(depth), np.ones_like(depth))
+    bands, footprint, surfaced = overlay.surface_bands(path)
+    bank = (-78 + 30 / 60, 33 + 30 / 60, -0.5)
+    got = by_layer(overlay.tile_areas(tuple(zip(bank)), PROPERTIES, bands, footprint, surfaced))
+    areas = {(f["properties"]["DRVAL1"], f["properties"]["DRVAL2"]) for f in got["DEPARE"]}
+    assert areas == {(overlay.DRYING_M, 0), (0, 2), (2, 5)}
+    assert 0 in {f["properties"]["VALDCO"] for f in got["DEPCNT"]}
+    assert -0.5 in {f["properties"]["depth_m"] for f in got["SOUNDG"]}
+
+
 def write_surface(path, lon0, lat0, depth, distance, count):
     """A whole tile's bands as its surface COG, written as build_tile writes one."""
     sparse = path.with_suffix(".sparse.tif")
