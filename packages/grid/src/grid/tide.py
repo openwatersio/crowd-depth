@@ -34,7 +34,7 @@ from scipy.spatial import cKDTree
 
 from . import cells
 from .catalog import TIDE_CELL, checkpoint
-from .sources import EARLIEST
+from .qc import EARLIEST
 
 log = logging.getLogger(__name__)
 

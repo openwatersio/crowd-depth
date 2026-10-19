@@ -15,21 +15,23 @@ import math
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import catalog, qc
+from . import catalog, definitions, qc
 from .catalog import BASE_ROW, MIN_DEPTH_M, checkpoint
+from .definitions import CELLS
 from .qc import HAZARD_M, MAX_DEPTH_M, QC_VERSION, TRACK_REASONS
 
 log = logging.getLogger(__name__)
 
 GRID_VERSION = 4
 BATCH_POINTS = 5_000_000
-BASE = 10_800  # base rows per 1° tile
+BASE = CELLS["rows_per_degree"]  # base rows per 1° tile
 SHOAL_QUANTILE = 0.10
 MIN_VESSELS = 2
 CELL_REASONS = ["cell_deep", "cell_shoal", "cell_confirmed", "consensus_deep", "consensus_shoal"]
 # A sounding of the same vessel this far apart in time is another pass.
 OTHER_PASS = "4 hours"
-DIVISORS = [d for d in range(1, 1201) if 1200 % d == 0]
+STEPS = CELLS["column_steps_divide"]
+DIVISORS = [d for d in range(1, STEPS + 1) if STEPS % d == 0]
 
 
 def k_for(lat0: int) -> int:
@@ -646,13 +648,19 @@ FROM lake.cells WHERE ($partition IS NULL OR cell_id = $partition) AND list_cont
 GROUP BY tile_id
 """
 
-# The code that builds cells and the QC they read: a build resumes only work this same
-# code did, since cell logic can change without a GRID_VERSION bump.
+# The code that builds cells, the QC they read and their definitions: a build resumes
+# only work this same code did, since cell logic can change without a GRID_VERSION bump.
 # The cells read corrected depths through catalog's macros, so its code counts too.
 CODE = hashlib.sha256(
-    Path(__file__).read_bytes()
-    + Path(qc.__file__).read_bytes()
-    + Path(catalog.__file__).read_bytes()
+    b"".join(
+        Path(f).read_bytes()
+        for f in (
+            __file__,
+            qc.__file__,
+            catalog.__file__,
+            Path(definitions.__file__).with_suffix(".json"),
+        )
+    )
 ).hexdigest()[:16]
 
 

@@ -124,7 +124,7 @@ def test_transits_split_at_long_gaps(env):  # noqa: F811
 
 def test_k_keeps_cells_roughly_square():
     assert [cells.k_for(lat) for lat in (0, 33, 60, 75, 89)] == [1, 1, 2, 4, 120]
-    assert all(1200 % cells.k_for(lat) == 0 for lat in range(-90, 90))
+    assert all(cells.STEPS % cells.k_for(lat) == 0 for lat in range(-90, 90))
 
 
 def test_levels_follow_vessel_counts(env):  # noqa: F811
@@ -431,13 +431,13 @@ def qc_both_ways(env):  # noqa: F811
         reference = set()
         for b in batches:
             reference |= set(con.execute(reference_qc.TRACK_QC, {"batch": b}).fetchall())
-        split = set(
+        stored = set(
             con.execute(
                 "SELECT point_id, flag, reason FROM lake.qc_flags WHERE reason <> 'very_shallow'"
             ).fetchall()
         )
     reference = {r for r in reference if r[2] != "very_shallow"}
-    return split, reference
+    return stored, reference
 
 
 def track(seed, start, n, step):
@@ -457,17 +457,17 @@ def track(seed, start, n, step):
     return rows
 
 
-def test_day_split_qc_matches_one_pass(env):  # noqa: F811
+def test_ingest_qc_matches_the_reference_sql(env):  # noqa: F811
     # Tracks crossing several midnights (T0 is 18:00), with jumps and spikes around them.
     for n in range(1, 7):
         put_dated(env, n, track(n, -6 * 3600, 900, 60), f"V{n}")
     env.run("noaa")
-    split, reference = qc_both_ways(env)
+    stored, reference = qc_both_ways(env)
     assert {r[2] for r in reference} >= {"jump", "spike"}
-    assert split == reference
+    assert stored == reference
 
 
-def test_day_split_qc_at_midnight_and_on_sparse_days(env):  # noqa: F811
+def test_ingest_qc_matches_the_reference_sql_at_midnight_and_on_sparse_days(env):  # noqa: F811
     midnight = 6 * 3600  # T0 is 18:00
     near = [midnight - 3, midnight - 2, midnight - 1, midnight, midnight + 1, midnight + 2]
     # A spike on each side of midnight and a jump exactly at it.
@@ -489,10 +489,10 @@ def test_day_split_qc_at_midnight_and_on_sparse_days(env):  # noqa: F811
     # A fix every 3 hours for 9 days: few soundings a day, and a 7-day split mid-day.
     put_dated(env, 2, [(i * 3 * 3600, *at(6000, i), 10.0 + (i % 3)) for i in range(72)], "SPARSE")
     env.run("noaa")
-    split, reference = qc_both_ways(env)
+    stored, reference = qc_both_ways(env)
     assert ("reject", "jump") in {(f, r) for _, f, r in reference}
     assert ("unconfirmed", "spike") in {(f, r) for _, f, r in reference}
-    assert split == reference
+    assert stored == reference
 
 
 @pytest.mark.parametrize("first", ["AQM-1", "AQM-2"])
