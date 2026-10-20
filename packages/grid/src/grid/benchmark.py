@@ -56,8 +56,9 @@ QUALIFY row_number() OVER (PARTITION BY py, px ORDER BY uncertainty NULLS LAST, 
 """
 
 # Per sounded pixel: the vessels with a sounding the surface would take (QC accepted: not
-# rejected or noisy, and not an unconfirmed shoal unless something confirmed it or it's
-# one no cell could judge; within the depths it trusts), and whether a confirmed shoal is there, as the statistic's cells flag one.
+# rejected or noisy, not a transit that lost the bottom, and not an unconfirmed shoal unless
+# something confirmed it or it's one no cell could judge; within the depths it trusts), and
+# whether a confirmed shoal is there, as the statistic's cells flag one.
 SOUNDED = f"""
 WITH pts AS MATERIALIZED (
   SELECT p.point_id, p.unique_id,
@@ -65,7 +66,7 @@ WITH pts AS MATERIALIZED (
     least(greatest(floor((p.lon - $lon0) * {BASE} / $k / 2)::INTEGER, 0), $cols - 1) AS px
   FROM corrected_points_in($partition, [$tile], 0, {BASE}) p
   WHERE p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M} AND p.depth >= {MIN_DEPTH_M}
-    AND NOT p.excluded AND NOT p.awaiting_tide
+    AND NOT p.excluded AND NOT p.lost_bottom AND NOT p.awaiting_tide
 ),
 flags AS (
   SELECT point_id, bool_or(flag IN ('reject', 'noisy')) AS rejected,
