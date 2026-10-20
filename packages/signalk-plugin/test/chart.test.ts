@@ -221,7 +221,7 @@ test("a sounding from a clock set in the future can't move the marker past now",
   ).toBeLessThanOrEqual(0);
 });
 
-test("a failed flush ends the writer instead of throwing from its timer", () => {
+test("a flush that keeps failing ends the writer instead of throwing from its timer", () => {
   vi.useFakeTimers();
   try {
     const store = createCellStore(createDB(":memory:"));
@@ -242,7 +242,10 @@ test("a failed flush ends the writer instead of throwing from its timer", () => 
         () => {},
       );
     }
+    // One failure is tried again; three in a row end the writer.
     expect(() => vi.advanceTimersByTime(150)).not.toThrow();
+    expect(writer.destroyed).toBe(false);
+    expect(() => vi.advanceTimersByTime(250)).not.toThrow();
     expect(writer.destroyed).toBe(true);
   } finally {
     vi.useRealTimers();
@@ -417,7 +420,9 @@ test("a failing backfill is retried on later starts, then given up", async () =>
   // fails doesn't cost every start forever.
   const db = createDB(":memory:");
   const { app: server } = serverApp();
+  // A log the plugin writes itself, so the backfill doesn't wait out History's delay.
   const failing = {
+    createWriter: () => undefined as never,
     createReader: () => undefined,
     getAvailableTimeframes: () => Promise.reject(new Error("history down")),
   };

@@ -86,11 +86,17 @@ function createTileWorker(file: string) {
       if (error) w?.reject(new Error(error));
       else w?.resolve(tile ? Buffer.from(tile) : undefined);
     });
-    worker.on("error", (err) => {
-      for (const w of waiting.values()) w.reject(err as Error);
+    const fail = (err: Error) => {
+      for (const w of waiting.values()) w.reject(err);
       waiting.clear();
       worker = undefined;
-    });
+    };
+    worker.on("error", (err) => fail(err as Error));
+    // An exit with tiles still asked for answers them, rather than leaving them hanging;
+    // the next request starts a new thread.
+    worker.on("exit", (code) =>
+      fail(new Error(`tile worker exited (${code})`)),
+    );
   };
   return {
     build(z: number, x: number, y: number): Promise<Buffer | undefined> {

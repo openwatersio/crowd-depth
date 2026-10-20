@@ -192,3 +192,24 @@ test("held passes wait for the backfill, then go in after it", async () => {
   expect(store.cells(-76.3, 36, -76.1, 37.1).length).toBeGreaterThan(0);
   writer.destroy();
 });
+
+test("a flush that fails once is written whole on the next", async () => {
+  const store = createCellStore(createDB(":memory:"));
+  const real = store.addPasses;
+  let fail = true;
+  store.addPasses = (passes, overviews) => {
+    if (fail) {
+      fail = false;
+      throw new Error("database is locked");
+    }
+    return real(passes, overviews);
+  };
+  vi.useFakeTimers();
+  const writer = createCellWriter(store, { flushIntervalMs: 100 });
+  for (const d of track(40)) writer.write(d, () => {});
+  vi.advanceTimersByTime(250);
+  vi.useRealTimers();
+  expect(writer.destroyed).toBe(false);
+  await end(writer);
+  expect(store.cells(-76.3, 36, -76.1, 37.1)).toHaveLength(40);
+});

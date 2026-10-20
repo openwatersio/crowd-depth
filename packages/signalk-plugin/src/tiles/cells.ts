@@ -234,7 +234,9 @@ export function createCellStore(db: DatabaseSync) {
   };
 
   const transaction = <T>(fn: () => T): T => {
-    db.exec("BEGIN");
+    // IMMEDIATE takes the write lock up front, so a second connection writing at the
+    // same time, the backfill's, waits for it rather than failing midway.
+    db.exec("BEGIN IMMEDIATE");
     try {
       const result = fn();
       db.exec("COMMIT");
@@ -320,42 +322,52 @@ export function createCellStore(db: DatabaseSync) {
       db.exec("DELETE FROM cells; DELETE FROM overviews; DELETE FROM shoals;");
     },
 
-    /** Find every overview block's shoalest cell again, in one pass over the cells in
-     * key order: each level holds only the blocks of its current row of blocks. */
+    /** Find every overview block's shoalest cell again, a stretch of rows at a time,
+     * each in a short transaction of its own so the plugin's other writes never wait
+     * long. Stretches are 64 rows of a 1° band, the tallest block, so no block spans
+     * two of them. */
     rebuildOverviews() {
-      const rows = db
-        .prepare(
-          `SELECT py, px, m, d, passes, first, last FROM cells ORDER BY py, px`,
-        )
-        .iterate() as Iterable<Cell>;
-      const levels = OVERVIEW_LEVELS.map((level) => ({
-        level,
-        oy: NaN,
-        best: new Map<number, { cell: Cell; depth: number }>(),
-      }));
-      const writeRow = (l: (typeof levels)[number]) => {
-        for (const [ox, { cell }] of l.best) {
-          write(writeBlock, [l.level, l.oy, ox], cell);
-        }
-        l.best.clear();
-      };
-      transaction(() => {
-        db.exec("DELETE FROM overviews");
-        for (const row of rows) {
-          const cell = fromRow(row);
-          const depth = cellDepth(cell);
-          for (const l of levels) {
-            const { oy, ox } = block(cell.py, cell.px, l.level);
-            if (oy !== l.oy) {
-              writeRow(l);
-              l.oy = oy;
+      const tallest = 2 ** Math.max(...OVERVIEW_LEVELS);
+      const range = db
+        .prepare("SELECT min(py) AS lo, max(py) AS hi FROM cells")
+        .get() as { lo: number | null; hi: number | null };
+      transaction(() => db.exec("DELETE FROM overviews"));
+      if (range.lo === null || range.hi === null) return;
+      const stretch = db.prepare(
+        `SELECT py, px, m, d, passes, first, last FROM cells WHERE py BETWEEN ? AND ?`,
+      );
+      for (
+        let band = Math.floor(range.lo / ROWS_PER_BAND);
+        band <= Math.floor(range.hi / ROWS_PER_BAND);
+        band++
+      ) {
+        for (let r = 0; r < ROWS_PER_BAND; r += tallest) {
+          const py0 = band * ROWS_PER_BAND + r;
+          if (py0 + tallest <= range.lo || py0 > range.hi) continue;
+          const py1 = Math.min(py0 + tallest, (band + 1) * ROWS_PER_BAND) - 1;
+          const best = new Map<
+            string,
+            { cell: Cell; depth: number; at: number[] }
+          >();
+          for (const row of stretch.all(py0, py1) as unknown as Cell[]) {
+            const cell = fromRow(row);
+            const depth = cellDepth(cell);
+            for (const level of OVERVIEW_LEVELS) {
+              const { oy, ox } = block(cell.py, cell.px, level);
+              const k = `${level},${oy},${ox}`;
+              const was = best.get(k);
+              if (!was || depth < was.depth) {
+                best.set(k, { cell, depth, at: [level, oy, ox] });
+              }
             }
-            const was = l.best.get(ox);
-            if (!was || depth < was.depth) l.best.set(ox, { cell, depth });
           }
+          if (best.size === 0) continue;
+          transaction(() => {
+            for (const { cell, at } of best.values())
+              write(writeBlock, at, cell);
+          });
         }
-        for (const l of levels) writeRow(l);
-      });
+      }
     },
   };
 }

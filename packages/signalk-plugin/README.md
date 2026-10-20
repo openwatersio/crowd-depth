@@ -109,7 +109,7 @@ On a chartplotter that supports Signal K plotter extensions, Crowd Depth draws t
 
 ### Using it
 
-The layer appears in the chartplotter's chart list as **My soundings**, with its own show and hide and opacity controls. Depths are labelled in the depth unit you've chosen in the chartplotter. Soundings the boat has just recorded show as orange dots, before the quality checks have judged them, until they're folded into the layer: usually within a minute of leaving a spot. The layer redraws at most every 30 seconds, so it doesn't flicker as it fills in. At a mooring, where the depth holds steady, they can stay orange for up to an hour, until the checks can tell a steady depth from a stuck sounder. A sounder reading one depth for a long way is held until it has covered a kilometre, as the checks need to judge it.
+The layer appears in the chartplotter's chart list as **My soundings**, with its own show and hide and opacity controls. Depths are labelled in the depth unit you've chosen in the chartplotter. Soundings the boat has just recorded show as orange dots, labelled with the depth the sounder read, before the quality checks have judged them and before the safety margin the layer's areas and soundings carry, until they're folded into the layer: usually within a minute of leaving a spot. The layer redraws at most every 30 seconds, so it doesn't flicker as it fills in. At a mooring, where the depth holds steady, they can stay orange for up to an hour, until the checks can tell a steady depth from a stuck sounder. A sounder reading one depth for a long way is held until it has covered a kilometre, as the checks need to judge it.
 
 ### What it shows
 

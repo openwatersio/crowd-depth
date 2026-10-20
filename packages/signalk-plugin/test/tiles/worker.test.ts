@@ -78,7 +78,8 @@ test.skipIf(!existsSync(dist))(
         signal: new AbortController().signal,
         file,
       });
-      expect(store.cells(-76.3, 36.9, -76.1, 38).length).toBeGreaterThan(2000);
+      // A sounding every 33 m in 20.5 m rows: one cell each, none dropped.
+      expect(store.cells(-76.3, 36.9, -76.1, 38)).toHaveLength(3000);
       expect(store.cells(-76.3, 36.9, -76.1, 38, 6).length).toBeGreaterThan(0);
     } finally {
       db.close();

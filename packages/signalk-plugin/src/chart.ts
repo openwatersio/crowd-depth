@@ -1,4 +1,6 @@
 import { pipeline } from "stream/promises";
+import { setTimeout } from "node:timers/promises";
+import { BATHY_REPORT_DELAY } from "./constants.js";
 import { DatabaseSync } from "node:sqlite";
 import { Temporal } from "@js-temporal/polyfill";
 import { transform } from "stream-transform";
@@ -125,7 +127,17 @@ export function startChart({
   });
 
   return {
-    backfill: (source: BathymetrySource) => {
+    backfill: async (source: BathymetrySource) => {
+      // A History provider such as signalk-to-influxdb2 writes a minute or more late,
+      // so the soundings just before this start aren't there to read yet. Wait as the
+      // reporter does; the plugin's own log is written as soundings arrive.
+      if (!source.createWriter) {
+        const wait =
+          startedAt.add(BATHY_REPORT_DELAY).epochMilliseconds - Date.now();
+        if (wait > 0)
+          await setTimeout(wait, undefined, { signal }).catch(() => {});
+        if (signal.aborted) return;
+      }
       return backfillCells({
         app,
         config,

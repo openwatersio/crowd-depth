@@ -11,6 +11,7 @@ import { contours } from "d3-contour";
 import { Cell, Shoal, cellDepth, cellSigma } from "./cells.js";
 import {
   DEFINITIONS,
+  M_PER_DEG_LAT,
   cellCenter,
   tileBounds,
   tileFraction,
@@ -27,7 +28,7 @@ const { k: K, sigma_per_m: SIGMA_PER_M } = DEFINITIONS.statistic;
 const P = DEFINITIONS.portrayal;
 
 /** A cell's height, 2/3″ of latitude. */
-export const CELL_M = 20.5;
+export const CELL_M = (2 * M_PER_DEG_LAT) / DEFINITIONS.cells.rows_per_degree;
 /** The grid's blur, a gaussian of 2 of its pixels. */
 const BLUR_M = blur_px * CELL_M;
 const MAX_POINTS = 12;
@@ -598,7 +599,8 @@ export function buildTile(
     POSACC: POSACC_M,
     SOUACC: Math.ceil(tvu * 10) / 10,
     TECSOU,
-    soundings: passes,
+    // Passes, not soundings: the plugin keeps a cell's passes, not its soundings.
+    passes,
     INFORM,
     ...(Number.isFinite(first)
       ? { SURSTA: date(first), SUREND: date(last) }

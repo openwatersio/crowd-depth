@@ -9,10 +9,14 @@ import { createCellStore } from "./cells.js";
 import { createCellWriter } from "./writer.js";
 
 const db = new DatabaseSync(workerData.file);
-// The plugin's own connection still writes its sounding log meanwhile.
+// As the plugin's own connection: no sync on every commit, which wears an SD card, and
+// a wait rather than a failure when that connection is writing its sounding log.
+db.exec("PRAGMA synchronous = NORMAL");
 db.exec("PRAGMA busy_timeout = 10000");
 const store = createCellStore(db);
 const writer = createCellWriter(store, { bulk: true, overviews: false });
+// A write that fails surfaces here, not from `write`, which only queues.
+writer.on("error", (err) => parentPort!.postMessage({ error: String(err) }));
 
 type Sent = {
   longitude: number;
@@ -36,7 +40,8 @@ parentPort!.on("message", (msg: { batch?: Sent[]; end?: true }) => {
       }
       parentPort!.postMessage({ ack: true });
     } else if (msg.end) {
-      writer.end(() => {
+      writer.end((err?: Error | null) => {
+        if (err) return parentPort!.postMessage({ error: String(err) });
         store.rebuildOverviews();
         db.close();
         parentPort!.postMessage({ done: true });

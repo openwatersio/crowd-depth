@@ -34,6 +34,9 @@ const LIVE_BATCH = 10;
 const BULK_BATCH = 200;
 const BATCH_PER_BUFFER = 0.01;
 
+/** Flushes in a row that may fail before the writer gives up. */
+const MAX_FLUSH_FAILURES = 3;
+
 /** How long a written sounding is listed as stored, which covers the chart's slowest
  * tile refresh, every 30 s. */
 const STORED_MS = 90_000;
@@ -165,6 +168,7 @@ export function createCellWriter(
   let shoals: Shoal[] = [];
   let latest = 0;
   let held = false;
+  let failures = 0;
   let holdTimer: ReturnType<typeof setTimeout> | undefined;
 
   const closePass = (k: string, pass: OpenPass) => {
@@ -285,12 +289,17 @@ export function createCellWriter(
     if (passes.length || shoals.length) {
       const batch = passes;
       const found = shoals;
-      passes = [];
-      shoals = [];
+      // Taken only once written, so a write that fails is tried again whole.
       const cells = store.addPasses(batch, overviews);
       if (found.length) store.addShoals(found);
-      const at = Date.now();
-      for (const s of [...unwritten, ...found]) stored.push({ id: s.time, at });
+      passes = passes.slice(batch.length);
+      shoals = shoals.slice(found.length);
+      if (!bulk) {
+        const at = Date.now();
+        stored = stored.filter((s) => s.at >= at - STORED_MS);
+        for (const s of [...unwritten, ...found])
+          stored.push({ id: s.time, at });
+      }
       unwritten = [];
       onChange([...cells.map((c) => cellCenter(c.py, c.px)), ...found]);
     }
@@ -363,8 +372,11 @@ export function createCellWriter(
         if (now - pass.last > MAX_PASS_US) closePass(k, pass);
       }
       flush();
+      failures = 0;
     } catch (err) {
-      writer.destroy(err as Error);
+      // A busy or briefly failing database is tried again next time; one that keeps
+      // failing ends the writer.
+      if (++failures >= MAX_FLUSH_FAILURES) writer.destroy(err as Error);
     }
   }, flushIntervalMs);
   timer.unref?.();

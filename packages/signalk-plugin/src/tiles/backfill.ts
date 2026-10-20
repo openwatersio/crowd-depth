@@ -183,17 +183,27 @@ export function createWorkerSink(file: string): Writable {
   });
   let batch: object[] = [];
   let waiting: ((err?: Error | null) => void) | undefined;
+  // The worker's first failure, kept: it may arrive between batches, with nothing
+  // waiting, and every later send must fail with it rather than wait for an answer
+  // that won't come.
+  let failed: Error | undefined;
+  let finished = false;
   const settle = (err?: Error | null) => {
+    if (err) failed ??= err;
     const w = waiting;
     waiting = undefined;
-    w?.(err);
+    w?.(err ?? undefined);
   };
   worker.on("message", (msg: { ack?: true; done?: true; error?: string }) => {
-    if (msg.error) settle(new Error(msg.error));
-    else settle();
+    if (msg.done) finished = true;
+    settle(msg.error ? new Error(msg.error) : undefined);
   });
   worker.on("error", (err) => settle(err as Error));
+  worker.on("exit", (code) => {
+    if (!finished) settle(new Error(`backfill worker exited (${code})`));
+  });
   const send = (msg: object, done: (err?: Error | null) => void) => {
+    if (failed) return done(failed);
     waiting = done;
     worker.postMessage(msg);
   };
