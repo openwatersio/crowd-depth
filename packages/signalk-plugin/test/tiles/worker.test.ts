@@ -147,3 +147,29 @@ test.skipIf(!existsSync(dist))(
   },
   30_000,
 );
+
+test.skipIf(!existsSync(dist))(
+  "track QC on its thread finds what it finds here",
+  async () => {
+    const { createQCThread } = await import("../../dist/tiles/qc-thread.js");
+    const { trackQC } = await import("../../dist/qc.js");
+    const { DEFINITIONS } = await import("../../dist/tiles/geometry.js");
+    const soundings = Array.from({ length: 2000 }, (_, i) => ({
+      time: 1_790_000_000_000_000 + i * 1_000_000,
+      lon: -76.2,
+      lat: 36.98 + (i * 3) / 110540,
+      depth: i % 97 === 0 ? 1 : i >= 800 && i < 900 ? 70 : 6 + (i % 5) * 0.1,
+    }));
+    const arrival = Date.now() * 1000;
+    const thread = createQCThread();
+    try {
+      const here = trackQC(soundings, arrival, DEFINITIONS.qc).map(
+        ([i, flag]) => [i, flag],
+      );
+      expect(here.length).toBeGreaterThan(0);
+      expect(await thread.run(soundings, arrival)).toEqual(here);
+    } finally {
+      thread.close();
+    }
+  },
+);

@@ -181,9 +181,10 @@ export async function backfillCells({
   // that fails isn't the backfill's failure: the span below is still read, and the
   // mark stays for the next try.
   if (store.getMeta(OVERVIEWS_STALE_KEY)) {
-    await rebuild().catch((err: unknown) =>
-      app.error(`Chart overview rebuild failed: ${err}`),
-    );
+    await rebuild().catch((err: unknown) => {
+      if (!signal.aborted) app.error(`Chart overview rebuild failed: ${err}`);
+    });
+    if (signal.aborted) return;
   }
 
   let pending = getPendingBackfill(store);
@@ -343,8 +344,8 @@ function rebuildOverviewsOnWorker(
     abort = () => reject(new Error("aborted"));
     signal.addEventListener("abort", abort);
     worker.postMessage({ rebuild: true });
-  }).finally(() => {
+  }).finally(async () => {
     signal.removeEventListener("abort", abort);
-    void worker.terminate();
+    await worker.terminate();
   });
 }

@@ -141,3 +141,61 @@ test("a rebuild replaces a shoaler pick whose cell has since deepened", () => {
     expect([pick.py, pick.px]).toEqual([b.py, b.px]);
   }
 });
+
+/** A store whose overview rebuild runs `live` just after it reads its first stretch of
+ * cells, as the live writer can on another connection. */
+function racing(live: (store: ReturnType<typeof createCellStore>) => void) {
+  const db = createDB(":memory:");
+  const store = createCellStore(db);
+  let hook: (() => void) | undefined = () => live(store);
+  const wrapped = new Proxy(db, {
+    get(target, p) {
+      if (p === "prepare") {
+        return (sql: string) => {
+          const stmt = target.prepare(sql);
+          if (!sql.includes("FROM cells WHERE py BETWEEN")) return stmt;
+          return {
+            all: (...args: number[]) => {
+              const rows = stmt.all(...args);
+              hook?.();
+              hook = undefined;
+              return rows;
+            },
+          };
+        };
+      }
+      const v = Reflect.get(target, p);
+      return typeof v === "function" ? v.bind(target) : v;
+    },
+  });
+  return { store, rebuilding: createCellStore(wrapped) };
+}
+
+test("a rebuild keeps the overview picks the live writer makes while it runs", () => {
+  const at = cellAt(-76.2, 36.98);
+  // Two cells in one block at every level.
+  const [a, b] = [0, 1].map((i) => ({
+    py: at.py,
+    px: at.px - (at.px & 63) + i,
+  }));
+  const pick = (s: ReturnType<typeof createCellStore>) =>
+    OVERVIEW_LEVELS.map((level) => {
+      const [p] = s.cells(-76.21, 36.97, -76.19, 36.99, level);
+      return p.px;
+    });
+
+  // A shoaler cell arrives after the rebuild read the stretch.
+  const shoaler = racing((s) => s.addPasses([{ ...b, depth: 1, day: 2 }]));
+  shoaler.store.addPasses([{ ...a, depth: 5, day: 1 }]);
+  shoaler.rebuilding.rebuildOverviews();
+  expect(pick(shoaler.store)).toEqual(OVERVIEW_LEVELS.map(() => b.px));
+
+  // The cell the rebuild picked deepens after it read it, and the writer re-picks.
+  // A deep pass widens a cell's spread, so a little deeper is what deepens it: a goes
+  // from about 6 cm shoaler than b to 5 cm deeper.
+  const deeper = racing((s) => s.addPasses([{ ...a, depth: 3, day: 2 }]));
+  deeper.store.addPasses([{ ...a, depth: 2, day: 1 }]);
+  deeper.store.addPasses([{ ...b, depth: 2.03, day: 1 }]);
+  deeper.rebuilding.rebuildOverviews();
+  expect(pick(deeper.store)).toEqual(OVERVIEW_LEVELS.map(() => b.px));
+});
