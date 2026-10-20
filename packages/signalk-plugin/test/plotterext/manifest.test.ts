@@ -1,71 +1,39 @@
 import { expect, test } from "vitest";
 import {
   ASSET_BASE,
+  OVERLAY_ID,
   PLUGIN_ID,
   buildManifest,
 } from "../../src/plotterext/manifest.js";
+import { STYLE_PATH } from "../../src/tiles/api.js";
 
-test("declares an image overlay drawn by a declared background runtime", () => {
-  const m = buildManifest("9.9.9");
-  expect(m.apiVersion).toBe("1");
-  expect(m.version).toBe("9.9.9");
-  expect(m.requires).toEqual(
-    expect.arrayContaining([
-      "background.iframe",
-      "overlays.image",
-      "signalk.stream",
-    ]),
-  );
-
-  const background = m.background as { id: string; url: string }[];
-  expect(background).toEqual([
-    { id: "renderer", type: "iframe", url: `${ASSET_BASE}/renderer.html` },
-  ]);
-
-  const overlays = m.overlays as {
-    id: string;
-    type: string;
-    runtime: string;
-    band: string;
-  }[];
-  expect(overlays).toEqual([
+test("declares a data overlay drawn from the plugin's style", () => {
+  const m = buildManifest("1.2.3");
+  expect(m.version).toBe("1.2.3");
+  expect(m.requires).toEqual(["overlays.data"]);
+  expect(m.overlays).toEqual([
     expect.objectContaining({
-      id: "depth",
-      type: "image",
-      runtime: "renderer",
+      id: OVERLAY_ID,
+      type: "data",
       band: "aboveCharts",
+      style: STYLE_PATH,
     }),
   ]);
-  // The overlay's runtime must name a runtime in this manifest, or the host
-  // omits the overlay.
-  expect(background.some((b) => b.id === overlays[0].runtime)).toBe(true);
 });
 
-test("the toolbar button opens a panel declared here", () => {
-  const m = buildManifest();
-  const buttons = m.buttons as {
-    action: { type: string; panel: string };
-  }[];
-  expect(buttons[0].action.type).toBe("togglePanel");
-  const panels = m.panels as { id: string; url: string }[];
-  expect(panels.some((p) => p.id === buttons[0].action.panel)).toBe(true);
-  expect(panels[0].url.startsWith(ASSET_BASE)).toBe(true);
-});
-
-test("the overlay points at a declared settings panel and a pixel density", () => {
-  const m = buildManifest();
-  const overlays = m.overlays as {
-    configPanel?: string;
-    preferredPixelRatio?: number;
-  }[];
-  const panels = m.panels as { id: string }[];
-  // A configPanel naming a panel here gives the layer a "Layer settings"
-  // button on its Chart-list row; one the host can't resolve is ignored.
-  expect(overlays[0].configPanel).toBe("my-soundings-settings");
-  expect(panels.some((p) => p.id === overlays[0].configPanel)).toBe(true);
-  expect(overlays[0].preferredPixelRatio).toBeGreaterThan(0);
+test("a background runtime keeps it current where the host has one", () => {
+  const m = buildManifest("1.2.3");
+  // Optional: without it the layer still draws, as of when it was shown.
+  expect(m.optional).toContain("background.iframe");
+  expect(m.background).toEqual([
+    expect.objectContaining({
+      type: "iframe",
+      url: `${ASSET_BASE}/runtime.html`,
+    }),
+  ]);
 });
 
 test("PLUGIN_ID names the extension resource key", () => {
   expect(PLUGIN_ID).toBe("crowd-depth");
+  expect(ASSET_BASE).toBe("/plotterext/crowd-depth");
 });

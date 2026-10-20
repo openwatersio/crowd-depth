@@ -292,10 +292,12 @@ def test_changing_a_threshold_bumps_the_qc_version():
 
 def test_changing_a_grid_definition_bumps_the_grid_version():
     # Cells and the surface are built from these: a change without a new GRID_VERSION
-    # leaves cells built under the old ones looking current.
+    # leaves cells built under the old ones looking current. `untided_sigma_m` and
+    # `uncalibrated_sigma_m` joined the statistic with catalog.py's values, which version 8
+    # already used.
     grid = {k: DEFINITIONS[k] for k in ("cells", "statistic", "surface")}
     digest = hashlib.sha256(json.dumps(grid, sort_keys=True).encode()).hexdigest()[:16]
-    assert (cells.GRID_VERSION, digest) == (8, "61dc2992d70b2244")
+    assert (cells.GRID_VERSION, digest) == (8, "48459fe943da7f87")
 
 
 def test_spike_chunks_give_the_same_flags(monkeypatch):

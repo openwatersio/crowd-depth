@@ -6,10 +6,10 @@ import { ServerAPI } from "@signalk/server-api";
 import { Config } from "../config.js";
 import { BathymetrySource, Timeframe } from "../types.js";
 import { correctForSensorPosition } from "../streams/index.js";
-import { TileStore } from "./core/index.js";
-import { createTileWriter, getThrough } from "./writer.js";
+import { CellStore } from "./cells.js";
+import { createCellWriter, getThrough, setThrough } from "./writer.js";
 
-/** How far back a store with no tiles yet is filled from the plugin's source. */
+/** How far back a store with no cells yet is filled from the plugin's source. */
 export const BACKFILL_PERIOD = Temporal.Duration.from({ hours: 30 * 24 });
 
 /** Meta key for the span still waiting to be backfilled, as `from/to`. */
@@ -28,7 +28,7 @@ const YIELD_EVERY = 1000;
 /** Size of each read from the source. */
 const WINDOW = Temporal.Duration.from({ hours: 1 });
 
-export function getPendingBackfill(store: TileStore): Timeframe | undefined {
+export function getPendingBackfill(store: CellStore): Timeframe | undefined {
   const value = store.getMeta(PENDING_KEY);
   if (!value) return undefined;
   const [from, to] = value.split("/").map((v) => Temporal.Instant.from(v));
@@ -40,9 +40,9 @@ export function getPendingBackfill(store: TileStore): Timeframe | undefined {
  * it last recorded, or {@link BACKFILL_PERIOD} for a new store, up to `until`,
  * never more than {@link BACKFILL_PERIOD} back. A span left from a backfill
  * that didn't finish is widened, not replaced, so an interrupted backfill is
- * run again in full, ancestors included.
+ * run again in full.
  */
-export function addPendingBackfill(store: TileStore, until: Temporal.Instant) {
+export function addPendingBackfill(store: CellStore, until: Temporal.Instant) {
   // Never more than BACKFILL_PERIOD back, however long the layer was off.
   const earliest = until.subtract(BACKFILL_PERIOD);
   const through = getThrough(store);
@@ -65,8 +65,8 @@ export function addPendingBackfill(store: TileStore, until: Temporal.Instant) {
   store.setMeta(PENDING_KEY, `${from}/${to}`);
 }
 
-/** Give up on the pending span, once it is done or when the tiles are cleared. */
-export function clearPendingBackfill(store: TileStore) {
+/** Give up on the pending span, once it is done or when the cells are cleared. */
+export function clearPendingBackfill(store: CellStore) {
   store.setMeta(PENDING_KEY, "");
   store.setMeta(FAILURES_KEY, "");
 }
@@ -81,9 +81,12 @@ export const MAX_BACKFILL_FAILURES = 3;
 
 /** Record a failed backfill, giving up on the span after
  * {@link MAX_BACKFILL_FAILURES} in a row. Returns whether it will be retried. */
-export function recordBackfillFailure(store: TileStore): boolean {
+export function recordBackfillFailure(store: CellStore): boolean {
   const failures = Number(store.getMeta(FAILURES_KEY) || 0) + 1;
   if (failures >= MAX_BACKFILL_FAILURES) {
+    // Past the span, or the next start would add the same gap again.
+    const pending = getPendingBackfill(store);
+    if (pending) setThrough(store, pending.to.epochMilliseconds * 1000);
     clearPendingBackfill(store);
     return false;
   }
@@ -92,12 +95,13 @@ export function recordBackfillFailure(store: TileStore): boolean {
 }
 
 /**
- * Fill the tiles for the pending span from the plugin's own source (the
+ * Fill the cells for the pending span from the plugin's own source (the
  * History API or its SQLite log). Soundings go through the same position
  * correction as what the plugin submits, so the chart shows what is shared.
- * The span is cleared only once the tiles and their ancestors are written.
+ * The span is cleared, and the marker moved to its end, only once its cells are
+ * written.
  */
-export async function backfillTiles({
+export async function backfillCells({
   app,
   config,
   source,
@@ -107,7 +111,7 @@ export async function backfillTiles({
   app: ServerAPI;
   config: Config;
   source: BathymetrySource;
-  store: TileStore;
+  store: CellStore;
   signal: AbortSignal;
 }): Promise<void> {
   let pending = getPendingBackfill(store);
@@ -132,7 +136,7 @@ export async function backfillTiles({
     (window) => window.clamp(pending),
   );
   if (windows.length > 0) {
-    app.debug(`Backfilling chart tiles from ${windows.length} windows`);
+    app.debug(`Backfilling chart cells from ${windows.length} windows`);
     await pipeline(
       async function* () {
         let read = 0;
@@ -147,9 +151,13 @@ export async function backfillTiles({
         }
       },
       transform(correctForSensorPosition(config)),
-      createTileWriter(store, { bulk: true }),
+      createCellWriter(store, { bulk: true }),
       { signal },
     );
   }
-  if (!signal.aborted) clearPendingBackfill(store);
+  if (signal.aborted) return;
+  // Done through the span's end, where the live writer took over, so a later start
+  // doesn't fold the same passes in again even if the live writer has written nothing.
+  setThrough(store, pending.to.epochMilliseconds * 1000);
+  clearPendingBackfill(store);
 }

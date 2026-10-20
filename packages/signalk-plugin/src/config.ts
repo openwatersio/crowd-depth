@@ -29,6 +29,8 @@ export type Config = {
   chart?: {
     /** Offer the "My soundings" layer to chartplotters; on unless turned off. */
     show?: boolean;
+    /** Depth areas and soundings shoaler than this, in metres, draw as unsafe. */
+    safetyDepth?: number;
   };
 };
 
@@ -287,7 +289,15 @@ export function schema(app: ServerAPI) {
             default: true,
             title: "Show my soundings on the chart",
             description:
-              "Draw the depths this boat records as a layer in chartplotters that support Signal K plotter extensions, such as Freeboard-SK 3.4 or later. The depths are raw and not for navigation.",
+              "Draw the depths this boat records as a layer in chartplotters that support Signal K plotter extensions, such as Freeboard-SK 3.4 or later. The depths aren't reduced for tide and aren't for navigation.",
+          },
+          safetyDepth: {
+            type: "number",
+            default: 3,
+            minimum: 0,
+            title: "Safety depth (m)",
+            description:
+              "Depth areas and soundings shoaler than this draw as unsafe on the layer.",
           },
         },
       },

@@ -11,50 +11,57 @@ import {
   getOffsets,
 } from "./streams/index.js";
 import {
-  TileStore,
+  CellStore,
+  Layer,
   addPendingBackfill,
-  backfillTiles,
-  createTileStore,
-  createTileWriter,
-  registerBathymetryRoutes,
-  BASE_ZOOM,
-  BATHYMETRY_FORMAT,
-  MIN_ZOOM,
+  backfillCells,
+  clearPendingBackfill,
+  createCellStore,
+  createCellWriter,
+  createTileService,
+  recordBackfillFailure,
+  registerLayerRoutes,
   DEPTH_SINCE_KEY,
   THROUGH_KEY,
-  clearPendingBackfill,
-  recordBackfillFailure,
-  type BathymetryMeta,
 } from "./tiles/index.js";
+import { DEFINITIONS } from "./tiles/geometry.js";
 import { registerPlotterExtension } from "./plotterext/provider.js";
 
-/** Meta keys for the configuration the tiles were built with. */
+/** Meta keys for the configuration the cells were built with. */
 const POSITION_CONFIG_KEY = "config_position";
 const DEPTH_CONFIG_KEY = "config_depth";
 
+/** The safety depth the layer draws with until the owner sets one, in metres. */
+export const DEFAULT_SAFETY_DEPTH_M = 3;
+
 /** What the routes and the plotter extension read; replaced on each start. */
-let current: { store: TileStore; meta: BathymetryMeta } | undefined;
+let current: Layer | undefined;
 let routesRegistered = false;
 
-/**
- * The meta a chart client needs to extend the served tiles with its own live
- * soundings exactly as the plugin records them: the depth path, the offset the
- * plugin adds to each depth, and the GNSS antenna to transducer offset.
- */
-export function chartMeta(config: Config): BathymetryMeta {
+/** The settings the cells depend on: the depth path and offset, and the antenna to
+ * transducer offset, QC and the cells' resolution, which place and judge each sounding.
+ * The statistic's k and σs aren't among them: they're applied as tiles are drawn. */
+export function cellConfig(config: Config) {
   const { distance, dx, dy } = getOffsets(config);
   return {
-    depthPath: `environment.depth.${config.path}`,
-    depthOffset: depthReference(config).offset,
-    transducer: distance > 0 ? { forward: dy, starboard: dx } : null,
+    position: JSON.stringify({
+      transducer: distance > 0 ? { forward: dy, starboard: dx } : null,
+      qc: DEFINITIONS.qc,
+      rows: DEFINITIONS.cells.rows_per_degree,
+      columns: DEFINITIONS.cells.column_steps_divide,
+    }),
+    depth: JSON.stringify({
+      depthPath: `environment.depth.${config.path}`,
+      depthOffset: depthReference(config).offset,
+    }),
   };
 }
 
 /**
- * Start the "My soundings" chart layer: fold the boat's live soundings into the
- * tile pyramid in the plugin's database, serve the tiles, and offer the layer
- * to chartplotters that support plotter extensions. Returns a backfill to run
- * once the plugin's source is known.
+ * Start the "My soundings" chart layer: fold the boat's live soundings into cells in the
+ * plugin's database, serve them as vector tiles, and offer the layer to chartplotters
+ * that support plotter extensions. Returns a backfill to run once the plugin's source is
+ * known.
  */
 export function startChart({
   app,
@@ -67,19 +74,27 @@ export function startChart({
   db: DatabaseSync;
   signal: AbortSignal;
 }) {
-  const store = createTileStore(db);
+  const store = createCellStore(db);
   const startedAt = Temporal.Now.instant();
-  const meta = chartMeta(config);
 
-  syncConfig(store, meta, startedAt);
+  syncConfig(store, cellConfig(config), startedAt);
   // Before the live writer starts, so its marker doesn't hide the gap.
   addPendingBackfill(store, startedAt);
 
-  const started = { store, meta };
+  const tiles = createTileService(store, db.location() ?? undefined);
+  const writer = createCellWriter(store, { onChange: tiles.changed });
+  // Until the backfill has run, so its older passes go into the cells first.
+  writer.hold(true);
+  const started: Layer = {
+    tiles,
+    provisional: writer.provisional,
+    safetyDepth: config.chart?.safetyDepth ?? DEFAULT_SAFETY_DEPTH_M,
+  };
   current = started;
   // Only this start's own state: an older start can end after a newer one
   // replaced it.
   const stop = () => {
+    tiles.close();
     if (current === started) current = undefined;
   };
   signal.addEventListener("abort", stop);
@@ -87,66 +102,54 @@ export function startChart({
   pipeline(
     createLiveStream(app, config),
     transform(correctForSensorPosition(config)),
-    createTileWriter(store),
+    writer,
     { signal },
   ).catch((err: unknown) => {
     if (signal.aborted) return;
-    app.error(`Chart tiles stopped: ${err}`);
+    app.error(`Chart layer stopped: ${err}`);
     // Stop offering a layer that no longer updates.
     stop();
   });
 
   registerPlotterExtension(app, () => current !== undefined);
   if (!routesRegistered) {
-    registerBathymetryRoutes(
-      app,
-      () => current?.store,
-      () => current?.meta ?? {},
-    );
+    registerLayerRoutes(app, () => current);
     routesRegistered = true;
   }
 
   return {
-    backfill: (source: BathymetrySource) =>
-      backfillTiles({
-        app,
-        config,
-        source,
-        store,
-        signal,
-      }).catch((err: unknown) => {
-        if (signal.aborted) return;
-        // The span stays for the next start, a few times at most; the live
-        // layer goes on either way.
-        const retry = recordBackfillFailure(store);
-        app.error(
-          `Chart backfill failed${retry ? ", will retry on restart" : ""}: ${err}`,
-        );
-      }),
+    backfill: (source: BathymetrySource) => {
+      return backfillCells({ app, config, source, store, signal })
+        .then(() => {
+          writer.hold(false);
+          tiles.reset();
+        })
+        .catch((err: unknown) => {
+          if (signal.aborted) return;
+          writer.hold(false);
+          tiles.reset();
+          // The span stays for the next start, a few times at most; the live
+          // layer goes on either way.
+          const retry = recordBackfillFailure(store);
+          app.error(
+            `Chart backfill failed${retry ? ", will retry on restart" : ""}: ${err}`,
+          );
+        });
+    },
   };
 }
 
 /**
- * Tiles hold soundings corrected with the offsets of their day, on the grid of
- * their build. When either changes, the old ones would sit beside the new, so
- * the tiles are cleared for a rebuild. Run on every start, including while the
- * layer is off, so a depth reference change is dated when it happens.
+ * Cells hold soundings corrected with the offsets of their day, judged and placed by the
+ * grid's definitions of their build. When any of those change, the old cells would sit
+ * beside the new, so they're cleared for a rebuild. Run on every start, including while
+ * the layer is off, so a depth reference change is dated when it happens.
  */
 function syncConfig(
-  store: TileStore,
-  meta: BathymetryMeta,
+  store: CellStore,
+  { position, depth }: ReturnType<typeof cellConfig>,
   startedAt: Temporal.Instant,
 ) {
-  const position = JSON.stringify({
-    transducer: meta.transducer,
-    baseZoom: BASE_ZOOM,
-    minZoom: MIN_ZOOM,
-    format: BATHYMETRY_FORMAT,
-  });
-  const depth = JSON.stringify({
-    depthPath: meta.depthPath,
-    depthOffset: meta.depthOffset,
-  });
   // A first start has nothing recorded under another depth reference.
   const previousDepth = store.getMeta(DEPTH_CONFIG_KEY);
   const depthChanged = previousDepth !== undefined && previousDepth !== depth;
@@ -156,8 +159,8 @@ function syncConfig(
     clearPendingBackfill(store);
     if (depthChanged) store.setMeta(DEPTH_SINCE_KEY, startedAt.toString());
     store.setMeta(POSITION_CONFIG_KEY, position);
-    store.setMeta(DEPTH_CONFIG_KEY, depth);
   }
+  store.setMeta(DEPTH_CONFIG_KEY, depth);
 }
 
 /**
@@ -169,8 +172,8 @@ export function startChartSafely(options: Parameters<typeof startChart>[0]) {
   try {
     if (options.config.chart?.show === false) {
       syncConfig(
-        createTileStore(options.db),
-        chartMeta(options.config),
+        createCellStore(options.db),
+        cellConfig(options.config),
         Temporal.Now.instant(),
       );
       return undefined;

@@ -2,7 +2,7 @@
 
 ## signalk-livedepth-plugin
 
-The chart layer (`src/tiles/`, `src/plotterext/`, `web/` and `scripts/build-web.mjs`) is adapted from [signalk-livedepth-plugin](https://github.com/night199uk/signalk-livedepth-plugin), used under the MIT License:
+The plotter extension's resource provider and page serving (`src/plotterext/provider.ts`, `scripts/build-web.mjs`) and the layout of the chart layer's routes under `/plotterext/<id>` (`src/tiles/api.ts`) are adapted from [signalk-livedepth-plugin](https://github.com/night199uk/signalk-livedepth-plugin), used under the MIT License:
 
 ```
 MIT License

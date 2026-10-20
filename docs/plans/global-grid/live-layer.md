@@ -12,7 +12,7 @@ The grid is Python and the plugin is TypeScript, so both read one set of definit
 - **Test vectors as JSON:** inputs and expected outputs for QC, the statistic, interpolation and rounding, run by both pytest and vitest. A change on either side fails the other's tests until both agree. QC's are in [qc_vectors.json](../../../packages/grid/tests/qc_vectors.json), with flags from `grid.qc`; pytest checks them against the reference SQL for every check but the steep and noise checks, and against flags worked out by hand for those two.
 - **QC as pure functions:** the grid's track QC as numpy functions ([qc.py](../../../packages/grid/src/grid/qc.py)), ported once to TypeScript as plain loops ([qc.ts](../../../packages/signalk-plugin/src/qc.ts)) and checked against the shared vectors with vitest ([qc-functions.md](qc-functions.md)).
 
-When the grid changes a definition, the plugin picks it up on its next release, and its cells are rebuilt from the plugin's sounding log, as they are for an offset change.
+When the grid changes a definition, the plugin picks it up on its next release, and its cells are rebuilt from the plugin's sounding log, as they are for an offset change. A rebuild reaches back as far as the backfill does, 30 days, so cells from older passes are lost with it.
 
 ## Pipeline
 
@@ -32,7 +32,7 @@ Unconfirmed shoals are handled as in the grid: they publish as soundings with a 
 
 The layer is a chart, so it shows charted depths: depth below the waterline reduced to chart datum, never depth below the keel or transducer. The plugin applies the grid's [corrections](README.md#3-corrections) in the same order:
 
-- **Offsets:** the plugin's depth reference and transducer offsets, which bring every sounding to depth below the waterline, and the GNSS antenna to transducer offset, which moves each sounding to where it was measured. The plugin logs every change of these settings with its time (see [Open questions](#open-questions)).
+- **Offsets:** the plugin's depth reference and transducer offsets, which bring every sounding to depth below the waterline, and the GNSS antenna to transducer offset, which moves each sounding to where it was measured. Each change of these settings is to go into a log with its time (see [Open questions](#open-questions)).
 - **Vessel calibration:** the vessel's own offset, scale and uncertainty, fetched from the grid's calibration ([Vessel calibration](README.md#vessel-calibration)). It needs the plugin's `SIGNALK-<uuid>` to match the vessel's `UNIQUE_ID` in the grid. A vessel without a calibration is marked uncalibrated, as the grid marks it.
 - **Tide:** the water level at each sounding's own time and place, from the same Slackwater engine the grid uses, which the plugin reaches through signalk-tides' Neaps API. The correction is applied as each pass enters its cell. The plugin's upload to the grid carries raw depths, so a better prediction or observed level reaches the grid; the live layer keeps the level it had.
 - **Datum:** the grid's low-water chart datum, from the same separation source.
@@ -46,7 +46,7 @@ Cells are the grid's 2/3″ surface pixels ([resolution](README.md#resolution)),
 - **A pass** is one transit through a cell. The plugin holds only the soundings of the cells under the boat and its neighbours, and when the boat leaves a cell, the median of the pass's soundings within a pixel of it goes into that cell's estimate. That's the grid's per-vessel smoothing along its own coverage, for one vessel.
 - **The estimate** is an exponential moving average of pass medians, m ← m + α(x − m), with an exponential moving average of their absolute deviation, d ← d + α(|x − m| − d), at α = 0.2, with d starting at 0.3 m. σ is √(σ_c² + (1.25d)²), where σ_c is the vessel's correction uncertainty (tide and calibration) and 1.25d estimates the spread of its passes, and depth is m − kσ. As in the grid, the margin never makes wet water drying: depth goes below 0 m only where m does. The two values fit in 4 bytes as centimetres.
 - **Against the grid:** the grid's σ also counts how far other vessels spread around a local plane, which one boat can't measure. Where vessels disagree, the grid draws shoaler than the live layer by k times that spread. Where the overlay covers the water, the plugin can draw the shoaler of the two.
-- **A vessel's offset changing** shifts its cells by the difference, since the average is linear. A new tide level for past passes doesn't reach the live layer; the grid's next build carries it.
+- **A vessel's offset changing** rebuilds its cells from the sounding log. Since the average is linear, a depth offset change could instead shift them by the difference and keep passes older than the log's reach. A new tide level for past passes doesn't reach the live layer; the grid's next build carries it.
 
 Replayed per vessel in Thimble Shoal Channel (2/3″ cells, per pass), against BlueTopo and on a synthetic 1 m change with 0.3 m noise:
 
@@ -62,14 +62,14 @@ The moving average shows a new shoal within 2 passes and lets go of one in about
 
 ### The grid's rules for one vessel
 
-Each rule the grid applies across vessels has a one-vessel form, with the overlay standing in for the other vessels where it covers the water:
+Each rule the grid applies across vessels has a one-vessel form, with the overlay standing in for the other vessels where it covers the water. The table is the design; [Phases](#phases) says which parts run today. Confirmed shoals, the checks against the overlay, GNSS quality and the offset log wait on theirs.
 
 | Grid rule                                                                                                                 | One vessel                                                                                                                                                  |
 | ------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Each vessel votes once per pixel with its median, smoothed along its own coverage                                         | The cell's estimate is the boat's one vote, built from pass medians over a pixel each way                                                                   |
 | Depth is the median of the votes less 1.75σ                                                                               | Depth is the estimate less 1.75σ                                                                                                                            |
 | σ is the vessels' spread around a local plane, with the corrections' σ                                                    | σ is the spread of the boat's passes, with its corrections' σ                                                                                               |
-| Track QC: spikes, stuck runs, noisy tracks, position jumps, GNSS quality                                                  | The same checks, from the same port, on the live stream                                                                                                     |
+| Track QC: spikes, stuck runs, noisy tracks, position jumps, GNSS quality                                                  | The same checks, from the same port, on the live stream; GNSS quality once the plugin records it                                                            |
 | Consensus QC against the other vessels within about 270 m                                                                 | Against the overlay's depth and σ where it covers the water; otherwise not run                                                                              |
 | A shoal is confirmed by another reading of the same depth in its block                                                    | Confirmed by another of the boat's transits reading the same depth, within 2 m + 5%                                                                         |
 | A confirmed shoal stands only within 2 m + 5% of the other vessels' median in its pixel                                   | Within 2 m + 5% of the overlay's depth where the overlay covers the water; otherwise it stands, as the grid's does where fewer than 2 other vessels sounded |
@@ -84,7 +84,7 @@ Each rule the grid applies across vessels has a one-vessel form, with the overla
 
 The surface follows the grid's [interpolation](README.md#interpolation) and [depth surface](surface.md), with the same definitions: from each cell's estimate at its centre, inverse distance to the 12 nearest cells within 200 m, with at least one in each quadrant and 40 m added to every distance, so it fills between tracks but never past their ends and a sounded pixel takes its neighbours' depths too. Then a gaussian blur over 2 pixels, clamped so no pixel reads deeper than it was interpolated; then k × σ off, with σ from the nearest sounded cell widened by its distance d, √(σ² + (r·d)²) with r = 0.005; then no pixel deeper than a confirmed shoal in it or next to it. A pixel more than a pixel from any sounded cell is interpolated, and coverage is split into measured and interpolated `M_QUAL`.
 
-The plugin builds the surface per vector tile as the tile is asked for, from the stored cells under it and a margin of 200 m plus the blur, and caches the encoded tile. A pass that changes a cell drops the cached tiles within that margin of it, and those are the tiles the layer refreshes. Areas and contours stop at 200 m, as the grid's do.
+The plugin builds the surface per vector tile as the tile is asked for, from the stored cells under it and a margin of 200 m plus the blur, and caches the encoded tile. A tile is a raster in Web Mercator of at most 256 pixels a side and none finer than a cell, to zoom 15 as the overlay's, so at the cells' zoom a pixel is about a cell, and zoomed out a pixel takes the shoalest of its cells, as the grid aggregates. A pass that changes a cell drops the cached tiles within that margin of it, and those are the tiles the layer refreshes. Below zoom 10 a tile spans a bay or more and a pass hardly shows, so those tiles refresh every 5 minutes instead. Areas and contours stop at 200 m, as the grid's do.
 
 ### Portrayal
 
@@ -95,29 +95,32 @@ The live layer has the overlay's schema: S-57 `DEPARE`, `DEPCNT`, `SOUNDG` and `
 Freeboard can't keep an S-57 chart resource current (see [Freeboard refresh](#freeboard-refresh)), so the plugin draws the layer as a plotter extension data overlay (`overlays.data`):
 
 - **Stored cells:** the MVT tiles, as a `vector` source in a MapLibre style. When a cell changes, the plugin's background runtime calls `overlay.refresh` with just the tiles it touches, and Freeboard refetches those within a second.
-- **Provisional soundings:** a `geojson` source, updated with `overlay.setData` upserts as soundings arrive and removed once their cell is stored.
+- **Provisional soundings:** a `geojson` source, replaced with `overlay.setData` on each poll, so a sounding leaves it once its cell is stored.
 - **Styling:** a MapLibre style with the overlay's Seascape palette for depth areas, contours and soundings. Depth units come from `units.get`, set as a `global-state` variable that picks the sounding label, and the safety contour from the plugin's settings, since Freeboard doesn't pass its S-52 settings to extensions.
 
-The plugin also lists the tiles as a `type=S-57` chart resource, for plotters without `overlays.data`. There they're current as of when the chart was last shown.
+The plugin is to list the same tiles as a `type=S-57` chart resource too, for plotters without `overlays.data`, where they'd be current as of when the chart was last shown.
 
 ## Phases
 
 - [x] Shared constants and test vectors, read by both the grid and the plugin.
 - [x] Track QC ported from the plain-loop functions and checked against the shared vectors.
-- [ ] Track QC on the live stream, with provisional soundings.
-- [ ] Cells as running estimates per pass, with the grid's resolution, statistic and interpolation.
-- [ ] S-57 vector tiles drawn as a data overlay with per-tile refresh, provisional soundings as GeoJSON, and the same tiles listed as a chart resource.
+- [x] Track QC on the live stream, with provisional soundings.
+- [x] Cells as running estimates per pass, with the grid's resolution, statistic and interpolation.
+- [x] S-57 vector tiles drawn as a data overlay with per-tile refresh, and provisional soundings as GeoJSON.
+- [ ] The same tiles listed as a chart resource, for plotters without `overlays.data`.
 - [ ] Tide and datum through signalk-tides, applied per sounding time.
 - [ ] The global overlay as a second data overlay, served from the PMTiles archive.
 - [ ] Cell QC, confirmed shoals and lost-bottom stretches against the overlay's depth and σ where the overlay covers the water.
 - [ ] A log of offset changes, sent with the plugin's submissions.
+- [ ] GNSS quality in the live QC, with the backlog's [Record GNSS quality](backlog.md) item.
+- [ ] A depth offset change shifting the cells by the difference instead of rebuilding them, so passes older than the backfill's 30 days survive it.
 - [ ] Vessel calibration fetched from the grid, once the grid publishes it per vessel.
 
 ## Open questions
 
 - What the layer shows where there's no tide station or datum separation: raw depths, flagged, or nothing on top of the overlay.
 - **Seabed change.** A seabed that moves, such as a shoaling channel or a dredged one, and a source that's wrong both make the boat disagree with the overlay or the survey. Time tells them apart: sources that disagree at the same time point to a bad source, and sources that agree at each time but drift across time point to a moving seabed. The moving average lets go of an old depth in about 12 passes, but the grid and the overlay need the comparison by time to keep a real change rather than reject it as a bad vessel.
-- **A log of offset changes.** Each time the owner changes the draft, the depth reference or the transducer or antenna position, the plugin records the time and the old and new values, and sends them with its submissions. For the grid's calibration, each change is a hint for step detection, not a fixed boundary: an owner may correct a setting long after the sounder moved, or change one without the soundings changing at all. In the live layer, a depth offset change shifts the cells by the difference at once, since the estimate is linear, and a position change rebuilds them from the sounding log.
+- **A log of offset changes.** Each time the owner changes the draft, the depth reference or the transducer or antenna position, the plugin records the time and the old and new values, and sends them with its submissions. For the grid's calibration, each change is a hint for step detection, not a fixed boundary: an owner may correct a setting long after the sounder moved, or change one without the soundings changing at all. In the live layer, a change rebuilds the cells from the sounding log.
 
 ## Freeboard refresh
 
@@ -130,7 +133,7 @@ Read from Freeboard-SK v3.4.0-beta.1, the latest release ([`afe3b1c`](https://gi
 **The Plotter Extensions API draws vector features.** It has two kinds of overlay:
 
 - `overlays.image`: the extension's background runtime renders the whole view, padded 10% per side, to an `ImageBitmap` and transfers it to Freeboard. It renders a new frame on every zoom or resize and whenever the view leaves the padded box. Live frames are limited to one per 200 ms, and a frame can be up to 8 M pixels, about 32 MB ([overlay-registry.ts:28-32](https://github.com/SignalK/freeboard-sk/blob/afe3b1ca419e26ed5a1f309d065552ecafdbefdf/src/app/modules/plotterext/overlay-registry.ts#L28-L32), [freeboard-plotter-ext-support.md "Budget" and "The frame cycle"](https://github.com/SignalK/freeboard-sk/blob/afe3b1ca419e26ed5a1f309d065552ecafdbefdf/docs/freeboard/freeboard-plotter-ext-support.md)). Each change to one cell means re-rendering the whole view on the client.
-- `overlays.data`, new in 3.4.0-beta.0 (freeboard-sk#1022): Freeboard draws `vector` (MVT), `geojson`, `raster` and `raster-dem` sources with `fill`, `line`, `circle` and `symbol` layers from a MapLibre style the extension supplies ([plotter-extensions-api.md "Data overlays"](https://github.com/SignalK/freeboard-sk/blob/afe3b1ca419e26ed5a1f309d065552ecafdbefdf/docs/api/plotter-extensions-api.md)). The extension renders nothing per frame. `overlay.refresh` with a list of `[z, x, y]` bumps those tiles' cache keys, so only they are fetched again, with `cache: 'reload'`. Old tiles stay drawn until the new ones load, and a burst of refreshes redraws once on the next animation frame ([layer-data-overlay.component.ts:446-475, 625-662](https://github.com/SignalK/freeboard-sk/blob/afe3b1ca419e26ed5a1f309d065552ecafdbefdf/src/app/modules/map/ol/lib/data-overlay/layer-data-overlay.component.ts#L446-L475), [tile-fetcher.ts:131](https://github.com/SignalK/freeboard-sk/blob/afe3b1ca419e26ed5a1f309d065552ecafdbefdf/src/app/modules/map/ol/lib/data-overlay/tile-fetcher.ts#L131)). `overlay.setData` upserts or removes GeoJSON features by id. The style is MapLibre's, not Freeboard's S-52 engine, and the host passes no S-52 settings to it.
+- `overlays.data`, new in 3.4.0-beta.0 (freeboard-sk#1022): Freeboard draws `vector` (MVT), `geojson`, `raster` and `raster-dem` sources with `fill`, `line`, `circle` and `symbol` layers from a MapLibre style the extension supplies ([plotter-extensions-api.md "Data overlays"](https://github.com/SignalK/freeboard-sk/blob/afe3b1ca419e26ed5a1f309d065552ecafdbefdf/docs/api/plotter-extensions-api.md)). The extension renders nothing per frame. `overlay.refresh` with a list of `[z, x, y]` bumps those tiles' cache keys, so only they are fetched again, with `cache: 'reload'`. Old tiles stay drawn until the new ones load, and a burst of refreshes redraws once on the next animation frame ([layer-data-overlay.component.ts:446-475, 625-662](https://github.com/SignalK/freeboard-sk/blob/afe3b1ca419e26ed5a1f309d065552ecafdbefdf/src/app/modules/map/ol/lib/data-overlay/layer-data-overlay.component.ts#L446-L475), [tile-fetcher.ts:131](https://github.com/SignalK/freeboard-sk/blob/afe3b1ca419e26ed5a1f309d065552ecafdbefdf/src/app/modules/map/ol/lib/data-overlay/tile-fetcher.ts#L131)). `overlay.setData` replaces a `geojson` source's features, or upserts or removes them by id. The style is MapLibre's, not Freeboard's S-52 engine, and the host passes no S-52 settings to it.
 
 How long a change takes to show:
 

@@ -33,8 +33,8 @@ export function createDB(filename: string): DatabaseSync {
       `);
     },
     () => {
-      // The chart layer's tile pyramid, derived from the soundings above; see
-      // tiles/store.ts.
+      // A tile pyramid that preview builds of the chart layer kept; the next migration
+      // replaces it.
       db.exec(`
         CREATE TABLE tiles(
           z INTEGER NOT NULL,
@@ -49,6 +49,49 @@ export function createDB(filename: string): DatabaseSync {
           key TEXT PRIMARY KEY,
           value TEXT NOT NULL
         );
+      `);
+    },
+    () => {
+      // The chart layer's cells, their overviews and its unconfirmed shoals, derived
+      // from the soundings above; see tiles/cells.ts. The previews' tiles and markers
+      // go, so the cells are built afresh.
+      db.exec(`
+        DROP TABLE tiles;
+        DELETE FROM tile_meta;
+
+        CREATE TABLE cells(
+          py INTEGER NOT NULL,
+          px INTEGER NOT NULL,
+          m INTEGER NOT NULL,
+          d INTEGER NOT NULL,
+          passes INTEGER NOT NULL,
+          first INTEGER NOT NULL,
+          last INTEGER NOT NULL,
+          PRIMARY KEY(py, px)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE overviews(
+          level INTEGER NOT NULL,
+          oy INTEGER NOT NULL,
+          ox INTEGER NOT NULL,
+          py INTEGER NOT NULL,
+          px INTEGER NOT NULL,
+          m INTEGER NOT NULL,
+          d INTEGER NOT NULL,
+          passes INTEGER NOT NULL,
+          first INTEGER NOT NULL,
+          last INTEGER NOT NULL,
+          PRIMARY KEY(level, oy, ox)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE shoals(
+          lon REAL NOT NULL,
+          lat REAL NOT NULL,
+          depth REAL NOT NULL,
+          time INTEGER NOT NULL,
+          PRIMARY KEY(time, lon, lat)
+        ) WITHOUT ROWID;
+        CREATE INDEX shoals_lat ON shoals(lat);
       `);
     },
   ]);

@@ -1,23 +1,25 @@
 import type { Request, Response } from "express";
 import type { ServerAPI } from "@signalk/server-api";
-import {
-  BASE_ZOOM,
-  MIN_ZOOM,
-  RECORD_BYTES,
-  TILE_SIZE,
-  TileStore,
-  encodeTile,
-} from "./core/index.js";
 import { ASSET_BASE } from "../plotterext/manifest.js";
+import type { Sounding } from "../qc.js";
+import { MAX_ZOOM, MIN_ZOOM, depthLabels } from "./surface.js";
+import type { TileService } from "./service.js";
+import { buildStyle } from "./style.js";
 
-/** Wire format of a `/bathymetry/tiles` response. */
-export const BATHYMETRY_FORMAT = "sparse-v1";
+/** The style, tiles and change feed, under the extension's top-level route. */
+export const STYLE_PATH = `${ASSET_BASE}/style.json`;
+export const TILES_PATH = `${ASSET_BASE}/tiles`;
+export const LIVE_PATH = `${ASSET_BASE}/live`;
 
-/** Top-level, non-admin route the store is served from. */
-export const BATHYMETRY_BASE = `${ASSET_BASE}/bathymetry`;
+/** Provisional soundings sent per poll, the newest: about half an hour at 1 Hz. */
+const MAX_PROVISIONAL = 2000;
 
-/** Extra fields a client needs to mirror the store (depth path, offsets, …). */
-export type BathymetryMeta = Record<string, unknown>;
+/** What the routes read; replaced on each start. */
+export interface Layer {
+  tiles: TileService;
+  provisional: () => Sounding[];
+  safetyDepth: number;
+}
 
 /** The server API also carries Express's route methods, which the typed
  * interface does not declare. */
@@ -41,87 +43,110 @@ function allowed(app: RouteApp, req: Request): boolean {
 }
 
 /**
- * Serve the gridded store to the extension runtime, and any other chart
- * client.
+ * Serve the live layer to the plotter extension and any other chart client, at a
+ * top-level, non-admin path (`/plotterext/<id>/…`) so a read-only user's chart can reach
+ * it: the provider guide warns that `/plugins/*` is admin-gated.
+ *
+ * - `style.json`: the MapLibre style the data overlay draws.
+ * - `tiles/{z}/{x}/{y}.pbf`: S-57 vector tiles of the boat's cells.
+ * - `live?since=<rev>`: the tiles changed since a revision, and the provisional
+ *   soundings as GeoJSON, which the extension's runtime polls.
+ *
+ * `getLayer` is read per request because the routes outlive a plugin restart.
  *
  * Adapted from signalk-livedepth-plugin (MIT); see THIRD_PARTY_NOTICES.md.
- *
- * Mounted at a top-level, non-admin path
- * (`/plotterext/<id>/bathymetry/…`) so an extension iframe loaded for a
- * read-only user can reach it: the provider guide warns that the `/plugins/*`
- * path is admin-gated. A client seeds its view from these tiles, then keeps its
- * own copy current from the live `navigation.position` + `environment.depth.*`
- * stream the plugin consumes.
- *
- * `getStore`/`getMeta` are read per request because the routes are registered
- * before the plugin's `start()` has built the store.
  */
-export function registerBathymetryRoutes(
+export function registerLayerRoutes(
   app: ServerAPI,
-  getStore: () => TileStore | undefined,
-  getMeta: () => BathymetryMeta = () => ({}),
+  getLayer: () => Layer | undefined,
 ): void {
   const a = app as RouteApp;
-  if (typeof a.get !== "function") {
-    return;
-  }
+  if (typeof a.get !== "function") return;
 
-  a.get(`${BATHYMETRY_BASE}/meta`, (req: Request, res: Response) => {
-    if (!allowed(a, req)) {
-      res.status(401).json({ error: "login required" });
-      return;
-    }
-    res.json({
-      format: BATHYMETRY_FORMAT,
-      baseZoom: BASE_ZOOM,
-      minZoom: MIN_ZOOM,
-      tileSize: TILE_SIZE,
-      recordBytes: RECORD_BYTES,
-      ...getMeta(),
-    });
-  });
+  const guard =
+    (handler: (req: Request, res: Response, layer: Layer) => unknown) =>
+    (req: Request, res: Response) => {
+      if (!allowed(a, req)) {
+        res.status(401).json({ error: "login required" });
+        return;
+      }
+      const layer = getLayer();
+      if (!layer) {
+        res.status(503).json({ error: "chart layer not running" });
+        return;
+      }
+      return handler(req, res, layer);
+    };
 
-  a.get(`${BATHYMETRY_BASE}/tiles/:z/:x/:y`, (req: Request, res: Response) => {
-    if (!allowed(a, req)) {
-      res.status(401).json({ error: "login required" });
-      return;
-    }
-    const store = getStore();
-    if (!store) {
-      res.status(503).json({ error: "bathymetry store not ready" });
-      return;
-    }
-    const z = Number(req.params.z);
-    const x = Number(req.params.x);
-    const y = Number(req.params.y);
-    const n = Math.pow(2, z);
-    if (
-      !Number.isInteger(z) ||
-      z < MIN_ZOOM ||
-      z > BASE_ZOOM ||
-      !Number.isInteger(x) ||
-      x < 0 ||
-      x >= n ||
-      !Number.isInteger(y) ||
-      y < 0 ||
-      y >= n
-    ) {
-      res.status(400).json({ error: "invalid tile coordinates" });
-      return;
-    }
-    const cells = store.read(z, x, y);
-    if (!cells || cells.size === 0) {
-      res.status(404).end();
-      return;
-    }
-    // Send a Buffer, not the Uint8Array `encodeTile` returns: express's
-    // `res.send` JSON-encodes anything that isn't a Buffer or string (it
-    // becomes `{"0":…,"1":…}`), so the client would decode the JSON text as
-    // sparse records. `Buffer` is a Uint8Array subclass, so it sends the
-    // bytes verbatim.
-    res
-      .set("Content-Type", "application/octet-stream")
-      .set("Cache-Control", "no-cache")
-      .send(Buffer.from(encodeTile(cells)));
-  });
+  a.get(
+    STYLE_PATH,
+    guard((_req, res, layer) => {
+      res.set("Cache-Control", "no-cache").json(
+        buildStyle({
+          tiles: `${TILES_PATH}/{z}/{x}/{y}.pbf`,
+          safetyDepth: layer.safetyDepth,
+        }),
+      );
+    }),
+  );
+
+  a.get(
+    `${TILES_PATH}/:z/:x/:y.pbf`,
+    guard((req, res, layer) => {
+      const z = Number(req.params.z);
+      const x = Number(req.params.x);
+      const y = Number(req.params.y);
+      const n = 2 ** z;
+      if (
+        ![z, x, y].every(Number.isInteger) ||
+        z < MIN_ZOOM ||
+        z > MAX_ZOOM ||
+        x < 0 ||
+        x >= n ||
+        y < 0 ||
+        y >= n
+      ) {
+        res.status(400).json({ error: "invalid tile coordinates" });
+        return;
+      }
+      return layer.tiles.get(z, x, y).then(
+        (tile) => {
+          if (!tile) {
+            res.status(204).end();
+            return;
+          }
+          res
+            .set("Content-Type", "application/vnd.mapbox-vector-tile")
+            .set("Cache-Control", "no-cache")
+            .send(tile);
+        },
+        () => {
+          res.status(500).json({ error: "tile failed" });
+        },
+      );
+    }),
+  );
+
+  a.get(
+    LIVE_PATH,
+    guard((req, res, layer) => {
+      const since = Number(req.query.since ?? -1);
+      res.set("Cache-Control", "no-store").json({
+        ...layer.tiles.since(Number.isInteger(since) ? since : -1),
+        provisional: {
+          type: "FeatureCollection",
+          features: layer
+            .provisional()
+            .slice(-MAX_PROVISIONAL)
+            // The source is replaced whole each poll, so ids need only be unique.
+            .map((s, i) => ({
+              type: "Feature",
+              id: i,
+              geometry: { type: "Point", coordinates: [s.lon, s.lat] },
+              properties: depthLabels(s.depth),
+            })),
+        },
+      });
+    }),
+  );
 }

@@ -64,8 +64,8 @@ test("serves the built pages without Express and passes other paths on", async (
   const root = mkdtempSync(join(tmpdir(), "crowd-depth-public-"));
   try {
     mkdirSync(join(root, "js"));
-    writeFileSync(join(root, "renderer.html"), "<!doctype html>");
-    writeFileSync(join(root, "js", "render-worker.js"), "");
+    writeFileSync(join(root, "runtime.html"), "<!doctype html>");
+    writeFileSync(join(root, "js", "runtime.js"), "");
     const serve = createAssetHandler(root);
 
     const request = (path: string) => {
@@ -79,11 +79,9 @@ test("serves the built pages without Express and passes other paths on", async (
       return { sent, passed };
     };
 
-    expect(request("/renderer.html").sent).toEqual([
-      join(root, "renderer.html"),
-    ]);
-    expect(request("/js/render-worker.js").sent).toEqual([
-      join(root, "js", "render-worker.js"),
+    expect(request("/runtime.html").sent).toEqual([join(root, "runtime.html")]);
+    expect(request("/js/runtime.js").sent).toEqual([
+      join(root, "js", "runtime.js"),
     ]);
     expect(request("/../package.json").passed).toBe(true);
     expect(request("/bathymetry/meta").passed).toBe(true);

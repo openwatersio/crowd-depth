@@ -1,47 +1,163 @@
 import { expect, test, vi } from "vitest";
-import { createDB } from "../../src/storage.js";
-import { createTileStore } from "../../src/tiles/store.js";
-import { createTileWriter, getThrough } from "../../src/tiles/writer.js";
-import { BASE_ZOOM, lngLatToCell } from "../../src/tiles/core/index.js";
 import { Temporal } from "@js-temporal/polyfill";
+import { createDB } from "../../src/storage.js";
+import {
+  createCellStore,
+  createCellWriter,
+  getThrough,
+  type Changed,
+} from "../../src/tiles/index.js";
+import type { BathymetryData } from "../../src/types.js";
 
-test("destroying the writer stops its flush timer", () => {
-  vi.useFakeTimers();
-  const store = createTileStore(createDB(":memory:"));
-  const writer = createTileWriter(store, { flushIntervalMs: 100 });
-  writer.write({ longitude: 0, latitude: 0, depth: 5 } as never, () => {});
+const start = Temporal.Instant.from("2026-10-16T08:00:00Z");
 
-  writer.destroy();
-  store.close();
+/** A track north along a meridian at about 6 kn, a sounding every 10 s. */
+function track(
+  n: number,
+  {
+    from = 0,
+    lon = -76.2,
+    at = start,
+    depth = (i: number) => 5 + (i % 3) * 0.1,
+  } = {},
+): BathymetryData[] {
+  return Array.from({ length: n }, (_, i) => ({
+    latitude: 36.98 + (from + i) * 0.0003,
+    longitude: lon,
+    depth: depth(i),
+    timestamp: at.add({ seconds: i * 10 }),
+  }));
+}
 
-  // The collector destroys writers on stop without ending them; a surviving
-  // timer would flush into the closed store and throw from an uncaught callback.
-  expect(() => vi.advanceTimersByTime(1000)).not.toThrow();
-  vi.useRealTimers();
-});
+function run(data: BathymetryData[], onChange?: (c: Changed) => void) {
+  const store = createCellStore(createDB(":memory:"));
+  const writer = createCellWriter(store, {
+    flushIntervalMs: 100_000,
+    onChange,
+  });
+  for (const d of data) writer.write(d, () => {});
+  return { store, writer };
+}
 
-test("ending the writer flushes pending soundings", async () => {
-  const store = createTileStore(createDB(":memory:"));
-  const writer = createTileWriter(store, { flushIntervalMs: 100000 });
-  writer.write({ longitude: 0, latitude: 0, depth: 5 } as never, () => {});
-  await new Promise<void>((resolve) => writer.end(() => resolve()));
+const end = (writer: { end: (cb: () => void) => void }) =>
+  new Promise<void>((resolve) => writer.end(() => resolve()));
 
-  const { x, y } = lngLatToCell(0, 0, BASE_ZOOM);
-  expect(store.read(BASE_ZOOM, x, y)?.size).toBe(1);
-});
-
-test("records the time the tiles hold soundings through", async () => {
-  const store = createTileStore(createDB(":memory:"));
-  const writer = createTileWriter(store, { flushIntervalMs: 100000 });
-  const at = (s: string) => Temporal.Instant.from(s);
-  for (const timestamp of [
-    at("2026-10-16T10:00:00Z"),
-    at("2026-10-16T10:00:05Z"),
-    at("2026-10-16T10:00:02Z"),
-  ]) {
-    writer.write({ longitude: 0, latitude: 0, depth: 5, timestamp }, () => {});
+test("each crossing of a cell is one pass, and only sounded cells get one", async () => {
+  const later = start.add({ hours: 5 });
+  const { store, writer } = run([
+    ...track(30),
+    ...track(30, { at: later, depth: (i) => 6 + (i % 3) * 0.1 }),
+  ]);
+  await end(writer);
+  const cells = store.cells(-76.3, 36, -76.1, 37.1);
+  // A sounding every 33 m in 20.5 m rows: one cell each, and none for the rows
+  // between, which only neighbouring soundings reached.
+  expect(cells).toHaveLength(30);
+  for (const c of cells) {
+    expect(c.passes).toBe(2);
+    // Second pass 1 m deeper: m moves a fifth of the way.
+    expect(c.m).toBeGreaterThan(5.1);
+    expect(c.m).toBeLessThan(5.5);
   }
-  await new Promise<void>((resolve) => writer.end(() => resolve()));
+});
 
-  expect(getThrough(store)?.toString()).toBe("2026-10-16T10:00:05Z");
+test("a shoal spike is kept as an unconfirmed shoal, out of the cells", async () => {
+  const { store, writer } = run(
+    track(40, { depth: (i) => (i === 20 ? 1 : 8) }),
+  );
+  await end(writer);
+  const shoals = store.shoals(-76.3, 36, -76.1, 37.1);
+  expect(shoals.map((s) => s.depth)).toEqual([1]);
+  for (const c of store.cells(-76.3, 36, -76.1, 37.1)) expect(c.m).toBe(8);
+});
+
+test("soundings draw as provisional until their cell is written", async () => {
+  const changed: Changed[] = [];
+  const { store, writer } = run(track(40), (c) => changed.push(c));
+  expect(writer.provisional()).toHaveLength(40);
+  expect(store.cells(-76.3, 36, -76.1, 37.1)).toHaveLength(0);
+  await end(writer);
+  expect(writer.provisional()).toHaveLength(0);
+  expect(changed.flat().length).toBe(
+    store.cells(-76.3, 36, -76.1, 37.1).length,
+  );
+});
+
+test("the marker stays before soundings still held, so a restart backfills them", () => {
+  const store = createCellStore(createDB(":memory:"));
+  const writer = createCellWriter(store, { flushIntervalMs: 100_000 });
+  for (const d of track(40)) writer.write(d, () => {});
+  // A plugin stop destroys the writer, which writes only closed passes.
+  writer.destroy();
+  const through = getThrough(store)!;
+  const lastWritten = start.add({ seconds: 39 * 10 });
+  expect(Temporal.Instant.compare(through, start)).toBeGreaterThanOrEqual(0);
+  expect(Temporal.Instant.compare(through, lastWritten)).toBeLessThan(0);
+});
+
+test("a stuck sounder's run isn't judged until it covers a kilometre", () => {
+  // 25 soundings 33 m apart: one depth for 800 m, which may yet be a stuck sounder.
+  const { store, writer } = run(track(25, { depth: () => 2.4 }));
+  expect(writer.provisional()).toHaveLength(25);
+  writer.destroy();
+  expect(store.cells(-76.3, 36, -76.1, 37.1)).toHaveLength(0);
+});
+
+test("a stuck run QC rejects at the end leaves nothing provisional", async () => {
+  const { store, writer } = run(track(40, { depth: () => 2.4 }));
+  await end(writer);
+  expect(writer.provisional()).toHaveLength(0);
+  expect(store.cells(-76.3, 36, -76.1, 37.1)).toHaveLength(0);
+});
+
+test("readings under half a metre stay in the cells, as the grid keeps them", async () => {
+  const { store, writer } = run(
+    track(30, { depth: (i) => 0.3 + (i % 3) * 0.01 }),
+  );
+  await end(writer);
+  expect(store.cells(-76.3, 36, -76.1, 37.1)).toHaveLength(30);
+});
+
+test("a boat at anchor folds its water in every few minutes, holding little", async () => {
+  // Six hours swinging within a few metres, 1 Hz, the sounder steady to the centimetre.
+  vi.useFakeTimers();
+  const store = createCellStore(createDB(":memory:"));
+  const writer = createCellWriter(store);
+  let most = 0;
+  for (let i = 0; i < 6 * 3600; i++) {
+    vi.advanceTimersByTime(1000);
+    writer.write(
+      {
+        latitude: 36.98 + Math.sin(i / 300) * 0.00002,
+        longitude: -76.2 + Math.cos(i / 300) * 0.00002,
+        depth: 4.2,
+        timestamp: start.add({ seconds: i }),
+      },
+      () => {},
+    );
+    most = Math.max(most, writer.provisional().length);
+  }
+  vi.useRealTimers();
+  await end(writer);
+  // A run of one depth is held for an hour at most, and a pass for 10 minutes.
+  expect(most).toBeLessThan(3600 + 700);
+  const cells = store.cells(-76.3, 36, -76.1, 37.1);
+  expect(cells.length).toBeGreaterThan(0);
+  expect(Math.max(...cells.map((c) => c.passes))).toBeGreaterThan(10);
+});
+
+test("a slow stuck sounder is judged whole, as the grid judges it", async () => {
+  // 1.5 kn, 1 Hz: 0.77 m a sounding, stuck at 40 m for 2 km in 5 m of water.
+  const { store, writer } = run(
+    Array.from({ length: 2600 + 100 }, (_, i) => ({
+      latitude: 36.98 + (i * 0.77) / 110540,
+      longitude: -76.2,
+      depth: i >= 100 ? 40 : 5 + (i % 3) * 0.1,
+      timestamp: start.add({ seconds: i }),
+    })),
+  );
+  await end(writer);
+  const cells = store.cells(-76.3, 36, -76.1, 37.1);
+  expect(cells.length).toBeGreaterThan(0);
+  expect(Math.max(...cells.map((c) => c.m))).toBeLessThan(10);
 });

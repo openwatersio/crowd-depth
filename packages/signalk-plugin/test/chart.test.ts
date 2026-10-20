@@ -8,25 +8,24 @@ import { DatabaseSync } from "node:sqlite";
 import { Temporal } from "@js-temporal/polyfill";
 import { app, config } from "./helper.js";
 import { Config } from "../src/config.js";
-import { chartMeta, startChart, startChartSafely } from "../src/chart.js";
+import { startChart, startChartSafely } from "../src/chart.js";
 import { createDB } from "../src/storage.js";
 import { createSqliteSource } from "../src/sources/sqlite.js";
 import { correctForSensorPosition } from "../src/streams/index.js";
 import {
-  BASE_ZOOM,
+  CellStore,
   addPendingBackfill,
-  backfillTiles,
-  createTileWriter,
-  encodeDepth,
+  backfillCells,
+  createCellStore,
+  createCellWriter,
   getPendingBackfill,
-  registerBathymetryRoutes,
-  correctToTransducer,
-  createTileStore,
-  decodeDepth,
   getThrough,
-  lngLatToCell,
+  registerLayerRoutes,
 } from "../src/tiles/index.js";
-import { buildDepthField } from "../web/shared/bathymetry.js";
+
+/** The cell holding a position, if the store has one. */
+const cellAt = (store: CellStore, lon: number, lat: number) =>
+  store.cells(lon - 1e-7, lat - 1e-7, lon + 1e-7, lat + 1e-7)[0];
 
 /** GNSS antenna 4 m aft of the transducer and 1 m to port of it. */
 const offsetConfig: Config = {
@@ -37,41 +36,6 @@ const offsetConfig: Config = {
 };
 
 const at = (s: string) => Temporal.Instant.from(s);
-
-test("serves the depth offset and transducer offset the plugin applies", () => {
-  expect(chartMeta(offsetConfig)).toEqual({
-    depthPath: "environment.depth.belowTransducer",
-    depthOffset: 0.5,
-    transducer: { forward: 4, starboard: 1 },
-  });
-  expect(chartMeta(config).transducer).toBeNull();
-});
-
-test("the client places a live sounding where the plugin records it", () => {
-  // The browser shifts live soundings with the served offset; the plugin uses
-  // geolib. Both must land on the same spot, or live soundings would sit apart
-  // from the tiles they extend.
-  const { transducer } = chartMeta(offsetConfig) as {
-    transducer: { forward: number; starboard: number };
-  };
-  const correct = correctForSensorPosition(offsetConfig);
-  for (const heading of [0, 0.7, Math.PI / 2, 2.5, Math.PI, 4.4, 6]) {
-    const server = correct({
-      latitude: 47.6,
-      longitude: -122.3,
-      depth: 5,
-      timestamp: at("2026-10-16T10:00:00Z"),
-      heading,
-    })!;
-    const client = correctToTransducer(
-      { lon: -122.3, lat: 47.6 },
-      heading,
-      transducer,
-    )!;
-    expect(client.lat).toBeCloseTo(server.latitude, 6);
-    expect(client.lon).toBeCloseTo(server.longitude, 6);
-  }
-});
 
 test("backfills the tiles from the plugin's source with its correction", async () => {
   const db = createDB(":memory:");
@@ -94,9 +58,9 @@ test("backfills the tiles from the plugin's source with its correction", async (
   ];
   await pipeline(Readable.from(soundings), source.createWriter!());
 
-  const store = createTileStore(db);
+  const store = createCellStore(db);
   addPendingBackfill(store, at("2026-10-16T12:00:00Z"));
-  await backfillTiles({
+  await backfillCells({
     app,
     config: offsetConfig,
     source,
@@ -105,23 +69,14 @@ test("backfills the tiles from the plugin's source with its correction", async (
   });
 
   const corrected = correctForSensorPosition(offsetConfig)(soundings[0])!;
-  const { x, y, cx, cy } = lngLatToCell(
-    corrected.longitude,
-    corrected.latitude,
-    BASE_ZOOM,
-  );
-  const cells = store.read(BASE_ZOOM, x, y)!;
-  expect(decodeDepth(cells.get(cy * 256 + cx)!.depth)).toBe(4.2);
+  const cell = cellAt(store, corrected.longitude, corrected.latitude)!;
+  expect(cell.m).toBe(4.2);
+  expect(cell.passes).toBe(1);
 
-  const dropped = lngLatToCell(-122.4, 47.7, BASE_ZOOM);
-  expect(store.read(BASE_ZOOM, dropped.x, dropped.y)).toBeUndefined();
-  // Coarser levels are rebuilt when a bulk backfill ends.
-  const parent = lngLatToCell(corrected.longitude, corrected.latitude, 10);
-  expect(store.read(10, parent.x, parent.y)?.size).toBe(1);
-  // Done: nothing is left to backfill, and the live marker is the live
-  // writer's alone.
+  expect(cellAt(store, -122.4, 47.7)).toBeUndefined();
+  // Done: nothing is left to backfill, and the marker is at the span's end.
   expect(getPendingBackfill(store)).toBeUndefined();
-  expect(getThrough(store)).toBeUndefined();
+  expect(getThrough(store)?.toString()).toBe("2026-10-16T12:00:00Z");
 });
 
 test("backfill starts where the tiles left off", async () => {
@@ -139,11 +94,11 @@ test("backfill starts where the tiles left off", async () => {
     ]),
     source.createWriter!(),
   );
-  const store = createTileStore(db);
+  const store = createCellStore(db);
   store.setMeta("through", "2026-10-16T09:00:00Z");
   addPendingBackfill(store, at("2026-10-16T12:00:00Z"));
 
-  await backfillTiles({
+  await backfillCells({
     app,
     config,
     source,
@@ -151,53 +106,14 @@ test("backfill starts where the tiles left off", async () => {
     signal: new AbortController().signal,
   });
 
-  const { x, y } = lngLatToCell(0, 0, BASE_ZOOM);
-  expect(store.read(BASE_ZOOM, x, y)).toBeUndefined();
+  expect(cellAt(store, 0, 0)).toBeUndefined();
 });
 
-test("the drawn surface is never deeper than a sounding in range", () => {
-  // Every cell a sounding reaches must be at or above that sounding. A plain
-  // inverse-distance average (shallowBias 0) fails this next to a shoal.
-  let seed = 42;
-  const random = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
-  const coverage = 12;
-  const mercX = (lon: number) => (lon * Math.PI * 6378137) / 180;
-  const mercY = (lat: number) =>
-    6378137 * Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360));
-  for (let run = 0; run < 20; run++) {
-    const samples = Array.from({ length: 40 }, () => ({
-      lon: random() * 0.001,
-      lat: random() * 0.001,
-      depth: 1 + random() * 20,
-    }));
-    const field = buildDepthField(samples, [0, 0, 112, 112], {
-      cellMetres: 4,
-      coverageMetres: coverage,
-    })!;
-    const [minX, minY, maxX] = field.extent;
-    const cell = (maxX - minX) / field.width;
-    for (const sample of samples) {
-      const sx = mercX(sample.lon);
-      const sy = mercY(sample.lat);
-      for (let gy = 0; gy < field.height; gy++) {
-        for (let gx = 0; gx < field.width; gx++) {
-          const dx = minX + (gx + 0.5) * cell - sx;
-          const dy = minY + (gy + 0.5) * cell - sy;
-          if (dx * dx + dy * dy > coverage * coverage) continue;
-          const depth = field.depth[gy * field.width + gx];
-          if (Number.isNaN(depth)) continue;
-          expect(depth).toBeLessThanOrEqual(sample.depth + 1e-4);
-        }
-      }
-    }
-  }
-});
-
-test("the tile tables migrate onto an existing database", () => {
+test("the chart tables migrate onto an existing database", () => {
   const dir = mkdtempSync(join(tmpdir(), "crowd-depth-"));
   try {
     const file = join(dir, "bathymetry.sqlite");
-    // A database at the schema before the tile tables, with a sounding in it.
+    // A database at the schema before the chart tables, with a sounding in it.
     const old = new DatabaseSync(file);
     old.exec(`
       CREATE TABLE bathymetry(
@@ -220,7 +136,7 @@ test("the tile tables migrate onto an existing database", () => {
       .prepare("SELECT count(*) AS count FROM bathymetry")
       .get() as { count: number };
     expect(count).toBe(1);
-    const store = createTileStore(db);
+    const store = createCellStore(db);
     store.setMeta("through", "2026-10-16T09:00:00Z");
     expect(store.getMeta("through")).toBe("2026-10-16T09:00:00Z");
     db.close();
@@ -246,10 +162,10 @@ test("the backfill still runs after the live writer has moved the marker on", as
     ]),
     source.createWriter!(),
   );
-  const store = createTileStore(db);
+  const store = createCellStore(db);
   addPendingBackfill(store, at("2026-10-16T12:00:00Z"));
 
-  const live = createTileWriter(store, { flushIntervalMs: 100000 });
+  const live = createCellWriter(store, { flushIntervalMs: 100000 });
   live.write(
     {
       latitude: 1,
@@ -262,19 +178,18 @@ test("the backfill still runs after the live writer has moved the marker on", as
   await new Promise<void>((resolve) => live.end(() => resolve()));
   expect(getThrough(store)?.toString()).toBe("2026-10-16T12:05:00Z");
 
-  await backfillTiles({
+  await backfillCells({
     app,
     config,
     source,
     store,
     signal: new AbortController().signal,
   });
-  const { x, y } = lngLatToCell(0, 0, BASE_ZOOM);
-  expect(store.read(BASE_ZOOM, x, y)?.size).toBe(1);
+  expect(cellAt(store, 0, 0)?.passes).toBe(1);
 });
 
 test("an interrupted backfill is widened, not lost, on the next start", () => {
-  const store = createTileStore(createDB(":memory:"));
+  const store = createCellStore(createDB(":memory:"));
   store.setMeta("through", "2026-10-16T10:00:00Z");
   addPendingBackfill(store, at("2026-10-16T12:00:00Z"));
   const first = getPendingBackfill(store)!;
@@ -288,8 +203,8 @@ test("an interrupted backfill is widened, not lost, on the next start", () => {
 });
 
 test("a sounding from a clock set in the future can't move the marker past now", async () => {
-  const store = createTileStore(createDB(":memory:"));
-  const writer = createTileWriter(store, { flushIntervalMs: 100000 });
+  const store = createCellStore(createDB(":memory:"));
+  const writer = createCellWriter(store, { flushIntervalMs: 100000 });
   writer.write(
     {
       latitude: 0,
@@ -309,22 +224,24 @@ test("a sounding from a clock set in the future can't move the marker past now",
 test("a failed flush ends the writer instead of throwing from its timer", () => {
   vi.useFakeTimers();
   try {
-    const store = createTileStore(createDB(":memory:"));
-    store.transaction = () => {
+    const store = createCellStore(createDB(":memory:"));
+    store.addPasses = () => {
       throw new Error("disk full");
     };
-    const writer = createTileWriter(store, { flushIntervalMs: 100 });
-    const errors: Error[] = [];
-    writer.on("error", (err) => errors.push(err));
-    writer.write(
-      {
-        latitude: 0,
-        longitude: 0,
-        depth: 3,
-        timestamp: at("2026-10-16T08:00:00Z"),
-      },
-      () => {},
-    );
+    const writer = createCellWriter(store, { flushIntervalMs: 100 });
+    writer.on("error", () => {});
+    // A track long enough for passes to close, about 30 m a sounding.
+    for (let i = 0; i < 40; i++) {
+      writer.write(
+        {
+          latitude: i * 0.0003,
+          longitude: 0,
+          depth: 3 + (i % 3) * 0.1,
+          timestamp: at("2026-10-16T08:00:00Z").add({ seconds: i * 10 }),
+        },
+        () => {},
+      );
+    }
     expect(() => vi.advanceTimersByTime(150)).not.toThrow();
     expect(writer.destroyed).toBe(true);
   } finally {
@@ -352,43 +269,40 @@ function serverApp() {
   };
 }
 
-test("rebuilds the tiles when the offsets change, and re-offers the layer each start", () => {
+test("rebuilds the cells when the offsets change, and re-offers the layer each start", () => {
   const db = createDB(":memory:");
   const { app: server, registerResourceProvider } = serverApp();
   const first = new AbortController();
   startChart({ app: server, config, db, signal: first.signal });
-  const store = createTileStore(db);
-  store.write(BASE_ZOOM, 1, 1, new Map([[0, { depth: 300, count: 1 }]]));
+  const store = createCellStore(db);
+  store.addPasses([{ py: 1, px: 1, depth: 3, day: 1 }]);
+  const stored = () => store.cells(-1, -1, 1, 1).length;
   first.abort();
 
-  // Same configuration: the tiles stay.
+  // Same configuration: the cells stay.
   const second = new AbortController();
   startChart({ app: server, config, db, signal: second.signal });
-  expect(store.read(BASE_ZOOM, 1, 1)?.size).toBe(1);
+  expect(stored()).toBe(1);
   second.abort();
 
-  // New offsets: the old tiles would sit beside the new ones, so they go.
+  // New offsets: the old cells would sit beside the new ones, so they go.
   const third = new AbortController();
   startChart({ app: server, config: offsetConfig, db, signal: third.signal });
-  expect(store.read(BASE_ZOOM, 1, 1)).toBeUndefined();
+  expect(stored()).toBe(0);
   third.abort();
 
   // The server drops a plugin's providers on stop, so each start registers.
   expect(registerResourceProvider).toHaveBeenCalledTimes(3);
 });
 
-test("the tile routes need a principal when security is on", () => {
+test("the layer routes need a principal when security is on", () => {
   const { app: server, routes } = serverApp();
   const secured = Object.assign(server, {
     securityStrategy: { isDummy: () => false },
   });
-  registerBathymetryRoutes(
-    secured,
-    () => undefined,
-    () => ({}),
-  );
+  registerLayerRoutes(secured, () => undefined);
   const meta = [...routes.entries()].find(([path]) =>
-    path.endsWith("/meta"),
+    path.endsWith("/style.json"),
   )![1];
 
   const respond = () => {
@@ -411,7 +325,8 @@ test("the tile routes need a principal when security is on", () => {
     { skPrincipal: { identifier: "AUTO", permissions: "readonly" } },
     readonly,
   );
-  expect(readonly.code).toBe(200);
+  // Past the access check; no layer is running.
+  expect(readonly.code).toBe(503);
 });
 
 test("after a depth reference change, the SQLite log only backfills newer soundings", async () => {
@@ -438,11 +353,11 @@ test("after a depth reference change, the SQLite log only backfills newer soundi
     ]),
     source.createWriter!(),
   );
-  const store = createTileStore(db);
+  const store = createCellStore(db);
   addPendingBackfill(store, at("2026-10-16T12:00:00Z"));
   store.setMeta("depth_since", "2026-10-16T10:00:00Z");
 
-  await backfillTiles({
+  await backfillCells({
     app,
     config,
     source,
@@ -450,10 +365,8 @@ test("after a depth reference change, the SQLite log only backfills newer soundi
     signal: new AbortController().signal,
   });
 
-  const before = lngLatToCell(0, 0, BASE_ZOOM);
-  const after = lngLatToCell(1, 1, BASE_ZOOM);
-  expect(store.read(BASE_ZOOM, before.x, before.y)).toBeUndefined();
-  expect(store.read(BASE_ZOOM, after.x, after.y)?.size).toBe(1);
+  expect(cellAt(store, 0, 0)).toBeUndefined();
+  expect(cellAt(store, 1, 1)).toBeDefined();
 });
 
 test("a first start backfills the SQLite log even though no depth reference was recorded", () => {
@@ -461,7 +374,7 @@ test("a first start backfills the SQLite log even though no depth reference was 
   const { app: server } = serverApp();
   const signal = new AbortController();
   startChart({ app: server, config, db, signal: signal.signal });
-  const store = createTileStore(db);
+  const store = createCellStore(db);
   expect(store.getMeta("depth_since") ?? "").toBe("");
   expect(getPendingBackfill(store)).toBeDefined();
   signal.abort();
@@ -469,7 +382,7 @@ test("a first start backfills the SQLite log even though no depth reference was 
 
 test("the backfill doesn't merge soundings past its span again", async () => {
   // Sources round windows out to whole hours; the live writer already has the
-  // soundings after the span, so merging them again would double their count.
+  // soundings after the span, so folding them in again would count a pass twice.
   const db = createDB(":memory:");
   const source = createSqliteSource(app, db);
   await pipeline(
@@ -484,11 +397,11 @@ test("the backfill doesn't merge soundings past its span again", async () => {
     ]),
     source.createWriter!(),
   );
-  const store = createTileStore(db);
+  const store = createCellStore(db);
   store.setMeta("through", "2026-10-16T11:00:00Z");
   addPendingBackfill(store, at("2026-10-16T11:30:00Z"));
 
-  await backfillTiles({
+  await backfillCells({
     app,
     config,
     source,
@@ -496,8 +409,7 @@ test("the backfill doesn't merge soundings past its span again", async () => {
     signal: new AbortController().signal,
   });
 
-  const { x, y } = lngLatToCell(0, 0, BASE_ZOOM);
-  expect(store.read(BASE_ZOOM, x, y)).toBeUndefined();
+  expect(cellAt(store, 0, 0)).toBeUndefined();
 });
 
 test("a failing backfill is retried on later starts, then given up", async () => {
@@ -509,7 +421,7 @@ test("a failing backfill is retried on later starts, then given up", async () =>
     createReader: () => undefined,
     getAvailableTimeframes: () => Promise.reject(new Error("history down")),
   };
-  const store = createTileStore(db);
+  const store = createCellStore(db);
   for (let start = 1; start <= 3; start++) {
     const signal = new AbortController();
     const chart = startChart({
@@ -525,64 +437,8 @@ test("a failing backfill is retried on later starts, then given up", async () =>
   }
 });
 
-test("the marker only moves once the coarser levels hold the soundings", () => {
-  // If the process dies between rebuilds, the next start backfills from the
-  // marker, so it must not be ahead of what the coarser levels hold.
-  vi.useFakeTimers();
-  try {
-    const store = createTileStore(createDB(":memory:"));
-    const writer = createTileWriter(store, {
-      flushIntervalMs: 10_000,
-      ancestorsIntervalMs: 300_000,
-    });
-    writer.write(
-      {
-        latitude: 0,
-        longitude: 0,
-        depth: 1.2,
-        timestamp: at("2026-10-16T08:00:00Z"),
-      },
-      () => {},
-    );
-    vi.advanceTimersByTime(20_000);
-    const base = lngLatToCell(0, 0, BASE_ZOOM);
-    const coarse = lngLatToCell(0, 0, 12);
-    expect(store.read(BASE_ZOOM, base.x, base.y)?.size).toBe(1);
-    expect(store.read(12, coarse.x, coarse.y)).toBeUndefined();
-    expect(getThrough(store)).toBeUndefined();
-
-    vi.advanceTimersByTime(300_000);
-    expect(store.read(12, coarse.x, coarse.y)?.size).toBe(1);
-    expect(getThrough(store)?.toString()).toBe("2026-10-16T08:00:00Z");
-  } finally {
-    vi.useRealTimers();
-  }
-});
-
-test("stopping the live writer writes the coarser levels it held", () => {
-  // A plugin stop destroys the pipeline, which doesn't run the writer's end.
-  const store = createTileStore(createDB(":memory:"));
-  const writer = createTileWriter(store, {
-    flushIntervalMs: 100_000,
-    ancestorsIntervalMs: 300_000,
-  });
-  writer.write(
-    {
-      latitude: 0,
-      longitude: 0,
-      depth: 1.2,
-      timestamp: at("2026-10-16T08:00:00Z"),
-    },
-    () => {},
-  );
-  writer.destroy();
-  const coarse = lngLatToCell(0, 0, 12);
-  expect(store.read(12, coarse.x, coarse.y)?.size).toBe(1);
-  expect(getThrough(store)?.toString()).toBe("2026-10-16T08:00:00Z");
-});
-
 test("the backfill never reaches back more than 30 days", () => {
-  const store = createTileStore(createDB(":memory:"));
+  const store = createCellStore(createDB(":memory:"));
   // The layer was off for three months.
   store.setMeta("through", "2026-07-16T00:00:00Z");
   addPendingBackfill(store, at("2026-10-16T00:00:00Z"));
@@ -642,14 +498,6 @@ test("an older start ending late doesn't take down the newer one", async () => {
   expect(await provider.methods.listResources()).toEqual({});
 });
 
-test("stored depths round toward shoal", () => {
-  for (const depth of [2.345, 12.34, 0.999, 7.5]) {
-    const stored = decodeDepth(encodeDepth(depth));
-    expect(stored).toBeLessThanOrEqual(depth);
-    expect(depth - stored).toBeLessThan(0.01);
-  }
-});
-
 test("a long SQLite backfill lets the server's event loop run", async () => {
   // The SQLite source reads synchronously; without pauses a backfill of weeks
   // of soundings held up the whole Signal K server.
@@ -668,7 +516,7 @@ test("a long SQLite backfill lets the server's event loop run", async () => {
     ),
     source.createWriter!(),
   );
-  const store = createTileStore(db);
+  const store = createCellStore(db);
   addPendingBackfill(store, at("2026-10-17T00:00:00Z"));
 
   // Count turns of the event loop between the first and last sounding read,
@@ -694,7 +542,7 @@ test("a long SQLite backfill lets the server's event loop run", async () => {
     },
   };
   try {
-    await backfillTiles({
+    await backfillCells({
       app,
       config,
       source: watched,
@@ -723,7 +571,7 @@ test("a depth change made while the layer is off is dated when it happens", () =
     db,
     signal: new AbortController().signal,
   });
-  const store = createTileStore(db);
+  const store = createCellStore(db);
   const since = store.getMeta("depth_since");
   expect(since).toBeTruthy();
 
@@ -732,4 +580,69 @@ test("a depth change made while the layer is off is dated when it happens", () =
   startChart({ app: server, config: offsetConfig, db, signal: on.signal });
   expect(store.getMeta("depth_since")).toBe(since);
   on.abort();
+});
+
+test("a finished backfill isn't folded in again on the next start", async () => {
+  const db = createDB(":memory:");
+  const source = createSqliteSource(app, db);
+  await pipeline(
+    Readable.from(
+      [10, 5].flatMap((depth, pass) =>
+        Array.from({ length: 30 }, (_, i) => ({
+          latitude: 36.98 + i * 0.0003,
+          longitude: -76.2,
+          depth: depth + (i % 3) * 0.1,
+          timestamp: at("2026-10-16T00:00:00Z").add({
+            hours: pass * 5,
+            seconds: i * 10,
+          }),
+          heading: 0,
+        })),
+      ),
+    ),
+    source.createWriter!(),
+  );
+  const store = createCellStore(db);
+  const backfill = async (until: string) => {
+    addPendingBackfill(store, at(until));
+    await backfillCells({
+      app,
+      config,
+      source,
+      store,
+      signal: new AbortController().signal,
+    });
+  };
+  await backfill("2026-10-16T12:00:00Z");
+  const first = cellAt(store, -76.2, 36.98 + 10 * 0.0003)!;
+  expect(first.passes).toBe(2);
+  // The sounder was off since: nothing live moved the marker.
+  await backfill("2026-10-16T13:00:00Z");
+  expect(cellAt(store, -76.2, 36.98 + 10 * 0.0003)).toEqual(first);
+});
+
+test("a database from a preview build moves to cells", () => {
+  const dir = mkdtempSync(join(tmpdir(), "crowd-depth-"));
+  try {
+    const file = join(dir, "bathymetry.sqlite");
+    createDB(file).close();
+    // Back to the preview's schema: its tile pyramid at user_version 3.
+    const old = new DatabaseSync(file);
+    old.exec(`
+      DROP TABLE cells; DROP TABLE overviews; DROP TABLE shoals;
+      CREATE TABLE tiles(z INTEGER, x INTEGER, y INTEGER, cells BLOB, updated INTEGER);
+      INSERT INTO tile_meta(key, value) VALUES ('through', '2026-10-16T09:00:00Z');
+      PRAGMA user_version = 3;
+    `);
+    old.close();
+    const db = createDB(file);
+    const store = createCellStore(db);
+    store.addPasses([{ py: 1, px: 1, depth: 3, day: 1 }]);
+    expect(store.cells(-1, -1, 1, 1)).toHaveLength(1);
+    // The preview's marker described its tiles, not these cells.
+    expect(store.getMeta("through")).toBeUndefined();
+    db.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -9,5 +9,5 @@
     "skipLibCheck": true,
     "types": []
   },
-  "include": ["web/**/*.ts", "src/tiles/core/**/*.ts"]
+  "include": ["web/**/*.ts"]
 }

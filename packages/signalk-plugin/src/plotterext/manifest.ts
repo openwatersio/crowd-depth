@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 export const PLUGIN_ID = "crowd-depth";
 /** Top-level, non-admin route the extension's pages and data are served from. */
 export const ASSET_BASE = `/plotterext/${PLUGIN_ID}`;
+/** The data overlay's id, which the runtime names in `overlay.*` calls. */
+export const OVERLAY_ID = "depth";
 
 /** The plotterExtensions manifest (see docs/api/plotter-extensions-api.md). */
 export interface PlotterExtManifest {
@@ -36,62 +38,39 @@ function pluginVersion(): string {
 
 /** Build the extension manifest offered to a host chartplotter.
  *
- * Adapted from signalk-livedepth-plugin (MIT); see THIRD_PARTY_NOTICES.md.
- *
- * One `image` overlay, drawn by a headless background runtime, placed above
- * the charts and below the vessel/resources. A `mapToolbar` button opens the
- * settings panel, which shares state with the runtime over the bus. */
+ * One data overlay, which the host draws from the plugin's style and vector tiles,
+ * placed above the charts and below the vessel and resources. A headless background
+ * runtime keeps it current: it refetches the tiles the boat's new passes changed and
+ * draws the soundings not yet in a cell. Without the runtime the layer still draws, as
+ * of when it was shown. */
 export function buildManifest(version = pluginVersion()): PlotterExtManifest {
   return {
     name: "Crowd Depth",
     description:
-      "Draw the depths this boat records as a live depth map on the chart, shaded with depth contours.",
+      "Draw the depths this boat records on the chart, with depth areas, contours and soundings.",
     version,
     apiVersion: "1",
-    requires: ["background.iframe", "overlays.image", "signalk.stream"],
-    optional: ["buttons", "panels.iframe", "units", "map", "nightMode"],
-    buttons: [
-      {
-        id: "open-my-soundings-settings",
-        title: "My soundings",
-        slot: "mapToolbar",
-        icon: "water",
-        action: { type: "togglePanel", panel: "my-soundings-settings" },
-      },
-    ],
-    panels: [
-      {
-        id: "my-soundings-settings",
-        title: "My soundings",
-        type: "iframe",
-        url: `${ASSET_BASE}/config.html`,
-        lifecycle: "keepAlive",
-      },
-    ],
+    requires: ["overlays.data"],
+    optional: ["background.iframe", "units"],
+    buttons: [],
+    panels: [],
     background: [
       {
-        id: "renderer",
+        id: "live",
         type: "iframe",
-        url: `${ASSET_BASE}/renderer.html`,
+        url: `${ASSET_BASE}/runtime.html`,
       },
     ],
     overlays: [
       {
-        id: "depth",
+        id: OVERLAY_ID,
         title: "My soundings",
-        type: "image",
-        runtime: "renderer",
+        type: "data",
         band: "aboveCharts",
         visible: true,
-        opacity: 0.85,
+        opacity: 1,
         minZoom: 4,
-        // The Chart list's "Layer settings" button opens this panel, so the
-        // layer's settings sit with the layer, not only behind the toolbar
-        // button.
-        configPanel: "my-soundings-settings",
-        // Isobaths and labels want the pixels; the host still clamps to its own
-        // memory budget.
-        preferredPixelRatio: 2,
+        style: `${ASSET_BASE}/style.json`,
       },
     ],
   };

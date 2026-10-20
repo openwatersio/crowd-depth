@@ -15,7 +15,7 @@ from pathlib import Path
 import duckdb
 from botocore.exceptions import BotoCoreError, ClientError
 
-from .definitions import CELLS
+from .definitions import CELLS, STATISTIC
 from .objects import Conflict, LocalObjects
 from .sources import literal
 
@@ -147,8 +147,8 @@ TIDE_KM_SIGMA = 0.005
 # never reads as better known than corrected: tide left in (half a range of a metre or
 # two), and a vessel's offset left in (vessels read 0 to 3 m shallow in the Chesapeake).
 # Starting values.
-UNTIDED_SIGMA = 0.5
-UNCALIBRATED_SIGMA = 1.0
+UNTIDED_SIGMA = STATISTIC["untided_sigma_m"]
+UNCALIBRATED_SIGMA = STATISTIC["uncalibrated_sigma_m"]
 
 # A point's base row (1/3″ of latitude) within its 1° tile. The cells build bands and
 # rows by this one expression, so a point can't land between two bands.

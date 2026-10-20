@@ -21,23 +21,23 @@ docs/               # CSB reference material (schemas, IHO/NOAA guidance PDFs)
 Runs inside a Signal K server. Collects depth + position, then reports it on a
 schedule to the trusted node API.
 
-| Path                 | What it does                                                                                                                                     |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `src/plugin.ts`      | Plugin entry: wires config, collector, reporter, and schedule together                                                                           |
-| `src/config.ts`      | Plugin settings JSON schema and config types                                                                                                     |
-| `src/collector.ts`   | Subscribes to live deltas and writes them to storage                                                                                             |
-| `src/sources/`       | Where report data comes from: `history.ts` (Signal K History API, e.g. signalk-to-influxdb2) with `sqlite.ts` as the fallback local store        |
-| `src/storage.ts`     | SQLite database setup (`node:sqlite`)                                                                                                            |
-| `src/streams/`       | Stream pipeline: `live.ts` (deltas → `BathymetryData`), `transforms.ts` (offset correction, precision), `geojson.ts` / `xyz.ts` (output formats) |
-| `src/reporters/`     | Submission to the trusted node API (`noaa.ts` builds and signs the upload)                                                                       |
-| `src/metadata.ts`    | Vessel identity (name/MMSI or anonymous UUID) persistence                                                                                        |
-| `src/status.ts`      | Plugin status messages shown in the Signal K admin UI                                                                                            |
-| `src/fetch.ts`       | HTTP helpers shared with the API package                                                                                                         |
-| `src/chart.ts`       | The "My soundings" chart layer: live tile writer, backfill, tile routes, and the plotter extension                                               |
-| `src/tiles/`         | Shoal-biased tile pyramid of the boat's own soundings in the plugin's SQLite database (`core/` is shared with the browser)                       |
-| `src/plotterext/`    | Plotter extension manifest and resource provider that offer the layer to chartplotters such as Freeboard-SK                                      |
-| `web/`               | Browser code for the layer: background runtime, WebGL render worker and settings panel, bundled into `public/` by `scripts/build-web.mjs`        |
-| `bin/xyz-to-geojson` | Helper CLI for converting XYZ files to GeoJSON                                                                                                   |
+| Path                 | What it does                                                                                                                                                       |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `src/plugin.ts`      | Plugin entry: wires config, collector, reporter, and schedule together                                                                                             |
+| `src/config.ts`      | Plugin settings JSON schema and config types                                                                                                                       |
+| `src/collector.ts`   | Subscribes to live deltas and writes them to storage                                                                                                               |
+| `src/sources/`       | Where report data comes from: `history.ts` (Signal K History API, e.g. signalk-to-influxdb2) with `sqlite.ts` as the fallback local store                          |
+| `src/storage.ts`     | SQLite database setup (`node:sqlite`)                                                                                                                              |
+| `src/streams/`       | Stream pipeline: `live.ts` (deltas → `BathymetryData`), `transforms.ts` (offset correction, precision), `geojson.ts` / `xyz.ts` (output formats)                   |
+| `src/reporters/`     | Submission to the trusted node API (`noaa.ts` builds and signs the upload)                                                                                         |
+| `src/metadata.ts`    | Vessel identity (name/MMSI or anonymous UUID) persistence                                                                                                          |
+| `src/status.ts`      | Plugin status messages shown in the Signal K admin UI                                                                                                              |
+| `src/fetch.ts`       | HTTP helpers shared with the API package                                                                                                                           |
+| `src/chart.ts`       | The "My soundings" chart layer: the live cell writer, backfill, layer routes, and the plotter extension                                                            |
+| `src/tiles/`         | The live layer: the boat's cells in the plugin's SQLite database, the depth surface, and S-57 vector tiles ([live-layer.md](docs/plans/global-grid/live-layer.md)) |
+| `src/plotterext/`    | Plotter extension manifest and resource provider that offer the layer to chartplotters such as Freeboard-SK                                                        |
+| `web/`               | The extension's background runtime, which keeps the data overlay current, bundled into `public/` by `scripts/build-web.mjs`                                        |
+| `bin/xyz-to-geojson` | Helper CLI for converting XYZ files to GeoJSON                                                                                                                     |
 
 ### `packages/api` (`crowd-depth-api`, private)
 

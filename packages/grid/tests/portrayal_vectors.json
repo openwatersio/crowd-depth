@@ -1,0 +1,122 @@
+{
+  "depths": [
+    [
+      0,
+      {
+        "depth_m": 0,
+        "depth_ft": 0,
+        "depth_fm": 0
+      }
+    ],
+    [
+      0.05,
+      {
+        "depth_m": 0,
+        "depth_ft": 0,
+        "depth_fm": 0
+      }
+    ],
+    [
+      0.3,
+      {
+        "depth_m": 0.3,
+        "depth_ft": 0,
+        "depth_fm": 0
+      }
+    ],
+    [
+      1.29,
+      {
+        "depth_m": 1.2,
+        "depth_ft": 4,
+        "depth_fm": 0
+      }
+    ],
+    [
+      2.999,
+      {
+        "depth_m": 2.9,
+        "depth_ft": 9,
+        "depth_fm": 1
+      }
+    ],
+    [
+      9.99,
+      {
+        "depth_m": 9.9,
+        "depth_ft": 32,
+        "depth_fm": 5
+      }
+    ],
+    [
+      20.95,
+      {
+        "depth_m": 20.9,
+        "depth_ft": 68,
+        "depth_fm": 11
+      }
+    ],
+    [
+      21.0,
+      {
+        "depth_m": 21,
+        "depth_ft": 68,
+        "depth_fm": 11
+      }
+    ],
+    [
+      24.7,
+      {
+        "depth_m": 24.5,
+        "depth_ft": 81,
+        "depth_fm": 13
+      }
+    ],
+    [
+      30.99,
+      {
+        "depth_m": 30.5,
+        "depth_ft": 101,
+        "depth_fm": 16
+      }
+    ],
+    [
+      31.0,
+      {
+        "depth_m": 31,
+        "depth_ft": 101,
+        "depth_fm": 16
+      }
+    ],
+    [
+      57.4,
+      {
+        "depth_m": 57,
+        "depth_ft": 188,
+        "depth_fm": 31
+      }
+    ],
+    [
+      199.9,
+      {
+        "depth_m": 199,
+        "depth_ft": 655,
+        "depth_fm": 109
+      }
+    ]
+  ],
+  "column_steps": [
+    [-90, 120],
+    [-61, 2],
+    [-45, 1],
+    [0, 1],
+    [30, 1],
+    [44, 1],
+    [48, 2],
+    [60, 2],
+    [70, 3],
+    [80, 6],
+    [84, 10],
+    [89, 120]
+  ]
+}
