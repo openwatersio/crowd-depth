@@ -100,6 +100,7 @@ export function startChart({
   const started: Layer = {
     tiles,
     provisional: writer.provisional,
+    stored: writer.stored,
     safetyDepth: config.chart?.safetyDepth ?? DEFAULT_SAFETY_DEPTH_M,
   };
   current = started;

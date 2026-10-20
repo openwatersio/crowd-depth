@@ -5,7 +5,8 @@
 //
 // Freeboard redraws the whole layer on any refresh, however few tiles it names, so
 // refreshes are batched to one per REFRESH_MS. Soundings stay drawn as provisional until
-// the refresh that brings in their tiles has landed, so the track never has a gap.
+// the refresh that brings in their tiles has landed, so the track has no gap at zoom 10
+// and in, where tiles refresh as the boat goes. Further out they refresh every 5 minutes.
 import { connectExtension } from "signalk-plotterext-bus/extension";
 import type { OverlayStateEvent } from "signalk-plotterext-bus/extension";
 import { createBatch, type Live } from "./batch.js";
@@ -48,6 +49,7 @@ async function poll(): Promise<void> {
     }
   } catch {
     // The server is restarting or the overlay isn't drawn; the next poll tries again.
+    batch.failed();
   } finally {
     busy = false;
   }

@@ -88,3 +88,29 @@ test("an unconfirmed shoal publishes as a flagged sounding, outside the surface"
 test("a tile with nothing in it is empty", () => {
   expect(buildTile(Z, tile.x, tile.y, [], [])).toBeUndefined();
 });
+
+test("shallow water the margin takes to 0 m is wet, not drying", () => {
+  // 1.5 m less the margin is under 0, clamped to 0 m.
+  const cells = [...lane(LON, () => 1.5), ...lane(LON + 0.001, () => 1.5)];
+  const t = decode(buildTile(Z, tile.x, tile.y, cells, [])!);
+  const bands = features(t, "DEPARE").map((f) => f.properties.DRVAL1);
+  expect(bands).toEqual([0]);
+});
+
+test("zoomed out, a tile still draws the cells under it", () => {
+  const z = 6;
+  const f = tileFraction(LON, LAT, z);
+  const t = decode(
+    buildTile(
+      z,
+      Math.floor(f.x),
+      Math.floor(f.y),
+      lane(LON, () => 8),
+      [],
+    )!,
+  );
+  expect(features(t, "DEPARE").length).toBeGreaterThan(0);
+  expect(features(t, "M_QUAL").map((m) => m.properties.kind)).toContain(
+    "measured",
+  );
+});

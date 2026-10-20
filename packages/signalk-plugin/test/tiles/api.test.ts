@@ -48,6 +48,7 @@ function serve() {
   registerLayerRoutes(app, () => ({
     tiles,
     provisional: () => [{ time: 1, lon: -76.2, lat: 36.98, depth: 4.37 }],
+    stored: () => [],
     safetyDepth: 3,
   }));
   const get = async (path: string, req: Req = {}) => {

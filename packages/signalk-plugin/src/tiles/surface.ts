@@ -37,6 +37,8 @@ const MIN_POINTS = 3;
 const MAX_AREA_DEPTH_M = 200;
 /** The deepest band's floor below chart datum, as the grid's drying band. */
 const DRYING_FLOOR_M = -30;
+/** Keeps a band's upper edge out of it, a millimetre: too little to see. */
+const BAND_EPS_M = 0.001;
 /** Soundings per tile side, as the grid's lattice. */
 const SOUNDINGS_PER_SIDE = 8;
 /** The finest zoom built; clients overzoom past it, as the grid's overlay. */
@@ -157,7 +159,9 @@ export function surface(
     bucket[Math.floor(s.y) * size + Math.floor(s.x)] = j;
   });
 
-  const reach = Math.ceil(RADIUS_M / pm);
+  // Zoomed out, a pixel is wider than the radius; it still sees every cell inside it.
+  const searchM = Math.max(RADIUS_M, pm * Math.SQRT1_2);
+  const reach = Math.ceil(searchM / pm);
   const measuredM = Math.max(CELL_M, pm);
   const median = new Float32Array(size * size).fill(NaN);
   const near = new Float32Array(size * size).fill(Infinity);
@@ -191,7 +195,7 @@ export function surface(
           const dx = (s.x - cx) * pm;
           const dy = (s.y - cy) * pm;
           const d2 = dx * dx + dy * dy;
-          if (d2 <= RADIUS_M * RADIUS_M) found.push({ s, d2, dx, dy });
+          if (d2 <= searchM * searchM) found.push({ s, d2, dx, dy });
         }
       }
       if (found.length === 0) continue;
@@ -228,7 +232,12 @@ export function surface(
     if (near[i] <= measuredM) measured[i] = 1;
     const m = blurred[i];
     if (Number.isNaN(m) || !Number.isFinite(near[i])) continue;
-    const sigma = Math.hypot(nearSigma[i], SIGMA_PER_M * near[i]);
+    const sigma = Math.hypot(
+      nearSigma[i],
+      // Widened only past sounded water: zoomed out, a pixel's own cells can sit far
+      // from its centre.
+      SIGMA_PER_M * Math.max(0, near[i] - measuredM),
+    );
     const d = m - K * sigma;
     depth[i] = m >= 0 ? Math.max(0, d) : d;
   }
@@ -486,6 +495,10 @@ export function buildTile(
   // it decides the edge, and the depth the bands within it.
   const edge = (i: number) =>
     Math.max((r.cover[i] - 0.5) * 100, r.measuredM - r.near[i]);
+  // Just outside the surface, how far outside, so an edge falls between pixels rather
+  // than on the last one with a depth, and a lone pixel draws as more than a point.
+  const outside = (i: number) =>
+    Number.isFinite(r.near[i]) ? Math.min(edge(i), -BAND_EPS_M) : -1;
 
   const DEPARE: Feature[] = [];
   const bands: [number, number][] = [
@@ -497,7 +510,11 @@ export function buildTile(
   for (const [lo, hi] of bands) {
     // At least 0 inside the band, crossing 0 where the depth reaches either edge.
     const polys = polygons(r, (i) =>
-      has(i) ? Math.min(depth[i] - lo, hi - depth[i], edge(i)) : NaN,
+      // A band holds its lower edge, not its upper: a depth of exactly 0 m, which the
+      // margin clamps shallow water to, is wet, not drying.
+      has(i)
+        ? Math.min(depth[i] - lo, hi - depth[i] - BAND_EPS_M, edge(i))
+        : outside(i),
     );
     if (polys.length) {
       DEPARE.push({
@@ -590,7 +607,7 @@ export function buildTile(
   const M_QUAL: Feature[] = [];
   // Coverage edges follow the distance to the nearest sounded cell.
   const measured = polygons(r, (i) =>
-    Number.isFinite(r.near[i]) ? r.measuredM - r.near[i] : NaN,
+    Number.isFinite(r.near[i]) ? r.measuredM - r.near[i] : -1,
   );
   if (measured.length) {
     M_QUAL.push({
@@ -600,7 +617,7 @@ export function buildTile(
     });
   }
   const between = polygons(r, (i) =>
-    has(i) ? Math.min(r.near[i] - r.measuredM, edge(i)) : NaN,
+    has(i) ? Math.min(r.near[i] - r.measuredM, edge(i)) : outside(i),
   );
   if (between.length) {
     M_QUAL.push({

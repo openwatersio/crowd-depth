@@ -95,7 +95,7 @@ The live layer has the overlay's schema: S-57 `DEPARE`, `DEPCNT`, `SOUNDG` and `
 Freeboard can't keep an S-57 chart resource current (see [Freeboard refresh](#freeboard-refresh)), so the plugin draws the layer as a plotter extension data overlay (`overlays.data`):
 
 - **Stored cells:** the MVT tiles, as a `vector` source in a MapLibre style. When a cell changes, the plugin's background runtime calls `overlay.refresh` with just the tiles it touches, and Freeboard refetches only those. Freeboard still re-keys the whole source to do it ([`applyRekeys`](https://github.com/SignalK/freeboard-sk/blob/afe3b1ca419e26ed5a1f309d065552ecafdbefdf/src/app/modules/map/ol/lib/data-overlay/layer-data-overlay.component.ts#L645-L660)), so OpenLayers re-renders and re-declutters every tile in view, which shows as a flicker. The runtime batches refreshes to one every 30 s, and keeps drawing a stored cell's soundings as provisional until the refresh that brings in its tile has landed. Re-keying only the refreshed tiles in Freeboard would let the layer refresh as often as it changes.
-- **Provisional soundings:** a `geojson` source, replaced with `overlay.setData` on each poll, so a sounding leaves it once its cell is stored.
+- **Provisional soundings:** a `geojson` source, replaced with `overlay.setData` when it changes. A sounding stays in it after its cell is stored, until the refresh that brings in its tile, and one QC drops leaves at once.
 - **Styling:** a MapLibre style with the overlay's Seascape palette for depth areas, contours and soundings. Depth units come from `units.get`, set as a `global-state` variable that picks the sounding label, and the safety contour from the plugin's settings, since Freeboard doesn't pass its S-52 settings to extensions.
 
 The plugin is to list the same tiles as a `type=S-57` chart resource too, for plotters without `overlays.data`, where they'd be current as of when the chart was last shown.
@@ -137,13 +137,13 @@ Read from Freeboard-SK v3.4.0-beta.1, the latest release ([`afe3b1c`](https://gi
 
 How long a change takes to show:
 
-| Path                                               | Latency                                                                            |
-| -------------------------------------------------- | ---------------------------------------------------------------------------------- |
-| S-57 chart resource                                | Until the user toggles the chart, changes S-52 settings or reloads; no upper bound |
-| Raster chart with `refreshInterval`                | 60 s at best, refetching every visible tile; not available for S-57                |
-| `overlays.image`                                   | 200 ms at best, re-rendering the whole view each time                              |
-| `overlays.data` vector tile with `overlay.refresh` | One tile fetch, under a second on the boat's network                               |
-| `overlays.data` GeoJSON with `overlay.setData`     | The next map render                                                                |
+| Path                                               | Latency                                                                                                                                            |
+| -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| S-57 chart resource                                | Until the user toggles the chart, changes S-52 settings or reloads; no upper bound                                                                 |
+| Raster chart with `refreshInterval`                | 60 s at best, refetching every visible tile; not available for S-57                                                                                |
+| `overlays.image`                                   | 200 ms at best, re-rendering the whole view each time                                                                                              |
+| `overlays.data` vector tile with `overlay.refresh` | One tile fetch, under a second on the boat's network; the runtime batches refreshes to every 30 s, since Freeboard redraws the whole layer on each |
+| `overlays.data` GeoJSON with `overlay.setData`     | The next map render                                                                                                                                |
 
 A chart resource for stored cells with an extension for provisional soundings doesn't work in Freeboard as it is: the stored cells would stop changing on screen. The data overlay carries both at the latencies a live layer needs, without per-frame rendering on the client, at the cost of drawing S-52 in a MapLibre style. Keeping Freeboard's own S-52 rendering needs the upstream change below.
 

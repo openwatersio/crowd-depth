@@ -34,6 +34,10 @@ const LIVE_BATCH = 10;
 const BULK_BATCH = 200;
 const BATCH_PER_BUFFER = 0.01;
 
+/** How long a written sounding is listed as stored, which covers the chart's slowest
+ * tile refresh, every 30 s. */
+const STORED_MS = 90_000;
+
 /** The longest the writer keeps passes back for a backfill that hasn't finished. */
 const HOLD_MAX_MS = 3 * 3600_000;
 
@@ -152,6 +156,8 @@ export function createCellWriter(
   const open = new Map<string, OpenPass>();
   let passes: Pass[] = [];
   let unwritten: Sounding[] = [];
+  /** Soundings written in the last {@link STORED_MS}, by time, and when. */
+  let stored: { id: number; at: number }[] = [];
   let shoals: Shoal[] = [];
   let latest = 0;
   let held = false;
@@ -279,6 +285,8 @@ export function createCellWriter(
       shoals = [];
       const cells = store.addPasses(batch);
       if (found.length) store.addShoals(found);
+      const at = Date.now();
+      for (const s of [...unwritten, ...found]) stored.push({ id: s.time, at });
       unwritten = [];
       onChange([...cells.map((c) => cellCenter(c.py, c.px)), ...found]);
     }
@@ -372,6 +380,13 @@ export function createCellWriter(
     /** Keep passes rather than write them, or write what was kept. */
     hold,
     /** Soundings not yet in a stored cell: unjudged, or in a pass still open. */
+    /** The soundings written to the store lately: still to show until the chart's tiles
+     * have caught up with them. */
+    stored(): number[] {
+      const since = Date.now() - STORED_MS;
+      stored = stored.filter((s) => s.at >= since);
+      return stored.map((s) => s.id);
+    },
     provisional(): Sounding[] {
       return [
         ...unwritten,

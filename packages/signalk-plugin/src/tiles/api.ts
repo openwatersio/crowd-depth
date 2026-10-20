@@ -18,6 +18,7 @@ const MAX_PROVISIONAL = 2000;
 export interface Layer {
   tiles: TileService;
   provisional: () => Sounding[];
+  stored: () => number[];
   safetyDepth: number;
 }
 
@@ -133,6 +134,9 @@ export function registerLayerRoutes(
       const since = Number(req.query.since ?? -1);
       res.set("Cache-Control", "no-store").json({
         ...layer.tiles.since(Number.isInteger(since) ? since : -1),
+        // Ids of soundings just written to cells, which the runtime keeps drawing until
+        // their tiles are refreshed; any other sounding that leaves `provisional` is gone.
+        stored: layer.stored(),
         provisional: {
           type: "FeatureCollection",
           features: layer

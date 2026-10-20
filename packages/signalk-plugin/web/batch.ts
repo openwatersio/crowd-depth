@@ -10,6 +10,8 @@ export interface Live {
   rev: number;
   all?: boolean;
   tiles: Tile[];
+  /** Ids of soundings just written to cells. */
+  stored?: (string | number)[];
   provisional: { features: Feature[] };
 }
 
@@ -24,6 +26,8 @@ export function createBatch(refreshMs: number, now = () => Date.now()) {
   let covered = new Set<string | number>();
   let shown = new Map<string | number, Feature>();
   let shownKey = "";
+  /** The last refresh handed out, put back if the host doesn't take it. */
+  let lastAsked: { tiles: Tile[]; all: boolean } | undefined;
 
   return {
     get rev() {
@@ -41,15 +45,21 @@ export function createBatch(refreshMs: number, now = () => Date.now()) {
 
       for (const id of covered) written.delete(id);
       const current = new Map(live.provisional.features.map((f) => [f.id, f]));
-      // A sounding the plugin no longer lists is in a stored cell, not yet in a tile.
+      // A sounding the plugin wrote to a cell stays until its tile is refreshed; any
+      // other that leaves the list, rejected by QC or past the list's end, goes.
+      const stored = new Set(live.stored ?? []);
       for (const [id, f] of shown) {
-        if (!current.has(id) && !covered.has(id)) written.set(id, f);
+        if (!current.has(id) && !covered.has(id) && stored.has(id)) {
+          written.set(id, f);
+        }
       }
       covered = new Set();
 
+      lastAsked = undefined;
       let refresh: { tiles?: Tile[] } | undefined;
       if ((pendingAll || pending.size) && now() - lastRefresh >= refreshMs) {
         refresh = pendingAll ? {} : { tiles: [...pending.values()] };
+        lastAsked = { tiles: [...pending.values()], all: pendingAll };
         pending.clear();
         pendingAll = false;
         lastRefresh = now();
@@ -61,6 +71,17 @@ export function createBatch(refreshMs: number, now = () => Date.now()) {
       if (key === shownKey) return { refresh };
       shownKey = key;
       return { refresh, data: [...shown.values()] };
+    },
+    /** The host didn't take the last answer: ask for its refresh and data again. */
+    failed() {
+      if (lastAsked) {
+        for (const t of lastAsked.tiles) pending.set(t.join("/"), t);
+        if (lastAsked.all) pendingAll = true;
+        lastRefresh = -Infinity;
+        covered = new Set();
+      }
+      lastAsked = undefined;
+      shownKey = "";
     },
   };
 }
