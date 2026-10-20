@@ -121,3 +121,24 @@ test("rebuilt overviews match the ones kept pass by pass", () => {
     expect(blocks(later)).toEqual(blocks(kept));
   }
 });
+
+test("a rebuild replaces a shoaler pick whose cell has since deepened", () => {
+  const db = createDB(":memory:");
+  const store = createCellStore(db);
+  // Two cells in one block at every level.
+  const at = cellAt(-76.2, 36.98);
+  const a = { py: at.py, px: at.px - (at.px & 63) };
+  const b = { py: at.py, px: a.px + 1 };
+  store.addPasses([{ ...a, depth: 2, day: 1 }]);
+  store.addPasses([{ ...b, depth: 5, day: 1 }]);
+  // The cell deepens without its blocks hearing of it, as a stopped backfill leaves it.
+  db.prepare("UPDATE cells SET m = 900 WHERE py = ? AND px = ?").run(
+    a.py,
+    a.px,
+  );
+  store.rebuildOverviews();
+  for (const level of OVERVIEW_LEVELS) {
+    const [pick] = store.cells(-76.21, 36.97, -76.19, 36.99, level);
+    expect([pick.py, pick.px]).toEqual([b.py, b.px]);
+  }
+});

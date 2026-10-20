@@ -232,3 +232,23 @@ test("a long steady run at anchor is judged once and carried, then QC picks up a
   expect(Math.max(...cells.map((c) => c.m))).toBeGreaterThan(5.2);
   expect(store.shoals(-76.3, 36, -76.1, 37.1)).toEqual([]);
 }, 30_000);
+
+test("a sounder stuck at a mooring and still stuck under way is caught as it leaves", async () => {
+  // 1 Hz: 65 minutes swinging at a mooring, then 2 km north at 1.5 kn, stuck at 40 m.
+  const moored = 65 * 60;
+  const { store, writer } = run(
+    Array.from({ length: moored + 2600 }, (_, i) => ({
+      latitude:
+        36.98 +
+        (i < moored
+          ? Math.sin(i / 300) * 0.0001
+          : ((i - moored) * 0.77) / 110540),
+      longitude: -76.2,
+      depth: 40,
+      timestamp: start.add({ seconds: i }),
+    })),
+  );
+  await end(writer);
+  const away = store.cells(-76.3, 36.985, -76.1, 37.1).filter((c) => c.m > 30);
+  expect(away).toEqual([]);
+}, 30_000);

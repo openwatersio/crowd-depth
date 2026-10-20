@@ -364,11 +364,20 @@ export function createCellStore(db: DatabaseSync) {
           }
           // Written over what's there, a couple of thousand rows a transaction, so no
           // write holds the lock for long. Nothing goes stale: a block keeps its cells,
-          // which only `clear` removes, and it clears the overviews too.
+          // which only `clear` removes, and it clears the overviews too. A shoaler pick
+          // whose cell still reads as picked is the live writer's, made since the read.
           const rows = [...best.values()];
           for (let i = 0; i < rows.length; i += REBUILD_ROWS) {
             transaction(() => {
-              for (const { cell, at } of rows.slice(i, i + REBUILD_ROWS)) {
+              for (const { cell, depth, at } of rows.slice(
+                i,
+                i + REBUILD_ROWS,
+              )) {
+                const row = readBlock.get(...at) as Cell | undefined;
+                if (row && cellDepth(fromRow(row)) < depth) {
+                  const now = readCell.get(row.py, row.px) as Cell | undefined;
+                  if (now?.m === row.m && now.d === row.d) continue;
+                }
                 write(writeBlock, at, cell);
               }
             });
