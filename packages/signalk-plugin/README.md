@@ -109,7 +109,7 @@ On a chartplotter that supports Signal K plotter extensions, Crowd Depth draws t
 
 ### Using it
 
-The layer appears in the chartplotter's chart list as **My soundings**, with its own show and hide and opacity controls. Depths are labelled in the depth unit you've chosen in the chartplotter. Soundings the boat has just recorded show as orange dots, before the quality checks have judged them, until they're folded into the layer: usually within about half a minute of leaving a spot, and up to ten minutes when the boat sits still. A sounder reading one depth for a long way is held until it has covered a kilometre, as the checks need to judge it.
+The layer appears in the chartplotter's chart list as **My soundings**, with its own show and hide and opacity controls. Depths are labelled in the depth unit you've chosen in the chartplotter. Soundings the boat has just recorded show as orange dots, before the quality checks have judged them, until they're folded into the layer: usually within about half a minute of leaving a spot. At a mooring, where the depth holds steady, they can stay orange for up to an hour, until the checks can tell a steady depth from a stuck sounder. A sounder reading one depth for a long way is held until it has covered a kilometre, as the checks need to judge it.
 
 ### What it shows
 
@@ -117,7 +117,7 @@ The layer appears in the chartplotter's chart list as **My soundings**, with its
 - **A shoal-biased depth.** Each spot about 20 m across keeps a running average of your passes over it, and shows that depth less a safety margin for its uncertainty, as the Open Waters overlay does. Without tide or calibration the margin is about 2 m, so the layer reads shallower than your sounder.
 - **Soundings, then areas.** Soundings are thinned as the overlay thins them, keeping the shoalest in each area, so zooming in shows more. Depth areas follow every track you've sounded, and fill in between tracks less than 200 m apart, never past the ends of a track.
 - **Suspect readings shown, not drawn.** The same checks the Open Waters grid runs on every boat's track run on yours. A reading they doubt on the shallow side, such as a spike or a stuck sounder in shallow water, stays out of the depth areas but shows as a faint unconfirmed sounding, so you see every shoal your sounder read. Readings that would show water deeper than it is, and bad data such as a position that jumped, are left out.
-- **History when it starts.** The first time the layer starts, it fills in the last 30 days from your recorded soundings (a History API provider such as signalk-to-influxdb2, or the plugin's own log). After that, it fills in whatever was recorded while it wasn't running, up to 30 days back. Spots already in the layer stay, however long ago they were sounded, until something below rebuilds it.
+- **History when it starts.** The first time the layer starts, it fills in the last 30 days from your recorded soundings (a History API provider such as signalk-to-influxdb2, or the plugin's own log). After that, it fills in whatever was recorded while it wasn't running, up to 30 days back. If that source fails at three starts in a row, the layer gives up on that span and leaves it empty. Spots already in the layer stay, however long ago they were sounded, until something below rebuilds it.
 
 ### When it rebuilds
 

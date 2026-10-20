@@ -343,6 +343,13 @@ export function createCellWriter(
 
   const timer = setInterval(() => {
     try {
+      // A sounder gone quiet, at a berth or switched off, would leave its last passes
+      // open for good.
+      // Live only: a backfill's soundings are all old.
+      const now = Date.now() * 1000;
+      for (const [k, pass] of bulk ? [] : [...open]) {
+        if (now - pass.last > MAX_PASS_US) closePass(k, pass);
+      }
       flush();
     } catch (err) {
       writer.destroy(err as Error);

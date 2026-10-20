@@ -179,3 +179,16 @@ test("a deep spike isn't shown: drawn, it would read deeper than the water", asy
   await end(writer);
   expect(store.shoals(-76.3, 36, -76.1, 37.1)).toEqual([]);
 });
+
+test("held passes wait for the backfill, then go in after it", async () => {
+  const store = createCellStore(createDB(":memory:"));
+  const writer = createCellWriter(store, { flushIntervalMs: 100_000 });
+  writer.hold(true);
+  for (const d of track(40)) writer.write(d, () => {});
+  // A flush while held writes nothing.
+  writer.hold(true);
+  expect(store.cells(-76.3, 36, -76.1, 37.1)).toHaveLength(0);
+  writer.hold(false);
+  expect(store.cells(-76.3, 36, -76.1, 37.1).length).toBeGreaterThan(0);
+  writer.destroy();
+});

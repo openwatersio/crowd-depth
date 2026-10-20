@@ -82,6 +82,13 @@ export function startChart({
   const store = createCellStore(db);
   const startedAt = Temporal.Now.instant();
 
+  // First, so a refused provider stops the start before anything runs.
+  registerPlotterExtension(app, () => current !== undefined);
+  if (!routesRegistered) {
+    registerLayerRoutes(app, () => current);
+    routesRegistered = true;
+  }
+
   syncConfig(store, cellConfig(config), startedAt);
   // Before the live writer starts, so its marker doesn't hide the gap.
   addPendingBackfill(store, startedAt);
@@ -115,12 +122,6 @@ export function startChart({
     // Stop offering a layer that no longer updates.
     stop();
   });
-
-  registerPlotterExtension(app, () => current !== undefined);
-  if (!routesRegistered) {
-    registerLayerRoutes(app, () => current);
-    routesRegistered = true;
-  }
 
   return {
     backfill: (source: BathymetrySource) => {

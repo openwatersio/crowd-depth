@@ -457,15 +457,13 @@ test("a chart that fails to start doesn't stop the plugin", () => {
     error: (message: string) => errors.push(message),
   });
   const signal = new AbortController();
+  const db = createDB(":memory:");
   expect(
-    startChartSafely({
-      app: failing,
-      config,
-      db: createDB(":memory:"),
-      signal: signal.signal,
-    }),
+    startChartSafely({ app: failing, config, db, signal: signal.signal }),
   ).toBeUndefined();
   expect(errors[0]).toMatch(/provider refused/);
+  // It stopped before anything ran: no live writer, so no gap set aside to backfill.
+  expect(getPendingBackfill(createCellStore(db))).toBeUndefined();
   signal.abort();
 
   expect(

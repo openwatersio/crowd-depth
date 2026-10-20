@@ -18,11 +18,11 @@ When the grid changes a definition, the plugin picks it up on its next release, 
 
 ### QC
 
-[Track QC](README.md#2-quality-control) runs on the plugin's stream, through the same port. Checks that look ahead along the track, such as the spike check's window and the noise check's, make the newest soundings provisional until their window fills. Provisional soundings draw as soundings with a provisional flag; only judged ones go into cells.
+[Track QC](README.md#2-quality-control) runs on the plugin's stream, through the same port. Checks that look ahead along the track, such as the spike check's window and the noise check's, make the newest soundings provisional until their window fills. Provisional soundings draw as their own points, apart from the tiles; only judged ones go into cells.
 
 Cell QC runs across the boat's own passes, as the grid's does across vessels. Consensus QC needs other vessels, so on its own the plugin can't run it. Where the grid overlay covers the water, its published depth and σ stand in for the other vessels' vote.
 
-The plugin reads GNSS quality from the same Signal K data it sends to the grid, so its position checks and horizontal uncertainty match the grid's for the same soundings.
+The plugin is to read GNSS quality from the same Signal K data it sends to the grid, so its position checks and horizontal uncertainty match the grid's for the same soundings (see [Phases](#phases)).
 
 Unconfirmed shoals are handled as in the grid: they publish as soundings with a low-reliability flag, and the surface is drawn as if those QC judged improbable weren't there.
 
