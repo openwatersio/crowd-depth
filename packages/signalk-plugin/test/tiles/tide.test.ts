@@ -43,7 +43,7 @@ const station = (id: string, latitude: number, longitude: number, more = {}) =>
 
 /** A fake tides API: stations listed by bounding box with their details by id, and
  * for each a level rising 0.1 m an hour from 0 at each UTC midnight, every 10 minutes.
- * `unpredictable` stations answer their timelines with a 400, as the API does. */
+ * `unpredictable` stations answer their timelines with a 500, as the API does when Slackwater throws. */
 function fakeApi(
   stations: Station[],
   { fail = false, unpredictable = [] as string[], holes = [] as string[] } = {},
@@ -71,7 +71,7 @@ function fakeApi(
     if (!station) throw new ApiError("404", 404, true);
     if (!what) return station;
     if (unpredictable.includes(station.id))
-      throw new ApiError("400", 400, true);
+      throw new ApiError("500", 500, true);
     const start = Date.parse(url.searchParams.get("start")!);
     return {
       datum: station.chart_datum,
@@ -445,4 +445,17 @@ test("a station the API has no details for is passed over for the next", async (
       : api.get(path);
   const tides = await started(get);
   expect((await tides.at(-76.45, 38.95, noon))!.level).toBeCloseTo(1.2, 6);
+});
+
+test("a refused or failed timeline request is asked again, not counted as the day's", async () => {
+  const api = fakeApi([annapolis]);
+  let refuse = true;
+  const tides = await started((path) =>
+    refuse && path.includes("/timeline")
+      ? Promise.reject(new ApiError("401", 401, true))
+      : api.get(path),
+  );
+  expect(await tides.at(-76.48, 38.98, noon)).toBeUndefined();
+  refuse = false;
+  expect((await tides.at(-76.48, 38.98, noon))!.level).toBeCloseTo(1.2, 1);
 });

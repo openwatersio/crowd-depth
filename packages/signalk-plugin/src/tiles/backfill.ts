@@ -228,7 +228,7 @@ export async function backfillCells({
         },
         transform(correctForSensorPosition(config)),
         // On this thread, so the worker never waits on the server it would ask.
-        ...(tided ? [withTide(tides)] : []),
+        ...(tided && tides ? [withTide(tides)] : []),
         file
           ? createWorkerSink(file)
           : createCellWriter(store, { bulk: true, overviews: false }),

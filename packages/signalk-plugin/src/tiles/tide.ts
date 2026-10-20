@@ -167,6 +167,12 @@ export function httpJson(base: string): GetJson {
     });
 }
 
+/** The API answered, in JSON as it does, that it can't predict a station's day. */
+const dayFailed = (err: unknown) =>
+  err instanceof ApiError &&
+  err.json &&
+  (err.status === 400 || err.status === 500);
+
 /** The API answered, in JSON as it does, that it has no such station. */
 const noStation = (err: unknown) =>
   err instanceof ApiError && err.json && err.status === 404;
@@ -292,7 +298,9 @@ export function createTides(get: GetJson, { now = Date.now } = {}) {
         MAX_TIMELINES,
       );
     } catch (err) {
-      if (!(err instanceof ApiError && err.json)) throw err;
+      // The API's own answer for this station's day: a 500 where Slackwater threw on its
+      // harmonics, or a 400. Anything else, a refusal or the server's, is asked again.
+      if (!dayFailed(err)) throw err;
       series = null;
     }
     return (series && interpolate(series, time)) ?? null;
