@@ -128,8 +128,14 @@ export async function backfillCells({
     else store.rebuildOverviews();
     store.setMeta(OVERVIEWS_STALE_KEY, "");
   };
-  // A backfill stopped with the plugin left cells without their overviews.
-  if (store.getMeta(OVERVIEWS_STALE_KEY)) await rebuild();
+  // A backfill stopped with the plugin left cells without their overviews. A rebuild
+  // that fails isn't the backfill's failure: the span below is still read, and the
+  // mark stays for the next try.
+  if (store.getMeta(OVERVIEWS_STALE_KEY)) {
+    await rebuild().catch((err: unknown) =>
+      app.error(`Chart overview rebuild failed: ${err}`),
+    );
+  }
 
   let pending = getPendingBackfill(store);
   if (!pending) return;

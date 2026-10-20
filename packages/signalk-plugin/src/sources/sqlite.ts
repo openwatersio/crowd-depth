@@ -146,18 +146,33 @@ export function createSqliteWriter(db: DatabaseSync) {
     },
 
     write(data: BathymetryData, encoding, callback) {
-      try {
-        stmt.run({
-          longitude: data.longitude,
-          latitude: data.latitude,
-          depth: data.depth,
-          timestamp: data.timestamp.epochMilliseconds,
-          heading: data.heading ?? null,
-        });
-        callback();
-      } catch (err) {
-        callback(err as Error);
-      }
+      // The chart's backfill writes from a second connection; a write that finds it
+      // holding the lock past the busy timeout is tried again before the log gives up.
+      const attempt = (left: number) => {
+        try {
+          stmt.run({
+            longitude: data.longitude,
+            latitude: data.latitude,
+            depth: data.depth,
+            timestamp: data.timestamp.epochMilliseconds,
+            heading: data.heading ?? null,
+          });
+          callback();
+        } catch (err) {
+          if (left > 0 && isBusy(err))
+            setTimeout(() => attempt(left - 1), 1000);
+          else callback(err as Error);
+        }
+      };
+      attempt(BUSY_RETRIES);
     },
   });
 }
+
+/** Writes the log tries again when another connection holds the database. */
+const BUSY_RETRIES = 3;
+
+const isBusy = (err: unknown) =>
+  /SQLITE_BUSY|database is locked/i.test(
+    `${(err as { errstr?: string }).errstr ?? ""} ${String(err)}`,
+  );
