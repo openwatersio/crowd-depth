@@ -22,6 +22,7 @@ export type QCRunner = (
  */
 export function createQCThread() {
   let worker: Worker | undefined;
+  let closed = false;
   let next = 0;
   const waiting = new Map<
     number,
@@ -64,6 +65,7 @@ export function createQCThread() {
     worker.on("exit", (code) => fail(new Error(`QC worker exited (${code})`)));
   };
   const run: QCRunner = (soundings, arrival) => {
+    if (closed) return Promise.reject(new Error("QC worker closed"));
     if (!worker) start();
     const data = new Float64Array(soundings.length * 4);
     soundings.forEach((s, i) => {
@@ -81,6 +83,7 @@ export function createQCThread() {
   return {
     run,
     close() {
+      closed = true;
       void worker?.terminate();
       fail(new Error("QC worker closed"));
     },

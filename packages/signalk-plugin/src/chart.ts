@@ -117,6 +117,7 @@ export function startChart({
   const writer = createCellWriter(store, {
     onChange: tiles.changed,
     qc: qc?.run,
+    onError: (err) => app.error(`Chart layer: ${err.message}`),
   });
   // One for the live writer and the backfill, so they share what they've fetched. Without
   // signalk-tides the soundings stay untided, and the tiles say so.
