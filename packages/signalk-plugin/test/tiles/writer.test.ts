@@ -103,11 +103,21 @@ test("a stuck sounder's run isn't judged until it covers a kilometre", () => {
   expect(store.cells(-76.3, 36, -76.1, 37.1)).toHaveLength(0);
 });
 
-test("a stuck run QC rejects at the end leaves nothing provisional", async () => {
+test("a stuck run QC sets aside still shows, as unconfirmed soundings", async () => {
   const { store, writer } = run(track(40, { depth: () => 2.4 }));
   await end(writer);
   expect(writer.provisional()).toHaveLength(0);
   expect(store.cells(-76.3, 36, -76.1, 37.1)).toHaveLength(0);
+  expect(store.shoals(-76.3, 36, -76.1, 37.1)).toHaveLength(40);
+});
+
+test("a position that jumped is dropped, not shown", async () => {
+  const data = track(30);
+  data[15] = { ...data[15], latitude: data[15].latitude + 0.05 };
+  const { store, writer } = run(data);
+  await end(writer);
+  const shoals = store.shoals(-76.3, 36, -76.1, 37.1);
+  expect(shoals.some((s) => s.lat > 37)).toBe(false);
 });
 
 test("readings under half a metre stay in the cells, as the grid keeps them", async () => {

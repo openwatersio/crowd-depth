@@ -68,6 +68,12 @@ const RANK: Record<string, number> = {
   reject: 3,
 };
 
+/** Readings QC rejects as bad data rather than a bad depth: no reading, an impossible
+ * time, or a position that jumped. Everything else QC sets aside still shows on the live
+ * layer, as an unconfirmed sounding outside the surface, so the boat sees what it
+ * measured, however doubtful. */
+const UNUSABLE = new Set(["sentinel", "time", "jump"]);
+
 /** Meta key for the time the cells hold every sounding through. */
 export const THROUGH_KEY = "through";
 
@@ -120,7 +126,7 @@ interface OpenPass {
  *
  * A sounding is judged once the soundings QC looks ahead over have arrived and it isn't
  * in a run of one depth that's still going, which the stuck-sounder check could yet
- * flag. Rejected soundings are dropped, unconfirmed shoals stored as such, and accepted
+ * flag. Bad data is dropped, other soundings QC sets aside are stored as unconfirmed, and accepted
  * ones go to the pass of every cell within a pixel. A cell's pass ends when the boat's
  * soundings leave its 3×3, and a cell gets a pass only where the boat sounded it itself.
  *
@@ -224,15 +230,17 @@ export function createCellWriter(
     }
     if (end <= judged) return;
     const flags = new Map<number, string>();
-    for (const [i, flag] of trackQC(buffer, Date.now() * 1000, QC)) {
+    const unusable = new Set<number>();
+    for (const [i, flag, reason] of trackQC(buffer, Date.now() * 1000, QC)) {
       const was = flags.get(i);
       if (was === undefined || RANK[flag] > RANK[was]) flags.set(i, flag);
+      if (UNUSABLE.has(reason)) unusable.add(i);
     }
     for (let i = judged; i < end; i++) {
       const s = buffer[i];
       const flag = flags.get(i);
-      if (flag === "unconfirmed") shoals.push(s);
-      else if (flag === undefined || flag === "review") accept(s);
+      if (flag === undefined || flag === "review") accept(s);
+      else if (!unusable.has(i)) shoals.push(s);
     }
     judged = end;
     // Keep what QC looks back over, and everything not yet judged.

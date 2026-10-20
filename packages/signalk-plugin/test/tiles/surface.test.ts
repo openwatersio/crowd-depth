@@ -28,16 +28,18 @@ const features = (t: VectorTile, layer: string) => {
   return l ? Array.from({ length: l.length }, (_, i) => l.feature(i)) : [];
 };
 
-test("a lone track publishes soundings and measured coverage, but no areas", () => {
-  const buf = buildTile(
-    Z,
-    tile.x,
-    tile.y,
-    lane(LON, () => 8),
-    [],
-  )!;
-  const t = decode(buf);
-  expect(features(t, "DEPARE")).toHaveLength(0);
+test("a lone track draws its own ribbon of areas, measured, never past it", () => {
+  const t = decode(
+    buildTile(
+      Z,
+      tile.x,
+      tile.y,
+      lane(LON, () => 8),
+      [],
+    )!,
+  );
+  // 8 m less the margin, about 6 m: the 5 to 10 m band, along the track only.
+  expect(features(t, "DEPARE").map((f) => f.properties.DRVAL1)).toEqual([5]);
   expect(features(t, "SOUNDG").length).toBeGreaterThan(0);
   const coverage = features(t, "M_QUAL");
   expect(coverage.map((f) => f.properties.kind)).toEqual(["measured"]);

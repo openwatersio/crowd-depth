@@ -77,7 +77,11 @@ test("serves a tile as MVT bytes, and nothing where there are no cells", async (
   const tile = await get(`${TILES_PATH}/:z/:x/:y.pbf`, { params });
   expect(Buffer.isBuffer(tile.body)).toBe(true);
   const decoded = new VectorTile(new PbfReader(tile.body as Buffer));
-  expect(Object.keys(decoded.layers).sort()).toEqual(["M_QUAL", "SOUNDG"]);
+  expect(Object.keys(decoded.layers).sort()).toEqual([
+    "DEPARE",
+    "M_QUAL",
+    "SOUNDG",
+  ]);
 
   const empty = await get(`${TILES_PATH}/:z/:x/:y.pbf`, {
     params: { ...params, x: "0" },
