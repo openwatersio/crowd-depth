@@ -24,6 +24,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import time
 import urllib.request
 from pathlib import Path
 
@@ -60,14 +61,16 @@ FETCH_ERRORS = (OSError, http.client.HTTPException)
 MEAN_M = 10
 RELIEF_M = 20
 BLOCK = 2048  # reference cells a side read at once
+MISMATCH_RETRY_S = 86400
 
 
 def catalog(name):
     """A catalog's newest tile scheme, from the cache once fetched: its path, table, link
-    and checksum columns, and whether it is stale. With the bucket out of reach, it is the
-    newest one cached, and stale: a newer one may cover more."""
+    and checksum columns, and whether it is stale. With the bucket out of reach, or its
+    newest scheme damaged, it is the newest readable one cached, and stale: a newer one
+    may cover more. A cached scheme that isn't a whole database is removed; a whole one
+    NOAA changed the shape of fails the run."""
     bucket, prefix, column, checksum = CATALOGS[name]
-    stale = False
     try:
         with urllib.request.urlopen(f"{bucket}/?list-type=2&prefix={prefix}", timeout=60) as r:
             key = max(re.findall(r"<Key>([^<]+\.gpkg)</Key>", r.read().decode()))
@@ -81,12 +84,34 @@ def catalog(name):
                 path = Path(scratch().name, path.name)
                 download(f"{bucket}/{key}", path)
     except (*FETCH_ERRORS, ValueError) as e:
-        cached = cached_catalogs(name)
-        if not cached:
-            raise
-        path, stale = cached[-1], True
-        log.warning("reference: %s tile scheme not fetched (%s); using %s", name, e, path.name)
-    return path, gpkg_table(path), column, checksum, stale
+        error = e
+    else:
+        try:
+            return path, gpkg_table(path), column, checksum, False
+        except sqlite3.DatabaseError as e:
+            if not damaged(e):
+                raise
+            error = e
+    for path in reversed(cached_catalogs(name)):
+        try:
+            table = gpkg_table(path)
+        except (OSError, ValueError, sqlite3.DatabaseError) as e:
+            if damaged(e):
+                log.warning("reference: %s damaged (%s); removed", path.name, e)
+                with contextlib.suppress(OSError):
+                    path.unlink()
+            else:
+                log.warning("reference: %s unreadable (%s); skipped", path.name, e)
+            continue
+        log.warning("reference: %s tile scheme not fetched (%s); using %s", name, error, path.name)
+        return path, table, column, checksum, True
+    raise error
+
+
+def damaged(e):
+    """Whether a tile scheme's error is a file that isn't a whole database, not a passing
+    fault or a scheme of another shape."""
+    return isinstance(e, sqlite3.DatabaseError) and not isinstance(e, sqlite3.OperationalError)
 
 
 @functools.cache
@@ -101,7 +126,13 @@ def cached_catalogs(name):
 
 
 def gpkg_table(path):
+    """A tile scheme's table, once the whole file reads as a database."""
+    # SQLite takes an empty file for an empty database.
+    if not path.stat().st_size:
+        raise sqlite3.DatabaseError(f"{path.name} is empty")
     with contextlib.closing(sqlite3.connect(path)) as db:
+        if db.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+            raise sqlite3.DatabaseError(f"{path.name} is damaged")
         [(table,)] = db.execute("SELECT table_name FROM gpkg_contents").fetchall()
     return table
 
@@ -121,30 +152,51 @@ def download(url, entry, sha=None):
         if expected is not None and int(expected) != size:
             raise OSError(f"{size} bytes of {expected}")
         if sha and digest.hexdigest() != sha:
-            raise OSError(f"SHA-256 {digest.hexdigest()}, catalog gives {sha}")
+            raise Mismatch(f"SHA-256 {digest.hexdigest()}, catalog gives {sha}")
 
 
-# Rasters that couldn't be cached this run: each is read remotely, not downloaded again
-# for every 1° tile it touches.
-uncached = set()
+class Mismatch(ValueError):
+    """A raster that isn't the one its tile scheme lists."""
+
+
+# Rasters that couldn't be cached this run, and what stands for each: its URL, read
+# remotely, or None for one that isn't what its scheme lists. Either way it isn't
+# downloaded again for every 1° tile it touches.
+uncached = {}
 
 
 def fetch(name, link, sha):
     """A catalog raster's path in the cache, downloaded and checked against its SHA-256 on
-    first use; its URL through /vsicurl, read remotely, when it can't be."""
+    first use; its URL through /vsicurl, read remotely, when it can't be; None when the
+    download isn't the raster its checksum names, so its tiles wait for it."""
     remote = f"/vsicurl/{link}"
     sha = (sha or "").lower()
     # The checksum names the entry's folder, so it must be one.
-    if not re.fullmatch("[0-9a-f]{64}", sha) or link in uncached:
+    if not re.fullmatch("[0-9a-f]{64}", sha):
         return remote
+    if link in uncached:
+        return uncached[link]
     path = cache.path("reference", name, sha, link.rsplit("/", 1)[-1])
     if path.exists():
         return str(path)
+    # A raster found unlike its checksum is tried again a day later, not every run: NOAA
+    # may list a raster before uploading it, or upload it before listing it.
+    mismatch = path.with_name(path.name + ".mismatch")
+    with contextlib.suppress(OSError):
+        if time.time() - mismatch.stat().st_mtime < MISMATCH_RETRY_S:
+            log.warning("reference: %s skipped, unlike its checksum a day ago", link)
+            uncached[link] = None
+            return None
     try:
         download(link, path, sha)
+    except Mismatch as e:
+        log.warning("reference: %s skipped for a day, unlike its checksum (%s)", link, e)
+        cache.write_json(mismatch, str(e))
+        uncached[link] = None
+        return None
     except FETCH_ERRORS as e:
         log.warning("reference: %s not cached (%s); read remotely", link, e)
-        uncached.add(link)
+        uncached[link] = remote
         return remote
     log.info("reference: cached %s", link)
     return str(path)
@@ -158,8 +210,12 @@ def prune():
         schemes = cached_catalogs(name)
         if not schemes:
             continue
-        with contextlib.closing(sqlite3.connect(schemes[-1])) as db:
+        try:
             table = gpkg_table(schemes[-1])
+        except (OSError, ValueError, sqlite3.DatabaseError) as e:
+            log.warning("reference: %s unreadable (%s); nothing pruned", schemes[-1].name, e)
+            continue
+        with contextlib.closing(sqlite3.connect(schemes[-1])) as db:
             keep = {
                 sha.lower()
                 for (sha,) in db.execute(
@@ -310,7 +366,9 @@ def sample_tile(con, tile, name, catalogs, shift_at):
     lon = lon0 + (px["px"] + 0.5) * 2 * k_for(lat0) / BASE
     depth, relief, unc = (np.full(len(lat), np.nan) for _ in range(3))
     paths, pending = rasters(name, (lon0, lat0, lon0 + 1, lat0 + 1), catalogs, lon, lat)
-    complete = True
+    # A raster that didn't match its checksum is skipped, like one that can't be read.
+    complete = None not in paths
+    paths = [p for p in paths if p]
     # Finest first, so a 4 m harbour tile wins over the 16 m tile around it.
     for path in sorted(paths, key=resolution):
         try:

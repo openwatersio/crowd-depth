@@ -158,8 +158,7 @@ def test_entries_are_readable_by_every_user():
 
 def test_a_cut_off_raster_download_is_never_an_entry(monkeypatch):
     files = bucket_files(scheme())
-    serve(monkeypatch, files | {LINK: RASTER[:100]})
-    asked = []
+    serve(monkeypatch, files, cut=[LINK])
     paths, _ = reference.rasters("bluetopo", (0, 0, 1, 1), {})
     # Read remotely instead, and nothing left in the cache under the checksum.
     assert paths == [f"/vsicurl/{LINK}"]
@@ -168,6 +167,62 @@ def test_a_cut_off_raster_download_is_never_an_entry(monkeypatch):
     asked = serve(monkeypatch, files)
     assert reference.rasters("bluetopo", (0, 0, 1, 1), {})[0] == [f"/vsicurl/{LINK}"]
     assert LINK not in asked
+
+
+def test_a_raster_unlike_its_checksum_is_skipped_not_read(monkeypatch):
+    files = bucket_files(scheme())
+    serve(monkeypatch, files | {LINK: b"another raster"})
+    # Neither cached nor read remotely, unverified: its tiles wait for it.
+    assert reference.rasters("bluetopo", (0, 0, 1, 1), {})[0] == [None]
+    assert not cache.path("reference", "bluetopo", SHA, LINK.rsplit("/", 1)[-1]).exists()
+    asked = serve(monkeypatch, files)
+    assert reference.rasters("bluetopo", (0, 0, 1, 1), {})[0] == [None]
+    assert LINK not in asked
+    # Nor in the next run that day; a day later, NOAA has uploaded the raster it listed.
+    monkeypatch.setattr(reference, "uncached", {})
+    asked = serve(monkeypatch, files)
+    assert reference.rasters("bluetopo", (0, 0, 1, 1), {})[0] == [None]
+    assert LINK not in asked
+    monkeypatch.setattr(reference, "uncached", {})
+    [marker] = cache.path("reference", "bluetopo", SHA).glob("*.mismatch")
+    os.utime(marker, (0, 0))
+    [path], _ = reference.rasters("bluetopo", (0, 0, 1, 1), {})
+    assert Path(path).read_bytes() == RASTER
+
+
+def test_a_damaged_cached_scheme_gives_way_to_an_older_one(monkeypatch):
+    serve(monkeypatch, bucket_files(scheme()))
+    reference.catalog("bluetopo")
+    [older] = reference.cached_catalogs("bluetopo")
+    name = "BlueTopo_Tile_Scheme_20260201_000000.gpkg"
+    damaged = older.with_name(name)
+    damaged.write_bytes(older.read_bytes()[: older.stat().st_size // 2])
+    serve(monkeypatch, bucket_files(b"", name))
+    path, *_, stale = reference.catalog("bluetopo")
+    assert path == older and stale
+    # Removed, so the next run downloads it again.
+    assert reference.cached_catalogs("bluetopo") == [older]
+
+
+def test_a_scheme_of_another_shape_fails_loudly_and_is_kept(monkeypatch):
+    serve(monkeypatch, bucket_files(scheme()))
+    reference.catalog("bluetopo")
+    [older] = reference.cached_catalogs("bluetopo")
+    name = "BlueTopo_Tile_Scheme_20260201_000000.gpkg"
+    newer = older.with_name(name)
+    newer.write_bytes(older.read_bytes())
+    with contextlib.closing(sqlite3.connect(newer)) as db:
+        db.execute("INSERT INTO gpkg_contents VALUES ('another')")
+        db.commit()
+    # Newest, it fails the run: NOAA changed what it publishes.
+    serve(monkeypatch, bucket_files(b"", name))
+    with pytest.raises(ValueError):
+        reference.catalog("bluetopo")
+    # Cached but out of reach, it gives way to an older one.
+    serve(monkeypatch, {})
+    path, *_, stale = reference.catalog("bluetopo")
+    assert path == older and stale
+    assert reference.cached_catalogs("bluetopo") == [older, newer]
 
 
 def test_an_interrupted_write_leaves_no_entry():
@@ -237,6 +292,57 @@ def test_a_trim_never_takes_a_file_a_run_is_reading(env, tmp_path):  # noqa: F81
     assert path.read_bytes() == (env.noaa.root / obj.key).read_bytes()
 
 
+def test_an_entry_this_user_cant_read_is_a_miss(env, tmp_path, monkeypatch):  # noqa: F811
+    put(env, 1, [(0, -78.1, 33.1, 5.0)])
+    env.run("noaa")
+
+    def refuse(src, dest):
+        raise PermissionError(13, "another user's entry", str(src))
+
+    monkeypatch.setattr(cache, "share", refuse)
+    access = os.access
+    # Where the link would succeed but the read fail: macOS, or no protected_hardlinks.
+    monkeypatch.setattr(os, "access", lambda p, mode: "files" not in str(p) and access(p, mode))
+    run = Ingest(None, "noaa", env.noaa)
+    run.tmp, run.cached = tmp_path, 0
+    [obj] = [o for o in env.noaa.list()[0]]
+    assert run.fetch(obj).read_bytes() == (env.noaa.root / obj.key).read_bytes()
+
+
+def test_a_download_kept_for_its_owner_alone_is_cached_for_everyone(tmp_path):
+    src = tmp_path / "download"
+    src.write_bytes(b"x")
+    src.chmod(0o600)
+    entry = cache.path("files", "k", "e")
+    assert cache.publish(src, entry)
+    assert entry.stat().st_mode & 0o777 == 0o644
+
+
+def test_entries_another_user_owns_dont_count_against_the_cap(monkeypatch):
+    for age, name in enumerate(["theirs", "newer", "older"]):
+        entry = cache.path("files", name, "e")
+        cache.write_json(entry, "x" * 98)
+        os.utime(entry, (1e9 - age, 1e9 - age))
+    access = os.access
+    monkeypatch.setattr(os, "access", lambda p, mode: Path(p).name != "theirs" and access(p, mode))
+    # Theirs is the newest, so a trim that counted it would remove both of this user's.
+    assert cache.trim("files", 150) == 100
+    assert sorted(p.parent.name for p, _ in cache.entries("files")) == ["newer", "theirs"]
+
+
+def test_only_the_caches_own_part_files_are_removed(tmp_path, monkeypatch):
+    monkeypatch.setenv("GRID_CACHE_DIR", str(tmp_path / "downloads"))
+    entry = cache.path("files", "k", "e")
+    with pytest.raises(KeyboardInterrupt), cache.writing(entry) as tmp:
+        os.link(tmp, tmp.with_name("left"))  # as a write that died leaves it
+        raise KeyboardInterrupt
+    own = tmp.with_name("left").rename(tmp)
+    theirs = cache.root() / "a browser's download.part"
+    theirs.write_bytes(b"")
+    assert cache.remove_stale_parts(now=1e12) == 1
+    assert theirs.exists() and not own.exists()
+
+
 def residuals(gauge, month):
     return [(datetime(month.year, month.month, 1, 0, 6 * i), 0.1) for i in range(5)]
 
@@ -273,3 +379,14 @@ def test_a_recent_gauge_month_is_fetched_again(tmp_path):
     # 31 January plus 45 days is 17 March: not final on the 10th.
     assert gauge_rows(tmp_path / "a", month, date(2026, 3, 10), residuals) == 5
     assert gauge_rows(tmp_path / "b", month, date(2026, 3, 10), offline) == 0
+
+
+@pytest.mark.parametrize(
+    "kept", [{"2026-01-01T00:00:00": 0.1}, [1, 2], [["2026-01-01T00:00:00", "x"]]]
+)
+def test_a_cached_gauge_month_of_another_shape_is_fetched_again(tmp_path, kept):
+    month = [("8574680", date(2026, 1, 1))]
+    cache.write_json(tide.cached_month(*month[0]), kept)
+    assert gauge_rows(tmp_path / "a", month, date(2026, 6, 1), residuals) == 5
+    # And replaced, for the next store.
+    assert gauge_rows(tmp_path / "b", month, date(2026, 6, 1), offline) == 5

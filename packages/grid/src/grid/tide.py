@@ -16,6 +16,7 @@ slope to the next half hour, so a sounding's level is interpolated at its own ti
 when depths are read (catalog's `corrected_points_in`). Raw depths are never changed.
 """
 
+import contextlib
 import json
 import logging
 import math
@@ -395,10 +396,16 @@ def fetch_residuals(con, months, today, residuals=coops_residuals):
     days take predictions alone until a later run gets it. A month some store has made
     final comes from the shared cache. Returns the months fetched."""
 
+    served = set()
+
     def fetch(m):
         kept = cache.read_json(cached_month(*m))
         if kept:
-            return [(datetime.fromisoformat(t), v) for t, v in kept]
+            # An entry of another shape is a miss: CO-OPS answers, and replaces it.
+            with contextlib.suppress(TypeError, ValueError):
+                rows = [(datetime.fromisoformat(t), float(v)) for t, v in kept]
+                served.add(m)
+                return rows
         try:
             return residuals(*m)
         except (OSError, ValueError, RuntimeError) as e:
@@ -471,10 +478,9 @@ def fetch_residuals(con, months, today, residuals=coops_residuals):
             con.execute("COMMIT")
             # Final here is final for every store. An empty month isn't kept: an outage's
             # empty answer could pass for one.
-            entry = cached_month(gauge, month)
             final = today >= month_end(month) + timedelta(days=RECENT_DAYS)
-            if rows and final and not entry.exists():
-                cache.write_json(entry, [(t.isoformat(), v) for t, v in rows])
+            if rows and final and (gauge, month) not in served:
+                cache.write_json(cached_month(gauge, month), [(t.isoformat(), v) for t, v in rows])
             fetched.append((gauge, month))
             checkpoint(con)
     if months:

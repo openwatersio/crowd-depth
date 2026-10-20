@@ -261,16 +261,18 @@ class Ingest:
             if self.source != "noaa":
                 return path if self.objects.download(obj.key, path) else None
             try:
-                # An entry of another size isn't this ETag's file.
-                if entry.stat().st_size != obj.size:
+                # An entry of another size isn't this ETag's file. One this user can't
+                # read could still be linked, and then fail as the file's own fault.
+                if entry.stat().st_size != obj.size or not os.access(entry, os.R_OK):
                     raise FileNotFoundError(entry)
                 cache.share(entry, path)
                 # Recently used, for the trim; an entry another user wrote may refuse it.
                 with contextlib.suppress(OSError):
                     os.utime(entry)
                 return path
-            except FileNotFoundError:
-                pass
+            except OSError:
+                # Missing, or unreadable to this user: a miss, never the file's failure.
+                path.unlink(missing_ok=True)
             if not self.objects.download(obj.key, path):
                 return None
             # Another ETag is another version of the key: the old one is never read again.
