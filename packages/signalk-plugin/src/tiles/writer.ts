@@ -396,7 +396,6 @@ export function createCellWriter(
   return Object.assign(writer, {
     /** Keep passes rather than write them, or write what was kept. */
     hold,
-    /** Soundings not yet in a stored cell: unjudged, or in a pass still open. */
     /** The soundings written to the store lately: still to show until the chart's tiles
      * have caught up with them. */
     stored(): number[] {
@@ -404,6 +403,7 @@ export function createCellWriter(
       stored = stored.filter((s) => s.at >= since);
       return stored.map((s) => s.id);
     },
+    /** Soundings not yet in a stored cell: unjudged, in a pass still open, or held. */
     provisional(): Sounding[] {
       return [
         ...unwritten,

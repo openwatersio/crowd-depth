@@ -6,6 +6,8 @@ import { DEFINITIONS, cellAt, cellRanges } from "./geometry.js";
  * than every cell under it. */
 export const OVERVIEW_LEVELS = [1, 2, 4, 6];
 const ROWS_PER_BAND = DEFINITIONS.cells.rows_per_degree / 2;
+/** Overview rows a rebuild writes per transaction. */
+const REBUILD_ROWS = 2000;
 
 /** An overview block's key. Blocks stay within a 1° band, whose columns are its own. */
 function block(py: number, px: number, level: number) {
@@ -332,9 +334,6 @@ export function createCellStore(db: DatabaseSync) {
         .prepare("SELECT min(py) AS lo, max(py) AS hi FROM cells")
         .get() as { lo: number | null; hi: number | null };
       if (range.lo === null || range.hi === null) return;
-      const clearRows = db.prepare(
-        "DELETE FROM overviews WHERE level = ? AND oy BETWEEN ? AND ?",
-      );
       const stretch = db.prepare(
         `SELECT py, px, m, d, passes, first, last FROM cells WHERE py BETWEEN ? AND ?`,
       );
@@ -363,19 +362,17 @@ export function createCellStore(db: DatabaseSync) {
               }
             }
           }
-          // Each stretch's blocks replaced in one short transaction; the table is never
-          // cleared at once, which on an SD card would hold the lock for seconds.
-          transaction(() => {
-            for (const level of OVERVIEW_LEVELS) {
-              clearRows.run(
-                level,
-                block(py0, 0, level).oy,
-                block(py1, 0, level).oy,
-              );
-            }
-            for (const { cell, at } of best.values())
-              write(writeBlock, at, cell);
-          });
+          // Written over what's there, a couple of thousand rows a transaction, so no
+          // write holds the lock for long. Nothing goes stale: a block keeps its cells,
+          // which only `clear` removes, and it clears the overviews too.
+          const rows = [...best.values()];
+          for (let i = 0; i < rows.length; i += REBUILD_ROWS) {
+            transaction(() => {
+              for (const { cell, at } of rows.slice(i, i + REBUILD_ROWS)) {
+                write(writeBlock, at, cell);
+              }
+            });
+          }
         }
       }
     },

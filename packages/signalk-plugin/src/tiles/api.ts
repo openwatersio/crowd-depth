@@ -11,8 +11,16 @@ export const STYLE_PATH = `${ASSET_BASE}/style.json`;
 export const TILES_PATH = `${ASSET_BASE}/tiles`;
 export const LIVE_PATH = `${ASSET_BASE}/live`;
 
-/** Provisional soundings sent per poll, the newest: about half an hour at 1 Hz. */
-const MAX_PROVISIONAL = 2000;
+/** Provisional soundings sent per poll: the newest in full, and older ones, held while a
+ * backfill runs, thinned to as many again, so the whole track stays on the chart. */
+const NEWEST_PROVISIONAL = 1000;
+
+/** Keep the newest soundings of `n`, in time order, and an even share of the rest. */
+export function thin(n: number) {
+  const older = n - NEWEST_PROVISIONAL;
+  const step = Math.max(1, Math.ceil(older / NEWEST_PROVISIONAL));
+  return (_: unknown, i: number) => i >= older || i % step === 0;
+}
 
 /** What the routes read; replaced on each start. */
 export interface Layer {
@@ -132,6 +140,7 @@ export function registerLayerRoutes(
     LIVE_PATH,
     guard((req, res, layer) => {
       const since = Number(req.query.since ?? -1);
+      const provisional = layer.provisional();
       res.set("Cache-Control", "no-store").json({
         ...layer.tiles.since(Number.isInteger(since) ? since : -1),
         // Ids of soundings just written to cells, which the runtime keeps drawing until
@@ -139,10 +148,9 @@ export function registerLayerRoutes(
         stored: layer.stored(),
         provisional: {
           type: "FeatureCollection",
-          features: layer
-            .provisional()
+          features: provisional
             .sort((a, b) => a.time - b.time)
-            .slice(-MAX_PROVISIONAL)
+            .filter(thin(provisional.length))
             // A sounding's id is its time, so the runtime can tell which have left.
             .map((s) => ({
               type: "Feature",

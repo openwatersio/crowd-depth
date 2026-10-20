@@ -14,6 +14,9 @@ import { createCellWriter, getThrough, setThrough } from "./writer.js";
 /** How far back a store with no cells yet is filled from the plugin's source. */
 export const BACKFILL_PERIOD = Temporal.Duration.from({ hours: 30 * 24 });
 
+/** Meta key set while a backfill's cells are without their overviews. */
+const OVERVIEWS_STALE_KEY = "overviews_stale";
+
 /** Meta key for the span still waiting to be backfilled, as `from/to`. */
 const PENDING_KEY = "backfill";
 
@@ -120,6 +123,14 @@ export async function backfillCells({
    * as for an in-memory database, they're written on this one. */
   file?: string;
 }): Promise<void> {
+  const rebuild = async () => {
+    if (file) await rebuildOverviewsOnWorker(file);
+    else store.rebuildOverviews();
+    store.setMeta(OVERVIEWS_STALE_KEY, "");
+  };
+  // A backfill stopped with the plugin left cells without their overviews.
+  if (store.getMeta(OVERVIEWS_STALE_KEY)) await rebuild();
+
   let pending = getPendingBackfill(store);
   if (!pending) return;
   // The SQLite log is the source that can write; its depths from before a
@@ -143,6 +154,9 @@ export async function backfillCells({
   );
   if (windows.length > 0) {
     app.debug(`Backfilling chart cells from ${windows.length} windows`);
+    // Its cells get their overviews at the end; until then they're marked missing,
+    // so a backfill that doesn't get there is made good by the next.
+    store.setMeta(OVERVIEWS_STALE_KEY, "1");
     try {
       await pipeline(
         async function* () {
@@ -163,14 +177,13 @@ export async function backfillCells({
           : createCellWriter(store, { bulk: true, overviews: false }),
         { signal },
       );
-      if (!file) store.rebuildOverviews();
+      // The worker rebuilt them as it finished.
+      if (file) store.setMeta(OVERVIEWS_STALE_KEY, "");
+      else await rebuild();
     } catch (err) {
       // The cells it wrote have no overviews yet, so zoomed out they'd not show.
       // Plugin stopping: the next start's backfill rebuilds them.
-      if (!signal.aborted) {
-        if (file) await rebuildOverviewsOnWorker(file).catch(() => {});
-        else store.rebuildOverviews();
-      }
+      if (!signal.aborted) await rebuild().catch(() => {});
       throw err;
     }
   }

@@ -11,6 +11,7 @@ import {
   createTileService,
   registerLayerRoutes,
 } from "../../src/tiles/index.js";
+import { thin } from "../../src/tiles/api.js";
 import { cellAt, cellCenter, tileFraction } from "../../src/tiles/geometry.js";
 
 interface Res {
@@ -118,4 +119,13 @@ test("the live feed names the tiles a change touched, and the provisional soundi
 
   tiles.reset();
   expect((await live(next.rev)).all).toBe(true);
+});
+
+test("a long held track is thinned, not cut, so all of it stays drawn", () => {
+  const kept = Array.from({ length: 10_000 }, (_, i) => i).filter(thin(10_000));
+  expect(kept.length).toBeLessThanOrEqual(2000);
+  expect(kept[0]).toBe(0);
+  expect(kept.slice(-1000)).toEqual(
+    Array.from({ length: 1000 }, (_, i) => 9000 + i),
+  );
 });

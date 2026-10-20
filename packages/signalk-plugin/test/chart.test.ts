@@ -688,3 +688,20 @@ test("a backfill that fails partway still leaves its cells drawn zoomed out", as
   expect(store.cells(-76.3, 36.9, -76.1, 37.1).length).toBeGreaterThan(0);
   expect(store.cells(-76.3, 36.9, -76.1, 37.1, 6).length).toBeGreaterThan(0);
 });
+
+test("cells a stopped backfill left without overviews get them on the next start", async () => {
+  const store = createCellStore(createDB(":memory:"));
+  const { py, px } = { py: 199_691, px: -411_481 };
+  store.addPasses([{ py, px, depth: 5, day: 1 }], false);
+  store.setMeta("overviews_stale", "1");
+  expect(store.cells(-76.3, 36.9, -76.1, 37.1, 6)).toHaveLength(0);
+  // Nothing left to backfill, as when History is down and the local log is empty.
+  await backfillCells({
+    app,
+    config,
+    source: createSqliteSource(app, createDB(":memory:")),
+    store,
+    signal: new AbortController().signal,
+  });
+  expect(store.cells(-76.3, 36.9, -76.1, 37.1, 6)).toHaveLength(1);
+});
