@@ -1,11 +1,12 @@
-"""Track QC: flag impossible values, position jumps, stuck sounders and depth spikes along each track.
+"""Track QC: flag impossible values, position jumps, lost bottom, stuck sounders, noise and
+depth spikes along each track.
 
 QC runs on each ingest batch as it lands, along each file's soundings: a submitted
 file is a contiguous piece of one vessel's track. The checks are pure functions over
 one file's soundings held whole, with thresholds from definitions.json. The plugin has
 a port of them, checked against the same definitions and test vectors
-(tests/qc_vectors.json), for its live layer. A transit's first and last few soundings are judged against
-one side only.
+(tests/qc_vectors.json), for its live layer. A transit's first and last few soundings
+are judged against one side only.
 
 Follows NOAA Office of Coast Survey's CSB processing tool, with its thresholds as
 starting values. Rejection is one-sided: a spike deeper than the track around it is
@@ -15,7 +16,7 @@ new shoal. QC writes flags and never deletes points.
 Times are int64 microseconds since the epoch, UTC, and depths float32, as the store
 holds them. Depth arithmetic rounds through float32 and position arithmetic is
 float64, so flags match those DuckDB computes from the same columns (the reference SQL
-in tests/reference_qc.py).
+in tests/reference_qc.py, which has every check but the steep and noise checks).
 """
 
 import itertools
@@ -38,16 +39,29 @@ QC_VERSION = QC["version"]
 # another vessel or pass, or enough of them, confirm and the other vessels don't
 # outvote, `cell_shoal`; it then counts like any other sounding). A
 # point can carry both an unconfirmed and a confirmed flag: confirmed wins. A reject
-# flag wins over both.
-TRACK_REASONS = ["sentinel", "time", "very_shallow", "jump", "flatline", "spike"]
+# flag wins over both. noisy (a sounding on a track hunting between echoes) votes in
+# consensus but sets no depth (see NOISE_REL).
+TRACK_REASONS = [
+    "sentinel",
+    "time",
+    "very_shallow",
+    "jump",
+    "steep",
+    "flatline",
+    "track_noise",
+    "spike",
+]
 # What track_qc returns, in order: each check's flag and reason.
 CHECKS = [
     ("reject", "sentinel"),
     ("reject", "time"),
     ("review", "very_shallow"),
     ("reject", "jump"),
+    ("reject", "steep"),
     ("unconfirmed", "flatline"),
     ("reject", "flatline"),
+    ("noisy", "track_noise"),
+    ("unconfirmed", "track_noise"),
     ("reject", "spike"),
     ("unconfirmed", "spike"),
 ]
@@ -81,6 +95,28 @@ HAZARD_M = QC["hazard_m"]
 # distance, so its error is at most the depth change across it. Deeper, a sounder that
 # loses bottom holds anything, so the path alone decides.
 FLAT_SPAN_M = QC["flat_span_m"]
+# A sounding deeper than STEEP_FACTOR times the depth before it, plus STEEP_ABS_M, plus
+# STEEP_SLOPE metres for every metre between them, came faster than any seabed falls:
+# a sounder that lost bottom. Judged against the last sounding before it that wasn't, so
+# a lost-bottom stretch is caught whole, and from both directions, so a real descent,
+# which stays deep, is kept. Deep side only: a sudden shoal is left to the spike check,
+# which keeps it as unconfirmed.
+STEEP_FACTOR = QC["steep_factor"]
+STEEP_ABS_M = QC["steep_abs_m"]
+STEEP_SLOPE = QC["steep_slope"]
+# The depth before counts as at least this much, so a sounder reading junk near the
+# surface, or a shallow spike, can't make the real depth after it look steep.
+STEEP_FLOOR_M = QC["steep_floor_m"]
+# A track whose soundings zig-zag by more than NOISE_REL of its depth (and NOISE_ABS_M)
+# is noisy: a sounder hunting between echoes, where a spike check would reject the deep
+# side, the true bottom as often as not. Noisy soundings vote in consensus but don't set
+# cell depths, vote in or cap the surface, or feed calibration. A shoaler spike on a
+# noisy track is kept as an unconfirmed shoal, since it may be a rock, but one that
+# neither confirms nor is confirmed (reason track_noise): the shoal side of a sounder
+# hunting between echoes agrees with itself.
+NOISE_WINDOW = QC["noise_window"]  # soundings either side; wide, so a few spikes aren't noise
+NOISE_REL = QC["noise_rel"]
+NOISE_ABS_M = QC["noise_abs_m"]
 # Spike windows sorted at once, to bound memory on the largest files.
 SPIKE_CHUNK = 65_536
 
@@ -195,6 +231,91 @@ def spikes(depth, transit):
     return off & deeper, off & ~deeper
 
 
+def _steep_pass(d, lon, lat, transit):
+    """Soundings deeper than the steep bound from the last one before them that wasn't."""
+    n = len(d)
+    out = np.zeros(n, bool)
+    if n < 2:
+        return out
+    cont = _continues(transit)
+    step = np.zeros(n)
+    step[1:] = distance(lon[:-1], lat[:-1], lon[1:], lat[1:])
+    bound = STEEP_FACTOR * np.maximum(d[:-1], STEEP_FLOOR_M) + STEEP_ABS_M + STEEP_SLOPE * step[1:]
+    entries = np.flatnonzero(cont[1:] & (d[1:] > bound)) + 1
+    ends = np.append(np.flatnonzero(~cont[1:]) + 1, n)  # each sounding's transit end
+    end_of = ends[np.searchsorted(ends, np.arange(n), side="right")]
+    # Most runs are one sounding long, the next back within the bound from the same anchor:
+    # judged here at once, so a sounder flickering between bottom and junk costs no more
+    # than a quiet one.
+    nxt = np.minimum(entries + 1, n - 1)
+    single = (nxt < end_of[entries]) & (
+        d[nxt]
+        <= STEEP_FACTOR * np.maximum(d[entries - 1], STEEP_FLOOR_M)
+        + STEEP_ABS_M
+        + STEEP_SLOPE * distance(lon[entries - 1], lat[entries - 1], lon[nxt], lat[nxt])
+    )
+    rejected = out.tolist()  # list indexing, since this loop can run once a sounding
+    for e, one in zip(entries.tolist(), single.tolist(), strict=True):
+        if rejected[e - 1]:
+            continue  # judged with the run before it
+        if one:
+            rejected[e] = True
+            continue
+        a, end, k = e - 1, end_of[e], 64
+        # The run of soundings beyond the bound from anchor a, read in growing chunks.
+        while True:
+            j = min(e + k, end)
+            far = distance(lon[a], lat[a], lon[e:j], lat[e:j])
+            limit = STEEP_FACTOR * max(d[a], STEEP_FLOOR_M) + STEEP_ABS_M + STEEP_SLOPE * far
+            ok = np.flatnonzero(d[e:j] <= limit)
+            if len(ok) or j == end:
+                stop = e + (ok[0] if len(ok) else j - e)
+                break
+            k *= 2
+        rejected[e:stop] = [True] * (stop - e)
+    return np.array(rejected, bool)
+
+
+def steep(depth, lon, lat, transit):
+    """Soundings deeper than the steep bound from both directions along their transit. A
+    stretch at a transit's start or end has no sounding before or after it to judge from,
+    so it's judged from its one side: a sounder that comes on, or stays, in lost bottom."""
+    d = depth.astype(np.float64)
+    forward = _steep_pass(d, lon, lat, transit)
+    backward = _steep_pass(d[::-1], lon[::-1], lat[::-1], transit[::-1])[::-1]
+    return (
+        (forward & backward)
+        | (backward & _from_start(backward, transit))
+        | (forward & _from_start(forward[::-1], transit[::-1])[::-1])
+    )
+
+
+def _from_start(flagged, transit):
+    """True where every sounding from the transit's start to here is flagged."""
+    i = np.arange(len(flagged))
+    start = np.maximum.accumulate(np.where(~_continues(transit), i, 0))
+    last_unflagged = np.maximum.accumulate(np.where(flagged, -1, i))
+    return last_unflagged < start
+
+
+def noisy(depth, transit):
+    """Soundings where the track's median zig-zag is more than NOISE_REL of its median
+    depth and NOISE_ABS_M. A sounding's zig-zag is the least of its distances from the
+    middle of its neighbors and from each of them: none on a steady slope, and once, not
+    three times, for a lone spike."""
+    n = len(depth)
+    rough = np.zeros(n, np.float32)
+    if n >= 3:
+        inner = _continues(transit)[1:-1] & _continues(transit)[2:]
+        d, before, after = depth[1:-1], depth[:-2], depth[2:]
+        mid = (before + after) / np.float32(2)
+        least = np.minimum(np.abs(d - mid), np.minimum(np.abs(d - before), np.abs(d - after)))
+        rough[1:-1] = np.where(inner, least, np.float32(0))
+    level = rolling_median(rough, transit, NOISE_WINDOW)
+    med = rolling_median(depth, transit, NOISE_WINDOW)
+    return (level > np.float32(NOISE_REL) * med) & (level > np.float32(NOISE_ABS_M))
+
+
 def track_qc(time, lon, lat, depth, arrival):
     """QC one file's soundings, given in the order they were written (their `row`).
 
@@ -212,19 +333,31 @@ def track_qc(time, lon, lat, depth, arrival):
     transit = transits(tt)
 
     jump = jumps(tt, lo, la, transit)
-    kept = order[~jump]
-    flat = flatlines(d[~jump], lo[~jump], la[~jump], transit[~jump])
-    clean = ~jump
-    clean[clean] = ~flat
+    left = ~jump
+    deep = np.zeros(len(order), bool)
+    deep[left] = steep(d[left], lo[left], la[left], transit[left])
+    left &= ~deep
+    kept = order[left]
+    flat = flatlines(d[left], lo[left], la[left], transit[left])
+    clean = left.copy()
+    clean[left] = ~flat
+    noise = noisy(d[clean], transit[clean])
     deeper, shoaler = spikes(d[clean], transit[clean])
+    deeper &= ~noise
+    noisy_shoal = shoaler & noise
+    shoaler &= ~noise
+    noise &= ~noisy_shoal
     flat_shoal = depth[kept[flat]] < HAZARD_M
     found = [
         np.flatnonzero(sentinel),
         np.flatnonzero(bad_time),
         np.flatnonzero((depth > 0) & (depth < SHALLOW_M)),
         order[jump],
+        order[deep],
         kept[flat][flat_shoal],
         kept[flat][~flat_shoal],
+        order[clean][noise],
+        order[clean][noisy_shoal],
         order[clean][deeper],
         order[clean][shoaler],
     ]
@@ -249,7 +382,7 @@ def run_batch(con, batch_id: int, fresh=False):
         FROM lake.points p JOIN lake.files f USING (file_id) WHERE p.batch_id = $batch""",
         params,
     )
-    # ponytail: holds a batch's columns and one file's working arrays, about 170 bytes a
+    # ponytail: holds a batch's columns and one file's working arrays, about 200 bytes a
     # sounding, so memory follows the largest file; judge a huge file a few transits at a
     # time if one outgrows a worker
     a = con.execute(

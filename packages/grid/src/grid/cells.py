@@ -19,8 +19,8 @@ import numpy as np
 
 from . import catalog, definitions, qc, statistic
 from .catalog import BASE_ROW, MIN_DEPTH_M, checkpoint
-from .definitions import CELLS
-from .qc import HAZARD_M, MAX_DEPTH_M, QC_VERSION, TRACK_REASONS
+from .definitions import CELLS, QC
+from .qc import HAZARD_M, MAX_DEPTH_M, QC_VERSION, SHALLOW_M, TRACK_REASONS
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +34,7 @@ CELL_REASONS = [
     "cell_unjudged",
     "cell_confirmed",
     "consensus_deep",
+    "consensus_far_deep",
     "consensus_shoal",
 ]
 # A sounding of the same vessel this far apart in time is another pass.
@@ -135,12 +136,18 @@ DISPROVE = 3
 # against its own and the adjacent bins, so the work is linear in the candidates
 # however many agree. That reaches up to two steps, about 10%, so it confirms a little
 # more than the tolerance, never less; more confirmed shoals only make cells shoaler.
+# A reading under SHALLOW_M is mostly a sounder's junk (a bubble, a hull echo), and two
+# boats' junk agrees as readily as two boats' shoal, so it neither confirms nor is
+# confirmed: it stays an unconfirmed candidate, out of the cell's depth. It's the raw
+# reading that counts: a corrected depth over a real drying shoal is honestly negative.
+# A noisy track's shoaler spike (`hunting`, qc.noisy) is held the same way: the shoal
+# side of a sounder hunting between echoes agrees with itself.
 CONFIRM = f"""
 CREATE OR REPLACE TEMP TABLE confirmed AS
 WITH shoals AS (
   SELECT point_id, tile_id, level, cr, cc, vessel, time,
     floor(ln(d + 40) / {math.log(1.05)})::BIGINT AS bin
-  FROM classed WHERE outlier = 'shoal'
+  FROM classed WHERE outlier = 'shoal' AND raw >= {SHALLOW_M} AND NOT hunting
 ),
 bins AS (
   SELECT tile_id, level, cr, cc, bin, count(*) AS n, min(vessel) AS vmin,
@@ -160,8 +167,9 @@ WHERE n.vmin <> s.vessel OR n.vmax <> s.vessel OR n.support >= {SUPPORT}
 # Consensus: each sounding against the other vessels nearby, since a sounder that has
 # lost bottom is wrong the whole way along its track, so QC along the track can't see
 # it. Each vessel votes once per 3″ block (9 base rows): its median depth there, from
-# soundings QC accepted. A sounding is judged against the other vessels' votes in the
-# 3x3 blocks around its own, each vessel once, wherever two or more voted. Deeper than
+# soundings QC accepted or marked noisy. A sounding is judged against the other vessels'
+# votes in the 3x3 blocks around its own, each vessel once, wherever two or more voted
+# (and on the deep side alone wherever one did, below). Deeper than
 # their consensus by more than the tolerance, it's rejected. Shoaler by more than that,
 # it's disproved when three or more of them agree with the consensus, unless another
 # vessel read the same depth: one of its soundings, unconfirmed ones included, in the
@@ -169,15 +177,29 @@ WHERE n.vmin <> s.vessel OR n.vmax <> s.vessel OR n.support >= {SUPPORT}
 # shoal is rejected at HAZARD_M or deeper and kept unconfirmed shallower. Every sounder
 # in deep water throws stray shallow echoes, at all sorts of depths, so a shoaler or
 # deeper reading nearby doesn't count; two vessels reading one depth does. A shoal
-# that isn't disproved goes on to the cell's own shoal confirmation. The
+# that isn't disproved goes on to the cell's own shoal confirmation. A reading under
+# SHALLOW_M neither corroborates a shoal nor is corroborated, as in CONFIRM. The
 # tolerance is the larger of 2 m + 5% of the consensus and three times the spread of
 # the votes, so it widens on slopes, where vessels a block apart honestly disagree.
+# Where only one other vessel voted, the consensus can't tell a slope from a lost bottom
+# within the tolerance, but a sounding deeper than lone_deep_factor times every other
+# vessel's vote, plus lone_deep_abs_m, is no slope: it's rejected (consensus_far_deep),
+# as it is wherever more vessels voted. Rejecting the deep side errs safe. A vote counts
+# as at least lone_deep_floor_m, since a sounder reading junk near the surface votes too,
+# and alone would make every real depth beside it look far deeper. A noisy
+# track's soundings (qc.noisy) vote, and can be rejected here, but are never kept as
+# unconfirmed shoals, which would stop the surface filling over them.
 # A vessel's vote is the median of a fixed sample, as cells' are, so one moored in a
 # block for a year costs fixed memory; a vote of the others is the median of at most 9.
 # ponytail: neighbors stop at tile edges; look across them if a tile's edge rows matter
+FAR = (
+    f"{QC['lone_deep_factor']} * greatest(c.most, {QC['lone_deep_floor_m']})"
+    f" + {QC['lone_deep_abs_m']}"
+)
 CONSENSUS = f"""
 CREATE OR REPLACE TEMP TABLE votes AS
-SELECT tile_id, br, bc, vessel, median(d) FILTER (WHERE flag IS NULL AND keep) AS med
+SELECT tile_id, br, bc, vessel,
+  median(d) FILTER (WHERE (flag IS NULL OR flag = 'noisy') AND keep) AS med
 FROM {sample("unit_points", ["tile_id", "br", "bc", "vessel"], "keep")} GROUP BY ALL;
 
 CREATE OR REPLACE TEMP TABLE consensus AS
@@ -190,23 +212,26 @@ WITH others AS (
   GROUP BY ALL
 )
 SELECT tile_id, br, bc, vessel, median(med) AS m, coalesce(mad(med), 0) AS spread,
-  list(med) FILTER (WHERE med IS NOT NULL) AS meds
-FROM others GROUP BY ALL HAVING count(med) >= 2;
+  list(med) FILTER (WHERE med IS NOT NULL) AS meds, count(med) AS n, max(med) AS most
+FROM others GROUP BY ALL HAVING count(med) >= 1;
 DROP TABLE votes;
 
 CREATE OR REPLACE TEMP TABLE consensus_judged AS
-SELECT p.point_id, p.tile_id, p.br, p.bc, p.vessel, p.d, c.m, c.meds,
-  greatest(2 + 0.05 * c.m, 3 * 1.4826 * c.spread) AS tol
+SELECT p.point_id, p.tile_id, p.br, p.bc, p.vessel, p.d, p.raw, p.hunting, p.flag, c.m, c.meds, c.n,
+  greatest(2 + 0.05 * c.m, 3 * 1.4826 * c.spread) AS tol,
+  p.d > {FAR} AS far
 FROM unit_points p JOIN consensus c
   ON c.tile_id = p.tile_id AND c.br = p.br AND c.bc = p.bc AND c.vessel = p.vessel
 WHERE p.r >= $rlo AND p.r < $rhi
-  AND (p.d > c.m + greatest(2 + 0.05 * c.m, 3 * 1.4826 * c.spread)
-    OR p.d < c.m - greatest(2 + 0.05 * c.m, 3 * 1.4826 * c.spread));
+  AND (p.d > {FAR}
+    OR (c.n >= 2 AND (p.d > c.m + greatest(2 + 0.05 * c.m, 3 * 1.4826 * c.spread)
+      OR p.d < c.m - greatest(2 + 0.05 * c.m, 3 * 1.4826 * c.spread))));
 
 CREATE OR REPLACE TEMP TABLE consensus_rejects AS
 WITH shoals AS (
   SELECT * FROM consensus_judged
-  WHERE d < m AND len(list_filter(meds, x -> abs(x - m) <= tol)) >= {DISPROVE}
+  WHERE d < m AND flag IS DISTINCT FROM 'noisy'
+    AND len(list_filter(meds, x -> abs(x - m) <= tol)) >= {DISPROVE}
 ),
 -- The shoal candidates' blocks, one row per depth read there with the least and
 -- greatest vessel that read it, so a busy harbor block costs its distinct depths, not
@@ -214,14 +239,19 @@ WITH shoals AS (
 -- greatest vessel other than the shoal's.
 depths AS (
   SELECT tile_id, br, bc, d, min(vessel) AS vmin, max(vessel) AS vmax FROM unit_points
-  WHERE (tile_id, br, bc) IN (SELECT tile_id, br, bc FROM shoals) GROUP BY ALL
+  WHERE (tile_id, br, bc) IN (SELECT tile_id, br, bc FROM shoals) AND raw >= {SHALLOW_M}
+    AND flag IS DISTINCT FROM 'noisy' AND NOT hunting
+  GROUP BY ALL
 ),
 corroborated AS (
   SELECT DISTINCT s.point_id FROM shoals s JOIN depths o
     ON o.tile_id = s.tile_id AND o.br = s.br AND o.bc = s.bc
     AND abs(o.d - s.d) <= 2 + 0.05 * s.d AND (o.vmin <> s.vessel OR o.vmax <> s.vessel)
+    AND s.raw >= {SHALLOW_M} AND NOT s.hunting
 )
-SELECT point_id, 'reject' AS flag, 'consensus_deep' AS reason FROM consensus_judged WHERE d > m
+SELECT point_id, 'reject' AS flag,
+  CASE WHEN n >= 2 AND d > m + tol THEN 'consensus_deep' ELSE 'consensus_far_deep' END AS reason
+FROM consensus_judged WHERE d > m
 UNION ALL
 SELECT point_id, CASE WHEN d < {HAZARD_M} THEN 'unconfirmed' ELSE 'reject' END,
   'consensus_shoal'
@@ -235,14 +265,15 @@ CREATE OR REPLACE TEMP TABLE unit_points AS
 WITH flags AS (
   -- A stuck run kept as an unconfirmed shoal never sets depths, even agreeing with
   -- itself: it stays out of cells, as a reject does, and publishes from its flag.
-  SELECT point_id, CASE WHEN reason = 'flatline' THEN 'reject' ELSE flag END AS flag
+  SELECT point_id, CASE WHEN reason = 'flatline' THEN 'reject' ELSE flag END AS flag,
+    flag = 'unconfirmed' AND reason = 'track_noise' AS hunting
   FROM lake.qc_flags
   WHERE cell_id = $partition AND qc_version = {QC_VERSION} AND list_contains({TRACK_REASONS}, reason)
-    AND flag IN ('reject', 'unconfirmed')
+    AND flag IN ('reject', 'unconfirmed', 'noisy')
 ),
 pts AS (
   SELECT a.point_id, a.tile_id, a.cell_id, a.unique_id AS vessel, a.time, a.lon, a.lat,
-    a.depth AS d, a.tide IS NOT NULL AS tided, a.offset_m IS NOT NULL AS calibrated, a.sigma,
+    a.depth AS d, a.depth_raw AS raw, coalesce(f.hunting, false) AS hunting, a.tide IS NOT NULL AS tided, a.offset_m IS NOT NULL AS calibrated, a.sigma,
     f.flag,
     a.tile_id // 360 - 90 AS lat0, a.tile_id % 360 - 180 AS lon0,
     {K_LIST}[a.tile_id // 360 - 90 + 91] AS k
@@ -266,9 +297,10 @@ SELECT *, r // 9 AS br, c // 9 AS bc FROM idx;
 
 {CONSENSUS}
 
+-- A noisy track's soundings go no further: they set no depths and confirm nothing.
 CREATE OR REPLACE TEMP TABLE unit_rows AS
 SELECT * EXCLUDE (br, bc) FROM unit_points WHERE r >= $rlo AND r < $rhi
-  AND point_id NOT IN (SELECT point_id FROM consensus_rejects);
+  AND flag IS DISTINCT FROM 'noisy' AND point_id NOT IN (SELECT point_id FROM consensus_rejects);
 DROP TABLE unit_points;
 
 {levels("unit_rows", "keyed")}
@@ -301,7 +333,9 @@ DROP TABLE keyed;
 
 CREATE OR REPLACE TEMP TABLE kept AS
 SELECT * EXCLUDE (level, cr, cc) FROM classed
-WHERE outlier IS NULL OR point_id IN (SELECT point_id FROM confirmed);
+-- A track spike under SHALLOW_M can't be confirmed, even by a cell that agrees with it.
+WHERE (outlier IS NULL AND NOT (from_track AND (raw < {SHALLOW_M} OR hunting)))
+  OR point_id IN (SELECT point_id FROM confirmed);
 
 -- Levels again from accepted soundings only, so a vessel whose soundings were all
 -- rejected can't raise another vessel's track to a finer level.
@@ -413,7 +447,7 @@ SELECT s.tile_id, s.level, s.cr AS "row", s.cc AS col,
 FROM stats s JOIN placed p USING (tile_id, level, cr, cc)
 """
 
-CELL_FLAGS = """
+CELL_FLAGS = f"""
 SELECT point_id, 'reject' AS flag, 'cell_deep' AS reason FROM classed WHERE outlier = 'deep'
 UNION ALL
 SELECT point_id, flag, reason FROM consensus_rejects
@@ -425,12 +459,14 @@ FROM classed
 WHERE outlier = 'shoal' AND NOT from_track AND point_id NOT IN (SELECT point_id FROM confirmed)
 UNION ALL
 -- A track spike its cell agrees with.
-SELECT point_id, 'confirmed', 'cell_confirmed' FROM classed WHERE from_track AND outlier IS NULL
+SELECT point_id, 'confirmed', 'cell_confirmed' FROM classed
+WHERE from_track AND outlier IS NULL AND raw >= {SHALLOW_M} AND NOT hunting
 UNION ALL
 -- A confirmed shoal, track spike or not: the surface is never drawn deeper than one. Its
 -- reason is a cell's shoal, as an unconfirmed one's is, so every build clears it.
 SELECT point_id, 'confirmed', 'cell_shoal' FROM classed
 WHERE outlier = 'shoal' AND point_id IN (SELECT point_id FROM confirmed)
+  AND NOT (from_track AND hunting)
 """
 
 

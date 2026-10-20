@@ -1,8 +1,9 @@
 """Track QC test vectors: one file's soundings each, with the flags QC must give them.
 
 qc_vectors.json is shared with the plugin, whose TypeScript port of the QC runs the
-same cases with vitest. Its flags come from the reference SQL, and these tests check
-both the reference and grid.qc against them, so the three agree.
+same cases with vitest. Its flags are grid.qc's. The reference SQL, written apart from
+grid.qc, has every rule but the steep and noise checks, and must agree with grid.qc on
+every case with those two switched off.
 
 To change a case or add one, edit `cases()` and write the file again:
 
@@ -11,6 +12,7 @@ To change a case or add one, edit `cases()` and write the file again:
 
 import hashlib
 import json
+import math
 import random
 from datetime import UTC, datetime
 from pathlib import Path
@@ -145,6 +147,41 @@ def cases():
         "a stuck run across midnight is one run",
         [[midnight - 300 + i * 35, *at(i * 9), d] for i, d in enumerate(across)],
     )
+    # FARSND's sounder losing bottom: 20 m, then 661 m within seconds, then 20 m again.
+    yield (
+        "a sounder that loses bottom for a moment is steep",
+        line([20, 20, 20, 20, 661, 640, 20, 20, 20], step=2),
+    )
+    # A channel edge: 4 m to 14 m over about 40 m, and it stays deep.
+    yield (
+        "a steep channel edge isn't steep",
+        [
+            [T0 + i * 4, *at(i), d]
+            for i, d in enumerate([4, 4, 4, 5, 7, 10, 13, 14, 14, 14, 14, 14])
+        ],
+    )
+    yield (
+        "a long lost-bottom stretch is steep from end to end",
+        line(
+            [20 + i % 3 * 0.2 for i in range(10)]
+            + [500] * 100
+            + [20 + i % 3 * 0.2 for i in range(10)],
+            step=1,
+        ),
+    )
+    ok = [20 + i % 3 * 0.2 for i in range(20)]
+    yield (
+        "a file that starts in lost bottom is steep",
+        line([370, 420, 480, 530, 590, 640] + ok, step=2),
+    )
+    yield "a file that ends in lost bottom is steep", line(ok + [370, 420, 480], step=2)
+    yield "real water between junk near the surface isn't steep", line([0.5, 15] * 8)
+    yield "a descent that stays deep isn't steep", line([5] * 10 + [25, 26] * 6)
+    yield "a sounder hunting between 6 and 13 m is noisy", line([6, 13] * 15, step=2)
+    yield (
+        "two spikes among steady soundings aren't noise",
+        line([10] * 6 + [20] + [10] * 6 + [3] + [10] * 6),
+    )
     for seed in (1, 2, 3):
         yield f"a wandering track with noise, spikes and jumps ({seed})", track(seed)
 
@@ -197,7 +234,46 @@ VECTOR_CASES = json.loads(VECTORS.read_text())["cases"] if VECTORS.exists() else
 def test_qc_gives_the_vectors_flags(con, case):
     expected = {tuple(f) for f in case["flags"]}
     assert qc_flags(case["soundings"], case["arrival"]) == expected
-    assert reference_flags(con, case["soundings"], case["arrival"]) == expected
+
+
+# The steep and noise checks' flags, worked out by hand rather than read back from
+# grid.qc, which writes the vectors.
+BY_HAND = {
+    "a sounder that loses bottom for a moment is steep": {
+        (4, "reject", "steep"),
+        (5, "reject", "steep"),
+    },
+    "a long lost-bottom stretch is steep from end to end": {
+        (i, "reject", "steep") for i in range(10, 110)
+    },
+    "a steep channel edge isn't steep": set(),
+    "a descent that stays deep isn't steep": set(),
+    # The deep side votes as noise; the shallow side is kept as unconfirmed shoals that
+    # neither confirm nor are confirmed.
+    "a sounder hunting between 6 and 13 m is noisy": {
+        (i, "noisy" if i % 2 else "unconfirmed", "track_noise") for i in range(30)
+    },
+    # 0.5 m isn't under shallow_m, so the junk isn't very_shallow.
+    "real water between junk near the surface isn't steep": {
+        (i, "noisy" if i % 2 else "unconfirmed", "track_noise") for i in range(16)
+    },
+    "a file that starts in lost bottom is steep": {(i, "reject", "steep") for i in range(6)},
+    "a file that ends in lost bottom is steep": {(i, "reject", "steep") for i in range(20, 23)},
+}
+
+
+@pytest.mark.parametrize("name", BY_HAND)
+def test_the_steep_and_noise_checks_flag_what_was_worked_out_by_hand(name):
+    [case] = [c for c in VECTOR_CASES if c["name"] == name]
+    assert qc_flags(case["soundings"], case["arrival"]) == BY_HAND[name]
+
+
+@pytest.mark.parametrize("case", VECTOR_CASES, ids=[c["name"] for c in VECTOR_CASES])
+def test_the_reference_sql_agrees_without_the_steep_and_noise_checks(con, case, monkeypatch):
+    monkeypatch.setattr(qc, "STEEP_FACTOR", math.inf)
+    monkeypatch.setattr(qc, "NOISE_REL", math.inf)
+    soundings, arrival_s = case["soundings"], case["arrival"]
+    assert reference_flags(con, soundings, arrival_s) == qc_flags(soundings, arrival_s)
 
 
 def test_the_vectors_are_current():
@@ -211,7 +287,7 @@ def test_changing_a_threshold_bumps_the_qc_version():
     # under the old thresholds looking current. Bump qc.version, then pin the new hash.
     thresholds = {k: v for k, v in qc.QC.items() if k != "version"}
     digest = hashlib.sha256(json.dumps(thresholds, sort_keys=True).encode()).hexdigest()[:16]
-    assert (qc.QC_VERSION, digest) == (4, "3932bc2edb46e0c3")
+    assert (qc.QC_VERSION, digest) == (6, "ad8db9ad341906fe")
 
 
 def test_changing_a_grid_definition_bumps_the_grid_version():
@@ -236,6 +312,9 @@ def test_every_check_fires():
         ("reject", "time"),
         ("review", "very_shallow"),
         ("reject", "jump"),
+        ("reject", "steep"),
+        ("noisy", "track_noise"),
+        ("unconfirmed", "track_noise"),
         ("reject", "flatline"),
         ("unconfirmed", "flatline"),
         ("reject", "spike"),
@@ -244,13 +323,12 @@ def test_every_check_fires():
 
 
 def write():
-    db = lake()
     out = [
         {
             "name": name,
             "arrival": arrival(soundings),
             "soundings": soundings,
-            "flags": sorted(reference_flags(db, soundings, arrival(soundings))),
+            "flags": sorted(qc_flags(soundings, arrival(soundings))),
         }
         for name, soundings in cases()
     ]

@@ -26,14 +26,17 @@ test("the vectors exercise every check", () => {
     vectors.cases.flatMap((c) => c.flags.map((f) => `${f[1]} ${f[2]}`)),
   );
   expect([...fired].sort()).toEqual([
+    "noisy track_noise",
     "reject flatline",
     "reject jump",
     "reject sentinel",
     "reject spike",
+    "reject steep",
     "reject time",
     "review very_shallow",
     "unconfirmed flatline",
     "unconfirmed spike",
+    "unconfirmed track_noise",
   ]);
 });
 

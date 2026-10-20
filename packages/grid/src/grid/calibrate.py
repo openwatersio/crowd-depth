@@ -103,7 +103,7 @@ WHERE p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M} AND p.time IS NOT NULL
   AND (p.tide IS NOT NULL OR (p.tide_assigned AND p.tide_station IS NULL))
   AND p.point_id NOT IN (
     SELECT point_id FROM lake.qc_flags WHERE cell_id = $partition AND qc_version = {QC_VERSION}
-      AND list_contains({TRACK_REASONS}, reason) AND flag IN ('reject', 'unconfirmed'))
+      AND list_contains({TRACK_REASONS}, reason) AND flag IN ('reject', 'unconfirmed', 'noisy'))
 GROUP BY ALL
 """
 

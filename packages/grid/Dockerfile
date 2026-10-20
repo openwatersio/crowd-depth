@@ -13,5 +13,6 @@ COPY --from=slackwater /usr/local/bin/node /usr/local/bin/
 COPY --from=slackwater /opt/slackwater /opt/slackwater
 COPY --from=ghcr.io/astral-sh/uv:0.13.1 /uv /uvx /bin/
 ENV UV_PROJECT_ENVIRONMENT=/venv UV_LINK_MODE=copy UV_CACHE_DIR=/cache/uv \
-    UV_PYTHON_INSTALL_DIR=/cache/python GRID_SLACKWATER=/opt/slackwater/predict.mjs
+    UV_PYTHON_INSTALL_DIR=/cache/python GRID_SLACKWATER=/opt/slackwater/predict.mjs \
+    GRID_CACHE_DIR=/cache/grid
 WORKDIR /app
