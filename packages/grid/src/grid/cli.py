@@ -192,6 +192,11 @@ def main(argv=None):
         elif args.command == "cells":
             # Cells read QC's flags: QC any batch that hasn't been at this version.
             qc.run(con, missing_only=True)
+            # Stuck runs found under another calibration would set the wrong soundings aside.
+            if not calibrate.runs_current(con):
+                raise SystemExit(
+                    "stuck runs weren't found under this calibration: run `grid calibrate` first"
+                )
             # Files that arrived since calibration take their segment's offset.
             calibrate.assign(con)
             if args.changed:

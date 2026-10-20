@@ -12,7 +12,7 @@ from rasterio.warp import transform_bounds
 from test_grid import LAT0, LON0, T0, at, put
 from test_ingest import env  # noqa: F401  (a fixture)
 
-from grid import calibrate, catalog, cells, overlay, tide
+from grid import calibrate, catalog, cells, cli, overlay, tide
 from grid import reference as reference_mod
 from grid.catalog import open_store
 
@@ -780,9 +780,8 @@ def test_a_step_too_few_transits_show_leaves_them_alone(env, tmp_path, monkeypat
 
 
 def test_a_transit_that_lost_the_bottom_publishes_shoals(env, tmp_path, monkeypatch):  # noqa: F811
-    # ROSEP-607cc5a5 at the Chesapeake's mouth: calibrated, then a run of transits reading
-    # 0.5 m in 8 m of water. Too few to make a step, they read 4.6 m shallower than their
-    # segment: lost bottom, not a draft.
+    # ROSEP-607cc5a5 at the Chesapeake's mouth: calibrated, then two transits reading a stuck
+    # 0.8 m over 10 m of seabed, where its segment reads 5.4 m: lost bottom, not a draft.
     ref = reference(tmp_path / "ref.tif", (0, 240))
     fleet = [
         *(transit(1 + i, "AQM-T", 5.4, (0, 240), i) for i in range(10)),
@@ -790,6 +789,7 @@ def test_a_transit_that_lost_the_bottom_publishes_shoals(env, tmp_path, monkeypa
         *(transit(30 + i, "AQM-A", 9.5, (0, 240), 30 + i) for i in range(3)),
     ]
     calibrated(env, fleet, ref, monkeypatch)
+    assert env.query("SELECT count(*) FROM lake.lost_runs") == [(2,)]
     got = {raw: c for u, _, raw, c in corrected(env, "depth_raw, lost_bottom") if u == "AQM-T"}
     assert {round(raw) for raw, c in got.items() if c} == {1}
     assert not any(c for raw, c in got.items() if raw > 5)
@@ -802,6 +802,186 @@ def test_a_transit_that_lost_the_bottom_publishes_shoals(env, tmp_path, monkeypa
         pytest.approx(len(fleet[10][1]) * 2, rel=0.1),
         pytest.approx(0.85, abs=0.01),
     )
+
+
+def stuck(n, vessel, depth, slot, cols=(0, 240), step=2):
+    """A transit reading `depth` wandering a tenth either way, one sounding per `step`
+    columns (step 0: sitting still)."""
+    rows = [
+        (slot * 1200 + i * 10, *at(5000, cols[0] + i * step), depth + 0.1 * (i % 3 - 1))
+        for i in range((cols[1] - cols[0]) // 2)
+    ]
+    return n, rows, vessel
+
+
+@pytest.mark.parametrize(
+    "case, runs",
+    [
+        ("moving", 1),  # 120 soundings over 2 km
+        ("moored", 0),  # 120 soundings where it lies
+        ("approach", 0),  # reading lost but unsteady over 1 km, then where it lies
+        ("short", 0),  # 88 soundings: 59 steady once the window fills, one under STUCK_RUN
+    ],
+)
+def test_a_stuck_run_must_last_and_go_somewhere(env, tmp_path, monkeypatch, case, runs):  # noqa: F811
+    lost = {
+        "moving": stuck(20, "AQM-T", 0.8, 20),
+        "moored": stuck(20, "AQM-T", 0.8, 20, step=0),
+        "approach": (
+            20,
+            [(24000 + i * 10, *at(5000, i * 2), 2.5 - 0.02 * i) for i in range(60)]
+            + [(24600 + i * 10, *at(5000, 120), 0.8 + 0.1 * (i % 3 - 1)) for i in range(120)],
+            "AQM-T",
+        ),
+        "short": stuck(20, "AQM-T", 0.8, 20, cols=(0, 176)),
+    }[case]
+    fleet = [
+        *(transit(1 + i, "AQM-T", 5.4, (0, 240), i) for i in range(10)),
+        lost,
+        *(transit(30 + i, "AQM-A", 9.5, (0, 240), 30 + i) for i in range(3)),
+    ]
+    calibrated(env, fleet, reference(tmp_path / "ref.tif", (0, 240)), monkeypatch)
+    assert env.query("SELECT count(*) FROM lake.lost_runs") == [(runs,)]
+
+
+@pytest.mark.parametrize(
+    "good, share, months, runs",
+    [
+        (10, 0.05, 0, 1),  # one transit lost in 11: its stuck run alone
+        (10, 0.5, 0, 0),  # no month at STUCK_SHARE: not looked for
+        (3, 0.05, 4, 1),  # one in 4: the month's files set aside whole
+    ],
+)
+def test_a_month_mostly_lost_is_set_aside(env, tmp_path, monkeypatch, good, share, months, runs):  # noqa: F811
+    monkeypatch.setattr(calibrate, "MONTH_PIXELS", 1)
+    monkeypatch.setattr(calibrate, "STUCK_SHARE", share)
+    fleet = [
+        *(transit(1 + i, "AQM-T", 5.4, (0, 240), i) for i in range(good)),
+        stuck(20, "AQM-T", 0.8, 20),
+        *(transit(30 + i, "AQM-A", 9.5, (0, 240), 30 + i) for i in range(3)),
+    ]
+    calibrated(env, fleet, reference(tmp_path / "ref.tif", (0, 240)), monkeypatch)
+    assert env.query(
+        "SELECT count(*) FILTER (WHERE tile_id IS NULL), count(*) FILTER (WHERE tile_id IS NOT NULL)"
+        " FROM lake.lost_runs"
+    ) == [(months, runs)]
+
+
+def test_a_stuck_run_holds_through_a_stray_reading(env, tmp_path, monkeypatch):  # noqa: F811
+    # One reading in 15 jumps to 1.6 m: still lost, and two to a window, under its top tenth.
+    n, rows, vessel = stuck(20, "AQM-T", 0.8, 20)
+    rows = [(ts, x, y, 1.6 if i % 15 == 7 else d) for i, (ts, x, y, d) in enumerate(rows)]
+    fleet = [
+        *(transit(1 + i, "AQM-T", 5.4, (0, 240), i) for i in range(10)),
+        (n, rows, vessel),
+        *(transit(30 + i, "AQM-A", 9.5, (0, 240), 30 + i) for i in range(3)),
+    ]
+    calibrated(env, fleet, reference(tmp_path / "ref.tif", (0, 240)), monkeypatch)
+    assert env.query("SELECT count(*) FROM lake.lost_runs") == [(1,)]
+
+
+@pytest.mark.parametrize("crowd, found", [(3, False), (99, True)])
+def test_shoaled_water_isnt_a_lost_bottom(env, tmp_path, monkeypatch, crowd, found):  # noqa: F811
+    # Four vessels reading 0.5 m shallow cross a bank that shoaled to 3 m on the far side of
+    # a survey that still charts 10 m: each reads 2.5 m there, for 100 soundings. With the
+    # crowd as the seabed they read as they should; against the survey alone, each lost it.
+    monkeypatch.setattr(calibrate, "CROWD_VESSELS", crowd)
+    ref = reference(tmp_path / "ref.tif", (0, 480))
+    fleet = []
+    for v in range(4):
+        for t in range(3):
+            n, rows, vessel = transit(1 + 3 * v + t, f"AQM-{v}", 9.5, (0, 480), 3 * v + t)
+            rows = [(ts, x, y, d - 7.0 if i >= 140 else d) for i, (ts, x, y, d) in enumerate(rows)]
+            fleet.append((n, rows, vessel))
+    calibrated(env, fleet, ref, monkeypatch)
+    assert (env.query("SELECT count(*) FROM lake.lost_runs")[0][0] > 0) == found
+
+
+def test_a_bank_crossed_before_the_sounder_sticks_isnt_in_the_run(env, tmp_path, monkeypatch):  # noqa: F811
+    # A bank 2.5 m deep, which three vessels sound, on a survey that charts 10 m. T crosses it
+    # reading true, then its sounder sticks at the same reading over the 10 m beyond: the
+    # readings that make its first steady window read true, and stay out of the run.
+    ref = reference(tmp_path / "ref.tif", (0, 240))
+    fleet = []
+    for v in "ABCT":
+        for t in range(3):
+            n, rows, vessel = transit(
+                10 * "ABCT".index(v) + t + 1, f"AQM-{v}", 9.5, (0, 240), 4 * t + "ABCT".index(v)
+            )
+            fleet.append(
+                (
+                    n,
+                    [(ts, x, y, 2.0 if i < 30 else d) for i, (ts, x, y, d) in enumerate(rows)],
+                    vessel,
+                )
+            )
+    n, rows, vessel = stuck(50, "AQM-T", 2.0, 40)
+    fleet.append((n, rows, vessel))
+    calibrated(env, fleet, ref, monkeypatch)
+    # Its 120 soundings 10 s apart, the first 30 over the bank: the run is the last 90.
+    assert env.query(
+        "SELECT epoch(t_end - t_start) FROM lake.lost_runs WHERE tile_id IS NOT NULL"
+    ) == [(890.0,)]
+
+
+def test_a_stuck_run_follows_its_soundings_to_a_copy(env, tmp_path, monkeypatch):  # noqa: F811
+    fleet = [
+        *(transit(1 + i, "AQM-T", 5.4, (0, 240), i) for i in range(10)),
+        stuck(20, "AQM-T", 0.8, 20),
+        *(transit(30 + i, "AQM-A", 9.5, (0, 240), 30 + i) for i in range(3)),
+    ]
+    calibrated(env, fleet, reference(tmp_path / "ref.tif", (0, 240)), monkeypatch)
+    before = sum(c for u, _, c in corrected(env, "lost_bottom") if u == "AQM-T")
+    with open_store(env.store) as con:
+        old = con.execute(
+            "SELECT file_id FROM lake.files f JOIN lake.lost_runs USING (content_hash)"
+        ).fetchone()[0]
+        new = con.execute("SELECT max(file_id) + 1 FROM lake.files").fetchone()[0]
+        con.execute(
+            "INSERT INTO lake.files SELECT * REPLACE ($new AS file_id, key || '.copy' AS key)"
+            " FROM lake.files WHERE file_id = $old",
+            {"new": new, "old": old},
+        )
+        con.execute("UPDATE lake.files SET status = 'withdrawn' WHERE file_id = $old", {"old": old})
+        con.execute(
+            "UPDATE lake.points SET file_id = $new WHERE file_id = $old", {"new": new, "old": old}
+        )
+    assert (
+        before > 60
+        and sum(c for u, _, c in corrected(env, "lost_bottom") if u == "AQM-T") == before
+    )
+
+
+def test_stuck_runs_from_another_calibration_arent_current(env, tmp_path, monkeypatch):  # noqa: F811
+    calibrated(env, FLEET, reference(tmp_path / "ref.tif", (0, 110)), monkeypatch)
+    with open_store(env.store) as con:
+        assert calibrate.runs_current(con)
+        # As an older build's calibration leaves it.
+        con.execute("UPDATE lake.calibration SET offset_m = offset_m + 0.1")
+        assert not calibrate.runs_current(con)
+    # So `grid cells` waits for `grid calibrate`, rather than build on stale runs.
+    with pytest.raises(SystemExit, match="grid calibrate"):
+        cli.main(["--store", str(env.store.root), "cells"])
+
+
+def test_a_recalibration_leaves_changed_tiles_to_rebuild(env, tmp_path, monkeypatch):  # noqa: F811
+    calibrated(env, FLEET, reference(tmp_path / "ref.tif", (0, 110)), monkeypatch)
+    with open_store(env.store) as con:
+        cells.build(con)
+        rows = con.execute("SELECT * FROM lake.calibration").fetchall()
+        # AQM-A's offset moves well past its standard error.
+        moved = [
+            (v, seg, s0, s1, o - 1.0 if v == "AQM-A" else o, *rest)
+            for v, seg, s0, s1, o, *rest in rows
+        ]
+        assert calibrate.publish(con, moved, accept_losses=True) > 0
+        changed = cells.changed(con)
+        cells.build(con, changed)
+        cells.done(con, changed)
+        # Rebuilding the changed tiles alone makes the cells current for the overlay.
+        assert con.execute("SELECT value FROM lake.store_meta WHERE key = 'cells'").fetchone()[
+            0
+        ] == cells.inputs(con)
 
 
 def test_a_store_from_before_lost_bottom_marks_no_tiles(env, tmp_path, monkeypatch):  # noqa: F811

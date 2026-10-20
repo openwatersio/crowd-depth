@@ -419,8 +419,8 @@ def test_a_transit_that_lost_the_bottom_never_votes(env, tmp_path, depth, counte
     with open_store(env.store) as con:
         # Calibration found both vessels' transits read far under the seabed.
         con.execute(
-            "INSERT INTO lake.file_offsets SELECT file_id, vessel, NULL, NULL, false, true"
-            " FROM lake.files"
+            "INSERT INTO lake.lost_runs SELECT DISTINCT f.content_hash, f.vessel, p.tile_id,"
+            " f.time_min, f.time_max FROM lake.files f JOIN lake.points p USING (file_id)"
         )
         [(partition,)] = con.execute("SELECT DISTINCT cell_id FROM lake.cells").fetchall()
         path = surface.build_tile(con, tile, partition, tmp_path)

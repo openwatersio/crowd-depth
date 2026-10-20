@@ -56,7 +56,7 @@ QUALIFY row_number() OVER (PARTITION BY py, px ORDER BY uncertainty NULLS LAST, 
 """
 
 # Per sounded pixel: the vessels with a sounding the surface would take (QC accepted: not
-# rejected or noisy, not a transit that lost the bottom, and not an unconfirmed shoal unless
+# rejected or noisy, not in a run whose sounder lost the bottom, and not an unconfirmed shoal unless
 # something confirmed it or it's one no cell could judge; within the depths it trusts), and
 # whether a confirmed shoal is there, as the statistic's cells flag one.
 SOUNDED = f"""

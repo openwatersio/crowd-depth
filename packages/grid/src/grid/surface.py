@@ -69,9 +69,8 @@ BLOCK = 512
 UNJUDGED = "cell_unjudged"
 
 # Each surface pixel's corrected soundings, from those QC accepted (not rejected, and not an
-# unconfirmed shoal QC judged improbable, unless something confirmed it, nor a transit that
-# lost the bottom), within the depths cells trust, with
-# the pixel numbered on this tile's grid from its south-west corner; a neighboring tile's
+# unconfirmed shoal QC judged improbable, unless something confirmed it), within the depths
+# cells trust, with the pixel numbered on this tile's grid from its south-west corner; a neighboring tile's
 # soundings get numbers outside it, which interpolation reads as a margin. A fixed sample
 # per pixel and vessel is marked `keep`, so a moored boat costs fixed memory and can't
 # sample other vessels out of the pixel.
@@ -85,8 +84,8 @@ WITH wanted AS MATERIALIZED (
     FROM corrected_points_in($partition, [$tile], $rlo, $rhi) p
     WHERE p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M} AND p.depth >= {MIN_DEPTH_M}
       AND NOT p.excluded AND NOT p.awaiting_tide
-      -- As cells publish them: a transit that lost the bottom only where it reads shoal,
-      -- and at least SHALLOW_M.
+      -- As cells publish them: a sounding after its sounder lost the bottom only where it
+      -- reads shoal, and at least SHALLOW_M.
       AND NOT (p.lost_bottom AND (p.depth >= {HAZARD_M} OR p.depth_raw < {SHALLOW_M}))
   )
   -- Only the pixels wanted: a neighbor's strip within the search radius, say.
@@ -104,7 +103,7 @@ flags AS (
   GROUP BY point_id
 ),
 pts AS (
-  -- A transit that lost the bottom never votes: its soundings publish as shoals.
+  -- A sounding after its sounder lost the bottom never votes: it publishes as a shoal.
   SELECT w.* EXCLUDE (lost_bottom), coalesce(f.unconfirmed, false) OR w.lost_bottom AS unconfirmed,
     coalesce(f.confirmed, false) AS confirmed
   FROM wanted w LEFT JOIN flags f USING (point_id) WHERE NOT coalesce(f.rejected, false)
