@@ -200,3 +200,25 @@ test("a rebuild keeps the overview picks the live writer makes while it runs", (
   deeper.rebuilding.rebuildOverviews();
   expect(pick(deeper.store)).toEqual(OVERVIEW_LEVELS.map(() => b.px));
 });
+
+test("a rebuild searches a block again when the cell it picked changes under it", () => {
+  const at = cellAt(-76.2, 36.98);
+  // In one row, three cells share a block from level 2 up.
+  const [a, b, x] = [0, 1, 2].map((i) => ({
+    py: at.py,
+    px: at.px - (at.px & 63) + i,
+  }));
+  // Deepened a little after the rebuild read it, a is no longer the shoalest.
+  const { store, rebuilding } = racing((s) =>
+    s.addPasses([{ ...a, depth: 3, day: 2 }]),
+  );
+  store.addPasses([{ ...x, depth: 10, day: 1 }]);
+  // A backfill's cells, not yet in the overviews.
+  store.addPasses([{ ...a, depth: 2, day: 1 }], false);
+  store.addPasses([{ ...b, depth: 2.03, day: 1 }], false);
+  rebuilding.rebuildOverviews();
+  for (const level of OVERVIEW_LEVELS.filter((l) => l >= 2)) {
+    const [pick] = store.cells(-76.21, 36.97, -76.19, 36.99, level);
+    expect(pick.px).toBe(b.px);
+  }
+});

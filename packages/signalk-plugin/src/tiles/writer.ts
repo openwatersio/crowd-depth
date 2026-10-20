@@ -39,6 +39,9 @@ const LIVE_BATCH = 10;
 const BULK_BATCH = 200;
 const BATCH_PER_BUFFER = 0.01;
 
+/** QC runs in a row that may fail on their thread before QC moves to this one. */
+const MAX_QC_FAILURES = 3;
+
 /** Flushes in a row that may fail before the writer gives up. */
 const MAX_FLUSH_FAILURES = 3;
 
@@ -128,14 +131,15 @@ interface OpenPass {
 
 /**
  * The live layer's pipeline from corrected soundings to cells: the grid's track QC on a
- * buffer of recent soundings, a pass per cell, and each pass's median folded into its cell's moving
- * average (docs/plans/global-grid/live-layer.md).
+ * buffer of recent soundings, a pass per cell, and each pass's median folded into its
+ * cell's moving average (docs/plans/global-grid/live-layer.md).
  *
  * A sounding is judged once the soundings QC looks ahead over have arrived and it isn't
  * in a run of one depth that's still going, which the stuck-sounder check could yet
  * flag. Rejected and deep-side soundings are dropped, shoal-side ones QC doubts are
- * stored as unconfirmed shoals, and accepted ones go to the pass of every cell within a pixel. A cell's pass ends when the boat's
- * soundings leave its 3×3, and a cell gets a pass only where the boat sounded it itself.
+ * stored as unconfirmed shoals, and accepted ones go to the pass of every cell within a
+ * pixel. A cell's pass ends when the boat's soundings leave its 3×3, and a cell gets a
+ * pass only where the boat sounded it itself.
  *
  * Passes are written every {@link DEFAULT_FLUSH_MS}, and the {@link THROUGH_KEY} marker
  * moves to the oldest sounding still held, so a restart backfills what was held. A pass
@@ -154,6 +158,7 @@ export function createCellWriter(
     overviews = true,
     onChange = () => {},
     qc: runQC,
+    onError = () => {},
   }: {
     flushIntervalMs?: number;
     bulk?: boolean;
@@ -162,6 +167,8 @@ export function createCellWriter(
     onChange?: (changed: Changed) => void;
     /** Where track QC runs, as on a thread of its own; without it, here. */
     qc?: QCRunner;
+    /** Told of trouble the writer goes on through. */
+    onError?: (err: Error) => void;
   } = {},
 ) {
   let qc = runQC;
@@ -175,6 +182,7 @@ export function createCellWriter(
   let ruled: { at: number; flags: (string | undefined)[] } | undefined;
   /** QC running on its thread; nothing is judged or trimmed meanwhile. */
   let running: Promise<void> | undefined;
+  let qcFailures = 0;
   const open = new Map<string, OpenPass>();
   let passes: Pass[] = [];
   let unwritten: Sounding[] = [];
@@ -324,14 +332,23 @@ export function createCellWriter(
     running = qc(buffer, arrival).then(
       (found) => {
         running = undefined;
+        qcFailures = 0;
         if (writer.destroyed) return;
-        rule(found, end);
-        fold(false);
+        try {
+          rule(found, end);
+          fold(false);
+        } catch (err) {
+          writer.destroy(err as Error);
+        }
       },
-      () => {
-        // The thread failed; QC goes on here.
+      (err: Error) => {
+        // The thread starts again on the next run; QC moves here if it keeps failing.
         running = undefined;
+        if (++qcFailures < MAX_QC_FAILURES) return;
         qc = undefined;
+        onError(
+          new Error(`QC thread failed, running QC on the server's: ${err}`),
+        );
       },
     );
   };
@@ -404,18 +421,20 @@ export function createCellWriter(
     final(callback) {
       clearInterval(timer);
       clearTimeout(holdTimer);
-      void (running ?? Promise.resolve()).then(() => {
-        try {
-          // A run part folded in finishes first; then the rest is judged.
-          while (judged < buffer.length) judge(true);
-          for (const [k, pass] of [...open]) closePass(k, pass);
-          held = false;
-          flush();
-          callback();
-        } catch (err) {
-          callback(err as Error);
-        }
-      });
+      void (running ?? Promise.resolve())
+        .catch(() => {})
+        .then(() => {
+          try {
+            // A run part folded in finishes first; then the rest is judged.
+            while (judged < buffer.length) judge(true);
+            for (const [k, pass] of [...open]) closePass(k, pass);
+            held = false;
+            flush();
+            callback();
+          } catch (err) {
+            callback(err as Error);
+          }
+        });
     },
     // A pipeline destroys its writer on abort, which doesn't run `final`. Passes already
     // closed are written; what's held is left for the next start's backfill.
@@ -437,6 +456,8 @@ export function createCellWriter(
       // open for good.
       // Live only: a backfill's soundings are all old.
       const now = Date.now() * 1000;
+      // Verdicts not yet folded in, which only writes otherwise fold.
+      if (ruled) fold(false);
       for (const [k, pass] of bulk ? [] : [...open]) {
         if (now - pass.last > MAX_PASS_US) closePass(k, pass);
       }

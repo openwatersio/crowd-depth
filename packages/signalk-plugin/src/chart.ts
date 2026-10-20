@@ -106,6 +106,7 @@ export function startChart({
   const writer = createCellWriter(store, {
     onChange: tiles.changed,
     qc: qc?.run,
+    onError: (err) => app.error(`Chart layer: ${err.message}`),
   });
   // Until the backfill has run, so its older passes go into the cells first; only for
   // a span long enough for the order to matter, so a restart's short gap doesn't

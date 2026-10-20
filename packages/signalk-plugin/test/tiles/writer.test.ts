@@ -332,3 +332,74 @@ test("QC on another thread gives the cells QC here does", async () => {
   expect(here[1].length).toBeGreaterThan(10);
   expect(await build(true)).toEqual(here);
 }, 30_000);
+
+/** 1 Hz at 6 kn over 6 m, with lone shoal spikes, whose verdicts need only the soundings
+ * either side of them. */
+const spiky = () =>
+  Array.from({ length: 2000 }, (_, i) => ({
+    latitude: 36.98 + (i * 3) / 110540,
+    longitude: -76.2 + Math.sin(i / 50) * 0.0005,
+    depth: i % 97 === 0 ? 1 : 6 + (i % 5) * 0.1,
+    timestamp: start.add({ seconds: i }),
+  }));
+
+async function written(qc?: Parameters<typeof createCellWriter>[1]["qc"]) {
+  const store = createCellStore(createDB(":memory:"));
+  const errors: Error[] = [];
+  const writer = createCellWriter(store, {
+    flushIntervalMs: 100_000,
+    qc,
+    onError: (e) => errors.push(e),
+  });
+  for (const [i, d] of spiky().entries()) {
+    writer.write(d, () => {});
+    if (i % 10 === 0) await new Promise((r) => setImmediate(r));
+  }
+  await end(writer);
+  const result = [
+    store.cells(-76.3, 36, -76.1, 37.1),
+    store.shoals(-76.3, 36, -76.1, 37.1),
+  ];
+  return { result, errors };
+}
+
+test("soundings arriving while QC runs on its thread don't shift its verdicts", async () => {
+  const here = (await written()).result;
+  expect(here[1].length).toBeGreaterThan(10);
+  const slow = await written((soundings, arrival) => {
+    const found = trackQC([...soundings], arrival, DEFINITIONS.qc);
+    return new Promise((resolve) => setTimeout(() => resolve(found), 2));
+  });
+  expect(slow.result).toEqual(here);
+});
+
+test("a QC thread that keeps failing hands QC to this one, and says so", async () => {
+  const here = (await written()).result;
+  let tries = 0;
+  const failing = await written(() => {
+    tries++;
+    return Promise.reject(new Error("worker exited"));
+  });
+  expect(tries).toBe(3);
+  expect(failing.errors).toHaveLength(1);
+  expect(failing.result).toEqual(here);
+});
+
+test("a writer stopped while QC runs ignores its findings", async () => {
+  const store = createCellStore(createDB(":memory:"));
+  let answer: (() => void) | undefined;
+  const writer = createCellWriter(store, {
+    flushIntervalMs: 100_000,
+    qc: (soundings, arrival) => {
+      const found = trackQC([...soundings], arrival, DEFINITIONS.qc);
+      return new Promise((resolve) => (answer = () => resolve(found)));
+    },
+  });
+  for (const d of spiky().slice(0, 200)) writer.write(d, () => {});
+  expect(answer).toBeDefined();
+  writer.destroy();
+  answer!();
+  await new Promise((r) => setTimeout(r));
+  expect(writer.provisional()).toHaveLength(200);
+  expect(store.cells(-76.3, 36, -76.1, 37.1)).toEqual([]);
+});

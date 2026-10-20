@@ -200,6 +200,26 @@ export function createCellStore(db: DatabaseSync) {
     return out;
   };
 
+  /** The shoalest cell of a block as it stands, `py` a row in its band. */
+  const shoalest = (level: number, oy: number, ox: number, py: number) => {
+    const band = Math.floor(py / ROWS_PER_BAND);
+    const blocks = Math.ceil(ROWS_PER_BAND / 2 ** level);
+    const py0 = band * ROWS_PER_BAND + (oy - band * blocks) * 2 ** level;
+    const py1 = Math.min(py0 + 2 ** level, (band + 1) * ROWS_PER_BAND) - 1;
+    const px0 = ox * 2 ** level;
+    const px1 = px0 + 2 ** level - 1;
+    let best: Cell | undefined;
+    let bestDepth = Infinity;
+    for (const c of rows(py0, py1, (py) => rowCells.all(py, px0, px1))) {
+      const d = cellDepth(c);
+      if (d < bestDepth) {
+        best = c;
+        bestDepth = d;
+      }
+    }
+    return best;
+  };
+
   /** Keep each level's shoalest cell of the block holding `cell`. */
   const updateBlocks = (cell: Cell) => {
     // Compared as stored, in centimetres.
@@ -214,23 +234,9 @@ export function createCellStore(db: DatabaseSync) {
       if (!was || depth <= cellDepth(was)) {
         write(writeBlock, [level, oy, ox], cell);
       } else if (was.py === cell.py && was.px === cell.px) {
-        // The block's shoalest cell deepened: another may now be shoalest.
-        const band = Math.floor(cell.py / ROWS_PER_BAND);
-        const blocks = Math.ceil(ROWS_PER_BAND / 2 ** level);
-        const py0 = band * ROWS_PER_BAND + (oy - band * blocks) * 2 ** level;
-        const py1 = Math.min(py0 + 2 ** level, (band + 1) * ROWS_PER_BAND) - 1;
-        const px0 = ox * 2 ** level;
-        let best = cell;
-        let bestDepth = depth;
-        const px1 = px0 + 2 ** level - 1;
-        for (const c of rows(py0, py1, (py) => rowCells.all(py, px0, px1))) {
-          const d = cellDepth(c);
-          if (d < bestDepth) {
-            best = c;
-            bestDepth = d;
-          }
-        }
-        write(writeBlock, [level, oy, ox], best);
+        // The block's shoalest cell deepened: another may now be shoalest. Its own row
+        // is already written, so the block's cells include it as it now stands.
+        write(writeBlock, [level, oy, ox], shoalest(level, oy, ox, cell.py)!);
       }
     }
   };
@@ -366,7 +372,8 @@ export function createCellStore(db: DatabaseSync) {
           // write holds the lock for long. Nothing goes stale: a block keeps its cells,
           // which only `clear` removes, and it clears the overviews too. The live writer
           // keeps blocks too: a shoaler pick whose cell still reads as picked is one it
-          // made since the read, and a cell it changed since then it has re-picked for.
+          // made since the read, and a block whose pick it changed since is searched
+          // again as it stands.
           const rows = [...best.values()];
           for (let i = 0; i < rows.length; i += REBUILD_ROWS) {
             transaction(() => {
@@ -375,7 +382,14 @@ export function createCellStore(db: DatabaseSync) {
                 i + REBUILD_ROWS,
               )) {
                 const was = readCell.get(cell.py, cell.px) as Cell | undefined;
-                if (was?.m !== read.m || was.d !== read.d) continue;
+                if (was?.m !== read.m || was.d !== read.d) {
+                  write(
+                    writeBlock,
+                    at,
+                    shoalest(at[0], at[1], at[2], cell.py)!,
+                  );
+                  continue;
+                }
                 const row = readBlock.get(...at) as Cell | undefined;
                 if (row && cellDepth(fromRow(row)) < depth) {
                   const now = readCell.get(row.py, row.px) as Cell | undefined;
