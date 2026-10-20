@@ -441,6 +441,15 @@ export function createCellStore(db: DatabaseSync) {
                       write(writeBlock, at, fromRow(row), [1]);
                     continue;
                   }
+                  // A stale row hides from the live writer any cell it added since the
+                  // read that's deeper than the row but shoaler than this pick.
+                  write(
+                    writeBlock,
+                    at,
+                    shoalest(at[0], at[1], at[2], cell.py)!,
+                    marked,
+                  );
+                  continue;
                 }
                 write(writeBlock, at, cell, marked);
               }

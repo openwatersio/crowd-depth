@@ -168,7 +168,7 @@ function racing(live: (store: ReturnType<typeof createCellStore>) => void) {
       return typeof v === "function" ? v.bind(target) : v;
     },
   });
-  return { store, rebuilding: createCellStore(wrapped) };
+  return { store, db, rebuilding: createCellStore(wrapped) };
 }
 
 test("a rebuild keeps the overview picks the live writer makes while it runs", () => {
@@ -219,5 +219,28 @@ test("a rebuild searches a block again when the cell it picked changes under it"
   for (const level of OVERVIEW_LEVELS.filter((l) => l >= 2)) {
     const [pick] = store.cells(-76.21, 36.97, -76.19, 36.99, level);
     expect(pick.px).toBe(b.px);
+  }
+});
+
+test("a rebuild over a stale block row keeps a cell the live writer added meanwhile", () => {
+  const at = cellAt(-76.2, 36.98);
+  const [s, p, x] = [0, 1, 2].map((i) => ({
+    py: at.py,
+    px: at.px - (at.px & 63) + i,
+  }));
+  const { store, rebuilding, db } = racing((live) =>
+    live.addPasses([{ ...x, depth: 5, day: 2 }]),
+  );
+  store.addPasses([{ ...s, depth: 3, day: 1 }]);
+  // A backfill deepened s, and added p, without the overviews hearing of it.
+  db.prepare("UPDATE cells SET m = 1000 WHERE py = ? AND px = ?").run(
+    s.py,
+    s.px,
+  );
+  store.addPasses([{ ...p, depth: 8, day: 1 }], false);
+  rebuilding.rebuildOverviews();
+  for (const level of OVERVIEW_LEVELS.filter((l) => l >= 2)) {
+    const [pick] = store.cells(-76.21, 36.97, -76.19, 36.99, level);
+    expect(pick.px).toBe(x.px);
   }
 });

@@ -46,8 +46,10 @@ const LIVE_BATCH = 10;
 const BULK_BATCH = 200;
 const BATCH_PER_BUFFER = 0.01;
 
-/** QC runs in a row that may fail on their thread before QC moves to this one. */
+/** QC runs in a row that may fail on their thread before QC moves to this one, and for
+ * how long before the thread is tried again. */
 const MAX_QC_FAILURES = 3;
+const QC_RETRY_MS = 10 * 60_000;
 
 /** Flushes in a row that may fail before the writer gives up. */
 const MAX_FLUSH_FAILURES = 3;
@@ -183,7 +185,8 @@ export function createCellWriter(
     onError?: (err: Error) => void;
   } = {},
 ) {
-  let qc = runQC;
+  /** While QC's thread has failed, when to try it again. */
+  let qcDownUntil = 0;
   let buffer: Sounding[] = [];
   /** Track metres from the buffer's start to each of its soundings. */
   let path: number[] = [];
@@ -351,6 +354,7 @@ export function createCellWriter(
     const end = ready(all);
     if (end <= judged) return;
     const arrival = Date.now() * 1000;
+    const qc = Date.now() >= qcDownUntil ? runQC : undefined;
     if (!qc || all) {
       rule(trackQC(buffer, arrival, QC), end);
       return fold(all);
@@ -370,12 +374,16 @@ export function createCellWriter(
         }
       },
       (err: Error) => {
-        // The thread starts again on the next run; QC moves here if it keeps failing.
+        // The thread starts again on the next run; QC moves here for a while if it
+        // keeps failing.
         running = undefined;
         if (++qcFailures < MAX_QC_FAILURES) return;
-        qc = undefined;
+        qcFailures = 0;
+        qcDownUntil = Date.now() + QC_RETRY_MS;
         onError(
-          new Error(`QC thread failed, running QC on the server's: ${err}`),
+          new Error(
+            `QC thread failed, running QC on the server's for 10 minutes: ${err}`,
+          ),
         );
       },
     );

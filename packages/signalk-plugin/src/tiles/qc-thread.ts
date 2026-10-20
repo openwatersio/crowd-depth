@@ -1,6 +1,10 @@
 import { Worker } from "node:worker_threads";
 import type { Flag, Sounding } from "../qc.js";
 
+/** The longest a QC run may take before its thread is taken for stuck and stopped. A
+ * full buffer takes about half a second on a Pi. */
+const RUN_TIMEOUT_MS = 60_000;
+
 export const FLAG_NAMES: Flag[1][] = [
   "reject",
   "review",
@@ -31,15 +35,19 @@ export function createQCThread() {
       reject: (e: Error) => void;
     }
   >();
-  const fail = (err: Error) => {
+  /** Fail what `failed` was asked, unless a newer thread has taken its place. */
+  const fail = (failed: Worker | undefined, err: Error) => {
+    if (failed !== worker) return;
+    void failed?.terminate();
+    worker = undefined;
     for (const w of waiting.values()) w.reject(err);
     waiting.clear();
-    worker = undefined;
   };
   const start = () => {
-    worker = new Worker(new URL("./qc-worker.js", import.meta.url));
-    worker.unref();
-    worker.on(
+    const started = new Worker(new URL("./qc-worker.js", import.meta.url));
+    worker = started;
+    started.unref();
+    started.on(
       "message",
       ({
         id,
@@ -61,8 +69,10 @@ export function createQCThread() {
         w?.resolve(Array.from(index, (i, k) => [i, FLAG_NAMES[flag[k]]]));
       },
     );
-    worker.on("error", (err) => fail(err as Error));
-    worker.on("exit", (code) => fail(new Error(`QC worker exited (${code})`)));
+    started.on("error", (err) => fail(started, err as Error));
+    started.on("exit", (code) =>
+      fail(started, new Error(`QC worker exited (${code})`)),
+    );
   };
   const run: QCRunner = (soundings, arrival) => {
     if (closed) return Promise.reject(new Error("QC worker closed"));
@@ -75,17 +85,25 @@ export function createQCThread() {
       data[i * 4 + 3] = s.depth;
     });
     const id = next++;
-    return new Promise((resolve, reject) => {
-      waiting.set(id, { resolve, reject });
-      worker!.postMessage({ id, data, arrival }, [data.buffer]);
+    const asked = worker!;
+    return new Promise<[number, Flag[1]][]>((resolve, reject) => {
+      const timer = setTimeout(
+        () => fail(asked, new Error("QC worker timed out")),
+        RUN_TIMEOUT_MS,
+      );
+      timer.unref();
+      waiting.set(id, {
+        resolve: (found) => (clearTimeout(timer), resolve(found)),
+        reject: (err) => (clearTimeout(timer), reject(err)),
+      });
+      asked.postMessage({ id, data, arrival }, [data.buffer]);
     });
   };
   return {
     run,
     close() {
       closed = true;
-      void worker?.terminate();
-      fail(new Error("QC worker closed"));
+      fail(worker, new Error("QC worker closed"));
     },
   };
 }
