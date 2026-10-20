@@ -38,7 +38,7 @@ from . import statistic
 from .catalog import MIN_DEPTH_M
 from .cells import BASE, CELL_SAMPLE, k_for
 from .definitions import SURFACE
-from .qc import HAZARD_M, MAX_DEPTH_M, QC_VERSION
+from .qc import HAZARD_M, MAX_DEPTH_M, QC_VERSION, SHALLOW_M
 
 NODATA = -9999.0
 # Rows per tile: 2/3″ of latitude, two base rows.
@@ -85,8 +85,9 @@ WITH wanted AS MATERIALIZED (
     FROM corrected_points_in($partition, [$tile], $rlo, $rhi) p
     WHERE p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M} AND p.depth >= {MIN_DEPTH_M}
       AND NOT p.excluded AND NOT p.awaiting_tide
-      -- As cells publish them: a transit that lost the bottom only where it reads shoal.
-      AND NOT (p.lost_bottom AND p.depth >= {HAZARD_M})
+      -- As cells publish them: a transit that lost the bottom only where it reads shoal,
+      -- and at least SHALLOW_M.
+      AND NOT (p.lost_bottom AND (p.depth >= {HAZARD_M} OR p.depth_raw < {SHALLOW_M}))
   )
   -- Only the pixels wanted: a neighbor's strip within the search radius, say.
   WHERE py BETWEEN $pylo AND $pyhi AND px BETWEEN $pxlo AND $pxhi

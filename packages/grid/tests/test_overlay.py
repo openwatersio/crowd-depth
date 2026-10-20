@@ -411,7 +411,7 @@ def test_contradicted_shoals_dont_vote_and_unjudged_ones_do(env, tmp_path, reaso
     assert (depth != surface.NODATA).any() == drawn and count[count > 0].sum() == 120
 
 
-@pytest.mark.parametrize("depth, counted", [(10.0, 120), (40.0, 0)])
+@pytest.mark.parametrize("depth, counted", [(10.0, 120), (40.0, 0), (0.3, 0)])
 def test_a_transit_that_lost_the_bottom_never_votes(env, tmp_path, depth, counted):  # noqa: F811
     put_tracks(env, parallel(depth))
     test_grid.build(env)

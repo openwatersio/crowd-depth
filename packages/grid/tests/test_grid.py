@@ -376,9 +376,9 @@ def test_shoals_are_the_soundings_nothing_confirmed_or_rejected():
     )
     tile = (LAT0 + 90) * 360 + LON0 + 180
     con.execute(
-        "CREATE TABLE tile_points AS SELECT unnest(range(1, 8)) AS point_id, ? AS tile_id,"
-        " 5000 AS r, ? AS lon, ? AS lat, 3.0 AS depth_raw, 3.0::DOUBLE AS depth, false AS excluded,"
-        " point_id IN (5, 6, 7) AS lost_bottom, false AS awaiting_tide",
+        "CREATE TABLE tile_points AS SELECT unnest(range(1, 9)) AS point_id, ? AS tile_id,"
+        " 5000 AS r, ? AS lon, ? AS lat, 3.0::DOUBLE AS depth_raw, 3.0::DOUBLE AS depth, false AS excluded,"
+        " point_id IN (5, 6, 7, 8) AS lost_bottom, false AS awaiting_tide",
         [tile, *at(5000, 7)],
     )
     v = qc.QC_VERSION
@@ -397,6 +397,8 @@ def test_shoals_are_the_soundings_nothing_confirmed_or_rejected():
     )
     # 7: lost the bottom, but reading deeper than HAZARD_M: no hazard to warn of.
     con.execute("UPDATE tile_points SET depth = ? WHERE point_id = 7", [qc.HAZARD_M + 5.0])
+    # 8: lost the bottom, reading under SHALLOW_M: a sounder's junk, no hazard either.
+    con.execute("UPDATE tile_points SET depth_raw = 0.3, depth = 0.3 WHERE point_id = 8")
     con.execute(cells.SHOALS, {"partition": 1})
     assert con.execute("SELECT tile_id, r, c FROM shoals").fetchall() == [(tile, 5000, 7)] * 2
 

@@ -24,7 +24,7 @@ from .qc import HAZARD_M, MAX_DEPTH_M, QC_VERSION, SHALLOW_M, TRACK_REASONS
 
 log = logging.getLogger(__name__)
 
-GRID_VERSION = 8
+GRID_VERSION = 9
 BATCH_POINTS = 5_000_000
 BASE = CELLS["rows_per_degree"]  # base rows per 1° tile
 MIN_VESSELS = 2
@@ -495,8 +495,10 @@ SELECT p.tile_id, p.r,
 FROM tile_points p
 -- A segment too deep to correct publishes nothing, its shoals included.
 WHERE NOT p.excluded AND NOT p.awaiting_tide
-  -- A transit that lost the bottom warns of no hazard from deeper than HAZARD_M.
-  AND NOT (p.lost_bottom AND p.depth >= {HAZARD_M}) AND (p.point_id IN (
+  -- A transit that lost the bottom warns of no hazard from deeper than HAZARD_M, nor from
+  -- a reading under SHALLOW_M, a sounder's junk.
+  AND NOT (p.lost_bottom AND (p.depth >= {HAZARD_M} OR p.depth_raw < {SHALLOW_M}))
+  AND (p.point_id IN (
   SELECT point_id FROM lake.qc_flags
   WHERE cell_id = $partition AND flag = 'unconfirmed' AND qc_version = {QC_VERSION}
   EXCEPT
