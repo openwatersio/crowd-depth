@@ -213,3 +213,22 @@ test("a flush that fails once is written whole on the next", async () => {
   await end(writer);
   expect(store.cells(-76.3, 36, -76.1, 37.1)).toHaveLength(40);
 });
+
+test("a long steady run at anchor is judged once and carried, then QC picks up again", async () => {
+  // 10 Hz for 40 minutes at one depth, swinging within 20 m, then the depth moves.
+  const { store, writer } = run(
+    Array.from({ length: 26_000 }, (_, i) => ({
+      latitude: 36.98 + Math.sin(i / 3000) * 0.0001,
+      longitude: -76.2 + Math.cos(i / 3000) * 0.0001,
+      depth: i < 24_000 ? 5 : 5.5 + (i % 3) * 0.1,
+      timestamp: start.add({ milliseconds: i * 100 }),
+    })),
+  );
+  await end(writer);
+  const cells = store.cells(-76.3, 36, -76.1, 37.1);
+  expect(cells.length).toBeGreaterThan(0);
+  // Both depths reached the cells: the run wasn't taken for a stuck sounder.
+  expect(Math.min(...cells.map((c) => c.m))).toBeLessThan(5.2);
+  expect(Math.max(...cells.map((c) => c.m))).toBeGreaterThan(5.2);
+  expect(store.shoals(-76.3, 36, -76.1, 37.1)).toEqual([]);
+}, 30_000);
