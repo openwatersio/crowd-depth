@@ -20,10 +20,20 @@ for (const [name, depth, glitch] of [
 ]) {
   const qc = createQCThread();
   const store = createCellStore(createDB(":memory:"));
-  // The writer flushes every 10 s of sailing: the loop below gives its timer a turn
-  // every 100 soundings.
-  const writer = createCellWriter(store, { flushIntervalMs: 5, qc: qc.run });
-  const t0 = Temporal.Instant.from("2026-10-16T08:00:00Z").epochMilliseconds;
+  // Each sounding waits for QC's findings before the next, as at 10 Hz, where QC
+  // answers long before the next one, and the soundings end now, as live.
+  let runs = 0;
+  let pending;
+  // It sails 100 minutes in about one, so the 10 s flush would let written passes pile
+  // up: it flushes every 5 ms instead, which overstates the cost of writes.
+  const writer = createCellWriter(store, {
+    flushIntervalMs: 5,
+    qc: (soundings, arrival) => {
+      runs++;
+      return (pending = qc.run(soundings, arrival));
+    },
+  });
+  const t0 = Date.now() - n * 100;
   const writes = [];
   let worstProvisional = 0;
   let most = 0;
@@ -37,7 +47,8 @@ for (const [name, depth, glitch] of [
       timestamp: Temporal.Instant.fromEpochMilliseconds(t0 + i * 100),
     });
     writes.push(performance.now() - a);
-    if (i % 100 === 99) await new Promise((r) => setTimeout(r, 6));
+    await pending;
+    await new Promise((r) => setImmediate(r));
     if (i % 20 === 0) {
       const b = performance.now();
       const p = writer.provisional();
@@ -51,7 +62,7 @@ for (const [name, depth, glitch] of [
   console.log(
     `${name}: ${n} soundings, CPU ${((cpu.user + cpu.system) / 1000 / (minutes * 60)).toFixed(1)} ms/s of sailing; ` +
       `write p99 ${q(0.99)} ms, max ${q(1)} ms; ` +
-      `provisional up to ${most}, slowest ${worstProvisional.toFixed(1)} ms`,
+      `provisional up to ${most}, slowest ${worstProvisional.toFixed(1)} ms; ${runs} QC runs`,
   );
   writer.destroy();
   qc.close();

@@ -394,6 +394,14 @@ export function createCellStore(db: DatabaseSync) {
                 if (row && cellDepth(fromRow(row)) < depth) {
                   const now = readCell.get(row.py, row.px) as Cell | undefined;
                   if (now?.m === row.m && now.d === row.d) continue;
+                  // A stale row hides from the live writer any cell it added since the
+                  // read that's deeper than the row but shoaler than this pick.
+                  write(
+                    writeBlock,
+                    at,
+                    shoalest(at[0], at[1], at[2], cell.py)!,
+                  );
+                  continue;
                 }
                 write(writeBlock, at, cell);
               }
