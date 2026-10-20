@@ -6,6 +6,9 @@ export function createDB(filename: string): DatabaseSync {
   // Skip per-commit fsync so 1Hz depth inserts don't wear out SD cards (#100).
   // WAL + NORMAL is durable against corruption; worst case loses recent rows on power loss.
   db.exec("PRAGMA synchronous = NORMAL");
+  // The chart's backfill writes from a worker thread on a connection of its own, in
+  // short transactions; this connection waits for one rather than failing.
+  db.exec("PRAGMA busy_timeout = 5000");
 
   runMigrations(db, [
     () => {

@@ -41,8 +41,9 @@ const STORED_MS = 90_000;
 /** The longest the writer keeps passes back for a backfill that hasn't finished. */
 const HOLD_MAX_MS = 3 * 3600_000;
 
-/** Passes a backfill writes at a time, so each write holds the event loop briefly. */
-const BULK_FLUSH_PASSES = 2000;
+/** Passes a backfill writes at a time, so each transaction holds the database's write
+ * lock, which the plugin's own sounding log waits on, only briefly. */
+const BULK_FLUSH_PASSES = 250;
 
 /** Metres between two soundings, equirectangular, as QC measures. */
 function metres(a: Sounding, b: Sounding): number {
@@ -142,10 +143,13 @@ export function createCellWriter(
   {
     flushIntervalMs = DEFAULT_FLUSH_MS,
     bulk = false,
+    overviews = true,
     onChange = () => {},
   }: {
     flushIntervalMs?: number;
     bulk?: boolean;
+    /** Keep the overviews up as passes are written; a backfill rebuilds them after. */
+    overviews?: boolean;
     onChange?: (changed: Changed) => void;
   } = {},
 ) {
@@ -283,7 +287,7 @@ export function createCellWriter(
       const found = shoals;
       passes = [];
       shoals = [];
-      const cells = store.addPasses(batch);
+      const cells = store.addPasses(batch, overviews);
       if (found.length) store.addShoals(found);
       const at = Date.now();
       for (const s of [...unwritten, ...found]) stored.push({ id: s.time, at });

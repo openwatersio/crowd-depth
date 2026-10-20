@@ -250,8 +250,10 @@ export function createCellStore(db: DatabaseSync) {
   };
 
   return {
-    /** Fold passes into their cells in one transaction; returns the cells written. */
-    addPasses(passes: Pass[]): Cell[] {
+    /** Fold passes into their cells in one transaction; returns the cells written.
+     * Without `overviews`, as during a backfill, the overviews are left for
+     * {@link rebuildOverviews}. */
+    addPasses(passes: Pass[], overviews = true): Cell[] {
       return transaction(() =>
         passes.map((pass) => {
           const row = readCell.get(pass.py, pass.px) as
@@ -267,7 +269,7 @@ export function createCellStore(db: DatabaseSync) {
             pass,
           );
           write(writeCell, [], cell);
-          updateBlocks(cell);
+          if (overviews) updateBlocks(cell);
           return cell;
         }),
       );
@@ -316,6 +318,44 @@ export function createCellStore(db: DatabaseSync) {
     transaction,
     clear() {
       db.exec("DELETE FROM cells; DELETE FROM overviews; DELETE FROM shoals;");
+    },
+
+    /** Find every overview block's shoalest cell again, in one pass over the cells in
+     * key order: each level holds only the blocks of its current row of blocks. */
+    rebuildOverviews() {
+      const rows = db
+        .prepare(
+          `SELECT py, px, m, d, passes, first, last FROM cells ORDER BY py, px`,
+        )
+        .iterate() as Iterable<Cell>;
+      const levels = OVERVIEW_LEVELS.map((level) => ({
+        level,
+        oy: NaN,
+        best: new Map<number, { cell: Cell; depth: number }>(),
+      }));
+      const writeRow = (l: (typeof levels)[number]) => {
+        for (const [ox, { cell }] of l.best) {
+          write(writeBlock, [l.level, l.oy, ox], cell);
+        }
+        l.best.clear();
+      };
+      transaction(() => {
+        db.exec("DELETE FROM overviews");
+        for (const row of rows) {
+          const cell = fromRow(row);
+          const depth = cellDepth(cell);
+          for (const l of levels) {
+            const { oy, ox } = block(cell.py, cell.px, l.level);
+            if (oy !== l.oy) {
+              writeRow(l);
+              l.oy = oy;
+            }
+            const was = l.best.get(ox);
+            if (!was || depth < was.depth) l.best.set(ox, { cell, depth });
+          }
+        }
+        for (const l of levels) writeRow(l);
+      });
     },
   };
 }

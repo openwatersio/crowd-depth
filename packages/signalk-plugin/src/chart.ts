@@ -126,7 +126,14 @@ export function startChart({
 
   return {
     backfill: (source: BathymetrySource) => {
-      return backfillCells({ app, config, source, store, signal })
+      return backfillCells({
+        app,
+        config,
+        source,
+        store,
+        signal,
+        file: db.location() ?? undefined,
+      })
         .then(() => {
           writer.hold(false);
           tiles.reset();

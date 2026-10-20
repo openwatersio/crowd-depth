@@ -1,3 +1,4 @@
+import { availableParallelism } from "node:os";
 import { Worker } from "node:worker_threads";
 import { CellStore, OVERVIEW_LEVELS } from "./cells.js";
 import type { Changed } from "./writer.js";
@@ -22,6 +23,9 @@ export function overviewLevel(z: number, lat: number): number {
   const pm = tileMetres(z, lat) / rasterSize(z, lat);
   return Math.max(0, ...OVERVIEW_LEVELS.filter((l) => CELL_M * 2 ** l <= pm));
 }
+
+/** Threads that build tiles. */
+const TILE_THREADS = Math.max(1, Math.min(3, availableParallelism() - 1));
 
 /** Encoded tiles kept in memory. A z13 tile of busy water is a few KB. */
 const CACHE_TILES = 2000;
@@ -120,9 +124,16 @@ export function createTileService(store: CellStore, file?: string) {
   /** Bumped when a tile changes, so a build that started before isn't cached. */
   const stamps = new Map<string, number>();
   const building = new Map<string, Promise<Buffer | undefined>>();
-  const worker = file ? createTileWorker(file) : undefined;
+  // A few threads, leaving a core for the server: a chart asks for a view's tiles at
+  // once, and each takes up to a second or so on a Pi.
+  const workers = file
+    ? Array.from({ length: TILE_THREADS }, () => createTileWorker(file))
+    : [];
+  let turn = 0;
   const build = (z: number, x: number, y: number) =>
-    worker ? worker.build(z, x, y) : Promise.resolve(readTile(store, z, x, y));
+    workers.length
+      ? workers[turn++ % workers.length].build(z, x, y)
+      : Promise.resolve(readTile(store, z, x, y));
   // Revisions count from the time the service started, so a client holding one from
   // before a restart is behind every revision this one keeps, and refetches everything.
   let rev = Date.now();
@@ -222,7 +233,7 @@ export function createTileService(store: CellStore, file?: string) {
 
     close() {
       clearInterval(timer);
-      worker?.close();
+      for (const w of workers) w.close();
     },
   };
 }

@@ -101,3 +101,23 @@ test("an unconfirmed shoal keeps the shoalest reading in its cell", () => {
     { ...at, depth: 1.1, time: 2 },
   ]);
 });
+
+test("rebuilt overviews match the ones kept pass by pass", () => {
+  const kept = createCellStore(createDB(":memory:"));
+  const later = createCellStore(createDB(":memory:"));
+  let seed = 7;
+  const random = () => ((seed = (seed * 16807) % 2147483647) - 1) / 2147483646;
+  for (let i = 0; i < 300; i++) {
+    const { py, px } = cellAt(-76.2 + random() * 0.05, 36.98 + random() * 0.05);
+    const pass = { py, px, depth: 2 + random() * 10, day: i };
+    kept.addPasses([pass]);
+    later.addPasses([pass], false);
+  }
+  later.rebuildOverviews();
+  for (const level of OVERVIEW_LEVELS) {
+    const key = (c: { py: number; px: number }) => `${c.py},${c.px}`;
+    const blocks = (s: typeof kept) =>
+      s.cells(-76.3, 36.9, -76.1, 37.1, level).map(key).sort();
+    expect(blocks(later)).toEqual(blocks(kept));
+  }
+});

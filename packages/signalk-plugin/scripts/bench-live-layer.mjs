@@ -12,7 +12,11 @@ import { setImmediate } from "node:timers/promises";
 import { join } from "node:path";
 import { Temporal } from "@js-temporal/polyfill";
 import { createDB } from "../dist/storage.js";
-import { createCellStore, createCellWriter } from "../dist/tiles/index.js";
+import {
+  createCellStore,
+  createCellWriter,
+  createWorkerSink,
+} from "../dist/tiles/index.js";
 import { createTileService } from "../dist/tiles/service.js";
 import { tileFraction } from "../dist/tiles/geometry.js";
 
@@ -70,13 +74,14 @@ for (const bulk of [false, true]) {
   );
 }
 
-// Fill to the target with the backfill writer, yielding as the backfill does.
+// Fill to the target as a backfill does, on its worker thread, and watch the event loop
+// the server would run on.
 const loop = monitorEventLoopDelay({ resolution: 10 });
 loop.enable();
 const fill0 = performance.now();
 let soundings = 200_000;
 while (count() < target) {
-  const writer = createCellWriter(store, { bulk: true });
+  const writer = createWorkerSink(file);
   for (let i = 0; i < 20; i++) {
     await lane(5000, writer);
     await setImmediate();

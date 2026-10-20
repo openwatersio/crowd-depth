@@ -4,9 +4,11 @@ import { Temporal } from "@js-temporal/polyfill";
 import { transform } from "stream-transform";
 import { ServerAPI } from "@signalk/server-api";
 import { Config } from "../config.js";
-import { BathymetrySource, Timeframe } from "../types.js";
+import { BathymetryData, BathymetrySource, Timeframe } from "../types.js";
 import { correctForSensorPosition } from "../streams/index.js";
 import { CellStore } from "./cells.js";
+import { Writable } from "stream";
+import { Worker } from "node:worker_threads";
 import { createCellWriter, getThrough, setThrough } from "./writer.js";
 
 /** How far back a store with no cells yet is filled from the plugin's source. */
@@ -107,12 +109,16 @@ export async function backfillCells({
   source,
   store,
   signal,
+  file,
 }: {
   app: ServerAPI;
   config: Config;
   source: BathymetrySource;
   store: CellStore;
   signal: AbortSignal;
+  /** The database file, for the cells to be written on a worker thread; without it,
+   * as for an in-memory database, they're written on this one. */
+  file?: string;
 }): Promise<void> {
   let pending = getPendingBackfill(store);
   if (!pending) return;
@@ -151,13 +157,75 @@ export async function backfillCells({
         }
       },
       transform(correctForSensorPosition(config)),
-      createCellWriter(store, { bulk: true }),
+      file
+        ? createWorkerSink(file)
+        : createCellWriter(store, { bulk: true, overviews: false }),
       { signal },
     );
+    if (!file) store.rebuildOverviews();
   }
   if (signal.aborted) return;
   // Done through the span's end, where the live writer took over, so a later start
   // doesn't fold the same passes in again even if the live writer has written nothing.
   setThrough(store, pending.to.epochMilliseconds * 1000);
   clearPendingBackfill(store);
+}
+
+/** Soundings sent to the backfill worker at a time. Each batch waits for the worker to
+ * take the last, so a fast source can't pile soundings up in memory. */
+const WORKER_BATCH = 2000;
+
+/** A Writable that hands soundings to the backfill worker and finishes once the worker
+ * has written them all and rebuilt the overviews. */
+export function createWorkerSink(file: string): Writable {
+  const worker = new Worker(new URL("./backfill-worker.js", import.meta.url), {
+    workerData: { file },
+  });
+  let batch: object[] = [];
+  let waiting: ((err?: Error | null) => void) | undefined;
+  const settle = (err?: Error | null) => {
+    const w = waiting;
+    waiting = undefined;
+    w?.(err);
+  };
+  worker.on("message", (msg: { ack?: true; done?: true; error?: string }) => {
+    if (msg.error) settle(new Error(msg.error));
+    else settle();
+  });
+  worker.on("error", (err) => settle(err as Error));
+  const send = (msg: object, done: (err?: Error | null) => void) => {
+    waiting = done;
+    worker.postMessage(msg);
+  };
+  return new Writable({
+    objectMode: true,
+    write(data: BathymetryData, _encoding, callback) {
+      batch.push({
+        longitude: data.longitude,
+        latitude: data.latitude,
+        depth: data.depth,
+        heading: data.heading,
+        time: data.timestamp.epochMilliseconds,
+      });
+      if (batch.length < WORKER_BATCH) return callback();
+      const sending = batch;
+      batch = [];
+      send({ batch: sending }, callback);
+    },
+    final(callback) {
+      const finish = () =>
+        send({ end: true }, (err) => {
+          void worker.terminate();
+          callback(err);
+        });
+      if (batch.length === 0) return finish();
+      const sending = batch;
+      batch = [];
+      send({ batch: sending }, (err) => (err ? callback(err) : finish()));
+    },
+    destroy(error, callback) {
+      void worker.terminate();
+      callback(error);
+    },
+  });
 }
