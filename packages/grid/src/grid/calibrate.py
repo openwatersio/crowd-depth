@@ -163,7 +163,9 @@ WITH p AS (
     AND p.unique_id IN (SELECT vessel FROM stuck_vessels)
     AND p.point_id NOT IN (
       SELECT point_id FROM lake.qc_flags WHERE cell_id = $partition AND qc_version = {QC_VERSION}
-        AND list_contains({TRACK_REASONS}, reason) AND flag IN ('reject', 'unconfirmed', 'noisy'))
+        AND list_contains({TRACK_REASONS}, reason) AND flag IN ('reject', 'unconfirmed', 'noisy')
+        -- A held depth is what a stuck sounder reads: in, or the run breaks around it.
+        AND NOT (flag = 'unconfirmed' AND reason = 'flatline'))
 ),
 w AS (
   SELECT p.*,
@@ -605,7 +607,9 @@ def run(con, references=(), accept_losses=False) -> dict:
                 int(crossed[unit]),
             )
         )
-    runs = stuck_runs(con, offset, status)
+    # Judged by the offsets that will apply.
+    kept = np.array([np.nan if r[4] is None else r[4] for r in keep(con, rows)])
+    runs = stuck_runs(con, kept, status)
     dirty = publish(con, rows, stray, accept_losses, runs)
     # The tide the offsets were solved against: once it changes, they are stale.
     con.execute("DELETE FROM lake.store_meta WHERE key = 'calibration_tide'")
@@ -637,11 +641,9 @@ def run(con, references=(), accept_losses=False) -> dict:
     return totals
 
 
-def publish(con, rows, stray=(), accept_losses=False, runs=()):
-    """Replace the calibration with `rows`, its stray transits with `stray` and its stuck
-    runs with `runs`, keeping a segment's published offset unless it moved by more than its
-    standard error, then give each file its segment's offset. Returns how many tiles that
-    made stale."""
+def keep(con, rows):
+    """`rows` with each segment's published offset kept unless it moved by more than its
+    standard error."""
     old = {
         (v, s0, s1, st): (off, se)
         for v, s0, s1, off, se, st in con.execute(
@@ -654,6 +656,16 @@ def publish(con, rows, stray=(), accept_losses=False, runs=()):
         if prev and off is not None and prev[0] is not None and abs(off - prev[0]) <= se:
             off, se = prev
         kept.append((v, seg, s0, s1, off, se, st, *rest))
+    return kept
+
+
+def publish(con, rows, stray=(), accept_losses=False, runs=()):
+    """Replace the calibration with `rows`, its stray transits with `stray` and its stuck
+    runs with `runs`, keeping a segment's published offset unless it moved by more than its
+    standard error, then give each file its segment's offset. Returns how many tiles that
+    made stale."""
+    old = con.execute("SELECT vessel, t_start, t_end, status FROM lake.calibration").fetchall()
+    kept = keep(con, rows)
     # A run that would drop most calibrated segments at once found too little to go on
     # (tide levels mid-rebuild, a reference outage), not a fleet that changed overnight.
     before = sum(st in APPLIED for *_, st in old)

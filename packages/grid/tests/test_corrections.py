@@ -880,6 +880,27 @@ def test_a_stuck_run_holds_through_a_stray_reading(env, tmp_path, monkeypatch): 
     assert env.query("SELECT count(*) FROM lake.lost_runs") == [(1,)]
 
 
+def test_a_sounder_holding_one_depth_is_a_stuck_run(env, tmp_path, monkeypatch):  # noqa: F811
+    # It wanders, then holds 0.8 m to the centimetre for its last 70 soundings, over 1 km:
+    # QC's flatline, unconfirmed, and still part of the run. Calibration's pixels leave the
+    # flatline out, so the month's share is the wandering half's.
+    monkeypatch.setattr(calibrate, "STUCK_SHARE", 0.01)
+    n, rows, vessel = stuck(20, "AQM-T", 0.8, 20)
+    fleet = [
+        *(transit(1 + i, "AQM-T", 5.4, (0, 240), i) for i in range(10)),
+        (n, [(ts, x, y, 0.8 if i >= 50 else d) for i, (ts, x, y, d) in enumerate(rows)], vessel),
+        *(transit(30 + i, "AQM-A", 9.5, (0, 240), 30 + i) for i in range(3)),
+    ]
+    calibrated(env, fleet, reference(tmp_path / "ref.tif", (0, 240)), monkeypatch)
+    assert (
+        env.query(
+            "SELECT count(*) FROM lake.qc_flags WHERE reason = 'flatline' AND flag = 'unconfirmed'"
+        )[0][0]
+        > 60
+    )
+    assert env.query("SELECT count(*) FROM lake.lost_runs") == [(1,)]
+
+
 @pytest.mark.parametrize("crowd, found", [(3, False), (99, True)])
 def test_shoaled_water_isnt_a_lost_bottom(env, tmp_path, monkeypatch, crowd, found):  # noqa: F811
     # Four vessels reading 0.5 m shallow cross a bank that shoaled to 3 m on the far side of
