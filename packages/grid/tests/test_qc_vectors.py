@@ -294,10 +294,10 @@ def test_changing_a_grid_definition_bumps_the_grid_version():
     # Cells and the surface are built from these: a change without a new GRID_VERSION
     # leaves cells built under the old ones looking current. `untided_sigma_m` and
     # `uncalibrated_sigma_m` joined the statistic with catalog.py's values, which version 8
-    # already used.
-    grid = {k: DEFINITIONS[k] for k in ("cells", "statistic", "surface")}
+    # already used, and `tide` joined with tide.py's and catalog.py's.
+    grid = {k: DEFINITIONS[k] for k in ("cells", "statistic", "surface", "tide")}
     digest = hashlib.sha256(json.dumps(grid, sort_keys=True).encode()).hexdigest()[:16]
-    assert (cells.GRID_VERSION, digest) == (8, "48459fe943da7f87")
+    assert (cells.GRID_VERSION, digest) == (8, "1da66efca7139c30")
 
 
 def test_spike_chunks_give_the_same_flags(monkeypatch):

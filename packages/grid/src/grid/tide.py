@@ -35,17 +35,18 @@ from scipy.spatial import cKDTree
 
 from . import cache, cells
 from .catalog import TIDE_CELL, checkpoint
+from .definitions import TIDE
 from .qc import EARLIEST
 
 log = logging.getLogger(__name__)
 
-STATION_KM = 50
+STATION_KM = TIDE["station_km"]
 GAUGE_KM = 100
 SLOT_S = 1800
 # Starting values for a level's uncertainty, until held-out gauges measure them: a
 # prediction alone misses the weather's part, which is 0.1 to 0.3 m in the Chesapeake;
 # with a gauge's residual, what's left grows with the distance to the gauge.
-PREDICTED_SIGMA = 0.25
+PREDICTED_SIGMA = TIDE["predicted_sigma_m"]
 OBSERVED_SIGMA = 0.10
 GAUGE_KM_SIGMA = 0.002
 # The image installs the helper with its modules outside the mounted package.
@@ -65,10 +66,10 @@ MAX_RESIDUAL_M = 5.0
 # Low-water chart datums, and mean sea level where charts use it (the Baltic). A station
 # with only its own station datum would reduce depths to roughly mean sea level, deeper
 # than chart datum.
-CHART_DATUMS = {"MLLW", "LAT", "NLLW", "LLWLT", "MLWS", "TLT", "CD", "MSL"}
+CHART_DATUMS = set(TIDE["chart_datums"])
 # Diurnal range (MHHW - MLLW) under which an LLWLT station is a lake gauge: the Great
 # Lakes' run 0.08 to 0.14 m.
-LAKE_RANGE_M = 0.15
+LAKE_RANGE_M = TIDE["lake_range_m"]
 # Seconds a batch of Slackwater predictions may take before the run gives up.
 NODE_TIMEOUT_S = 3600
 # A gauge month is final this long after its end, once late and verified data is in.

@@ -1,7 +1,7 @@
 import type { Request, Response } from "express";
 import type { ServerAPI } from "@signalk/server-api";
 import { ASSET_BASE } from "../plotterext/manifest.js";
-import type { Sounding } from "../qc.js";
+import { charted, type Sounding } from "./writer.js";
 import { MAX_ZOOM, MIN_ZOOM, depthLabels } from "./surface.js";
 import type { TileService } from "./service.js";
 import { buildStyle } from "./style.js";
@@ -156,7 +156,7 @@ export function registerLayerRoutes(
               type: "Feature",
               id: s.time,
               geometry: { type: "Point", coordinates: [s.lon, s.lat] },
-              properties: depthLabels(s.depth),
+              properties: depthLabels(charted(s)),
             })),
         },
       });

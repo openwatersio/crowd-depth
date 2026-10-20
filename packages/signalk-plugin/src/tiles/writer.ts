@@ -1,9 +1,16 @@
 import { Writable } from "stream";
 import { Temporal } from "@js-temporal/polyfill";
 import { BathymetryData } from "../types.js";
-import { trackQC, type Sounding } from "../qc.js";
+import { trackQC, type Sounding as QCSounding } from "../qc.js";
 import { CellStore, Pass, Shoal } from "./cells.js";
 import { DEFINITIONS, cellAt, cellCenter, neighbours } from "./geometry.js";
+import { Tide } from "./tide.js";
+
+/** A sounding with its tide, where it has one. QC judges its raw depth. */
+export type Sounding = QCSounding & { tide?: Tide };
+
+/** A sounding's depth below chart datum where it's tided, and its raw depth where not. */
+export const charted = (s: Sounding) => s.depth - (s.tide?.level ?? 0);
 
 const QC = DEFINITIONS.qc;
 
@@ -119,7 +126,12 @@ const key = (c: { py: number; px: number }) => `${c.py},${c.px}`;
 interface OpenPass {
   py: number;
   px: number;
+  /** Depths reduced to chart datum, with the largest tide σ among them, and raw depths
+   * of soundings without a tide, used only where the pass has no reduced ones: one pass
+   * never mixes the two references. */
   depths: number[];
+  tide: number;
+  raw: number[];
   soundings: Sounding[];
   sounded: boolean;
   first: number;
@@ -189,8 +201,10 @@ export function createCellWriter(
       passes.push({
         py: pass.py,
         px: pass.px,
-        depth: median(pass.depths),
         day: Math.floor(pass.last / 86_400_000_000),
+        ...(pass.depths.length
+          ? { depth: median(pass.depths), tide: pass.tide }
+          : { depth: median(pass.raw) }),
       });
     }
   };
@@ -208,7 +222,7 @@ export function createCellWriter(
         pass &&
         (s.time - pass.last > OTHER_PASS_US ||
           s.time - pass.first > MAX_PASS_US ||
-          pass.depths.length >= MAX_PASS_DEPTHS)
+          pass.depths.length + pass.raw.length >= MAX_PASS_DEPTHS)
       ) {
         closePass(k, pass);
         pass = undefined;
@@ -217,6 +231,8 @@ export function createCellWriter(
         pass = {
           ...n,
           depths: [],
+          tide: 0,
+          raw: [],
           soundings: [],
           sounded: false,
           first: s.time,
@@ -224,7 +240,12 @@ export function createCellWriter(
         };
         open.set(k, pass);
       }
-      pass.depths.push(s.depth);
+      if (s.tide) {
+        pass.depths.push(charted(s));
+        pass.tide = Math.max(pass.tide, s.tide.sigma);
+      } else {
+        pass.raw.push(s.depth);
+      }
       pass.last = s.time;
       if (n.py === at.py && n.px === at.px) {
         pass.sounded = true;
@@ -307,7 +328,14 @@ export function createCellWriter(
       const s = buffer[judged + k];
       const flag = ruled.flags[offset + k];
       if (flag === undefined || flag === "review") accept(s);
-      else if (flag === "unconfirmed") shoals.push(s);
+      else if (flag === "unconfirmed") {
+        shoals.push({
+          time: s.time,
+          lon: s.lon,
+          lat: s.lat,
+          depth: charted(s),
+        });
+      }
     }
     judged += count;
     if (offset + count >= ruled.flags.length) ruled = undefined;
@@ -374,6 +402,7 @@ export function createCellWriter(
           lon: data.longitude,
           lat: data.latitude,
           depth: data.depth,
+          tide: data.tide,
         };
         const prev = buffer[buffer.length - 1];
         path.push(prev ? path[path.length - 1] + metres(prev, s) : 0);
