@@ -348,7 +348,7 @@ export function createCellStore(db: DatabaseSync) {
           const py1 = Math.min(py0 + tallest, (band + 1) * ROWS_PER_BAND) - 1;
           const best = new Map<
             string,
-            { cell: Cell; depth: number; at: number[] }
+            { cell: Cell; depth: number; at: number[]; read: Cell }
           >();
           for (const row of stretch.all(py0, py1) as unknown as Cell[]) {
             const cell = fromRow(row);
@@ -358,21 +358,24 @@ export function createCellStore(db: DatabaseSync) {
               const k = `${level},${oy},${ox}`;
               const was = best.get(k);
               if (!was || depth < was.depth) {
-                best.set(k, { cell, depth, at: [level, oy, ox] });
+                best.set(k, { cell, depth, at: [level, oy, ox], read: row });
               }
             }
           }
           // Written over what's there, a couple of thousand rows a transaction, so no
           // write holds the lock for long. Nothing goes stale: a block keeps its cells,
-          // which only `clear` removes, and it clears the overviews too. A shoaler pick
-          // whose cell still reads as picked is the live writer's, made since the read.
+          // which only `clear` removes, and it clears the overviews too. The live writer
+          // keeps blocks too: a shoaler pick whose cell still reads as picked is one it
+          // made since the read, and a cell it changed since then it has re-picked for.
           const rows = [...best.values()];
           for (let i = 0; i < rows.length; i += REBUILD_ROWS) {
             transaction(() => {
-              for (const { cell, depth, at } of rows.slice(
+              for (const { cell, depth, at, read } of rows.slice(
                 i,
                 i + REBUILD_ROWS,
               )) {
+                const was = readCell.get(cell.py, cell.px) as Cell | undefined;
+                if (was?.m !== read.m || was.d !== read.d) continue;
                 const row = readBlock.get(...at) as Cell | undefined;
                 if (row && cellDepth(fromRow(row)) < depth) {
                   const now = readCell.get(row.py, row.px) as Cell | undefined;

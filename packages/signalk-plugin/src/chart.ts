@@ -28,6 +28,7 @@ import {
   THROUGH_KEY,
 } from "./tiles/index.js";
 import { DEFINITIONS } from "./tiles/geometry.js";
+import { createQCThread } from "./tiles/qc-thread.js";
 import { registerPlotterExtension } from "./plotterext/provider.js";
 
 /** Meta keys for the configuration the cells were built with. */
@@ -36,7 +37,7 @@ const DEPTH_CONFIG_KEY = "config_depth";
 
 /** How the plugin turns soundings into cells. Bump it when that changes, so cells built
  * the old way are rebuilt. */
-const LAYER_VERSION = 3;
+const LAYER_VERSION = 4;
 
 /** A backfill span longer than this holds live passes back until it's done. */
 const HOLD_FOR_HOURS = 1;
@@ -100,7 +101,12 @@ export function startChart({
   addPendingBackfill(store, startedAt);
 
   const tiles = createTileService(store, db.location() ?? undefined);
-  const writer = createCellWriter(store, { onChange: tiles.changed });
+  // Off the main thread, given a database file to say the plugin is built and running.
+  const qc = db.location() ? createQCThread() : undefined;
+  const writer = createCellWriter(store, {
+    onChange: tiles.changed,
+    qc: qc?.run,
+  });
   // Until the backfill has run, so its older passes go into the cells first; only for
   // a span long enough for the order to matter, so a restart's short gap doesn't
   // freeze the layer while the source is found.
@@ -119,6 +125,7 @@ export function startChart({
   // replaced it.
   const stop = () => {
     tiles.close();
+    qc?.close();
     if (current === started) current = undefined;
   };
   signal.addEventListener("abort", stop);

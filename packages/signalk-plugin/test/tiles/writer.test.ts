@@ -8,6 +8,8 @@ import {
   type Changed,
 } from "../../src/tiles/index.js";
 import type { BathymetryData } from "../../src/types.js";
+import { trackQC } from "../../src/qc.js";
+import { DEFINITIONS } from "../../src/tiles/geometry.js";
 
 const start = Temporal.Instant.from("2026-10-16T08:00:00Z");
 
@@ -214,7 +216,7 @@ test("a flush that fails once is written whole on the next", async () => {
   expect(store.cells(-76.3, 36, -76.1, 37.1)).toHaveLength(40);
 });
 
-test("a long steady run at anchor is judged once and carried, then QC picks up again", async () => {
+test("a long steady run at anchor reaches the cells, then QC picks up again", async () => {
   // 10 Hz for 40 minutes at one depth, swinging within 20 m, then the depth moves.
   const { store, writer } = run(
     Array.from({ length: 26_000 }, (_, i) => ({
@@ -251,4 +253,82 @@ test("a sounder stuck at a mooring and still stuck under way is caught as it lea
   await end(writer);
   const away = store.cells(-76.3, 36.985, -76.1, 37.1).filter((c) => c.m > 30);
   expect(away).toEqual([]);
+}, 30_000);
+
+test("a long stretch where the sounder lost the bottom isn't drawn", async () => {
+  // 10 Hz at 5 kn over 6 m, reading 60 to 90 m for 30 s.
+  const { store, writer } = run(
+    Array.from({ length: 1200 }, (_, i) => ({
+      latitude: 36.98 + (i * 0.257) / 110540,
+      longitude: -76.2,
+      depth: i >= 400 && i < 700 ? 60 + (i % 30) : 6 + (i % 3) * 0.1,
+      timestamp: start.add({ milliseconds: i * 100 }),
+    })),
+  );
+  await end(writer);
+  const cells = store.cells(-76.3, 36, -76.1, 37.1);
+  expect(cells.length).toBeGreaterThan(0);
+  expect(Math.max(...cells.map((c) => c.m))).toBeLessThan(10);
+});
+
+test("a sounder stuck at a mooring at 10 Hz is caught as it leaves", async () => {
+  // 65 minutes at a mooring, then 2 km north at 1.5 kn, stuck at 40 m throughout.
+  const moored = 65 * 600;
+  const { store, writer } = run(
+    Array.from({ length: moored + 26_000 }, (_, i) => ({
+      latitude:
+        36.98 +
+        (i < moored
+          ? Math.sin(i / 3000) * 0.0001
+          : ((i - moored) * 0.077) / 110540),
+      longitude: -76.2,
+      depth: 40,
+      timestamp: start.add({ milliseconds: i * 100 }),
+    })),
+  );
+  await end(writer);
+  const away = store.cells(-76.3, 36.983, -76.1, 37.1).filter((c) => c.m > 30);
+  expect(away).toEqual([]);
+}, 60_000);
+
+test("QC on another thread gives the cells QC here does", async () => {
+  // 1 Hz at 6 kn: spikes, a stretch where the sounder lost the bottom, and a stuck run.
+  // A verdict depends on how far ahead QC sees, so each comes back before the next
+  // sounding, as QC here judges.
+  const data = Array.from({ length: 3000 }, (_, i) => ({
+    latitude: 36.98 + (i * 3) / 110540,
+    longitude: -76.2 + Math.sin(i / 50) * 0.0005,
+    depth:
+      i % 97 === 0
+        ? 1
+        : i >= 800 && i < 900
+          ? 60 + (i % 30)
+          : i >= 1500 && i < 1900
+            ? 12
+            : 6 + (i % 5) * 0.1,
+    timestamp: start.add({ seconds: i }),
+  }));
+  const build = async (threaded: boolean) => {
+    const store = createCellStore(createDB(":memory:"));
+    const writer = createCellWriter(store, {
+      flushIntervalMs: 100_000,
+      qc: threaded
+        ? (soundings, arrival) =>
+            Promise.resolve(trackQC(soundings, arrival, DEFINITIONS.qc))
+        : undefined,
+    });
+    for (const d of data) {
+      writer.write(d, () => {});
+      await new Promise((r) => setImmediate(r));
+    }
+    await end(writer);
+    return [
+      store.cells(-76.3, 36, -76.1, 37.1),
+      store.shoals(-76.3, 36, -76.1, 37.1),
+    ];
+  };
+  const here = await build(false);
+  expect(here[0].length).toBeGreaterThan(100);
+  expect(here[1].length).toBeGreaterThan(10);
+  expect(await build(true)).toEqual(here);
 }, 30_000);

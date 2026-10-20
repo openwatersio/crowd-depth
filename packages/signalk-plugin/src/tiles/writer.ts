@@ -3,6 +3,7 @@ import { Temporal } from "@js-temporal/polyfill";
 import { BathymetryData } from "../types.js";
 import { trackQC, type Sounding } from "../qc.js";
 import { CellStore, Pass, Shoal } from "./cells.js";
+import type { QCRunner } from "./qc-thread.js";
 import { DEFINITIONS, cellAt, cellCenter, neighbours } from "./geometry.js";
 
 const QC = DEFINITIONS.qc;
@@ -15,21 +16,20 @@ export const DEFAULT_FLUSH_MS = 10_000;
  * far ahead along the track. */
 const LOOKAHEAD = Math.max(QC.spike_window, QC.noise_window) + 1;
 
-/** Soundings either side of what QC judges that it reads too: its spike, noise and steep
- * checks look only this far. The stuck-sounder check reads the whole run of one depth
- * it judges, so QC starts this far before that run. */
-const CONTEXT = 4 * LOOKAHEAD;
-
-/** The most soundings kept, which a 10 Hz sounder reaches in about half an hour: a run
- * of one depth this long is judged as it stands. */
-const HISTORY_MAX = 20_000;
+/** Track QC looks back over: the stuck-sounder check's distance with some to spare, and
+ * at least this many soundings, at most the cap, a little over an hour of a 10 Hz
+ * sounder, so a boat at anchor reaches {@link RUN_MAX_US} first. */
+const HISTORY_M = QC.flat_m * 1.5;
+const HISTORY_MIN = 1000;
+const HISTORY_MAX = 40_000;
 
 /** Judged soundings folded into passes per write, at most. */
 const FOLD_CHUNK = 2000;
 
 /** A run of one depth still going is held until it covers the stuck-sounder check's
- * distance, so QC judges it whole, as the grid does, or until it's this old: a boat at
- * a mooring, whose depth honestly holds. */
+ * distance, so QC judges it whole, as the grid does, or until it's this old with the boat
+ * still within the check's span of where the run began: a boat at a mooring, whose depth
+ * honestly holds. */
 const RUN_MAX_US = 3600 * 1_000_000;
 
 /** Soundings judged at a time past the lookahead: few live, so provisional soundings
@@ -128,7 +128,7 @@ interface OpenPass {
 
 /**
  * The live layer's pipeline from corrected soundings to cells: the grid's track QC on a
- * rolling buffer, a pass per cell, and each pass's median folded into its cell's moving
+ * buffer of recent soundings, a pass per cell, and each pass's median folded into its cell's moving
  * average (docs/plans/global-grid/live-layer.md).
  *
  * A sounding is judged once the soundings QC looks ahead over have arrived and it isn't
@@ -153,14 +153,18 @@ export function createCellWriter(
     bulk = false,
     overviews = true,
     onChange = () => {},
+    qc: runQC,
   }: {
     flushIntervalMs?: number;
     bulk?: boolean;
     /** Keep the overviews up as passes are written; a backfill rebuilds them after. */
     overviews?: boolean;
     onChange?: (changed: Changed) => void;
+    /** Where track QC runs, as on a thread of its own; without it, here. */
+    qc?: QCRunner;
   } = {},
 ) {
+  let qc = runQC;
   let buffer: Sounding[] = [];
   /** Track metres from the buffer's start to each of its soundings. */
   let path: number[] = [];
@@ -169,11 +173,8 @@ export function createCellWriter(
   let base = 0;
   /** QC's verdicts on soundings judged but not yet all folded in, from sounding `at`. */
   let ruled: { at: number; flags: (string | undefined)[] } | undefined;
-  /** The verdict on a run of one depth judged whole, for the rest of that run. */
-  let carried:
-    { depth: number; flag: string | undefined; at: Sounding } | undefined;
-  /** Where a run of one depth was first held for {@link RUN_MAX_US}, keyed by its start. */
-  let moored: { since: number; at: Sounding } | undefined;
+  /** QC running on its thread; nothing is judged or trimmed meanwhile. */
+  let running: Promise<void> | undefined;
   const open = new Map<string, OpenPass>();
   let passes: Pass[] = [];
   let unwritten: Sounding[] = [];
@@ -237,85 +238,43 @@ export function createCellWriter(
     for (const [k, pass] of open) if (!near.has(k)) closePass(k, pass);
   };
 
-  /** Where QC starts reading: before the run of one depth the first unjudged sounding
-   * is in, by {@link CONTEXT}. */
-  const readFrom = () => {
-    let run = Math.min(judged, buffer.length - 1);
-    while (run > 0 && buffer[run - 1].depth === buffer[run].depth) run--;
-    return Math.max(0, run - CONTEXT);
+  /** Which soundings QC can judge now, to `end`, or none. */
+  const ready = (all: boolean) => {
+    if (all) return buffer.length;
+    let end = Math.max(judged, buffer.length - LOOKAHEAD);
+    // A run of one depth reaching the newest sounding may yet be a stuck sounder.
+    const n = buffer.length - 1;
+    let run = n;
+    while (run > 0 && buffer[run - 1].depth === buffer[n].depth) run--;
+    const whole =
+      path[n] - path[run] >= QC.flat_m ||
+      (buffer[n].time - buffer[run].time >= RUN_MAX_US &&
+        metres(buffer[run], buffer[n]) < QC.flat_span_m) ||
+      buffer.length - judged >= HISTORY_MAX - HISTORY_MIN;
+    if (!whole) end = Math.min(end, run);
+    return end;
   };
 
-  /** Judge what QC can, or everything when `all`. */
-  const judge = (all = false) => {
-    if (buffer.length === 0) return;
-    if (!ruled) {
-      let end = all
-        ? buffer.length
-        : Math.max(judged, buffer.length - LOOKAHEAD);
-      let whole = all;
-      if (!all) {
-        // A run of one depth reaching the newest sounding may yet be a stuck sounder.
-        const n = buffer.length - 1;
-        let run = n;
-        while (run > 0 && buffer[run - 1].depth === buffer[n].depth) run--;
-        // An hour of it is judged whole only while the boat stays put, as at anchor: a
-        // run that moves on waits for flat_m of path, so a sounder stuck at a mooring
-        // and still stuck under way is judged over the whole run, as the grid judges it.
-        let held = buffer[n].time - buffer[run].time >= RUN_MAX_US;
-        if (held && moored?.since !== buffer[run].time) {
-          moored = { since: buffer[run].time, at: buffer[n] };
-        } else if (held) {
-          held = metres(moored!.at, buffer[n]) < QC.flat_span_m;
-        }
-        whole =
-          path[n] - path[run] >= QC.flat_m ||
-          held ||
-          n - run >= HISTORY_MAX - CONTEXT;
-        if (!whole) end = Math.min(end, run);
-      }
-      if (end <= judged) return;
-      // The rest of a run already judged whole takes its verdict, while the boat stays
-      // where it was judged: QC would reread the whole run each batch, thousands of
-      // soundings, to say the same. A run that moves on is QC'd again.
-      let k = 0;
-      while (
-        carried &&
-        judged + k < end &&
-        buffer[judged + k].depth === carried.depth &&
-        metres(carried.at, buffer[judged + k]) < QC.flat_span_m
-      ) {
-        k++;
-      }
-      if (carried && k > 0) {
-        ruled = { at: base + judged, flags: new Array(k).fill(carried.flag) };
-      } else {
-        carried = undefined;
-        // QC from just before the run the first unjudged sounding is in, not the whole
-        // buffer: at anchor that runs to thousands of soundings, and rereading them all
-        // each batch held the server up for a quarter of a second on a Pi.
-        const from = readFrom();
-        const flags: (string | undefined)[] = new Array(end - judged);
-        for (const [j, flag] of trackQC(
-          buffer.slice(from),
-          Date.now() * 1000,
-          QC,
-        )) {
-          const k = j + from - judged;
-          if (k < 0 || k >= flags.length) continue;
-          const was = flags[k];
-          if (was === undefined || RANK[flag] > RANK[was]) flags[k] = flag;
-        }
-        ruled = { at: base + judged, flags };
-        // A run judged whole, still going: its verdict holds for the rest of it.
-        const last = buffer[end - 1];
-        carried =
-          whole && !all && buffer[end - 2]?.depth === last.depth
-            ? { depth: last.depth, flag: flags[flags.length - 1], at: last }
-            : undefined;
-      }
+  /** Take QC's findings over the buffer as it stood, for the soundings to `end`. */
+  const rule = (
+    found: readonly (readonly [number, string, ...unknown[]])[],
+    end: number,
+  ) => {
+    const flags: (string | undefined)[] = new Array(end - judged);
+    for (const [i, flag] of found) {
+      const k = i - judged;
+      if (k < 0 || k >= flags.length) continue;
+      const was = flags[k];
+      if (was === undefined || RANK[flag] > RANK[was]) flags[k] = flag;
     }
-    // Folded in a share at a time: a long run of one depth judged at once would
-    // otherwise hold the server up while thousands of soundings go into passes.
+    ruled = { at: base + judged, flags };
+  };
+
+  /** Fold judged soundings in, a share at a time, or all of them. */
+  const fold = (all: boolean) => {
+    if (!ruled) return;
+    // A long run of one depth judged at once would otherwise hold the server up while
+    // thousands of soundings go into passes.
     const offset = base + judged - ruled.at;
     const count = all
       ? ruled.flags.length - offset
@@ -331,18 +290,50 @@ export function createCellWriter(
     }
     judged += count;
     if (offset + count >= ruled.flags.length) ruled = undefined;
-    // Keep what QC will read next time, and no more than the cap.
-    const drop = Math.max(
-      Math.min(readFrom(), judged),
-      buffer.length - HISTORY_MAX,
-      0,
-    );
+    // Keep what QC looks back over, and everything not yet judged.
+    const n = buffer.length - 1;
+    let drop = 0;
+    while (
+      drop < judged &&
+      n - drop > HISTORY_MIN &&
+      (path[n] - path[drop] > HISTORY_M || n - drop > HISTORY_MAX)
+    ) {
+      drop++;
+    }
     if (drop > 0) {
       buffer = buffer.slice(drop);
       path = path.slice(drop);
       judged -= drop;
       base += drop;
     }
+  };
+
+  /** Judge what QC can, or everything when `all`, which runs QC here. */
+  const judge = (all = false) => {
+    if (ruled) return fold(all);
+    if (running || buffer.length === 0) return;
+    const end = ready(all);
+    if (end <= judged) return;
+    const arrival = Date.now() * 1000;
+    if (!qc || all) {
+      rule(trackQC(buffer, arrival, QC), end);
+      return fold(all);
+    }
+    // On its thread: the buffer only grows until the findings are back, so their
+    // indexes still hold.
+    running = qc(buffer, arrival).then(
+      (found) => {
+        running = undefined;
+        if (writer.destroyed) return;
+        rule(found, end);
+        fold(false);
+      },
+      () => {
+        // The thread failed; QC goes on here.
+        running = undefined;
+        qc = undefined;
+      },
+    );
   };
 
   /** The oldest sounding not yet written, or Infinity. */
@@ -413,16 +404,18 @@ export function createCellWriter(
     final(callback) {
       clearInterval(timer);
       clearTimeout(holdTimer);
-      try {
-        // A run part folded in finishes first; then the rest is judged.
-        while (judged < buffer.length) judge(true);
-        for (const [k, pass] of [...open]) closePass(k, pass);
-        held = false;
-        flush();
-        callback();
-      } catch (err) {
-        callback(err as Error);
-      }
+      void (running ?? Promise.resolve()).then(() => {
+        try {
+          // A run part folded in finishes first; then the rest is judged.
+          while (judged < buffer.length) judge(true);
+          for (const [k, pass] of [...open]) closePass(k, pass);
+          held = false;
+          flush();
+          callback();
+        } catch (err) {
+          callback(err as Error);
+        }
+      });
     },
     // A pipeline destroys its writer on abort, which doesn't run `final`. Passes already
     // closed are written; what's held is left for the next start's backfill.
