@@ -72,6 +72,10 @@ export function createBatch(refreshMs: number, now = () => Date.now()) {
       shownKey = key;
       return { refresh, data: [...shown.values()] };
     },
+    /** The host took the last answer. */
+    taken() {
+      lastAsked = undefined;
+    },
     /** The host didn't take the last answer: ask for its refresh and data again. */
     failed() {
       if (lastAsked) {

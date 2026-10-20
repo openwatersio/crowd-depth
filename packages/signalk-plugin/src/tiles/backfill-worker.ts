@@ -26,28 +26,36 @@ type Sent = {
   heading?: number;
 };
 
-parentPort!.on("message", (msg: { batch?: Sent[]; end?: true }) => {
-  try {
-    if (msg.batch) {
-      for (const s of msg.batch) {
-        writer.write({
-          longitude: s.longitude,
-          latitude: s.latitude,
-          depth: s.depth,
-          heading: s.heading,
-          timestamp: Temporal.Instant.fromEpochMilliseconds(s.time),
-        });
-      }
-      parentPort!.postMessage({ ack: true });
-    } else if (msg.end) {
-      writer.end((err?: Error | null) => {
-        if (err) return parentPort!.postMessage({ error: String(err) });
+parentPort!.on(
+  "message",
+  (msg: { batch?: Sent[]; end?: true; rebuild?: true }) => {
+    try {
+      if (msg.rebuild) {
         store.rebuildOverviews();
         db.close();
-        parentPort!.postMessage({ done: true });
-      });
+        return parentPort!.postMessage({ done: true });
+      }
+      if (msg.batch) {
+        for (const s of msg.batch) {
+          writer.write({
+            longitude: s.longitude,
+            latitude: s.latitude,
+            depth: s.depth,
+            heading: s.heading,
+            timestamp: Temporal.Instant.fromEpochMilliseconds(s.time),
+          });
+        }
+        parentPort!.postMessage({ ack: true });
+      } else if (msg.end) {
+        writer.end((err?: Error | null) => {
+          if (err) return parentPort!.postMessage({ error: String(err) });
+          store.rebuildOverviews();
+          db.close();
+          parentPort!.postMessage({ done: true });
+        });
+      }
+    } catch (err) {
+      parentPort!.postMessage({ error: String(err) });
     }
-  } catch (err) {
-    parentPort!.postMessage({ error: String(err) });
-  }
-});
+  },
+);

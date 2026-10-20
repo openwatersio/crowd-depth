@@ -24,8 +24,9 @@ export function overviewLevel(z: number, lat: number): number {
   return Math.max(0, ...OVERVIEW_LEVELS.filter((l) => CELL_M * 2 ** l <= pm));
 }
 
-/** Threads that build tiles. */
-const TILE_THREADS = Math.max(1, Math.min(3, availableParallelism() - 1));
+/** Threads that build tiles. Worked out when a service starts, not when the module
+ * loads, which the API's Worker bundle does too. */
+const tileThreads = () => Math.max(1, Math.min(3, availableParallelism() - 1));
 
 /** Encoded tiles kept in memory. A z13 tile of busy water is a few KB. */
 const CACHE_TILES = 2000;
@@ -133,7 +134,7 @@ export function createTileService(store: CellStore, file?: string) {
   // A few threads, leaving a core for the server: a chart asks for a view's tiles at
   // once, and each takes up to a second or so on a Pi.
   const workers = file
-    ? Array.from({ length: TILE_THREADS }, () => createTileWorker(file))
+    ? Array.from({ length: tileThreads() }, () => createTileWorker(file))
     : [];
   let turn = 0;
   const build = (z: number, x: number, y: number) =>

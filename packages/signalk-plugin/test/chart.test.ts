@@ -11,6 +11,7 @@ import { Config } from "../src/config.js";
 import { startChart, startChartSafely } from "../src/chart.js";
 import { createDB } from "../src/storage.js";
 import { createSqliteSource } from "../src/sources/sqlite.js";
+import { Timeframe } from "../src/types.js";
 import { correctForSensorPosition } from "../src/streams/index.js";
 import {
   CellStore,
@@ -648,4 +649,42 @@ test("a database from a preview build moves to cells", () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("a backfill that fails partway still leaves its cells drawn zoomed out", async () => {
+  const store = createCellStore(createDB(":memory:"));
+  addPendingBackfill(store, at("2026-10-16T12:00:00Z"));
+  const start = at("2026-10-16T08:00:00Z");
+  const failing = {
+    createWriter: () => undefined as never,
+    getAvailableTimeframes: async () => [
+      new Timeframe(start, start.add({ hours: 1 })),
+    ],
+    createReader: async () =>
+      Readable.from(
+        (async function* () {
+          for (let i = 0; i < 300; i++) {
+            yield {
+              latitude: 36.98 + i * 0.0003,
+              longitude: -76.2,
+              depth: 5 + (i % 3) * 0.1,
+              timestamp: start.add({ seconds: i * 10 }),
+              heading: 0,
+            };
+          }
+          throw new Error("history went away");
+        })(),
+      ),
+  };
+  await expect(
+    backfillCells({
+      app,
+      config,
+      source: failing,
+      store,
+      signal: new AbortController().signal,
+    }),
+  ).rejects.toThrow(/history went away/);
+  expect(store.cells(-76.3, 36.9, -76.1, 37.1).length).toBeGreaterThan(0);
+  expect(store.cells(-76.3, 36.9, -76.1, 37.1, 6).length).toBeGreaterThan(0);
 });

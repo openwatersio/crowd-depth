@@ -289,9 +289,10 @@ export function createCellWriter(
     if (passes.length || shoals.length) {
       const batch = passes;
       const found = shoals;
-      // Taken only once written, so a write that fails is tried again whole.
-      const cells = store.addPasses(batch, overviews);
+      // Taken only once written, so a write that fails is tried again whole. Shoals
+      // first: writing one again changes nothing, where a pass would count twice.
       if (found.length) store.addShoals(found);
+      const cells = store.addPasses(batch, overviews);
       passes = passes.slice(batch.length);
       shoals = shoals.slice(found.length);
       if (!bulk) {

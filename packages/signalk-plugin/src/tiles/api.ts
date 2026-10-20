@@ -141,6 +141,7 @@ export function registerLayerRoutes(
           type: "FeatureCollection",
           features: layer
             .provisional()
+            .sort((a, b) => a.time - b.time)
             .slice(-MAX_PROVISIONAL)
             // A sounding's id is its time, so the runtime can tell which have left.
             .map((s) => ({

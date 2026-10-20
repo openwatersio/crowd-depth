@@ -47,6 +47,7 @@ async function poll(): Promise<void> {
         data: { type: "FeatureCollection", features: data },
       });
     }
+    batch.taken();
   } catch {
     // The server is restarting or the overlay isn't drawn; the next poll tries again.
     batch.failed();

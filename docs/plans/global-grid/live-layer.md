@@ -9,7 +9,7 @@ Every number below comes from the grid's design and changes with it. This note c
 The grid is Python and the plugin is TypeScript, so both read one set of definitions instead of porting by hand:
 
 - **Constants as JSON:** QC thresholds, cell resolution, the statistic's k, the interpolation radius, smoothing and blur, band levels, contour tiers and sounding rounding, in [definitions.json](../../../packages/grid/src/grid/definitions.json), which the grid's modules read and the plugin imports at build time.
-- **Test vectors as JSON:** inputs and expected outputs for QC, the statistic, interpolation and rounding, run by both pytest and vitest. A change on either side fails the other's tests until both agree. QC's are in [qc_vectors.json](../../../packages/grid/tests/qc_vectors.json), with flags from `grid.qc`; pytest checks them against the reference SQL for every check but the steep and noise checks, and against flags worked out by hand for those two.
+- **Test vectors as JSON:** inputs and expected outputs, run by both pytest and vitest: QC's, and the sounding labels and cell column widths in [portrayal_vectors.json](../../../packages/grid/tests/portrayal_vectors.json). The statistic and interpolation are to follow. A change on either side fails the other's tests until both agree. QC's are in [qc_vectors.json](../../../packages/grid/tests/qc_vectors.json), with flags from `grid.qc`; pytest checks them against the reference SQL for every check but the steep and noise checks, and against flags worked out by hand for those two.
 - **QC as pure functions:** the grid's track QC as numpy functions ([qc.py](../../../packages/grid/src/grid/qc.py)), ported once to TypeScript as plain loops ([qc.ts](../../../packages/signalk-plugin/src/qc.ts)) and checked against the shared vectors with vitest ([qc-functions.md](qc-functions.md)).
 
 When the grid changes a definition, the plugin picks it up on its next release, and its cells are rebuilt from the plugin's sounding log, as they are for an offset change. With the plugin's own SQLite log, which stores depths with the offset of their day, a depth offset change starts the cells afresh instead. A rebuild reaches back as far as the backfill does, 30 days, so cells from older passes are lost with it.
@@ -30,14 +30,14 @@ Unconfirmed shoals are handled as in the grid: they publish as soundings with a 
 
 ### Corrections
 
-The layer is a chart, so it shows charted depths: depth below the waterline reduced to chart datum, never depth below the keel or transducer. The plugin applies the grid's [corrections](README.md#3-corrections) in the same order:
+The layer is a chart, so it shows charted depths: depth below the waterline reduced to chart datum, never depth below the keel or transducer. Where the owner hasn't set the offsets that would correct it, the plugin can't, and the layer draws the depth as the sounder gives it. The plugin applies the grid's [corrections](README.md#3-corrections) in the same order:
 
 - **Offsets:** the plugin's depth reference and transducer offsets, which bring every sounding to depth below the waterline, and the GNSS antenna to transducer offset, which moves each sounding to where it was measured. Each change of these settings is to go into a log with its time (see [Open questions](#open-questions)).
 - **Vessel calibration:** the vessel's own offset, scale and uncertainty, fetched from the grid's calibration ([Vessel calibration](README.md#vessel-calibration)). It needs the plugin's `SIGNALK-<uuid>` to match the vessel's `UNIQUE_ID` in the grid. A vessel without a calibration is marked uncalibrated, as the grid marks it.
 - **Tide:** the water level at each sounding's own time and place, from the same Slackwater engine the grid uses, which the plugin reaches through signalk-tides' Neaps API. The correction is applied as each pass enters its cell. The plugin's upload to the grid carries raw depths, so a better prediction or observed level reaches the grid; the live layer keeps the level it had.
 - **Datum:** the grid's low-water chart datum, from the same separation source.
 
-Each cell records which corrections it has, as in the grid. A cell without tide and datum isn't on the overlay's reference, and the layer says so.
+Each cell is to record which corrections it has, as the grid's do; a cell without tide and datum isn't on the overlay's reference, and the layer says so. Until tide lands every cell lacks both, and the layer's coverage says so in its notes.
 
 ### Cells and surface
 

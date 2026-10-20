@@ -143,26 +143,36 @@ export async function backfillCells({
   );
   if (windows.length > 0) {
     app.debug(`Backfilling chart cells from ${windows.length} windows`);
-    await pipeline(
-      async function* () {
-        let read = 0;
-        for (const window of windows) {
-          if (signal.aborted) return;
-          const reader = await source.createReader(window);
-          if (!reader) continue;
-          for await (const sounding of reader) {
-            yield sounding;
-            if (++read % YIELD_EVERY === 0) await setImmediate();
+    try {
+      await pipeline(
+        async function* () {
+          let read = 0;
+          for (const window of windows) {
+            if (signal.aborted) return;
+            const reader = await source.createReader(window);
+            if (!reader) continue;
+            for await (const sounding of reader) {
+              yield sounding;
+              if (++read % YIELD_EVERY === 0) await setImmediate();
+            }
           }
-        }
-      },
-      transform(correctForSensorPosition(config)),
-      file
-        ? createWorkerSink(file)
-        : createCellWriter(store, { bulk: true, overviews: false }),
-      { signal },
-    );
-    if (!file) store.rebuildOverviews();
+        },
+        transform(correctForSensorPosition(config)),
+        file
+          ? createWorkerSink(file)
+          : createCellWriter(store, { bulk: true, overviews: false }),
+        { signal },
+      );
+      if (!file) store.rebuildOverviews();
+    } catch (err) {
+      // The cells it wrote have no overviews yet, so zoomed out they'd not show.
+      // Plugin stopping: the next start's backfill rebuilds them.
+      if (!signal.aborted) {
+        if (file) await rebuildOverviewsOnWorker(file).catch(() => {});
+        else store.rebuildOverviews();
+      }
+      throw err;
+    }
   }
   if (signal.aborted) return;
   // Done through the span's end, where the live writer took over, so a later start
@@ -238,4 +248,20 @@ export function createWorkerSink(file: string): Writable {
       callback(error);
     },
   });
+}
+
+/** Rebuild the overviews on a worker thread, as after a backfill that failed. */
+function rebuildOverviewsOnWorker(file: string): Promise<void> {
+  const worker = new Worker(new URL("./backfill-worker.js", import.meta.url), {
+    workerData: { file },
+  });
+  return new Promise<void>((resolve, reject) => {
+    worker.on("message", (msg: { done?: true; error?: string }) => {
+      if (msg.error) reject(new Error(msg.error));
+      else if (msg.done) resolve();
+    });
+    worker.on("error", reject);
+    worker.on("exit", () => reject(new Error("backfill worker exited")));
+    worker.postMessage({ rebuild: true });
+  }).finally(() => void worker.terminate());
 }

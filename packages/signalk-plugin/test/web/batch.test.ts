@@ -65,3 +65,15 @@ test("a refresh the host didn't take is asked for again", () => {
   t = 42_000;
   expect(batch.next(live(2, [])).refresh).toEqual({ tiles: [[15, 1, 1]] });
 });
+
+test("a fetch that fails after the host took a refresh doesn't refresh again early", () => {
+  let t = 0;
+  const batch = createBatch(30_000, () => t);
+  batch.next(live(1, []));
+  t = 40_000;
+  expect(batch.next(live(2, [], [[15, 1, 1]])).refresh).toBeDefined();
+  batch.taken();
+  batch.failed();
+  t = 42_000;
+  expect(batch.next(live(2, [])).refresh).toBeUndefined();
+});

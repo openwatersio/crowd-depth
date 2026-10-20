@@ -331,8 +331,10 @@ export function createCellStore(db: DatabaseSync) {
       const range = db
         .prepare("SELECT min(py) AS lo, max(py) AS hi FROM cells")
         .get() as { lo: number | null; hi: number | null };
-      transaction(() => db.exec("DELETE FROM overviews"));
       if (range.lo === null || range.hi === null) return;
+      const clearRows = db.prepare(
+        "DELETE FROM overviews WHERE level = ? AND oy BETWEEN ? AND ?",
+      );
       const stretch = db.prepare(
         `SELECT py, px, m, d, passes, first, last FROM cells WHERE py BETWEEN ? AND ?`,
       );
@@ -361,8 +363,16 @@ export function createCellStore(db: DatabaseSync) {
               }
             }
           }
-          if (best.size === 0) continue;
+          // Each stretch's blocks replaced in one short transaction; the table is never
+          // cleared at once, which on an SD card would hold the lock for seconds.
           transaction(() => {
+            for (const level of OVERVIEW_LEVELS) {
+              clearRows.run(
+                level,
+                block(py0, 0, level).oy,
+                block(py1, 0, level).oy,
+              );
+            }
             for (const { cell, at } of best.values())
               write(writeBlock, at, cell);
           });
