@@ -411,6 +411,29 @@ def test_contradicted_shoals_dont_vote_and_unjudged_ones_do(env, tmp_path, reaso
     assert (depth != surface.NODATA).any() == drawn and count[count > 0].sum() == 120
 
 
+@pytest.mark.parametrize("depth, counted", [(10.0, 120), (40.0, 0)])
+def test_a_transit_that_lost_the_bottom_never_votes(env, tmp_path, depth, counted):  # noqa: F811
+    put_tracks(env, parallel(depth))
+    test_grid.build(env)
+    tile = tile_of(test_grid.LAT0, test_grid.LON0)
+    with open_store(env.store) as con:
+        # Calibration found both vessels' transits read far under the seabed.
+        con.execute(
+            "INSERT INTO lake.file_offsets SELECT file_id, vessel, NULL, NULL, false, true"
+            " FROM lake.files"
+        )
+        [(partition,)] = con.execute("SELECT DISTINCT cell_id FROM lake.cells").fetchall()
+        path = surface.build_tile(con, tile, partition, tmp_path)
+    # Nothing votes, so nothing is drawn. Shoaler than HAZARD_M its soundings still band
+    # the surface, as they publish as shoals; deeper they publish nowhere, and leave no tile.
+    if not counted:
+        assert path is None
+        return
+    with rasterio.open(path) as src:
+        drawn, count = src.read(1), src.read(3)
+    assert (drawn == surface.NODATA).all() and count[count > 0].sum() == counted
+
+
 def test_interpolated_pixels_widen_with_distance_and_are_marked(env, monkeypatch, tmp_path):  # noqa: F811
     monkeypatch.setattr(statistic, "SIGMA_PER_M", 0.01)
     put_tracks(env, parallel())
