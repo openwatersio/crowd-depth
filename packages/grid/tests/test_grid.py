@@ -1,15 +1,15 @@
 import math
 import random
+import statistics
 import struct
 from datetime import date, datetime, timedelta
 
 import duckdb
-import pyarrow as pa
 import pytest
 import reference_qc
 from test_ingest import HEADER, VESSEL, env, geojson, ow_key  # noqa: F401  (env is a fixture)
 
-from grid import catalog, cells, ingest, qc
+from grid import catalog, cells, ingest, qc, statistic
 from grid.catalog import open_store
 
 
@@ -61,6 +61,14 @@ def grid(env):  # noqa: F811
         """SELECT level, "row", col, depth, median, count, vessels, kind, first, last
         FROM lake.cells ORDER BY level, "row", col"""
     )
+
+
+# Every correction's σ when none applies: no tide, no calibration.
+CSIG = math.hypot(catalog.UNTIDED_SIGMA, catalog.UNCALIBRATED_SIGMA)
+
+
+def sigma(env):  # noqa: F811
+    return env.query('SELECT level, "row", col, sigma FROM lake.cells ORDER BY level, "row", col')
 
 
 def line(depths, start=0, step=10, r=5000):
@@ -136,7 +144,7 @@ def test_levels_follow_vessel_counts(env):  # noqa: F811
     put(env, 4, [(0, *at(7000, 0), 13)], "D")
     put(env, 5, [(0, *at(7001, 5), 14)], "E")
     build(env)
-    got = {(lv, r, c) for lv, r, c, *_ in grid(env) if _[4] != "filled"}
+    got = {(lv, r, c) for lv, r, c, *_ in grid(env)}
     assert got == {
         (1, 4998, 0),
         (1, 4999, 1),
@@ -146,17 +154,58 @@ def test_levels_follow_vessel_counts(env):  # noqa: F811
     }
 
 
-def test_depth_is_a_real_shoal_biased_sounding(env):  # noqa: F811
+def test_depth_is_the_median_of_vessels_less_k_sigma(env):  # noqa: F811
     depths = [6 + (i * 7 % 20) / 10 for i in range(20)]  # 6.0 to 7.9, shuffled
     for i, d in enumerate(depths):
         # One sounding per vessel, so no track spike tests apply.
         put(env, i + 1, [(i, *at(5000, 0, 0.02 + i * 0.045, 0.5), d)], f"V{i}")
     build(env)
-    [(level, _, _, depth, median, count, vessels, kind, first, last)] = grid(env)
+    [(level, _, _, depth, _, count, vessels, kind, first, last)] = grid(env)
     assert (level, count, vessels, kind) == (1, 20, 20, "multi")
-    # The 10th percentile of 20 soundings is the second shoalest, an actual sounding.
-    assert depth == float32(sorted(depths)[1]) and depth <= median
+    # One pixel: too few pixels for a plane, so the spread is around the median.
+    m = statistics.median(float32(d) for d in depths)
+    spread = 1.4826 * statistics.median(abs(float32(d) - m) for d in depths)
+    want_sigma = math.hypot(spread, CSIG)
+    [(*_, got_sigma)] = sigma(env)
+    assert got_sigma == pytest.approx(want_sigma, abs=1e-5)
+    assert depth == pytest.approx(m - statistic.K * want_sigma, abs=1e-5)
     assert (first, last) == (date(2026, 10, 1), date(2026, 10, 1))
+
+
+def test_the_margin_alone_never_makes_water_drying(env):  # noqa: F811
+    # One uncorrected vessel at 1.5 m: 1.5 m less K σ would be about -0.5 m, drying.
+    put(env, 1, [(0, *at(5000, 0), 1.5)])
+    build(env)
+    [row] = grid(env)
+    assert 1.5 - statistic.K * CSIG < 0 and row[3] == 0
+
+
+def test_smoothing_never_takes_a_narrow_shoal_out_of_the_soundings(env):  # noqa: F811
+    # Six vessels cross a bar one pixel (two base columns) wide at 5 m in 9 m water, four
+    # soundings to a base cell, so the bar is no track spike. Along each track the bar is
+    # one vote among its neighbours' 9s, but the cell on it is never deeper than its own
+    # vessels' median less K σ.
+    for i in range(6):
+        rows = [(i * 1000 + 3 * (4 * c + j), *at(5000, c, 0.1 + 0.15 * i, 0.1 + 0.25 * j),
+                 5.0 if c in (30, 31) else 9.0) for c in range(60) for j in range(4)]  # fmt: skip
+        put(env, i + 1, rows, f"V{i}")
+    build(env)
+    bar = [row for row in grid(env) if row[:2] == (1, 5000) and row[2] in (30, 31)]
+    assert len(bar) == 2 and all(row[3] <= 5.0 for row in bar)
+    assert all(row[3] > 6 for row in grid(env) if row[2] not in (30, 31))
+
+
+def test_a_vessel_logging_at_1_hz_counts_once(env):  # noqa: F811
+    # A logs 100 soundings at 9 m in one base cell; B and C read 9.8 and 9.9 m. By
+    # soundings the cell is 9 m; by vessels it's 9.8.
+    put(env, 1, [(i, *at(5000, 0, 0.1 + i * 0.008), 9.0) for i in range(100)], "A")
+    put(env, 2, [(200, *at(5000, 0, 0.5), 9.8)], "B")
+    put(env, 3, [(201, *at(5000, 0, 0.6), 9.9)], "C")
+    build(env)
+    [(_, _, _, depth, median, count, vessels, *_)] = grid(env)
+    assert (count, vessels, median) == (102, 3, 9.0)
+    want_sigma = math.hypot(1.4826 * 0.1, CSIG)
+    assert depth == pytest.approx(9.8 - statistic.K * want_sigma, abs=1e-5)
 
 
 def test_single_vessel_dates_are_years(env):  # noqa: F811
@@ -173,14 +222,21 @@ def test_cell_outliers_are_one_sided_and_shoals_can_be_confirmed(env):  # noqa: 
         put(env, i + 1, [(i, *at(5000, 0, 0.1 + i * 0.1), d)], "V0" if i < 5 else "V1")
     build(env)
     assert flags(env) == [("reject", "cell_deep", 30), ("unconfirmed", "cell_shoal", 2)]
-    assert grid(env)[0][3] == float32(9.9)
+    # One vessel left, alone in the tile: no spread, only the corrections' σ.
+    assert grid(env)[0][3] == pytest.approx(10.0 - statistic.K * CSIG, abs=1e-5)
 
     # A second vessel sounding the shoal within its tolerance confirms it.
     put(env, 9, [(20, *at(5000, 0, 0.9), 2.5)], "V9")
     build(env)
-    # Two other vessels now vote on the 30 m sounding, and it's far deeper than both.
-    assert flags(env) == [("reject", "consensus_deep", 30)]
-    assert grid(env)[0][3] == 2.0
+    # Two other vessels now vote on the 30 m sounding, and it's far deeper than both; the
+    # two shoals confirm each other.
+    assert flags(env) == [
+        ("confirmed", "cell_shoal", 2.0),
+        ("confirmed", "cell_shoal", 2.5),
+        ("reject", "consensus_deep", 30),
+    ]
+    # Two of three vessels now read the shoal, so the median less K σ is shoaler still.
+    assert grid(env)[0][3] <= 2.0 and ("confirmed", "cell_shoal", 2.0) in flags(env)
 
 
 def test_track_shoal_spike_confirmed_by_another_vessel(env):  # noqa: F811
@@ -199,7 +255,7 @@ def test_readings_under_half_a_metre_dont_confirm_each_other(env):  # noqa: F811
     build(env)
     assert not [f for f in flags(env) if f[0] == "confirmed"]
     assert ("unconfirmed", "spike", float32(0.3)) in flags(env)
-    assert all(row[3] == 14 for row in grid(env))
+    assert all(row[4] == 14 for row in grid(env))
 
 
 def test_a_half_metre_track_spike_never_sets_a_cells_depth(env):  # noqa: F811
@@ -251,7 +307,7 @@ def test_a_noisy_track_votes_but_sets_no_depth(env):  # noqa: F811
         ("noisy", "track_noise", 13),
         ("unconfirmed", "track_noise", 6),
     }
-    assert [row[3] for row in grid(env) if row[2] < 5 or row[0] > 1] == [9.0]
+    assert [row[4] for row in grid(env) if row[2] < 5 or row[0] > 1] == [9.0]
 
 
 def test_a_noisy_track_doesnt_corroborate_another_vessels_shoal(env):  # noqa: F811
@@ -283,9 +339,7 @@ def test_two_vessels_shoal_readings_confirm_each_other(env):  # noqa: F811
     put(env, 1, line([14, 14, 14, 14, 3, 14, 14, 14, 14]))
     put(env, 2, line([14, 14, 14, 14, 3, 14, 14, 14, 14], start=100), "AQM-2")
     build(env)
-    assert [f for f in flags(env) if f[0] == "confirmed"] == [
-        ("confirmed", "cell_confirmed", 3)
-    ] * 2
+    assert [f for f in flags(env) if f[0] == "confirmed"] == [("confirmed", "cell_shoal", 3)] * 2
 
 
 def test_cells_keep_the_shoals_still_unconfirmed(env):  # noqa: F811
@@ -298,6 +352,19 @@ def test_cells_keep_the_shoals_still_unconfirmed(env):  # noqa: F811
     assert ("confirmed", "cell_confirmed", 3) in flags(env)
     shoals = env.query('SELECT tile_id, "row", lon, lat, depth FROM lake.shoals')
     assert shoals == [((LAT0 + 90) * 360 + LON0 + 180, 5000, *at(5000, 6), 3.0)]
+
+
+@pytest.mark.parametrize("judged, reason", [(True, "cell_shoal"), (False, "cell_unjudged")])
+def test_a_cell_shoal_is_unjudged_without_a_median_to_judge_it(judged, reason):
+    con = duckdb.connect()
+    con.execute(
+        """CREATE TABLE classed AS SELECT 1 AS point_id, 'shoal' AS outlier,
+        false AS from_track, ? AS judged, 5.0 AS raw, false AS hunting""",
+        [judged],
+    )
+    con.execute("CREATE TABLE confirmed (point_id INTEGER)")
+    con.execute("CREATE TABLE consensus_rejects (point_id INTEGER, flag VARCHAR, reason VARCHAR)")
+    assert con.execute(cells.CELL_FLAGS).fetchall() == [(1, "unconfirmed", reason)]
 
 
 def test_shoals_are_the_soundings_nothing_confirmed_or_rejected():
@@ -329,47 +396,21 @@ def test_shoals_are_the_soundings_nothing_confirmed_or_rejected():
     assert con.execute("SELECT tile_id, r, c FROM shoals").fetchall() == [(tile, 5000, 7)]
 
 
-def holes(cells_):
-    """Run the hole query over cells (row, col, depth, level) in one tile."""
-    t = 123 * 360 + 102
-    table = pa.Table.from_pylist(
-        [
-            {"tile_id": t, "level": lv, "row": r, "col": c, "depth": d, "tvu": 2.5, "cell_id": 1}
-            for r, c, d, lv in cells_
-        ]
-    )
-    con = duckdb.connect()
-    con.register("measured", table)
-    con.execute("CREATE TABLE shoals (tile_id INTEGER, r INTEGER, c INTEGER)")
-    query = f'SELECT "row", col, depth, kind FROM ({cells.HOLES})'
-    return sorted(con.execute(query, {"rlo": 0, "rhi": cells.BASE}).fetchall())
-
-
-def test_holes_fill_between_opposite_sides_with_the_shoaler():
-    assert holes([(10, 10, 5.0, 1), (10, 12, 4.0, 1)]) == [(10, 11, 4.0, "filled")]
-    # One side only, or two cells apart: nothing.
-    assert holes([(10, 10, 5.0, 1)]) == []
-    assert holes([(10, 10, 5.0, 1), (10, 13, 4.0, 1)]) == []
-    # A coarse cell covers its area and brackets base holes beside it.
-    assert holes([(1, 1, 6.0, 9), (10, 19, 3.0, 1)]) == [
-        (10, 18, 3.0, "filled"),
-        (11, 18, 3.0, "filled"),
-    ]
-    # Filled cells never fill others: a gap of two stays open.
-    assert holes([(10, 10, 5.0, 1), (10, 13, 4.0, 1), (9, 11, 4.5, 1)]) == []
-
-
 def test_aggregated_cells_keep_their_shoalest_base_cell(env):  # noqa: F811
     # One vessel, so the 3″ cell is published. One base cell holds a single 12 m
-    # sounding among 49 at 14 to 20 m elsewhere: the 3″ cell's own 10th percentile
-    # would be about 14 m, but it keeps the shoalest base cell's 12 m. Soundings are
-    # five hours apart, each its own transit, so the track spike test leaves them alone.
+    # sounding among 49 at 14 to 20 m elsewhere: the 3″ cell keeps that base cell's
+    # depth, 12 m less K σ, and its σ. Soundings are five hours apart, each its own
+    # transit, so the track spike test leaves them alone.
     rows = [(-i * 5 * 3600, *at(4995 + i % 8, i // 8), 14 + (i * 13 % 49) / 8) for i in range(49)]
     rows.append((-50 * 5 * 3600, *at(5003, 8), 12.0))
     put(env, 1, rows)
     build(env)
     [(level, *_, depth, _median, count, _vessels, _kind, _first, _last)] = grid(env)
-    assert (level, count, depth) == (9, 50, 12.0)
+    [(*_, got_sigma)] = sigma(env)
+    assert (level, count) == (9, 50)
+    # One vessel ranging 14 to 20 m pixel to pixel: σ is wide, and the margin alone
+    # stops at 0 m rather than draw the water drying.
+    assert depth == pytest.approx(max(12.0 - statistic.K * got_sigma, 0), abs=1e-5)
 
 
 def apart(rows):
@@ -384,7 +425,7 @@ def test_cells_never_trust_that_qc_ran(env):  # noqa: F811
     with open_store(env.store) as con:
         con.execute("DELETE FROM lake.qc_flags")  # as if QC never ran
         cells.build(con)
-    assert [row[3] for row in grid(env)] == [10]
+    assert [row[3] for row in grid(env)] == [pytest.approx(10 - statistic.K * CSIG, abs=1e-5)]
 
 
 def test_a_feature_one_track_crosses_is_not_noise(env):  # noqa: F811
@@ -394,8 +435,9 @@ def test_a_feature_one_track_crosses_is_not_noise(env):  # noqa: F811
     put(env, 1, apart(rows))
     build(env)
     [row] = grid(env)
-    assert (row[0], row[5], row[3]) == (9, 30, 3.0)  # level, count, depth
-    assert flags(env) == []
+    assert (row[0], row[5]) == (9, 30)  # level, count
+    # The 3 m soundings confirm each other: shoals, flagged so the surface holds them.
+    assert row[3] <= 3.0 and flags(env) == [("confirmed", "cell_shoal", 3.0)] * 9
 
 
 def test_levels_count_only_vessels_with_accepted_soundings(env):  # noqa: F811
@@ -404,18 +446,67 @@ def test_levels_count_only_vessels_with_accepted_soundings(env):  # noqa: F811
     put(env, 1, apart(rows))
     put(env, 2, [(0, *at(5000, 0, 0.9), 60.0)], "B")  # rejected: far deeper than A's 10 m
     build(env)
-    assert [row[:3] for row in grid(env) if row[7] != "filled"] == [(9, 5000 // 9, 0)]
+    assert [row[:3] for row in grid(env)] == [(9, 5000 // 9, 0)]
     assert ("reject", "consensus_far_deep", 60) in flags(env)
 
 
-def test_confirmed_shoals_set_the_depth_however_many_soundings(env):  # noqa: F811
+@pytest.mark.parametrize("shoal, kept", [(8.0, True), (2.0, False)])
+def test_a_confirmed_shoal_stands_only_near_the_other_vessels(env, shoal, kept):  # noqa: F811
+    # 30 vessels read 10 m; two others read a shoal and confirm each other. Within 2 m + 5%
+    # of the others' 10 m it sets the depth; far shoaler, it's an echo they outvote.
     for i in range(30):
         put(env, i + 1, [(i, *at(5000, 0, 0.02 + i * 0.03), 10.0)], f"V{i}")
-    put(env, 31, [(40, *at(5000, 0, 0.95), 2.0)], "R1")
-    put(env, 32, [(41, *at(5000, 0, 0.97), 2.3)], "R2")
+    put(env, 31, [(40, *at(5000, 0, 0.95), shoal)], "R1")
+    put(env, 32, [(41, *at(5000, 0, 0.97), shoal + 0.3)], "R2")
     build(env)
     [row] = grid(env)
-    assert row[3] == 2.0
+    got = flags(env)
+    if kept:
+        # However many deeper soundings surround it, it sets the depth.
+        assert row[3] == pytest.approx(shoal) and ("confirmed", "cell_shoal", shoal) in got
+        [(lon, lat)] = env.query("SELECT depth_lon, depth_lat FROM lake.cells")
+        assert (lon, lat) == at(5000, 0, 0.95)
+    else:
+        assert ("unconfirmed", "consensus_shoal", shoal) in got
+        assert ("confirmed", "cell_shoal", shoal) not in got and row[3] > 7
+        assert (shoal,) in env.query("SELECT depth FROM lake.shoals")
+
+
+def test_each_other_vessel_votes_once_around_a_shoal():
+    # R's confirmed 2 m shoal shares its pixel with A only, so the pixels around it judge.
+    # A read 10 m across three of them and B 2.2 m in one: each votes once, half of them
+    # read the shoal, and it stands.
+    rows = [(1, 10, 10, "R", 2.0, "shoal")]
+    rows += [
+        (2 + i, r, c, "A", 10.0, None)
+        for i, (r, c) in enumerate(((10, 11), (12, 10), (12, 12), (10, 12)))
+    ]
+    rows.append((9, 8, 10, "B", 2.2, None))
+    con = duckdb.connect()
+    con.execute(
+        """CREATE TABLE group_accepted (point_id INTEGER, r INTEGER, c INTEGER, vessel VARCHAR,
+        d DOUBLE, outlier VARCHAR, tile_id INTEGER DEFAULT 1)"""
+    )
+    con.executemany(
+        "INSERT INTO group_accepted (point_id, r, c, vessel, d, outlier) VALUES (?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    con.execute(cells.OUTVOTED)
+    assert con.execute("SELECT * FROM outvoted").fetchall() == []
+    # With B reading 10 m too, both other vessels are deeper by far, and it's outvoted.
+    con.execute("UPDATE group_accepted SET d = 10.0, vessel = 'C' WHERE vessel = 'B'")
+    con.execute(cells.OUTVOTED)
+    assert con.execute("SELECT point_id FROM outvoted").fetchall() == [(1,)]
+
+
+def test_a_confirmed_shoal_too_few_others_can_judge_stands(env):  # noqa: F811
+    # One other vessel reads 10 m; R reads 2 m on two passes five hours apart, which
+    # confirm each other. One vessel is too few to outvote it.
+    put(env, 1, [(i, *at(5000, 0, 0.1 + i * 0.1), 10.0) for i in range(5)], "V")
+    put(env, 2, [(0, *at(5000, 0, 0.8), 2.0), (5 * 3600, *at(5000, 0, 0.9), 2.2)], "R")
+    build(env)
+    assert ("confirmed", "cell_shoal", 2.0) in flags(env)
+    assert grid(env)[0][3] == pytest.approx(2.0)
 
 
 def test_units_group_small_tiles_and_band_dense_ones(env, monkeypatch):  # noqa: F811
@@ -447,7 +538,6 @@ def test_bands_build_the_same_cells_as_whole_tiles(env, monkeypatch):  # noqa: F
         assert len(cells.units(con, partition, [])) > 2
         assert cells.build(con)["kept"] == 0  # a finished build is rebuilt, not kept
     assert grid(env) == whole and env.query("SELECT * FROM lake.shoals") == shoals
-    assert any(row[7] == "filled" for row in whole)
 
 
 def test_a_lone_ping_shoaler_than_its_cell_stays_unconfirmed(env):  # noqa: F811
@@ -458,7 +548,7 @@ def test_a_lone_ping_shoaler_than_its_cell_stays_unconfirmed(env):  # noqa: F811
     put(env, 21, [(30, *at(5000, 0, 0.97), 8.5)], "X")
     build(env)
     assert flags(env) == [("unconfirmed", "cell_shoal", 8.5)]
-    assert grid(env)[0][3] == 10.0
+    assert grid(env)[0][3] == pytest.approx(10.0 - statistic.K * CSIG, abs=1e-5)
 
 
 def test_ingest_qcs_each_batch_and_reruns_match(env):  # noqa: F811
@@ -495,24 +585,17 @@ def test_a_band_reads_only_its_rows(env):  # noqa: F811
     assert rows == (1,)
 
 
-def test_sampled_cells_still_publish_an_actual_sounding(env, monkeypatch):  # noqa: F811
+def test_sampled_cells_still_publish_at_an_actual_sounding(env, monkeypatch):  # noqa: F811
     monkeypatch.setattr(cells, "CELL_SAMPLE", 4)
     depths = [10 + (i * 7 % 40) / 10 for i in range(40)]
-    put(env, 1, apart([(0, *at(5000, 0, 0.01 + i * 0.024), d) for i, d in enumerate(depths)]))
+    rows = [(0, *at(5000, 0, 0.01 + i * 0.024), d) for i, d in enumerate(depths)]
+    put(env, 1, apart(rows))
     build(env)
     [row] = grid(env)
     depth, median, count = row[3], row[4], row[5]
-    assert count == 40 and depth <= median and float32(depth) in [float32(d) for d in depths]
-
-
-def test_holes_never_cover_an_unconfirmed_shoal(env):  # noqa: F811
-    # A's 3 m spike at (5000, 1) stays unconfirmed; B makes the 1″ cell multi-vessel,
-    # so base cells publish and (5000, 1) sits between sounded cells.
-    put(env, 1, line([10, 3, 10, 10, 10, 10, 10, 10]))
-    put(env, 2, [(0, *at(4999, 0), 10)], "B")
-    build(env)
-    assert ("unconfirmed", "spike", 3) in flags(env)
-    assert [row for row in grid(env) if row[:3] == (1, 5000, 1)] == []
+    assert count == 40 and depth < median
+    [at_] = env.query("SELECT depth_lon, depth_lat FROM lake.cells")
+    assert at_ in [(lon, lat) for _, lon, lat, _ in rows]
 
 
 def put_dated(env, n, rows, unique_id, day="2026/10/22"):  # noqa: F811
@@ -625,20 +708,24 @@ def two_tiles(env):  # noqa: F811
     return tile, tile + 1
 
 
+def group_tiles(con):
+    return [t for (t,) in con.execute("SELECT DISTINCT tile_id FROM group_accepted").fetchall()]
+
+
 def test_a_cells_build_that_stops_resumes_from_its_last_checkpoint(env, monkeypatch):  # noqa: F811
     # Every tile is its own group and every group a checkpoint; the second group fails.
     monkeypatch.setattr(cells, "BATCH_POINTS", 1)
     monkeypatch.setattr(catalog, "CHECKPOINT_SECONDS", 0)
     first, second = two_tiles(env)
     env.run("noaa")
-    fill, filled = cells.fill, []
+    measure, measured = cells.measure, []
 
-    def failing(con, partition, tiles, rlo, rhi):
-        if second in tiles:
+    def failing(con, rlo, rhi):
+        if second in group_tiles(con):
             raise RuntimeError("R2 dropped the connection")
-        return fill(con, partition, tiles, rlo, rhi)
+        return measure(con, rlo, rhi)
 
-    monkeypatch.setattr(cells, "fill", failing)
+    monkeypatch.setattr(cells, "measure", failing)
     with pytest.raises(RuntimeError), open_store(env.store) as con:
         cells.build(con)
     # The first group was published; the marker wasn't.
@@ -646,20 +733,20 @@ def test_a_cells_build_that_stops_resumes_from_its_last_checkpoint(env, monkeypa
     assert tiles == {first}
     assert env.query("SELECT count(*) FROM lake.store_meta WHERE key = 'cells'") == [(0,)]
 
-    def counting(con, partition, tiles, rlo, rhi):
-        filled.extend(tiles)
-        return fill(con, partition, tiles, rlo, rhi)
+    def counting(con, rlo, rhi):
+        measured.extend(group_tiles(con))
+        return measure(con, rlo, rhi)
 
-    monkeypatch.setattr(cells, "fill", counting)
+    monkeypatch.setattr(cells, "measure", counting)
     with open_store(env.store) as con:
         assert cells.build(con)["kept"] > 0
-    assert set(filled) == {second}
+    assert set(measured) == {second}
     assert env.query("SELECT count(*) FROM lake.store_meta WHERE key = 'cells'") == [(1,)]
     resumed = grid(env)
     # Finished, it keeps nothing: the next build of the same inputs rebuilds every tile.
     with open_store(env.store) as con:
         assert cells.build(con)["kept"] == 0
-    assert grid(env) == resumed and {first, second} <= set(filled)
+    assert grid(env) == resumed and {first, second} <= set(measured)
 
 
 @pytest.mark.parametrize("since", ["ingest", "cleared", "older build", "rebuilt", "new code"])
@@ -668,17 +755,17 @@ def test_a_stopped_cells_build_keeps_nothing_that_changed_since(env, monkeypatch
     monkeypatch.setattr(catalog, "CHECKPOINT_SECONDS", 0)
     first, second = two_tiles(env)
     env.run("noaa")
-    fill = cells.fill
+    measure = cells.measure
 
-    def failing(con, partition, tiles, rlo, rhi):
-        if second in tiles:
+    def failing(con, rlo, rhi):
+        if second in group_tiles(con):
             raise RuntimeError("stopped")
-        return fill(con, partition, tiles, rlo, rhi)
+        return measure(con, rlo, rhi)
 
-    monkeypatch.setattr(cells, "fill", failing)
+    monkeypatch.setattr(cells, "measure", failing)
     with pytest.raises(RuntimeError), open_store(env.store) as con:
         cells.build(con)
-    monkeypatch.setattr(cells, "fill", fill)
+    monkeypatch.setattr(cells, "measure", measure)
     if since == "ingest":  # new soundings: other inputs
         put(env, 9, line([12.0] * 6, r=5100), "AQM-3")
         env.run("noaa")
@@ -780,9 +867,9 @@ def test_binned_confirmation_brackets_the_windowed_one():
     assert 0 < len(tolerance) < len(binned) < len(rows) * 0.9 * 0.9
 
 
-def test_a_shoal_dedupe_dropped_doesnt_hold_a_hole_open(env):  # noqa: F811
+def test_a_shoal_dedupe_dropped_doesnt_publish(env):  # noqa: F811
     # NOAA's copy of an Open Waters track has a 3 m spike in a base cell the Open
-    # Waters track skips. Rule 5 drops NOAA's copy, so the cell is an ordinary hole.
+    # Waters track skips. Rule 5 drops NOAA's copy, so the shoal isn't published.
     vessel = "SIGNALK-" + VESSEL
     env.ow.put(ow_key(1), geojson([(s, *at(5000, s), 10.0) for s in (0, 2, 3, 4, 5)]))
     put(env, 1, [(s, *at(5000, s), 3.0 if s == 1 else 10.0) for s in range(6)], vessel)
@@ -791,8 +878,7 @@ def test_a_shoal_dedupe_dropped_doesnt_hold_a_hole_open(env):  # noqa: F811
     with open_store(env.store) as con:
         cells.build(con)
     assert ("unconfirmed", "spike", 3) in flags(env)
-    [hole] = [row for row in grid(env) if row[:3] == (1, 5000, 1)]
-    assert hole[7] == "filled"
+    assert env.query("SELECT * FROM lake.shoals") == []
 
 
 def test_cells_count_a_soundings_twins_once(env):  # noqa: F811
@@ -802,7 +888,7 @@ def test_cells_count_a_soundings_twins_once(env):  # noqa: F811
     put(env, 2, rows[3:])
     build(env)
     assert [s for (s,) in env.query("SELECT status FROM lake.files")] == ["active"] * 2
-    assert sum(row[5] for row in grid(env) if row[7] != "filled") == 9
+    assert sum(row[5] for row in grid(env)) == 9
 
 
 def test_a_depth_held_over_a_kilometre_is_a_stuck_sounder(env):  # noqa: F811

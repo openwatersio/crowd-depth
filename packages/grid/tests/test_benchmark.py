@@ -30,7 +30,14 @@ def write_cog(path, depth, count, lon0=LON0):
     block = np.s_[r0:r1, : surface.BLOCK]
     with surface.open_sparse(sparse, lon0, LAT0, depth.shape) as dst:
         dst.write(
-            np.stack([depth[block], np.zeros_like(depth[block]), count[block]]),
+            np.stack(
+                [
+                    depth[block],
+                    np.zeros_like(depth[block]),
+                    count[block],
+                    np.full_like(depth[block], 0.5),
+                ]
+            ),
             window=Window(0, r0, surface.BLOCK, r1 - r0),
         )
     rasterio.shutil.copy(sparse, path, driver="COG", sparse_ok=True)
@@ -96,7 +103,7 @@ def test_known_errors_give_known_shares(store):
     assert o["too_deep"] == pytest.approx(3 / 100)
     assert o["false_shoal"] == pytest.approx(2 / 100)
     assert o["under_1m_over_2m"] == pytest.approx(1 / 100)
-    assert o["sigma_m"] is None  # no sigma band
+    assert o["sigma_m"] == 0.5
     c = s["classes"]
     assert c["depth"]["2–5 m"]["pixels"] == 1
     assert c["measured"]["measured"]["pixels"] == 50
@@ -111,6 +118,27 @@ def test_known_errors_give_known_shares(store):
     assert o["roughness_m"] == 0
     cells = result["estimates"]["cells"]["overall"]
     assert (cells["covered"], cells["bias_m"]) == (1, -1)
+
+
+def test_vessels_count_as_the_surface_takes_them(store):
+    objects, surface_dir = store
+    with open_store(objects) as con:
+        # Pixel 1's B and C are on noisy tracks, which don't vote; pixel 0's A is a shoal no
+        # cell could judge, which does.
+        con.executemany(
+            "INSERT INTO lake.qc_flags VALUES (?, ?, ?, 7, ?)",
+            [
+                (b"b1", "noisy", "track_noise", PARTITION),
+                (b"c1", "noisy", "track_noise", PARTITION),
+                (b"a0", "unconfirmed", "cell_unjudged", PARTITION),
+            ],
+        )
+    with open_store(objects, write=False) as con:
+        result = benchmark.run(con, surface_dir, qc_version=7)
+    vessels = result["estimates"]["surface"]["classes"]["vessels"]
+    assert vessels["1"]["pixels"] == 3
+    assert vessels["2–3"]["pixels"] == 0
+    assert vessels["0"]["pixels"] == 98
 
 
 def test_without_flags_at_the_version_every_sounding_counts(store):

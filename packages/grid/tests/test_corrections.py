@@ -373,7 +373,7 @@ def test_cells_use_corrected_depths_and_count_corrections(env, tmp_path, monkeyp
         assert cells.changed(con) == []
     rows = env.query(
         """SELECT median, count, tided, calibrated FROM lake.cells
-        WHERE kind <> 'filled' AND col * level * 1 >= 130"""
+        WHERE col * level * 1 >= 130"""
     )
     assert rows
     for median, count, tided, calibrated_ in rows:
@@ -678,9 +678,7 @@ def test_a_segment_reading_too_deep_to_correct_is_left_out(env, tmp_path, monkey
     assert excluded == {"AQM-A"}
     with open_store(env.store) as con:
         cells.build(con)
-    assert env.query("SELECT count(*) FROM lake.cells WHERE col < 55 AND kind <> 'filled'") == [
-        (0,)
-    ]
+    assert env.query("SELECT count(*) FROM lake.cells WHERE col < 55") == [(0,)]
 
 
 def test_a_late_file_takes_its_segments_offset(env, tmp_path, monkeypatch):  # noqa: F811
@@ -776,7 +774,7 @@ def test_a_step_too_few_transits_show_leaves_them_alone(env, tmp_path, monkeypat
     # No cell over the early transits is drawn deeper than they read.
     deepest = env.query(
         """SELECT max(depth) FROM lake.cells
-        WHERE kind <> 'filled' AND "row" * level <= 5100 AND ("row" + 1) * level > 5100"""
+        WHERE "row" * level <= 5100 AND ("row" + 1) * level > 5100"""
     )[0][0]
     assert deepest is not None and deepest <= 10.35 + 1e-4
 
@@ -1000,7 +998,7 @@ def test_soundings_awaiting_their_tide_stay_out_of_the_grid(env):  # noqa: F811
         cells.build(con)
     # Its station is in reach but has no level for the day: no cell, rather than a raw depth
     # deeper than chart datum.
-    assert env.query("SELECT count(*) FROM lake.cells WHERE kind <> 'filled'") == [(0,)]
+    assert env.query("SELECT count(*) FROM lake.cells") == [(0,)]
     [(awaiting,)] = env.query(
         "SELECT awaiting_tide FROM corrected_points_in((SELECT any_value(cell_id) FROM lake.points), [], 0, 10800)"
     )

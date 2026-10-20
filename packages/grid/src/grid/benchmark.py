@@ -18,7 +18,6 @@ What the numbers can't say:
 - References are sampled only where calibration had soundings, so an `interpolated` pixel
   is mostly one whose soundings the surface didn't take, or whose file has since gone,
   rarely water between tracks.
-- The cells scored are those with a depth position: hole-filled cells have none.
 - The surface is what the render wrote; vessels, shoals and cells are the store as it is
   now. Benchmark a render against the store it was rendered from.
 - The reference's shoalest is its depth (a mean within about 10 m) less its relief
@@ -57,8 +56,8 @@ QUALIFY row_number() OVER (PARTITION BY py, px ORDER BY uncertainty NULLS LAST, 
 """
 
 # Per sounded pixel: the vessels with a sounding the surface would take (QC accepted: not
-# rejected, and not an unconfirmed shoal unless something confirmed it; within the depths
-# it trusts), and whether a confirmed shoal is there, as the statistic's cells flag one.
+# rejected or noisy, and not an unconfirmed shoal unless something confirmed it or it's
+# one no cell could judge; within the depths it trusts), and whether a confirmed shoal is there, as the statistic's cells flag one.
 SOUNDED = f"""
 WITH pts AS MATERIALIZED (
   SELECT p.point_id, p.unique_id,
@@ -69,8 +68,9 @@ WITH pts AS MATERIALIZED (
     AND NOT p.excluded AND NOT p.awaiting_tide
 ),
 flags AS (
-  SELECT point_id, bool_or(flag = 'reject') AS rejected,
-    bool_or(flag = 'unconfirmed') AND NOT bool_or(flag = 'confirmed') AS unconfirmed,
+  SELECT point_id, bool_or(flag IN ('reject', 'noisy')) AS rejected,
+    bool_or(flag = 'unconfirmed' AND reason <> 'cell_unjudged') AND NOT bool_or(flag = 'confirmed')
+      AS unconfirmed,
     bool_or(flag = 'confirmed' AND reason = 'cell_shoal') AS shoal
   FROM lake.qc_flags WHERE cell_id = $partition AND qc_version = $qc_version
     AND point_id IN (SELECT point_id FROM pts)

@@ -33,10 +33,11 @@ log = logging.getLogger(__name__)
 QC_VERSION = QC["version"]
 
 # Flags: reject (left out of everything), review (kept, looked at later),
-# unconfirmed (a shoal kept out of cell depths, areas and contours, and published by
-# the overlay as a low-reliability sounding), and confirmed (written by the cells step
-# for a track spike that its cell agrees with, or that other shoals of another vessel
-# or pass, or enough of them, confirm; it then counts like any other sounding). A
+# unconfirmed (a shoal kept out of cell depths, and published by the overlay as a
+# low-reliability sounding), and confirmed (written by the cells step for a track spike
+# that its cell agrees with, `cell_confirmed`, and for a shoal that other shoals of
+# another vessel or pass, or enough of them, confirm and the other vessels don't
+# outvote, `cell_shoal`; it then counts like any other sounding). A
 # point can carry both an unconfirmed and a confirmed flag: confirmed wins. A reject
 # flag wins over both. noisy (a sounding on a track hunting between echoes) votes in
 # consensus but sets no depth (see NOISE_REL).
@@ -109,7 +110,7 @@ STEEP_FLOOR_M = QC["steep_floor_m"]
 # A track whose soundings zig-zag by more than NOISE_REL of its depth (and NOISE_ABS_M)
 # is noisy: a sounder hunting between echoes, where a spike check would reject the deep
 # side, the true bottom as often as not. Noisy soundings vote in consensus but don't set
-# cell depths, cap the surface, stop it filling or feed calibration. A shoaler spike on a
+# cell depths, vote in or cap the surface, or feed calibration. A shoaler spike on a
 # noisy track is kept as an unconfirmed shoal, since it may be a rock, but one that
 # neither confirms nor is confirmed (reason track_noise): the shoal side of a sounder
 # hunting between echoes agrees with itself.
