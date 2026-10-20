@@ -19,6 +19,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -28,6 +29,8 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 PART = ".part"
+# What `writing` names its temporary files: `.{name}.` and mkstemp's eight characters.
+OWN_PART = re.compile(r"\..+\.[a-z0-9_]{8}\.part")
 # A `.part` file this old is a write that died, not one still going.
 STALE_PART_S = 86400
 FILES_GB = 20
@@ -82,6 +85,8 @@ def publish(src: Path, entry: Path) -> bool:
         with writing(entry) as tmp:
             tmp.unlink()
             share(src, tmp)
+            # A link shares the download's mode, which may be the owner's alone.
+            os.chmod(tmp, 0o644)
     except OSError as e:
         log.warning("cache: %s not kept (%s)", entry, e)
         return False
@@ -128,9 +133,14 @@ def sizes() -> dict[str, tuple[int, int]]:
 
 
 def trim(kind: str, cap: int) -> int:
-    """Remove a kind's least recently used entries until it holds at most `cap` bytes;
-    returns the bytes it holds."""
-    found = sorted(entries(kind), key=lambda e: e[1].st_mtime)
+    """Remove a kind's least recently used entries until those it can remove come to at
+    most `cap` bytes; returns their bytes. Another user's entries it can't remove don't
+    count, or a run would empty the cache around them."""
+    # An entry is removable by whoever may write to its key's folder.
+    found = sorted(
+        (e for e in entries(kind) if os.access(e[0].parent, os.W_OK | os.X_OK)),
+        key=lambda e: e[1].st_mtime,
+    )
     total = sum(s.st_size for _, s in found)
     for p, s in found:
         if total <= cap:
@@ -139,7 +149,8 @@ def trim(kind: str, cap: int) -> int:
             p.unlink(missing_ok=True)
             total -= s.st_size
         except OSError:
-            continue  # another user's entry
+            total -= s.st_size  # removable after all only to another user
+            continue
         # A key's folder goes with its last entry, so the walk doesn't grow with them.
         with contextlib.suppress(OSError):
             p.parent.rmdir()
@@ -147,13 +158,14 @@ def trim(kind: str, cap: int) -> int:
 
 
 def remove_stale_parts(now=None) -> int:
-    """Remove `.part` files writes left when they died; returns how many."""
+    """Remove `.part` files writes left when they died; returns how many. Only the cache's
+    own: GRID_CACHE_DIR may be a folder other programs write to."""
     now, n = now or time.time(), 0
     for dirpath, _, names in os.walk(root()):
         for name in names:
             p = Path(dirpath, name)
             try:
-                if name.endswith(PART) and now - p.stat().st_mtime > STALE_PART_S:
+                if OWN_PART.fullmatch(name) and now - p.stat().st_mtime > STALE_PART_S:
                     p.unlink()
                     n += 1
             except OSError:
