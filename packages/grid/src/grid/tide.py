@@ -16,6 +16,7 @@ slope to the next half hour, so a sounding's level is interpolated at its own ti
 when depths are read (catalog's `corrected_points_in`). Raw depths are never changed.
 """
 
+import contextlib
 import json
 import logging
 import math
@@ -32,9 +33,9 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial import cKDTree
 
-from . import cells
+from . import cache, cells
 from .catalog import TIDE_CELL, checkpoint
-from .sources import EARLIEST
+from .qc import EARLIEST
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +60,7 @@ NO_RESIDUAL = ("no data", "data was found", "no mllw", "don't have predictions")
 # CO-OPS lists about 300 water level gauges.
 MIN_GAUGES = 100
 # Storm surges reach about 4 m (Sandy, 2012); a larger residual is a faulty reading.
+# Changing it, or what else coops_residuals keeps, needs a new cached_month version.
 MAX_RESIDUAL_M = 5.0
 # Low-water chart datums, and mean sea level where charts use it (the Baltic). A station
 # with only its own station datum would reduce depths to roughly mean sea level, deeper
@@ -382,12 +384,28 @@ def month_end(month: date) -> date:
     return (month.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
 
 
+def cached_month(gauge, month):
+    """Where a final gauge month is kept in the shared cache, for every store. The version
+    changes with what coops_residuals keeps of CO-OPS' answer."""
+    return cache.path("coops", "residuals-v1", gauge, f"{month:%Y-%m}.json")
+
+
 def fetch_residuals(con, months, today, residuals=coops_residuals):
     """Fetch gauge `months` (gauge, first day), replacing what is kept for each. A month
     CO-OPS can't give now keeps what it had, or is recorded open if it had nothing, so its
-    days take predictions alone until a later run gets it. Returns the months fetched."""
+    days take predictions alone until a later run gets it. A month some store has made
+    final comes from the shared cache. Returns the months fetched."""
+
+    served = set()
 
     def fetch(m):
+        kept = cache.read_json(cached_month(*m))
+        if kept:
+            # An entry of another shape is a miss: CO-OPS answers, and replaces it.
+            with contextlib.suppress(TypeError, ValueError):
+                rows = [(datetime.fromisoformat(t), float(v)) for t, v in kept]
+                served.add(m)
+                return rows
         try:
             return residuals(*m)
         except (OSError, ValueError, RuntimeError) as e:
@@ -458,6 +476,11 @@ def fetch_residuals(con, months, today, residuals=coops_residuals):
                 "INSERT INTO lake.tide_residual_months VALUES (?, ?, ?)", [gauge, month, today]
             )
             con.execute("COMMIT")
+            # Final here is final for every store. An empty month isn't kept: an outage's
+            # empty answer could pass for one.
+            final = today >= month_end(month) + timedelta(days=RECENT_DAYS)
+            if rows and final and (gauge, month) not in served:
+                cache.write_json(cached_month(gauge, month), [(t.isoformat(), v) for t, v in rows])
             fetched.append((gauge, month))
             checkpoint(con)
     if months:

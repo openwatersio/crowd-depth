@@ -1,0 +1,61 @@
+{
+  "qc": {
+    "version": 6,
+    "earliest": "2000-01-01",
+    "arrival_slack_s": 86400,
+    "max_depth_m": 11000,
+    "shallow_m": 0.5,
+    "transit_gap_s": 14400,
+    "transit_span_s": 604800,
+    "max_speed_kn": 20,
+    "spike_window": 5,
+    "spike_abs_m": 2.0,
+    "spike_rel": 0.1,
+    "spike_min_soundings": 3,
+    "flat_m": 1000,
+    "flat_min_soundings": 3,
+    "flat_span_m": 200,
+    "hazard_m": 30,
+    "steep_factor": 2,
+    "steep_abs_m": 5,
+    "steep_slope": 0.25,
+    "steep_floor_m": 10,
+    "noise_window": 10,
+    "noise_rel": 0.1,
+    "noise_abs_m": 0.3,
+    "lone_deep_factor": 2,
+    "lone_deep_abs_m": 10,
+    "lone_deep_floor_m": 10
+  },
+  "cells": {
+    "rows_per_degree": 10800,
+    "column_steps_divide": 1200,
+    "shoal_check_vessels": 2
+  },
+  "surface": {
+    "interpolation_radius_m": 200,
+    "smoothing_m": 40,
+    "blur_px": 2
+  },
+  "statistic": {
+    "k": 1.75,
+    "window_px": 2,
+    "sigma_per_m": 0.005
+  },
+  "portrayal": {
+    "isobaths_m": [0, 2, 5, 10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 3000, 4000, 5000, 6000, 8000, 10000],
+    "contour_tiers": [
+      { "below_zoom": 6, "isobaths_m": [10, 20, 50, 100, 200, 1000, 2000, 4000] },
+      { "below_zoom": 7, "isobaths_m": [10, 20, 50, 100, 200, 500, 1000, 2000, 3000, 4000] },
+      { "below_zoom": 9, "isobaths_m": [10, 20, 50, 100, 200, 300, 500, 1000, 2000, 3000, 4000, 5000, 6000, 8000, 10000] },
+      { "below_zoom": 11, "isobaths_m": [10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 3000, 4000, 5000, 6000, 8000, 10000] }
+    ],
+    "sounding_rounding": [
+      { "below_m": 21, "per_m": 10 },
+      { "below_m": 31, "per_m": 2 },
+      { "per_m": 1 }
+    ],
+    "m_per_ft": 0.3048,
+    "m_per_fathom": 1.8288
+  }
+}

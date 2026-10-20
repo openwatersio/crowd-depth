@@ -14,6 +14,7 @@ point_id, derived from the content hash and row, is never stored twice. When
 that file leaves, a copy takes its points over instead of storing them again.
 """
 
+import contextlib
 import hashlib
 import logging
 import os
@@ -29,15 +30,15 @@ from pathlib import Path
 from boto3.exceptions import Boto3Error
 from botocore.exceptions import BotoCoreError, ClientError
 
-from . import catalog, qc
+from . import cache, catalog, qc
 from .sources import NOAA_PREFIX, Invalid, Parsed, arrival, is_submission, load
 
 log = logging.getLogger(__name__)
 
 # Share of a source's active files one listing may withdraw before it's held.
 WITHDRAWAL_LIMIT = 0.01
-# Files are downloaded to disk this many bytes at a time, then loaded one by one into
-# DuckDB, whose memory is capped; points wait in a DuckDB table until a flush.
+# Files are downloaded to the shared cache this many bytes at a time, then loaded one by
+# one into DuckDB, whose memory is capped; points wait in a DuckDB table until a flush.
 FETCH_BYTES = 512 * 2**20
 FLUSH_POINTS = 500_000
 # Rule 4 checks files for coverage in groups holding at most this many points.
@@ -191,6 +192,9 @@ class Ingest:
             if key not in current or current[key].etag != subs[key].etag
             or current[key].status == "withdrawn"
         ][: self.max_files]  # fmt: skip
+        cap = cache.files_cap()
+        # Bytes the cache's files hold, counted again only when they may pass the cap.
+        self.cached = cache.trim("files", cap)
         downloads = tempfile.TemporaryDirectory(dir=os.environ.get("GRID_TEMP_DIR") or None)
         with downloads as tmp, ThreadPoolExecutor(FETCHERS) as pool:
             self.tmp = Path(tmp)
@@ -227,6 +231,8 @@ class Ingest:
                     # ETags adds no points, but still has work to keep.
                     if self.pending >= FLUSH_POINTS or self.checkpoint_due():
                         self.flush()
+                if self.cached > cap:
+                    self.cached = cache.trim("files", cap)
 
         self.withdraw(subs, current, complete)
         self.flush()
@@ -242,10 +248,42 @@ class Ingest:
     # Files
 
     def fetch(self, obj) -> Path | Exception | None:
-        """Download a file to disk; None if it's gone, the error if it can't be read now."""
+        """Download a file to the run's own directory, from the shared cache if this ETag of
+        it is there; None if it's gone, the error if it can't be read now. The run reads its
+        own link or copy, so another run's trim can't take a file from under it. Only NOAA's
+        public files are cached: an Open Waters upload must leave when it is withdrawn."""
         path = self.tmp / hashlib.sha256(obj.key.encode()).hexdigest()
+        folder = cache.path(
+            "files", hashlib.sha256(f"{self.objects.url}\0{obj.key}".encode()).hexdigest()
+        )
+        entry = folder / hashlib.sha256(obj.etag.encode()).hexdigest()
         try:
-            return path if self.objects.download(obj.key, path) else None
+            if self.source != "noaa":
+                return path if self.objects.download(obj.key, path) else None
+            try:
+                # An entry of another size isn't this ETag's file. One this user can't
+                # read could still be linked, and then fail as the file's own fault.
+                if entry.stat().st_size != obj.size or not os.access(entry, os.R_OK):
+                    raise FileNotFoundError(entry)
+                cache.share(entry, path)
+                # Recently used, for the trim; an entry another user wrote may refuse it.
+                with contextlib.suppress(OSError):
+                    os.utime(entry)
+                return path
+            except OSError:
+                # Missing, or unreadable to this user: a miss, never the file's failure.
+                path.unlink(missing_ok=True)
+            if not self.objects.download(obj.key, path):
+                return None
+            # Another ETag is another version of the key: the old one is never read again.
+            for old in folder.glob("*"):
+                if not old.name.endswith(cache.PART):
+                    with contextlib.suppress(OSError):
+                        old.unlink()
+            if cache.publish(path, entry):
+                # ponytail: unlocked across fetch threads; an estimate, and the trim recounts
+                self.cached += obj.size
+            return path
         except (BotoCoreError, ClientError, Boto3Error, OSError) as e:
             log.warning("%s: fetching %s failed: %s", self.source, obj.key, e)
             return e

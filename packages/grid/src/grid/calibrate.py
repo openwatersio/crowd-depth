@@ -76,6 +76,12 @@ MAX_SE_M = 0.5
 APPLIED = ("anchored", "crossover")
 # A file reading deeper than this, known but not corrected, is left out of the grid.
 DEEP_M = 0.5
+# A stray transit reading this much shallower than its own segment, and under half of
+# what its segment reads over the same seabed, has lost the bottom. On the Chesapeake 145
+# of the 157 strays past 2 m did: a median 0.2 m in 14 m, or a sounder stuck near 2.5 m
+# whatever the depth. The other 12 read as a moved sounder would.
+CONTRADICTED_M = 2.0
+LOST_BOTTOM = 0.5
 # Of a store's calibrated segments, more than this share lost in one run is refused.
 MAX_LOST = 0.5
 GUARDED_SEGMENTS = 20
@@ -97,14 +103,14 @@ WHERE p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M} AND p.time IS NOT NULL
   AND (p.tide IS NOT NULL OR (p.tide_assigned AND p.tide_station IS NULL))
   AND p.point_id NOT IN (
     SELECT point_id FROM lake.qc_flags WHERE cell_id = $partition AND qc_version = {QC_VERSION}
-      AND list_contains({TRACK_REASONS}, reason) AND flag IN ('reject', 'unconfirmed'))
+      AND list_contains({TRACK_REASONS}, reason) AND flag IN ('reject', 'unconfirmed', 'noisy'))
 GROUP BY ALL
 """
 
 # Rows at anchor-quality reference pixels, with the difference from the reference: at
 # each pixel, the reference with the least uncertainty there.
 ANCHOR_ROWS = f"""
-SELECT o.vessel, o.file_id, o.t, o.tile_id, o.py, o.px, o.m - r.depth AS e
+SELECT o.vessel, o.file_id, o.t, o.tile_id, o.py, o.px, o.m - r.depth AS e, r.depth AS z
 FROM cal_obs o JOIN (
   -- Among the references that would anchor here, so one that wouldn't can't hide one
   -- that would.
@@ -299,9 +305,9 @@ def inverse_diagonal(lu, n, batch=256):
 
 
 def transit_offsets(con, offset):
-    """Each transit's offset, as rows (vessel, file_id, start, offset) in time order:
-    against the reference where it has one, elsewhere against the pixel depths of the
-    units other than its own."""
+    """Each transit's offset, as rows (vessel, file_id, start, offset, seabed depth) in time
+    order: against the reference where it has one, elsewhere against the pixel depths of
+    the units other than its own, which are also the seabed it's judged over."""
     con.register("offsets_np", {"unit": np.arange(len(offset)), "o": offset})
     rows = con.execute(
         f"""WITH x AS (SELECT x.*, o.o FROM xrows x JOIN offsets_np o USING (unit)),
@@ -314,11 +320,11 @@ def transit_offsets(con, offset):
           FROM x JOIN px USING (tile_id, py, px) WHERE px.w > x.b
         ),
         e AS (
-          SELECT o.vessel, o.file_id, o.t, o.m - z.z AS e
+          SELECT o.vessel, o.file_id, o.t, o.m - z.z AS e, z.z AS z
           FROM xobs o JOIN others z USING (tile_id, py, px, unit)
           UNION ALL BY NAME {ANCHOR_ROWS}
         )
-        SELECT e.vessel, e.file_id, f.time_min AS t, median(e) AS e
+        SELECT e.vessel, e.file_id, f.time_min AS t, median(e) AS e, median(z) AS z
         FROM e JOIN lake.files f USING (file_id) GROUP BY ALL
         HAVING count(*) >= {STEP_PIXELS} ORDER BY e.vessel, t, e.file_id"""
     ).fetchall()
@@ -329,7 +335,7 @@ def transit_offsets(con, offset):
 def series(rows):
     """{vessel: ([start times], [offsets])} from transit_offsets' rows."""
     out = {}
-    for vessel, _, t, e in rows:
+    for vessel, _, t, e, _ in rows:
         out.setdefault(vessel, ([], []))
         out[vessel][0].append(t)
         out[vessel][1].append(e)
@@ -340,20 +346,20 @@ def outliers(con, rows, offset, se, anchored):
     """Transits that disagree with their segment by more than a step: a step with too
     few transits on one side to be found. They don't take the segment's offset, which
     would correct them by another sounder's error, and are left uncalibrated. Returns
-    rows (file_id, vessel, transit offset, segment offset, content hash), the hash so
-    another file holding the same soundings, as ingest moves them on a takeover, keeps
-    the exemption."""
+    rows (file_id, vessel, transit offset, segment offset, content hash, seabed depth), the
+    hash so another file holding the same soundings, as ingest moves them on a takeover,
+    keeps the exemption."""
     unit_of = {(v, f): u for v, f, u in con.execute("SELECT * FROM file_units").fetchall()}
     hashes = dict(con.execute("SELECT file_id, content_hash FROM lake.files").fetchall())
     out = []
-    for vessel, file_id, _, e in rows:
+    for vessel, file_id, _, e, z in rows:
         u = unit_of.get((vessel, file_id))
         # A unit no survey reaches has an offset about an arbitrary zero: nothing to judge by.
         if u is None or np.isnan(offset[u]) or not anchored[u]:
             continue
         d = abs(e - offset[u])
         if d > STEP_M and d > STEP_SE * math.hypot(se[u], TRANSIT_SIGMA_M):
-            out.append((file_id, vessel, float(e), float(offset[u]), hashes.get(file_id)))
+            out.append((file_id, vessel, float(e), float(offset[u]), hashes.get(file_id), float(z)))
     return out
 
 
@@ -509,7 +515,9 @@ def publish(con, rows, stray=(), accept_losses=False):
             )
         con.execute("DELETE FROM lake.calibration_outliers")
         if stray:
-            con.executemany("INSERT INTO lake.calibration_outliers VALUES (?, ?, ?, ?, ?)", stray)
+            con.executemany(
+                "INSERT INTO lake.calibration_outliers VALUES (?, ?, ?, ?, ?, ?)", stray
+            )
         con.execute("COMMIT")
     except BaseException:
         con.execute("ROLLBACK")
@@ -523,27 +531,36 @@ def assign(con):
     arrived since calibration takes its segment's offset. A stray transit takes no offset
     and reads as logged, uncalibrated. A file known to read deep that can't be corrected,
     a segment not applied whose offset is DEEP_M past zero by two standard errors or a
-    stray transit measured as deep, is excluded: as logged it would publish too deep.
-    Returns how many tiles were marked."""
+    stray transit measured as deep, is excluded: as logged it would publish too deep. A
+    stray transit that lost the bottom, CONTRADICTED_M shallower than its segment and under
+    LOST_BOTTOM of what its segment reads over that seabed, is marked lost_bottom: its
+    soundings publish as unconfirmed shoals but set no depths. Returns how many tiles were
+    marked."""
     was_settled = cells.settled(con)
     con.execute("BEGIN")
     try:
-        con.execute("CREATE OR REPLACE TEMP TABLE old_offsets AS SELECT * FROM lake.file_offsets")
+        # A store from before lost_bottom has NULL there, which is no change from false.
+        con.execute(
+            "CREATE OR REPLACE TEMP TABLE old_offsets AS SELECT * REPLACE"
+            " (coalesce(lost_bottom, false) AS lost_bottom) FROM lake.file_offsets"
+        )
         con.execute("DELETE FROM lake.file_offsets")
         con.execute(
             f"""INSERT INTO lake.file_offsets
             WITH stray AS (
               -- A stray transit, by file or by content, as ingest may move its soundings.
-              SELECT file_id, max(transit_m) AS transit_m FROM (
-                SELECT file_id, transit_m FROM lake.calibration_outliers
+              SELECT file_id, max(transit_m) AS transit_m,
+                bool_or(transit_m - segment_m < {-CONTRADICTED_M}
+                  AND seabed_m + transit_m < {LOST_BOTTOM} * (seabed_m + segment_m)) AS lost FROM (
+                SELECT file_id, transit_m, segment_m, seabed_m FROM lake.calibration_outliers
                 UNION ALL
-                SELECT f.file_id, o.transit_m FROM lake.files f
+                SELECT f.file_id, o.transit_m, o.segment_m, o.seabed_m FROM lake.files f
                 JOIN lake.calibration_outliers o USING (content_hash)
               ) GROUP BY file_id
             ),
             j AS (
               SELECT f.file_id, f.vessel, c.offset_m, c.se_m, c.status IN {APPLIED} AS applied,
-                s.file_id IS NOT NULL AS strayed, s.transit_m
+                s.file_id IS NOT NULL AS strayed, s.transit_m, s.lost
               FROM lake.files f JOIN lake.calibration c ON c.vessel = f.vessel
                 AND (c.t_start IS NULL OR f.time_min >= c.t_start)
                 AND (c.t_end IS NULL OR f.time_min < c.t_end)
@@ -554,13 +571,15 @@ def assign(con):
               SELECT *, CASE
                   WHEN strayed THEN transit_m > {DEEP_M + 2 * TRANSIT_SIGMA_M}
                   ELSE NOT applied AND offset_m - 2 * se_m > {DEEP_M}
-                END AS excluded
+                END AS excluded,
+                strayed AND lost AS lost_bottom
               FROM j
             )
             SELECT file_id, vessel,
               CASE WHEN applied AND NOT strayed THEN offset_m END,
-              CASE WHEN applied AND NOT strayed THEN se_m END, coalesce(excluded, false)
-            FROM k WHERE (applied AND NOT strayed) OR excluded"""
+              CASE WHEN applied AND NOT strayed THEN se_m END, coalesce(excluded, false),
+              coalesce(lost_bottom, false)
+            FROM k WHERE (applied AND NOT strayed) OR excluded OR lost_bottom"""
         )
         dirty = cells.stale(
             con,

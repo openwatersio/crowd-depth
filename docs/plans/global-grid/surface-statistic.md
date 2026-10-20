@@ -113,6 +113,30 @@ In Tangier Sound, before cleaning, every statistic drew 19 to 30% of pixels as f
 4. **Leave uncalibrated vessels out of the median** where calibrated vessels sounded the pixel, and keep them where they're the only data, marked uncalibrated.
 5. **Measure a slope floor next:** the shoalest accepted sounding as a floor only on pixels where σ_a is well above σ_b.
 
+## In the pipeline
+
+`grid cells` and the surface draw `median − 1.75σ_b` ([statistic.py](../../../packages/grid/src/grid/statistic.py)). On a pixel's own votes, σ_b is the one measured here: built from the same store on the tiles' own pixel grid, central depth and σ_b agree with this comparison's within 0.1 m at 98% of Thimble's pixels, and the same pixels are more than 1 m too deep. The measured rates in [Results](#results) move with the grid: the same statistic on a grid 0.4 pixel off the tiles' draws 0.06% of Thimble's pixels too deep instead of 0.03%, and 0.34% of its channel instead of 0.18%, because on the channel's edges where a pixel boundary falls moves its median by up to a metre.
+
+Interpolated pixels widen σ by 0.005 m per metre from the nearest sounding. That takes Tangier Sound from 2.7% to 2.1% too deep and changes nothing in Thimble, where every pixel is within 100 m of a track.
+
+`grid cells` on Thimble's tile, the densest (28M soundings), takes 14 minutes and peaks at 3.2 GB resident with DuckDB at 4 GB; its surface takes 3.5 minutes. Vessel smoothing and σ are worked about 2 million window entries at a time.
+
+### Legibility
+
+The surface also smooths each vessel along its own coverage, adds 40 m of smoothing to `gdal_grid` and blurs over 2 pixels. Unconfirmed shoals QC judged improbable don't affect it, and a confirmed shoal caps it only within 2 m + 5% of the other vessels' median. Rebuilt on Thimble's tile, which holds Norfolk, and the tile north of it, and scored against `reference_pixels` (BlueTopo and S-102 at MLLW) on every pixel a vessel sounded, from the published render to now:
+
+| Vessels in the pixel |         Empty | Roughness, m | More than 1 m too deep | False shoals over 2 m | Under 1 m where the survey is 2 m or more |
+| -------------------- | ------------: | -----------: | ---------------------: | --------------------: | ----------------------------------------: |
+| 1                    | 15.5% → 12.5% |  0.08 → 0.05 |            3.7% → 3.5% |           7.2% → 7.6% |                               1.9% → 1.3% |
+| 2–3                  |  13.9% → 4.3% |  0.09 → 0.05 |            4.3% → 4.3% |           4.1% → 5.6% |                               0.4% → 0.3% |
+| 4–9                  |  29.9% → 1.4% |  0.11 → 0.07 |            9.2% → 9.0% |          9.6% → 12.8% |                               0.5% → 0.0% |
+| 10 or more           |  77.2% → 2.9% |  0.10 → 0.08 |          23.2% → 13.0% |         32.7% → 54.7% |                               5.0% → 0.0% |
+| All                  |  16.8% → 9.8% |  0.08 → 0.05 |            4.2% → 4.2% |           6.6% → 8.1% |                               1.5% → 0.9% |
+
+Holes fall as traffic rises. Among pixels mostly surrounded by drawn surface on Thimble's tile, by soundings within about 5 pixels, the share left empty goes from 5.1% to 0.0% over 1,000 soundings, 2.1% to 0.2% at 200 to 1,000, 1.1% to 0.7% at 50 to 200, and 1.0% to 0.9% under 50. Before, every pixel holding an unconfirmed shoal stayed empty, and in busy water some vessel almost always logs one.
+
+In Norfolk's harbour (−76.36 to −76.30, 36.83 to 36.97), echoes off piers and moored hulls that many vessels read are confirmed as shoals. Capping the surface at all of them drew 10.1% of the harbour's surface as drying and 9.7% at 0 to 2 m, in a channel dredged to about 15 m. Capping only near the other vessels' median draws 0.1% drying and 2.9% at 0 to 2 m. It outvotes 339,522 of Thimble's tile's 780,149 confirmed-shoal soundings, 264,690 of them in the harbour, and 28,098 of 128,259 on the tile north. Of those outvoted, 5.6% and 2.0% sit where the survey also reads within 1 m as shallow, so some may be real; they publish as unconfirmed soundings, not as capping shoals. Busy water's false shoals stay high: echoes within the tolerance and channel edges.
+
 ## Not measured
 
 - **Crossover-only offsets:** most offsets here are anchored to BlueTopo or S-102; crossover offsets were 10 of 343 segments.

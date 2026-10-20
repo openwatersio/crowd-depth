@@ -1,10 +1,9 @@
-"""QC as one pass over each file: the reference the day-split QC must agree with.
-
-Its windows hold a whole file, which is why ingest doesn't use it.
-"""
+"""Track QC as SQL over each file: the reference the numpy QC must agree with."""
 
 from grid.cells import OTHER_PASS, SUPPORT
 from grid.qc import (
+    ARRIVAL_SLACK_S,
+    EARLIEST,
     FLAT_M,
     FLAT_MIN_SOUNDINGS,
     FLAT_SPAN_M,
@@ -13,9 +12,10 @@ from grid.qc import (
     MAX_SPEED_KN,
     SHALLOW_M,
     SPIKE_ABS_M,
+    SPIKE_MIN_SOUNDINGS,
     SPIKE_REL,
     SPIKE_WINDOW,
-    TRANSIT_GAP,
+    TRANSIT_GAP_S,
     TRANSIT_SPAN_S,
 )
 
@@ -58,7 +58,8 @@ basic AS (
   SELECT point_id,
     CASE
       WHEN d <= 0 OR d > {MAX_DEPTH_M} THEN 'sentinel'
-      WHEN time < TIMESTAMP '2000-01-01' OR time > arrival + INTERVAL 1 DAY THEN 'time'
+      WHEN time < TIMESTAMP '{EARLIEST}' OR time > arrival + INTERVAL {ARRIVAL_SLACK_S} SECOND
+        THEN 'time'
     END AS reason
   FROM p
 ),
@@ -66,7 +67,7 @@ track AS (
   SELECT p.* FROM p JOIN basic USING (point_id) WHERE basic.reason IS NULL
 ),
 segments AS (
-  SELECT *, sum(CASE WHEN gap IS NULL OR gap > INTERVAL '{TRANSIT_GAP}' THEN 1 ELSE 0 END)
+  SELECT *, sum(CASE WHEN gap IS NULL OR gap > INTERVAL {TRANSIT_GAP_S} SECOND THEN 1 ELSE 0 END)
     OVER (PARTITION BY file_id ORDER BY time, file_id, "row") AS seg
   FROM (SELECT *, time - lag(time) OVER (PARTITION BY file_id ORDER BY time, file_id, "row") AS gap
         FROM track)
@@ -121,7 +122,7 @@ SELECT point_id, CASE WHEN d < {HAZARD_M} THEN 'unconfirmed' ELSE 'reject' END, 
 UNION ALL
 SELECT point_id, CASE WHEN d > med THEN 'reject' ELSE 'unconfirmed' END, 'spike'
 FROM spikes
-WHERE n >= 3 AND abs(d - med) > {SPIKE_ABS_M} + {SPIKE_REL} * med
+WHERE n >= {SPIKE_MIN_SOUNDINGS} AND abs(d - med) > {SPIKE_ABS_M} + {SPIKE_REL} * med
 """
 
 

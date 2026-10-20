@@ -8,9 +8,9 @@ Every number below comes from the grid's design and changes with it. This note c
 
 The grid is Python and the plugin is TypeScript, so both read one set of definitions instead of porting by hand:
 
-- **Constants as JSON:** QC thresholds, cell resolution, the statistic's k, the interpolation radius, band levels, contour tiers and sounding rounding, in one file under `packages/grid` that the plugin imports at build time.
-- **Test vectors as JSON:** inputs and expected outputs for QC, the statistic, interpolation and rounding, run by both pytest and vitest. A change on either side fails the other's tests until both agree.
-- **QC as pure functions:** the grid's track QC as plain loops, ported once to TypeScript and checked against the shared vectors ([qc-functions.md](qc-functions.md)).
+- **Constants as JSON:** QC thresholds, cell resolution, the statistic's k, the interpolation radius, band levels, contour tiers and sounding rounding, in [definitions.json](../../../packages/grid/src/grid/definitions.json), which the grid's modules read and the plugin will import at build time once the port is in its data flow.
+- **Test vectors as JSON:** inputs and expected outputs for QC, the statistic, interpolation and rounding, run by both pytest and vitest. A change on either side fails the other's tests until both agree. QC's are in [qc_vectors.json](../../../packages/grid/tests/qc_vectors.json), with flags from `grid.qc`; pytest checks them against the reference SQL for every check but the steep and noise checks, and against flags worked out by hand for those two.
+- **QC as pure functions:** the grid's track QC as numpy functions ([qc.py](../../../packages/grid/src/grid/qc.py)), ported once to TypeScript as plain loops ([qc.ts](../../../packages/signalk-plugin/src/qc.ts)) and checked against the shared vectors with vitest ([qc-functions.md](qc-functions.md)). The port isn't in the plugin's data flow yet.
 
 When the grid changes a definition, the plugin picks it up on its next release, and its tiles are rebuilt from the plugin's sounding log, as they are for an offset change.
 
@@ -24,7 +24,7 @@ Cell QC runs across the boat's own passes, as the grid's does across vessels. Co
 
 The plugin reads GNSS quality from the same Signal K data it sends to the grid, so its position checks and horizontal uncertainty match the grid's for the same soundings.
 
-Unconfirmed shoals are handled as in the grid: they publish as soundings with a low-reliability flag, and the surface is never drawn over them.
+Unconfirmed shoals are handled as in the grid: they publish as soundings with a low-reliability flag, and the surface is drawn as if those QC judged improbable weren't there.
 
 ### Corrections
 
@@ -46,7 +46,7 @@ Cells use the grid's [resolution](README.md#resolution) and the form of the grid
 - **Against the grid:** the grid's σ_b also counts how far other vessels spread around a local plane, which one boat can't measure. Where vessels disagree, the grid draws shoaler than the live layer by k times that spread. Where the overlay covers the water, the plugin can draw the shoaler of the two.
 - **A vessel's offset changing** shifts its cells by the difference, since the average is linear. A new tide level for past passes doesn't reach the live layer; the grid's next build carries it.
 
-The surface follows the grid's [interpolation](README.md#interpolation): bounded, marked, with σ widening with distance from the nearest track. Interpolated cells within the radius of a changed cell are recomputed from the stored cells.
+The surface follows the grid's [interpolation](README.md#interpolation): bounded, marked, with σ widening with distance from the nearest track. The surface within the radius of a changed cell is interpolated again from the stored cells.
 
 Replayed per vessel in Thimble Shoal Channel (2/3″ cells, per pass), against BlueTopo and on a synthetic 1 m change with 0.3 m noise:
 
