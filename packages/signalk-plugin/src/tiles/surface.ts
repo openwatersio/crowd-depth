@@ -342,12 +342,12 @@ function polygons(r: Raster, field: (i: number) => number): Point[][][] {
   );
 }
 
-/** Points on the edge of the traced grid, in the tile's buffer, which smoothing leaves
- * where they are. */
 /** Pixels past each edge a tile's areas and contours are traced over, drawn in the
  * tile's buffer. */
 const BUFFER_PX = 3;
 
+/** Points on the edge of the traced grid, in the tile's buffer, which smoothing leaves
+ * where they are. */
 const onEdge = ([x, y]: Point, n: number) =>
   x <= 0 || y <= 0 || x >= n || y >= n;
 

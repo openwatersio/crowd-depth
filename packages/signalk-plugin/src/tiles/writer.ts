@@ -182,7 +182,10 @@ export function createCellWriter(
   /** QC's verdicts on soundings judged but not yet all folded in, from sounding `at`. */
   let ruled: { at: number; flags: (string | undefined)[] } | undefined;
   /** The verdict on a run of one depth judged whole, for the rest of that run. */
-  let carried: { depth: number; flag: string | undefined } | undefined;
+  let carried:
+    { depth: number; flag: string | undefined; at: Sounding } | undefined;
+  /** Where a run of one depth was first held for {@link RUN_MAX_US}, keyed by its start. */
+  let moored: { since: number; at: Sounding } | undefined;
   const open = new Map<string, OpenPass>();
   let passes: Pass[] = [];
   let unwritten: Sounding[] = [];
@@ -276,21 +279,38 @@ export function createCellWriter(
         const n = buffer.length - 1;
         let run = n;
         while (run > 0 && buffer[run - 1].depth === buffer[n].depth) run--;
+        // An hour of it is judged whole only while the boat stays put, as at anchor: a
+        // run that moves on waits for flat_m of path, so a sounder stuck at a mooring
+        // and still stuck under way is judged over the whole run, as the grid judges it.
+        let held = buffer[n].time - buffer[run].time >= RUN_MAX_US;
+        if (held && moored?.since !== buffer[run].time) {
+          moored = { since: buffer[run].time, at: buffer[n] };
+        } else if (held) {
+          held = metres(moored!.at, buffer[n]) < QC.flat_span_m;
+        }
         whole =
           path[n] - path[run] >= QC.flat_m ||
-          buffer[n].time - buffer[run].time >= RUN_MAX_US ||
+          held ||
           n - run >= HISTORY_MAX - CONTEXT;
         if (!whole) end = Math.min(end, run);
       }
       if (end <= judged) return;
-      if (carried && buffer[judged].depth === carried.depth) {
-        // The rest of a run already judged whole takes its verdict: QC would reread the
-        // whole run each batch, thousands of soundings, to say the same.
-        let k = 0;
-        while (judged + k < end && buffer[judged + k].depth === carried.depth)
-          k++;
+      // The rest of a run already judged whole takes its verdict, while the boat stays
+      // where it was judged: QC would reread the whole run each batch, thousands of
+      // soundings, to say the same. A run that moves on is QC'd again.
+      let k = 0;
+      while (
+        carried &&
+        judged + k < end &&
+        buffer[judged + k].depth === carried.depth &&
+        metres(carried.at, buffer[judged + k]) < QC.flat_span_m
+      ) {
+        k++;
+      }
+      if (carried && k > 0) {
         ruled = { at: base + judged, flags: new Array(k).fill(carried.flag) };
       } else {
+        carried = undefined;
         // QC from just before the run the first unjudged sounding is in, not the whole
         // buffer: at anchor that runs to thousands of soundings, and rereading them all
         // each batch held the server up for a quarter of a second on a Pi.
@@ -311,7 +331,7 @@ export function createCellWriter(
         const last = buffer[end - 1];
         carried =
           whole && !all && buffer[end - 2]?.depth === last.depth
-            ? { depth: last.depth, flag: flags[flags.length - 1] }
+            ? { depth: last.depth, flag: flags[flags.length - 1], at: last }
             : undefined;
       }
     }

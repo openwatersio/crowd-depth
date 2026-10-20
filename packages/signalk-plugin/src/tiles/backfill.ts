@@ -173,7 +173,7 @@ export async function backfillCells({
   }
   store.setMeta(TIDE_CONFIG_KEY, tideConfig(tided));
   const rebuild = async () => {
-    if (file) await rebuildOverviewsOnWorker(file);
+    if (file) await rebuildOverviewsOnWorker(file, signal);
     else store.rebuildOverviews();
     store.setMeta(OVERVIEWS_STALE_KEY, "");
   };
@@ -322,10 +322,15 @@ export function createWorkerSink(file: string): Writable {
 }
 
 /** Rebuild the overviews on a worker thread, as after a backfill that failed. */
-function rebuildOverviewsOnWorker(file: string): Promise<void> {
+function rebuildOverviewsOnWorker(
+  file: string,
+  signal: AbortSignal,
+): Promise<void> {
+  if (signal.aborted) return Promise.reject(new Error("aborted"));
   const worker = new Worker(new URL("./backfill-worker.js", import.meta.url), {
     workerData: { file },
   });
+  let abort = () => {};
   return new Promise<void>((resolve, reject) => {
     worker.on("message", (msg: { done?: true; error?: string }) => {
       if (msg.error) reject(new Error(msg.error));
@@ -333,6 +338,13 @@ function rebuildOverviewsOnWorker(file: string): Promise<void> {
     });
     worker.on("error", reject);
     worker.on("exit", () => reject(new Error("backfill worker exited")));
+    // Stopped, as before a restart that clears the cells: the rebuild mustn't write
+    // overviews of cells that are gone.
+    abort = () => reject(new Error("aborted"));
+    signal.addEventListener("abort", abort);
     worker.postMessage({ rebuild: true });
-  }).finally(() => void worker.terminate());
+  }).finally(() => {
+    signal.removeEventListener("abort", abort);
+    void worker.terminate();
+  });
 }
