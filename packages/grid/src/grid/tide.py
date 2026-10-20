@@ -401,11 +401,13 @@ def fetch_residuals(con, months, today, residuals=coops_residuals):
     def fetch(m):
         kept = cache.read_json(cached_month(*m))
         if kept:
-            # An entry of another shape is a miss: CO-OPS answers, and replaces it.
+            # An entry of another shape, or with a value CO-OPS' answer would have dropped,
+            # is a miss: CO-OPS answers, and replaces it.
             with contextlib.suppress(TypeError, ValueError):
                 rows = [(datetime.fromisoformat(t), float(v)) for t, v in kept]
-                served.add(m)
-                return rows
+                if all(math.isfinite(v) and abs(v) <= MAX_RESIDUAL_M for _, v in rows):
+                    served.add(m)
+                    return rows
         try:
             return residuals(*m)
         except (OSError, ValueError, RuntimeError) as e:
