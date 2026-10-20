@@ -147,8 +147,12 @@ export function createCellStore(db: DatabaseSync) {
        depth = excluded.depth, time = excluded.time
      WHERE excluded.depth < shoals.depth`,
   );
-  const rowShoals = db.prepare(
-    `SELECT lon, lat, depth, time FROM shoals WHERE py = ? AND px BETWEEN ? AND ?`,
+  // One range per latitude band: shoals are one per cell at most, so reading a band's
+  // rows across every longitude stays small, and a zoomed-out tile makes a query per
+  // band rather than per row.
+  const bandShoals = db.prepare(
+    `SELECT lon, lat, depth, time FROM shoals
+     WHERE py BETWEEN ? AND ? AND px BETWEEN ? AND ?`,
   );
   const getMetaStmt = db.prepare("SELECT value FROM tile_meta WHERE key = ?");
   const setMetaStmt = db.prepare(
@@ -299,13 +303,9 @@ export function createCellStore(db: DatabaseSync) {
     },
 
     shoals(west: number, south: number, east: number, north: number): Shoal[] {
-      return cellRanges(west, south, east, north).flatMap((r) => {
-        const out: Shoal[] = [];
-        for (let py = r.py0; py <= r.py1; py++) {
-          out.push(...(rowShoals.all(py, r.px0, r.px1) as unknown as Shoal[]));
-        }
-        return out;
-      });
+      return cellRanges(west, south, east, north).flatMap(
+        (r) => bandShoals.all(r.py0, r.py1, r.px0, r.px1) as unknown as Shoal[],
+      );
     },
 
     getMeta: (key: string) =>
