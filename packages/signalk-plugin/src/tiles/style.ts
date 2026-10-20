@@ -46,6 +46,9 @@ export function buildStyle({
   ];
   return {
     version: 8,
+    // Plotters draw text in their own fonts and ignore this, but the style spec wants a
+    // glyphs URL wherever a layer has text, and validating hosts refuse a style without.
+    glyphs: "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
     state: {
       safetyDepth: { default: safetyDepth },
       // The SOUNDG label in the user's unit: `depth_m` or `depth_ft`.

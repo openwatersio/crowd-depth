@@ -94,6 +94,22 @@ export function createDB(filename: string): DatabaseSync {
         CREATE INDEX shoals_lat ON shoals(lat);
       `);
     },
+    () => {
+      // Unconfirmed shoals, the shoalest per cell, so the table is bounded by the water
+      // the boat covered, as the cells are. The rows before it are rebuilt with the cells.
+      db.exec(`
+        DROP TABLE shoals;
+        CREATE TABLE shoals(
+          py INTEGER NOT NULL,
+          px INTEGER NOT NULL,
+          lon REAL NOT NULL,
+          lat REAL NOT NULL,
+          depth REAL NOT NULL,
+          time INTEGER NOT NULL,
+          PRIMARY KEY(py, px)
+        ) WITHOUT ROWID;
+      `);
+    },
   ]);
 
   return db;

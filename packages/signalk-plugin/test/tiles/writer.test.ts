@@ -171,3 +171,11 @@ test("a slow stuck sounder is judged whole, as the grid judges it", async () => 
   expect(cells.length).toBeGreaterThan(0);
   expect(Math.max(...cells.map((c) => c.m))).toBeLessThan(10);
 });
+
+test("a deep spike isn't shown: drawn, it would read deeper than the water", async () => {
+  const { store, writer } = run(
+    track(40, { depth: (i) => (i === 20 ? 30 : 8) }),
+  );
+  await end(writer);
+  expect(store.shoals(-76.3, 36, -76.1, 37.1)).toEqual([]);
+});

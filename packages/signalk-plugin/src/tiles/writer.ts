@@ -35,7 +35,7 @@ const BULK_BATCH = 200;
 const BATCH_PER_BUFFER = 0.01;
 
 /** The longest the writer keeps passes back for a backfill that hasn't finished. */
-const HOLD_MAX_MS = 30 * 60_000;
+const HOLD_MAX_MS = 3 * 3600_000;
 
 /** Passes a backfill writes at a time, so each write holds the event loop briefly. */
 const BULK_FLUSH_PASSES = 2000;
@@ -67,12 +67,6 @@ const RANK: Record<string, number> = {
   unconfirmed: 2,
   reject: 3,
 };
-
-/** Readings QC rejects as bad data rather than a bad depth: no reading, an impossible
- * time, or a position that jumped. Everything else QC sets aside still shows on the live
- * layer, as an unconfirmed sounding outside the surface, so the boat sees what it
- * measured, however doubtful. */
-const UNUSABLE = new Set(["sentinel", "time", "jump"]);
 
 /** Meta key for the time the cells hold every sounding through. */
 export const THROUGH_KEY = "through";
@@ -126,8 +120,8 @@ interface OpenPass {
  *
  * A sounding is judged once the soundings QC looks ahead over have arrived and it isn't
  * in a run of one depth that's still going, which the stuck-sounder check could yet
- * flag. Bad data is dropped, other soundings QC sets aside are stored as unconfirmed, and accepted
- * ones go to the pass of every cell within a pixel. A cell's pass ends when the boat's
+ * flag. Rejected and deep-side soundings are dropped, shoal-side ones QC doubts are
+ * stored as unconfirmed shoals, and accepted ones go to the pass of every cell within a pixel. A cell's pass ends when the boat's
  * soundings leave its 3×3, and a cell gets a pass only where the boat sounded it itself.
  *
  * Passes are written every {@link DEFAULT_FLUSH_MS}, and the {@link THROUGH_KEY} marker
@@ -181,6 +175,8 @@ export function createCellWriter(
     const near = new Set<string>();
     for (const n of neighbours(at.py, at.px)) {
       const k = key(n);
+      // Across a latitude band's edge two neighbours can be one cell.
+      if (near.has(k)) continue;
       near.add(k);
       let pass = open.get(k);
       if (
@@ -225,22 +221,23 @@ export function createCellWriter(
       const whole =
         path[n] - path[run] >= QC.flat_m ||
         buffer[n].time - buffer[run].time >= RUN_MAX_US ||
-        n - run >= HISTORY_MAX / 2;
+        n - run >= HISTORY_MAX - HISTORY_MIN;
       if (!whole) end = Math.min(end, run);
     }
     if (end <= judged) return;
     const flags = new Map<number, string>();
-    const unusable = new Set<number>();
-    for (const [i, flag, reason] of trackQC(buffer, Date.now() * 1000, QC)) {
+    for (const [i, flag] of trackQC(buffer, Date.now() * 1000, QC)) {
       const was = flags.get(i);
       if (was === undefined || RANK[flag] > RANK[was]) flags.set(i, flag);
-      if (UNUSABLE.has(reason)) unusable.add(i);
     }
+    // Every doubtful reading on the shoal side shows, as an unconfirmed sounding outside
+    // the surface: QC marks those `unconfirmed`. What it rejects or marks `noisy` is
+    // bad data or the deep side, which drawn would show water deeper than it is.
     for (let i = judged; i < end; i++) {
       const s = buffer[i];
       const flag = flags.get(i);
       if (flag === undefined || flag === "review") accept(s);
-      else if (!unusable.has(i)) shoals.push(s);
+      else if (flag === "unconfirmed") shoals.push(s);
     }
     judged = end;
     // Keep what QC looks back over, and everything not yet judged.
@@ -371,6 +368,7 @@ export function createCellWriter(
     provisional(): Sounding[] {
       return [
         ...unwritten,
+        ...shoals,
         ...[...open.values()].flatMap((p) => p.soundings),
         ...buffer.slice(judged),
       ];

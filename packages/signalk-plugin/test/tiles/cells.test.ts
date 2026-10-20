@@ -88,3 +88,16 @@ test("each overview block holds its shoalest cell, also after that cell deepens"
   for (const level of OVERVIEW_LEVELS)
     expect(shoalest(level)).toEqual([[c2.py, c2.px]]);
 });
+
+test("an unconfirmed shoal keeps the shoalest reading in its cell", () => {
+  const store = createCellStore(createDB(":memory:"));
+  const at = { lon: -76.2, lat: 36.98 };
+  store.addShoals([
+    { ...at, depth: 2.4, time: 1 },
+    { ...at, depth: 1.1, time: 2 },
+    { ...at, depth: 3.0, time: 3 },
+  ]);
+  expect(store.shoals(-76.21, 36.97, -76.19, 36.99)).toEqual([
+    { ...at, depth: 1.1, time: 2 },
+  ]);
+});

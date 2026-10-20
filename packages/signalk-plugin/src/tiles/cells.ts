@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { DEFINITIONS, cellRanges } from "./geometry.js";
+import { DEFINITIONS, cellAt, cellRanges } from "./geometry.js";
 
 /** Overview levels: blocks of 2^level cells a side (about 41 m, 82 m, 330 m and 1.3 km),
  * each holding its shoalest cell, so a zoomed-out tile reads a row per block rather
@@ -106,9 +106,9 @@ export type CellStore = ReturnType<typeof createCellStore>;
  * shoaler than its block's takes its place, and when the block's own cell deepens, the
  * block is found again from its cells.
  *
- * ponytail: one row per cell, about 27 bytes in SQLite with the overviews. A blob per
- * block of cells would bring the busiest boat's 1.5M cells from about 41 MB toward the
- * raw 12 MB.
+ * ponytail: one row per cell and per overview block, about 75 bytes a cell in SQLite. A
+ * blob per block of cells would bring the busiest boat's 1.5M cells from about 114 MB
+ * toward the raw 12 MB.
  */
 export function createCellStore(db: DatabaseSync) {
   const readCell = db.prepare(
@@ -140,12 +140,15 @@ export function createCellStore(db: DatabaseSync) {
     `SELECT py, px, m, d, passes, first, last FROM overviews
      WHERE level = ? AND oy = ? AND ox BETWEEN ? AND ?`,
   );
+  // The shoalest per cell; a sounding read again at the same depth changes nothing.
   const insertShoal = db.prepare(
-    "INSERT OR IGNORE INTO shoals(lon, lat, depth, time) VALUES(?, ?, ?, ?)",
+    `INSERT INTO shoals(py, px, lon, lat, depth, time) VALUES(?, ?, ?, ?, ?, ?)
+     ON CONFLICT(py, px) DO UPDATE SET lon = excluded.lon, lat = excluded.lat,
+       depth = excluded.depth, time = excluded.time
+     WHERE excluded.depth < shoals.depth`,
   );
-  const rangeShoals = db.prepare(
-    `SELECT lon, lat, depth, time FROM shoals
-     WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?`,
+  const rowShoals = db.prepare(
+    `SELECT lon, lat, depth, time FROM shoals WHERE py = ? AND px BETWEEN ? AND ?`,
   );
   const getMetaStmt = db.prepare("SELECT value FROM tile_meta WHERE key = ?");
   const setMetaStmt = db.prepare(
@@ -268,7 +271,10 @@ export function createCellStore(db: DatabaseSync) {
 
     addShoals(shoals: Shoal[]) {
       transaction(() => {
-        for (const s of shoals) insertShoal.run(s.lon, s.lat, s.depth, s.time);
+        for (const s of shoals) {
+          const { py, px } = cellAt(s.lon, s.lat);
+          insertShoal.run(py, px, s.lon, s.lat, s.depth, s.time);
+        }
       });
     },
 
@@ -293,7 +299,13 @@ export function createCellStore(db: DatabaseSync) {
     },
 
     shoals(west: number, south: number, east: number, north: number): Shoal[] {
-      return rangeShoals.all(south, north, west, east) as unknown as Shoal[];
+      return cellRanges(west, south, east, north).flatMap((r) => {
+        const out: Shoal[] = [];
+        for (let py = r.py0; py <= r.py1; py++) {
+          out.push(...(rowShoals.all(py, r.px0, r.px1) as unknown as Shoal[]));
+        }
+        return out;
+      });
     },
 
     getMeta: (key: string) =>

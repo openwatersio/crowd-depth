@@ -33,7 +33,7 @@ const DEPTH_CONFIG_KEY = "config_depth";
 
 /** How the plugin turns soundings into cells. Bump it when that changes, so cells built
  * the old way are rebuilt. */
-const LAYER_VERSION = 2;
+const LAYER_VERSION = 3;
 
 /** The safety depth the layer draws with until the owner sets one, in metres. */
 export const DEFAULT_SAFETY_DEPTH_M = 3;
