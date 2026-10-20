@@ -1,53 +1,51 @@
 // The "My soundings" background runtime: a headless iframe the host loads while the
 // plugin is enabled. The host draws the data overlay itself; this keeps it current. It
 // polls the plugin for the tiles the boat's passes changed and asks the host to refetch
-// just those, replaces the provisional soundings, and sets the user's depth unit.
+// them, draws the soundings not yet in a tile, and sets the user's depth unit.
+//
+// Freeboard redraws the whole layer on any refresh, however few tiles it names, so
+// refreshes are batched to one per REFRESH_MS. Soundings stay drawn as provisional until
+// the refresh that brings in their tiles has landed, so the track never has a gap.
 import { connectExtension } from "signalk-plotterext-bus/extension";
 import type { OverlayStateEvent } from "signalk-plotterext-bus/extension";
+import { createBatch, type Live } from "./batch.js";
 
 // The overlay and source ids in src/plotterext/manifest.ts and src/tiles/style.ts.
 const overlayId = "depth";
 const POLL_MS = 2000;
+const REFRESH_MS = 30_000;
 const LIVE_URL = "/plotterext/crowd-depth/live";
 const M_PER_FT = 0.3048;
 
 const client = await connectExtension();
 
-let rev = -1;
 let visible = true;
 let busy = false;
+const batch = createBatch(REFRESH_MS);
 
 async function poll(): Promise<void> {
   if (!visible || busy) return;
   busy = true;
   try {
-    const res = await fetch(`${LIVE_URL}?since=${rev}`, {
+    const res = await fetch(`${LIVE_URL}?since=${batch.rev}`, {
       credentials: "include",
     });
     if (!res.ok) return;
-    const live = (await res.json()) as {
-      rev: number;
-      all?: boolean;
-      tiles: [number, number, number][];
-      provisional: unknown;
-    };
-    // `all` on the first poll too: the host may have fetched tiles before a backfill
-    // finished, and refetching the view once costs little.
-    if (live.all) {
-      await client.call("overlay.refresh", { overlayId, source: "cells" });
-    } else if (live.tiles.length) {
+    const { refresh, data } = batch.next((await res.json()) as Live);
+    if (refresh) {
       await client.call("overlay.refresh", {
         overlayId,
         source: "cells",
-        tiles: live.tiles,
+        ...refresh,
       });
     }
-    rev = live.rev;
-    await client.call("overlay.setData", {
-      overlayId,
-      source: "provisional",
-      data: live.provisional,
-    });
+    if (data) {
+      await client.call("overlay.setData", {
+        overlayId,
+        source: "provisional",
+        data: { type: "FeatureCollection", features: data },
+      });
+    }
   } catch {
     // The server is restarting or the overlay isn't drawn; the next poll tries again.
   } finally {

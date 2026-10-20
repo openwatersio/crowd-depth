@@ -138,10 +138,10 @@ export function registerLayerRoutes(
           features: layer
             .provisional()
             .slice(-MAX_PROVISIONAL)
-            // The source is replaced whole each poll, so ids need only be unique.
-            .map((s, i) => ({
+            // A sounding's id is its time, so the runtime can tell which have left.
+            .map((s) => ({
               type: "Feature",
-              id: i,
+              id: s.time,
               geometry: { type: "Point", coordinates: [s.lon, s.lat] },
               properties: depthLabels(s.depth),
             })),
