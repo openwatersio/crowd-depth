@@ -91,7 +91,8 @@ WITH wanted AS MATERIALIZED (
 ),
 -- Only these points' flags, so memory follows the tile, not its whole partition.
 flags AS (
-  SELECT point_id, bool_or(flag = 'reject') AS rejected,
+  -- A noisy track's soundings neither vote nor cap a pixel.
+  SELECT point_id, bool_or(flag IN ('reject', 'noisy')) AS rejected,
     bool_or(flag = 'confirmed' AND reason = 'cell_shoal') AS confirmed,
     bool_or(flag = 'unconfirmed' AND reason <> '{UNJUDGED}') AND NOT bool_or(flag = 'confirmed')
       AS unconfirmed

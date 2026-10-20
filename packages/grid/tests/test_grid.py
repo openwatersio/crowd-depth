@@ -246,6 +246,102 @@ def test_track_shoal_spike_confirmed_by_another_vessel(env):  # noqa: F811
     assert ("confirmed", "cell_confirmed", 3) in flags(env)
 
 
+def test_readings_under_half_a_metre_dont_confirm_each_other(env):  # noqa: F811
+    # Two vessels' junk 0.3 m readings in one cell of a 14 m channel: as a 3 m shoal they
+    # would confirm each other, as readings under 0.5 m they stay unconfirmed and out of
+    # the cell's depth.
+    put(env, 1, line([14, 14, 14, 14, 0.3, 14, 14, 14, 14]))
+    put(env, 2, line([14, 14, 14, 14, 0.3, 14, 14, 14, 14], start=100), "AQM-2")
+    build(env)
+    assert not [f for f in flags(env) if f[0] == "confirmed"]
+    assert ("unconfirmed", "spike", float32(0.3)) in flags(env)
+    assert all(row[4] == 14 for row in grid(env))
+
+
+def test_a_half_metre_track_spike_never_sets_a_cells_depth(env):  # noqa: F811
+    # A's 0.3 m spike lands among B's ordinary 0.3 m readings, which agree with it: it
+    # still can't be confirmed, so it stays an unconfirmed shoal, out of the cell's depth.
+    put(env, 1, line([4, 4, 4, 4, 0.3, 4, 4, 4, 4]))
+    put(env, 2, apart([(0, *at(5000, 4, 0.3 + 0.1 * i), 0.3) for i in range(5)]), "AQM-2")
+    build(env)
+    assert ("unconfirmed", "spike", float32(0.3)) in flags(env)
+    assert not [f for f in flags(env) if f[0] == "confirmed"]
+    [count] = [row[5] for row in grid(env) if row[:3] == (1, 5000, 4)]
+    assert count == 5  # B's five, not A's spike
+
+
+def test_a_sounder_that_loses_bottom_is_steep(env):  # noqa: F811
+    # FARSND in the Chesapeake: 20 m, then 370-716 m within a minute, then 20 m again.
+    put(env, 1, line([20.0] * 10 + [370.0 + 13.3 * i for i in range(26)] + [20.0] * 10, step=2))
+    env.run("noaa")
+    assert {(f, r) for f, r, _ in flags(env)} == {("reject", "steep")}
+    assert len(flags(env)) == 26
+
+
+def test_one_other_vessel_is_enough_to_reject_a_far_deeper_sounding(env):  # noqa: F811
+    # Vessel A's 20 m in two places 45 base cells (about 400 m) apart, each with one other
+    # vessel beside it: one lost bottom there, the other crossed a real hole.
+    a = [(0, *at(5000, c, 0.1 + 0.1 * i), 20.0) for c in (0, 45) for i in range(5)]
+    put(env, 1, apart(a))
+    put(env, 2, apart([(0, *at(5000, 1, 0.5), 400.0)]), "LOST")
+    put(env, 3, apart([(0, *at(5000, 46, 0.5), 35.0)]), "HOLE")  # deeper, but not far
+    build(env)
+    assert flags(env) == [("reject", "consensus_far_deep", 400)]
+
+
+def test_a_vessel_reading_junk_near_the_surface_cant_make_real_water_far_deep(env):  # noqa: F811
+    put(env, 1, apart([(0, *at(5000, 0, 0.1 + 0.1 * i), 1.0) for i in range(5)]), "JUNK")
+    put(env, 2, apart([(0, *at(5000, 1, 0.5), 15.0)]), "REAL")
+    build(env)
+    assert not [f for f in flags(env) if f[1] == "consensus_far_deep"]
+
+
+def test_a_noisy_track_votes_but_sets_no_depth(env):  # noqa: F811
+    # A sounder hunting between 6 and 13 m, as NOAA Ship Pisces' did, crossing B's 9 m.
+    # Its 13 m side is noise and its 6 m side unconfirmed shoals that can't confirm each
+    # other: neither sets a depth, so B's 9 m does.
+    put(env, 1, line([6, 13] * 15, step=2), "PISCES")
+    put(env, 2, apart([(0, *at(5000, 4, 0.5), 9.0)]), "B")
+    build(env)
+    assert {(f, r, d) for f, r, d in flags(env) if r in ("track_noise", "spike")} == {
+        ("noisy", "track_noise", 13),
+        ("unconfirmed", "track_noise", 6),
+    }
+    assert [row[4] for row in grid(env) if row[2] < 5 or row[0] > 1] == [9.0]
+
+
+def test_a_noisy_track_doesnt_corroborate_another_vessels_shoal(env):  # noqa: F811
+    # Three vessels agree on 20 m; A reads 12 m once; B hunts between 12 and 15 m in the
+    # same block. B's 12 m readings are noise, so they don't save A's from being disproved.
+    for n, v in enumerate(("V1", "V2", "V3"), 1):
+        put(env, n, apart([(0, *at(5000, 2 + n, 0.5), 20.0)]), v)
+    put(env, 4, apart([(0, *at(5000, 4, 0.2), 12.0)]), "A")
+    put(env, 5, line([12, 15] * 8, step=2, r=5001), "B")
+    build(env)
+    assert ("noisy", "track_noise", 12) in flags(env)
+    assert ("unconfirmed", "consensus_shoal", 12) in [
+        f for f in flags(env) if f[1] == "consensus_shoal"
+    ]
+
+
+def test_a_rock_on_a_noisy_track_stays_a_shoal(env):  # noqa: F811
+    # A hunting sounder crosses a 2 m rock: it's kept as an unconfirmed shoal and published,
+    # not lost as noise.
+    depths = [9, 13] * 10
+    depths[10] = 2
+    put(env, 1, line(depths, step=2), "HUNTER")
+    build(env)
+    assert ("unconfirmed", "track_noise", 2) in flags(env)
+    assert 2.0 in [row[4] for row in env.query("SELECT * FROM lake.shoals")]
+
+
+def test_two_vessels_shoal_readings_confirm_each_other(env):  # noqa: F811
+    put(env, 1, line([14, 14, 14, 14, 3, 14, 14, 14, 14]))
+    put(env, 2, line([14, 14, 14, 14, 3, 14, 14, 14, 14], start=100), "AQM-2")
+    build(env)
+    assert [f for f in flags(env) if f[0] == "confirmed"] == [("confirmed", "cell_shoal", 3)] * 2
+
+
 def test_cells_keep_the_shoals_still_unconfirmed(env):  # noqa: F811
     # A's 20 m spike is rejected and its 3 m one stays unconfirmed; B's 3 m spike is
     # confirmed by C reading 3.4 m beside it.
@@ -263,7 +359,7 @@ def test_a_cell_shoal_is_unjudged_without_a_median_to_judge_it(judged, reason):
     con = duckdb.connect()
     con.execute(
         """CREATE TABLE classed AS SELECT 1 AS point_id, 'shoal' AS outlier,
-        false AS from_track, ? AS judged""",
+        false AS from_track, ? AS judged, 5.0 AS raw, false AS hunting""",
         [judged],
     )
     con.execute("CREATE TABLE confirmed (point_id INTEGER)")
@@ -348,10 +444,10 @@ def test_levels_count_only_vessels_with_accepted_soundings(env):  # noqa: F811
     rows = [(0, *at(5000, 0, 0.1 + i * 0.1), 10.0) for i in range(5)]
     rows += [(0, *at(5000, 1), 10.0), (0, *at(5000, 2), 10.0)]
     put(env, 1, apart(rows))
-    put(env, 2, [(0, *at(5000, 0, 0.9), 60.0)], "B")  # rejected as deeper than its cell
+    put(env, 2, [(0, *at(5000, 0, 0.9), 60.0)], "B")  # rejected: far deeper than A's 10 m
     build(env)
     assert [row[:3] for row in grid(env)] == [(9, 5000 // 9, 0)]
-    assert ("reject", "cell_deep", 60) in flags(env)
+    assert ("reject", "consensus_far_deep", 60) in flags(env)
 
 
 @pytest.mark.parametrize("shoal, kept", [(8.0, True), (2.0, False)])
@@ -508,6 +604,13 @@ def put_dated(env, n, rows, unique_id, day="2026/10/22"):  # noqa: F811
     env.noaa.put(key, csv(rows, unique_id))
 
 
+@pytest.fixture
+def sql_rules(monkeypatch):
+    """Only the rules the reference SQL has: no steep or noise checks."""
+    monkeypatch.setattr(qc, "STEEP_FACTOR", math.inf)
+    monkeypatch.setattr(qc, "NOISE_REL", math.inf)
+
+
 def qc_both_ways(env):  # noqa: F811
     with open_store(env.store, write=False) as con:
         batches = [
@@ -542,7 +645,7 @@ def track(seed, start, n, step):
     return rows
 
 
-def test_ingest_qc_matches_the_reference_sql(env):  # noqa: F811
+def test_ingest_qc_matches_the_reference_sql(env, sql_rules):  # noqa: F811
     # Tracks crossing several midnights (T0 is 18:00), with jumps and spikes around them.
     for n in range(1, 7):
         put_dated(env, n, track(n, -6 * 3600, 900, 60), f"V{n}")
@@ -552,7 +655,7 @@ def test_ingest_qc_matches_the_reference_sql(env):  # noqa: F811
     assert stored == reference
 
 
-def test_ingest_qc_matches_the_reference_sql_at_midnight_and_on_sparse_days(env):  # noqa: F811
+def test_ingest_qc_matches_the_reference_sql_at_midnight_and_on_sparse_days(env, sql_rules):  # noqa: F811
     midnight = 6 * 3600  # T0 is 18:00
     near = [midnight - 3, midnight - 2, midnight - 1, midnight, midnight + 1, midnight + 2]
     # A spike on each side of midnight and a jump exactly at it.
@@ -701,7 +804,9 @@ def test_a_qc_run_that_stops_resumes_from_its_last_checkpoint(env, monkeypatch):
     with pytest.raises(RuntimeError), open_store(env.store) as con:
         qc.run(con, missing_only=True)
     monkeypatch.setattr(
-        qc, "run_batch", lambda con, b, fresh=False: ran.append(b) or run_batch(con, b, fresh)
+        qc,
+        "run_batch",
+        lambda con, b, fresh=False: ran.append(b) or run_batch(con, b, fresh),
     )
     ran.clear()
     with open_store(env.store) as con:
@@ -746,6 +851,10 @@ def test_binned_confirmation_brackets_the_windowed_one():
     con.executemany(
         "INSERT INTO classed (point_id, cc, d, vessel, time, outlier) VALUES (?, ?, ?, ?, ?, ?)",
         rows,
+    )
+    con.execute(
+        "ALTER TABLE classed ADD COLUMN raw DOUBLE; UPDATE classed SET raw = d;"
+        " ALTER TABLE classed ADD COLUMN hunting BOOLEAN DEFAULT false"
     )
     con.execute(cells.CONFIRM)
     binned = {p for (p,) in con.execute("SELECT point_id FROM confirmed").fetchall()}

@@ -308,6 +308,21 @@ def test_offsets_per_step_segment_from_anchors_and_crossings(env, tmp_path, monk
     ]
 
 
+def test_a_noisy_tracks_soundings_dont_calibrate_its_vessel(env, tmp_path, monkeypatch):  # noqa: F811
+    # A sounder hunting between 6 and 13 m over the surveyed 10 m: its 13 m side is noise
+    # and its 6 m side unconfirmed shoals, so nothing it logged reaches calibration.
+    ref = reference(tmp_path / "ref.tif", (0, 110))
+    hunting = []
+    for n, rows, vessel in (transit(1 + i, "AQM-H", 10.0, (0, 240), i) for i in range(3)):
+        rows = [(s, lon, lat, 6.0 if j % 2 else 13.0) for j, (s, lon, lat, _) in enumerate(rows)]
+        hunting.append((n, rows, vessel))
+    calibrated(env, hunting, ref, monkeypatch)
+    assert [status for (v, _), (_, status) in segments(env).items() if v == "AQM-H"] in (
+        [],
+        ["uncalibrated"],
+    )
+
+
 def test_offsets_republish_only_past_their_standard_error(env, tmp_path, monkeypatch):  # noqa: F811
     ref = reference(tmp_path / "ref.tif", (0, 110))
     calibrated(env, FLEET, ref, monkeypatch)
@@ -644,13 +659,13 @@ def test_the_finest_raster_of_a_source_wins(env, tmp_path, monkeypatch):  # noqa
 def test_a_catalog_tile_with_no_link_yet_is_tried_again(tmp_path):
     path = tmp_path / "scheme.gpkg"
     with contextlib.closing(sqlite3.connect(path)) as db:
-        db.execute("CREATE TABLE t (fid INTEGER PRIMARY KEY, link TEXT)")
+        db.execute("CREATE TABLE t (fid INTEGER PRIMARY KEY, link TEXT, sha TEXT)")
         db.execute('CREATE VIRTUAL TABLE "rtree_t_geom" USING rtree(id, minx, maxx, miny, maxy)')
-        db.executemany("INSERT INTO t VALUES (?, ?)", [(1, "https://x/a.tif"), (2, None)])
+        db.executemany("INSERT INTO t VALUES (?, ?, NULL)", [(1, "https://x/a.tif"), (2, None)])
         db.executemany('INSERT INTO "rtree_t_geom" VALUES (?, 0, 1, 0, 1)', [(1,), (2,)])
         db.commit()
-    catalogs = {"bluetopo": (path, "t", "link")}
-    paths, pending = reference_mod.rasters("bluetopo", (0, 0, 1, 1), catalogs, tmp_path)
+    catalogs = {"bluetopo": (path, "t", "link", "sha", False)}
+    paths, pending = reference_mod.rasters("bluetopo", (0, 0, 1, 1), catalogs)
     assert paths == ["/vsicurl/https://x/a.tif"] and pending == [[0, 0, 1, 1]]
 
 
@@ -869,7 +884,7 @@ def test_a_failed_fine_raster_keeps_no_coarse_samples(env, tmp_path, monkeypatch
 
 def test_a_reference_path_with_no_rasters_is_an_error(tmp_path):
     with pytest.raises(FileNotFoundError):
-        reference_mod.rasters(str(tmp_path / "unmounted"), (0, 0, 1, 1), {}, tmp_path)
+        reference_mod.rasters(str(tmp_path / "unmounted"), (0, 0, 1, 1), {})
 
 
 def test_a_station_with_no_license_type_is_still_credited(env):  # noqa: F811
