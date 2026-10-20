@@ -107,10 +107,12 @@ CREATE TABLE IF NOT EXISTS lake.calibration (
 );
 -- Transits that disagree with their segment by more than a step, left uncalibrated.
 CREATE TABLE IF NOT EXISTS lake.calibration_outliers (
-  file_id BIGINT, vessel VARCHAR, transit_m FLOAT, segment_m FLOAT, content_hash VARCHAR
+  file_id BIGINT, vessel VARCHAR, transit_m FLOAT, segment_m FLOAT, content_hash VARCHAR,
+  seabed_m FLOAT
 );
 CREATE TABLE IF NOT EXISTS lake.file_offsets (
-  file_id BIGINT, vessel VARCHAR, offset_m FLOAT, se_m FLOAT, excluded BOOLEAN
+  file_id BIGINT, vessel VARCHAR, offset_m FLOAT, se_m FLOAT, excluded BOOLEAN,
+  lost_bottom BOOLEAN
 );
 -- Tiles whose cells a correction change has made stale, until `cells --changed` rebuilds them.
 CREATE TABLE IF NOT EXISTS lake.tile_changes (tile_id INTEGER, reason VARCHAR, changed TIMESTAMP);
@@ -123,6 +125,8 @@ ALTER TABLE lake.cells ADD COLUMN IF NOT EXISTS calibrated INTEGER;
 ALTER TABLE lake.cells ADD COLUMN IF NOT EXISTS sigma FLOAT;
 ALTER TABLE lake.calibration_outliers ADD COLUMN IF NOT EXISTS content_hash VARCHAR;
 ALTER TABLE lake.tide_stations ADD COLUMN IF NOT EXISTS unpredictable BOOLEAN;
+ALTER TABLE lake.file_offsets ADD COLUMN IF NOT EXISTS lost_bottom BOOLEAN;
+ALTER TABLE lake.calibration_outliers ADD COLUMN IF NOT EXISTS seabed_m FLOAT;
 """
 
 # A corrected depth past this is no drying height but a correction gone wrong; cells, the
@@ -217,7 +221,8 @@ CREATE OR REPLACE TEMP MACRO active_points_in(cell, tiles, rlo, rhi) AS TABLE {
 -- offset; `depth`, depth_raw reduced by both; and `sigma`, both corrections'
 -- uncertainty, the tide's widened by the station's distance. A correction that doesn't
 -- apply is NULL and leaves the depth as it is, and its uncertainty as UNTIDED_SIGMA or
--- UNCALIBRATED_SIGMA. `excluded` marks a vessel segment known to read too deep to use.
+-- UNCALIBRATED_SIGMA. `excluded` marks a vessel segment known to read too deep to use, and
+-- `lost_bottom` a transit its own vessel's calibration shows reading far too shallow.
 CREATE OR REPLACE TEMP MACRO corrected_points_in(cell, tiles, rlo, rhi) AS TABLE
 WITH c AS (
   SELECT tide_cell, station_id, km FROM lake.tide_cells
@@ -227,7 +232,9 @@ WITH c AS (
 l AS (SELECT * FROM lake.tide_levels WHERE station_id IN (SELECT station_id FROM c)),
 p AS (
   SELECT p.*, c.tide_cell IS NOT NULL AS tide_assigned, c.station_id AS tide_station,
-    coalesce(o.excluded, false) AS excluded, l.level + l.slope * epoch(p.time - l.slot) AS tide,
+    coalesce(o.excluded, false) AS excluded,
+    coalesce(o.lost_bottom, false) AS lost_bottom,
+    l.level + l.slope * epoch(p.time - l.slot) AS tide,
     sqrt(l.sigma ^ 2 + (c.km * {TIDE_KM_SIGMA}) ^ 2) AS tide_sigma, o.offset_m, o.se_m
   FROM active_points_in(cell, tiles, rlo, rhi) p
   LEFT JOIN c ON c.tide_cell = {TIDE_CELL}

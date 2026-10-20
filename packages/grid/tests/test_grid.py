@@ -376,8 +376,9 @@ def test_shoals_are_the_soundings_nothing_confirmed_or_rejected():
     )
     tile = (LAT0 + 90) * 360 + LON0 + 180
     con.execute(
-        "CREATE TABLE tile_points AS SELECT unnest(range(1, 6)) AS point_id, ? AS tile_id,"
-        " 5000 AS r, ? AS lon, ? AS lat, 3.0 AS depth_raw, 3.0 AS depth, false AS excluded, false AS awaiting_tide",
+        "CREATE TABLE tile_points AS SELECT unnest(range(1, 8)) AS point_id, ? AS tile_id,"
+        " 5000 AS r, ? AS lon, ? AS lat, 3.0 AS depth_raw, 3.0::DOUBLE AS depth, false AS excluded,"
+        " point_id IN (5, 6, 7) AS lost_bottom, false AS awaiting_tide",
         [tile, *at(5000, 7)],
     )
     v = qc.QC_VERSION
@@ -390,10 +391,14 @@ def test_shoals_are_the_soundings_nothing_confirmed_or_rejected():
             (3, "unconfirmed", "spike", v),
             (3, "reject", "consensus_shoal", v),
             (4, "unconfirmed", "spike", v - 1),  # an older QC's
+            # 5: a sounding of a transit that lost the bottom, a shoal with no flag of its own
+            (6, "reject", "spike", v),  # lost the bottom, but rejected anyway
         ],
     )
+    # 7: lost the bottom, but reading deeper than HAZARD_M: no hazard to warn of.
+    con.execute("UPDATE tile_points SET depth = ? WHERE point_id = 7", [qc.HAZARD_M + 5.0])
     con.execute(cells.SHOALS, {"partition": 1})
-    assert con.execute("SELECT tile_id, r, c FROM shoals").fetchall() == [(tile, 5000, 7)]
+    assert con.execute("SELECT tile_id, r, c FROM shoals").fetchall() == [(tile, 5000, 7)] * 2
 
 
 def test_aggregated_cells_keep_their_shoalest_base_cell(env):  # noqa: F811

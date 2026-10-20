@@ -779,6 +779,39 @@ def test_a_step_too_few_transits_show_leaves_them_alone(env, tmp_path, monkeypat
     assert deepest is not None and deepest <= 10.35 + 1e-4
 
 
+def test_a_transit_that_lost_the_bottom_publishes_shoals(env, tmp_path, monkeypatch):  # noqa: F811
+    # ROSEP-607cc5a5 at the Chesapeake's mouth: calibrated, then a run of transits reading
+    # 0.5 m in 8 m of water. Too few to make a step, they read 4.6 m shallower than their
+    # segment: lost bottom, not a draft.
+    ref = reference(tmp_path / "ref.tif", (0, 240))
+    fleet = [
+        *(transit(1 + i, "AQM-T", 5.4, (0, 240), i) for i in range(10)),
+        *(transit(20 + i, "AQM-T", 0.8, (0, 240), 20 + i) for i in range(2)),
+        *(transit(30 + i, "AQM-A", 9.5, (0, 240), 30 + i) for i in range(3)),
+    ]
+    calibrated(env, fleet, ref, monkeypatch)
+    got = {raw: c for u, _, raw, c in corrected(env, "depth_raw, lost_bottom") if u == "AQM-T"}
+    assert {round(raw) for raw, c in got.items() if c} == {1}
+    assert not any(c for raw, c in got.items() if raw > 5)
+    with open_store(env.store) as con:
+        cells.build(con)
+    # The cells are drawn from the other transits, 10 m deep, never from the lost ones...
+    assert env.query("SELECT min(depth) FROM lake.cells")[0][0] > 9
+    # ...which still publish, as unconfirmed shoals.
+    assert env.query("SELECT count(*), max(depth) FROM lake.shoals")[0] == (
+        pytest.approx(len(fleet[10][1]) * 2, rel=0.1),
+        pytest.approx(0.85, abs=0.01),
+    )
+
+
+def test_a_store_from_before_lost_bottom_marks_no_tiles(env, tmp_path, monkeypatch):  # noqa: F811
+    calibrated(env, FLEET, reference(tmp_path / "ref.tif", (0, 110)), monkeypatch)
+    with open_store(env.store) as con:
+        # As the migration leaves an older store's rows.
+        con.execute("UPDATE lake.file_offsets SET lost_bottom = NULL")
+        assert calibrate.assign(con) == 0
+
+
 def test_a_too_deep_segment_publishes_no_shoals(env, tmp_path, monkeypatch):  # noqa: F811
     # A reads 4 m deep, and one of its soundings is a spike shoaler than its track: an
     # unconfirmed shoal, at a depth that is 4 m too deep.
@@ -901,17 +934,28 @@ def test_a_station_with_no_license_type_is_still_credited(env):  # noqa: F811
 
 
 @pytest.mark.parametrize(
-    "status, offset, se, transit, excluded",
+    "status, offset, se, transit, expected, seabed",
     [
-        ("rejected", 3.4, 0.3, None, True),  # past the bound, however uncertain
-        ("rejected", 2.5, 0.6, None, True),  # too uncertain to apply, but surely deep
-        ("uncalibrated", 0.3, 0.2, None, False),  # within noise of zero
-        ("uncalibrated", -2.0, 0.2, None, False),  # reads shallow: errs safe
-        ("anchored", -1.0, 0.05, 2.0, True),  # a stray transit measured 2 m deep
-        ("anchored", -1.0, 0.05, -4.0, False),  # a stray transit reading shallow
+        ("rejected", 3.4, 0.3, None, (True, False), 8.0),  # past the bound, however uncertain
+        ("rejected", 2.5, 0.6, None, (True, False), 8.0),  # too uncertain to apply, but surely deep
+        ("uncalibrated", 0.3, 0.2, None, (False, False), 8.0),  # within noise of zero
+        ("uncalibrated", -2.0, 0.2, None, (False, False), 8.0),  # reads shallow: errs safe
+        ("anchored", -1.0, 0.05, 2.0, (True, False), 8.0),  # a stray transit measured 2 m deep
+        # Stray transits over 8 m of seabed. One reading as a draft would...
+        ("anchored", -1.0, 0.05, -2.5, (False, False), 8.0),
+        # ...one that lost the bottom: 5 m under its segment, reading 2 m in 8.
+        ("anchored", -1.0, 0.05, -6.0, (False, True), 8.0),
+        # True among a segment reading 2.6 m deep: shallower than it, but not of the seabed.
+        ("anchored", 2.6, 0.05, 0.0, (False, False), 8.0),
+        # A sounder moved 3.6 m down, too few transits since to make a step: 4.4 m of 8.
+        ("anchored", 0.0, 0.05, -3.6, (False, False), 8.0),
+        # A deep draft reading 7 m of 16, its sounder moved 2.5 m: 4.5 m is over half of 7.
+        ("anchored", -9.0, 0.05, -11.5, (False, False), 16.0),
+        # Calibrated before the seabed was recorded: nothing to judge it by.
+        ("anchored", -1.0, 0.05, -6.0, (False, False), None),
     ],
 )
-def test_files_known_to_read_deep_are_left_out(env, status, offset, se, transit, excluded):  # noqa: F811
+def test_files_read_wrong(env, status, offset, se, transit, expected, seabed):  # noqa: F811
     lon, lat = at(5000, 0)
     put(env, 1, [(0, lon, lat, 5.0)])
     env.run("noaa")
@@ -922,16 +966,16 @@ def test_files_known_to_read_deep_are_left_out(env, status, offset, se, transit,
         )
         if transit is not None:
             con.execute(
-                "INSERT INTO lake.calibration_outliers SELECT file_id, vessel, ?, ?, content_hash"
-                " FROM lake.files",
-                [transit, offset],
+                "INSERT INTO lake.calibration_outliers"
+                " SELECT file_id, vessel, ?, ?, content_hash, ? FROM lake.files",
+                [transit, offset, seabed],
             )
         calibrate.assign(con)
-    [(x,)] = env.query(
-        "SELECT DISTINCT excluded FROM corrected_points_in("
+    [(x, c)] = env.query(
+        "SELECT DISTINCT excluded, lost_bottom FROM corrected_points_in("
         "(SELECT any_value(cell_id) FROM lake.points), [], 0, 10800)"
     )
-    assert x == excluded
+    assert (x, c) == expected
 
 
 def test_an_empty_refetch_keeps_a_months_residuals(env):  # noqa: F811

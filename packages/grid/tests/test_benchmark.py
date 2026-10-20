@@ -141,6 +141,19 @@ def test_vessels_count_as_the_surface_takes_them(store):
     assert vessels["0"]["pixels"] == 98
 
 
+def test_transits_that_lost_the_bottom_dont_count(store):
+    objects, surface_dir = store
+    with open_store(objects) as con:
+        # Calibration found B's and C's transits read far under the seabed.
+        con.executemany(
+            "INSERT INTO lake.file_offsets VALUES (1, ?, NULL, NULL, false, true)", [("B",), ("C",)]
+        )
+    with open_store(objects, write=False) as con:
+        result = benchmark.run(con, surface_dir, qc_version=7)
+    vessels = result["estimates"]["surface"]["classes"]["vessels"]
+    assert vessels["1"]["pixels"] == 3 and vessels["2–3"]["pixels"] == 0
+
+
 def test_without_flags_at_the_version_every_sounding_counts(store):
     objects, surface_dir = store
     with open_store(objects) as con:
