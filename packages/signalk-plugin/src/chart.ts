@@ -31,6 +31,10 @@ import { registerPlotterExtension } from "./plotterext/provider.js";
 const POSITION_CONFIG_KEY = "config_position";
 const DEPTH_CONFIG_KEY = "config_depth";
 
+/** How the plugin turns soundings into cells. Bump it when that changes, so cells built
+ * the old way are rebuilt. */
+const LAYER_VERSION = 2;
+
 /** The safety depth the layer draws with until the owner sets one, in metres. */
 export const DEFAULT_SAFETY_DEPTH_M = 3;
 
@@ -46,6 +50,7 @@ export function cellConfig(config: Config) {
   return {
     position: JSON.stringify({
       transducer: distance > 0 ? { forward: dy, starboard: dx } : null,
+      layer: LAYER_VERSION,
       qc: DEFINITIONS.qc,
       rows: DEFINITIONS.cells.rows_per_degree,
       columns: DEFINITIONS.cells.column_steps_divide,
