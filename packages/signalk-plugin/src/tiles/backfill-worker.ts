@@ -7,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { Temporal } from "@js-temporal/polyfill";
 import { createCellStore } from "./cells.js";
 import { createCellWriter } from "./writer.js";
+import type { Tide } from "./tide.js";
 
 const db = new DatabaseSync(workerData.file);
 // As the plugin's own connection: no sync on every commit, which wears an SD card, and
@@ -24,6 +25,7 @@ type Sent = {
   depth: number;
   time: number;
   heading?: number;
+  tide?: Tide;
 };
 
 parentPort!.on(
@@ -42,6 +44,7 @@ parentPort!.on(
             latitude: s.latitude,
             depth: s.depth,
             heading: s.heading,
+            tide: s.tide,
             timestamp: Temporal.Instant.fromEpochMilliseconds(s.time),
           });
         }

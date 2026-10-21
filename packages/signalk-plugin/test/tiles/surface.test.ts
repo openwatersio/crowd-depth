@@ -114,3 +114,16 @@ test("zoomed out, a tile still draws the cells under it", () => {
     "measured",
   );
 });
+
+test("coverage says whether its water is reduced to chart datum", () => {
+  const quality = (cells: Cell[]) =>
+    features(decode(buildTile(Z, tile.x, tile.y, cells, [])!), "M_QUAL")[0]
+      .properties;
+  const tided = lane(LON, () => 8).map((c) => ({ ...c, t: 0.25 }));
+  expect(quality(tided)).toMatchObject({ tided: 1 });
+  expect(String(quality(tided).INFORM)).toContain("Reduced to chart datum");
+  // One untided cell makes the tile untided.
+  const mixed = [...tided.slice(1), lane(LON, () => 8)[0]];
+  expect(quality(mixed)).toMatchObject({ tided: 0 });
+  expect(String(quality(mixed).INFORM)).toContain("Not reduced for tide");
+});
