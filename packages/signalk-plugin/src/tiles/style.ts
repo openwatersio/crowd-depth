@@ -3,7 +3,8 @@
 // read as the chart's do, but drawn over a chart in that palette, such as Seamap, they'd
 // vanish into it: its soundings, contours and the water the boat sounded itself are
 // drawn in a colour of their own. The depth unit is a `global-state` variable the
-// runtime sets, and the safety depth one whose default comes from the plugin's settings.
+// runtime sets; the safety depth and the boat's own colours and tint are ones whose
+// defaults come from the plugin's settings.
 import { MAX_ZOOM, MIN_ZOOM } from "./surface.js";
 
 /** Seascape's day flavor. */
@@ -22,12 +23,31 @@ const DAY = {
   drying: "#58af9c",
   labelHalo: "rgba(255,255,255,0.8)",
   provisional: "#f58231",
-  // The boat's own data, in a colour no chart in this palette uses for depths.
-  own: "#7b2cbf",
-  ownEmphasis: "#3c096c",
-  // Tint over the water the boat sounded, and fainter over what's interpolated.
+  // Tint over the water the boat sounded, and fainter over what's interpolated, at
+  // the "normal" strength.
   ownMeasured: 0.14,
   ownInterpolated: 0.07,
+};
+
+/** How the boat's own data is drawn, from the plugin's settings. */
+export interface OwnStyle {
+  /** Soundings, contours and the tint, as `#rrggbb`. */
+  accent: string;
+  /** Soundings shoaler than the safety depth, as `#rrggbb`. */
+  shoal: string;
+  tint: Tint;
+  contours: boolean;
+}
+
+export const TINTS = { off: 0, faint: 0.5, normal: 1, strong: 2 };
+export type Tint = keyof typeof TINTS;
+
+/** The boat's own data, in a colour no chart in Seascape's palette uses for depths. */
+export const DEFAULT_OWN_STYLE: OwnStyle = {
+  accent: "#7b2cbf",
+  shoal: "#3c096c",
+  tint: "normal",
+  contours: true,
 };
 
 /** Small float error in stored band edges stays inside a band. */
@@ -36,9 +56,11 @@ const EPS = 0.01;
 export function buildStyle({
   tiles,
   safetyDepth,
+  own = DEFAULT_OWN_STYLE,
 }: {
   tiles: string;
   safetyDepth: number;
+  own?: OwnStyle;
 }) {
   const band: unknown[] = ["step", ["get", "DRVAL1"], DAY.bandColors[5]];
   [...DAY.bandEdges].reverse().forEach((edge, i) => {
@@ -60,6 +82,9 @@ export function buildStyle({
       depthLabel: { default: "depth_m" },
       // Metres per the user's depth unit, for contour labels.
       metresPerUnit: { default: 1 },
+      ownColor: { default: own.accent },
+      ownShoal: { default: own.shoal },
+      ownTint: { default: TINTS[own.tint] },
     },
     sources: {
       cells: {
@@ -97,12 +122,16 @@ export function buildStyle({
         source: "cells",
         "source-layer": "M_QUAL",
         paint: {
-          "fill-color": DAY.own,
+          "fill-color": ["global-state", "ownColor"],
           "fill-opacity": [
-            "case",
-            ["==", ["get", "kind"], "measured"],
-            DAY.ownMeasured,
-            DAY.ownInterpolated,
+            "*",
+            ["global-state", "ownTint"],
+            [
+              "case",
+              ["==", ["get", "kind"], "measured"],
+              DAY.ownMeasured,
+              DAY.ownInterpolated,
+            ],
           ],
         },
       },
@@ -112,7 +141,7 @@ export function buildStyle({
         source: "cells",
         "source-layer": "DEPCNT",
         paint: {
-          "line-color": DAY.own,
+          "line-color": ["global-state", "ownColor"],
           "line-width": 1.2,
           "line-opacity": 0.9,
         },
@@ -140,7 +169,7 @@ export function buildStyle({
           "text-size": 10,
         },
         paint: {
-          "text-color": DAY.own,
+          "text-color": ["global-state", "ownColor"],
           "text-halo-color": DAY.labelHalo,
           "text-halo-width": 1,
         },
@@ -159,8 +188,8 @@ export function buildStyle({
           "text-color": [
             "case",
             ["<", ["get", "VALSOU"], ["global-state", "safetyDepth"]],
-            DAY.ownEmphasis,
-            DAY.own,
+            ["global-state", "ownShoal"],
+            ["global-state", "ownColor"],
           ],
           // An unconfirmed shoal is a warning, not a measured depth: drawn fainter.
           "text-opacity": ["case", ["has", "unconfirmed"], 0.7, 1],
@@ -194,6 +223,8 @@ export function buildStyle({
           "text-halo-width": 1,
         },
       },
-    ],
+      // Left out rather than hidden, as visibility takes no `global-state`, so turning
+      // contours on or off shows once the plotter loads the style again.
+    ].filter((layer) => own.contours || !layer.id.startsWith("depcnt")),
   };
 }
