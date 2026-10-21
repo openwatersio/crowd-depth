@@ -4,9 +4,12 @@ import { PbfReader as Pbf } from "pbf";
 import { Cell, cellDepth } from "../../src/tiles/cells.js";
 import { cellAt, cellCenter, tileFraction } from "../../src/tiles/geometry.js";
 import { EXTENT } from "../../src/tiles/mvt.js";
+import { createDB } from "../../src/storage.js";
+import { createCellStore } from "../../src/tiles/index.js";
+import { readTile } from "../../src/tiles/service.js";
 import {
   buildTile,
-  close,
+  outline,
   contourLevels,
   surface,
 } from "../../src/tiles/surface.js";
@@ -238,19 +241,19 @@ test("a notch between two passes ending side by side is filled", () => {
 });
 
 test("gaps of up to four pixels are closed, a 3×3 one kept", () => {
-  const size = 20;
-  const edge = new Float32Array(size * size).fill(1);
-  const depth = new Float32Array(size * size).fill(5);
+  const size = 24;
+  const mask = new Float32Array(size * size).fill(1);
   const hole = (x0: number, y0: number, w: number) => {
     for (let y = y0; y < y0 + w; y++) {
-      for (let x = x0; x < x0 + w; x++) edge[y * size + x] = -1;
+      for (let x = x0; x < x0 + w; x++) mask[y * size + x] = 0;
     }
   };
-  hole(2, 2, 2);
-  hole(10, 10, 3);
-  close(edge, edge.slice(), depth, size, true);
-  expect(edge[2 * size + 2]).toBeGreaterThanOrEqual(0);
-  expect(edge[11 * size + 11]).toBeLessThan(0);
+  // Grown a pixel, a 4×4 hole is 2×2, and closed; a 5×5 one is 3×3, and kept.
+  hole(2, 2, 4);
+  hole(12, 12, 5);
+  const edge = outline(mask, size, true);
+  expect(edge[3 * size + 3]).toBeGreaterThanOrEqual(0);
+  expect(edge[14 * size + 14]).toBeLessThan(0);
 });
 
 test("every depth area is covered, as measured or interpolated, never both", () => {
@@ -335,4 +338,37 @@ test("water a diagonal pass sounded stays measured beside interpolated water", (
     });
     expect(inside, `cell ${c.py},${c.px}`).toBe(true);
   }
+});
+
+test("a shoal just past a tile's edge caps the depths carried beside it", () => {
+  // 12 m water around a corner just west of a tile's edge, and a 3 m shoal in the
+  // corner, outside the tile: the tile reads it over its margin.
+  const z = 15;
+  const f = tileFraction(LON, LAT, z);
+  const x = Math.floor(f.x) + 1;
+  const y = Math.floor(f.y);
+  const s = cellAt((x / 2 ** z) * 360 - 180 - 0.0003, LAT);
+  const store = createCellStore(createDB(":memory:"));
+  const passes = [];
+  for (let r = -12; r <= 12; r++) {
+    for (let c = -12; c <= 12; c++) {
+      if (r < -1 || c < -1) {
+        passes.push({ py: s.py + r, px: s.px + c, depth: 12, day: 20000 });
+      }
+    }
+  }
+  store.addPasses(passes);
+  const bands = () =>
+    features(decode(readTile(store, z, x, y)!), "DEPARE").map(
+      (a) => a.properties.DRVAL1,
+    );
+  expect(bands()).toEqual([5]);
+  const p = cellCenter(s.py, s.px);
+  store.addShoals([{ lon: p.lon, lat: p.lat, depth: 3, time: 0 }]);
+  const t = decode(readTile(store, z, x, y)!);
+  expect(bands()).toEqual([2, 5]);
+  // It publishes in its own tile, not this one.
+  expect(features(t, "SOUNDG").filter((g) => g.properties.unconfirmed)).toEqual(
+    [],
+  );
 });

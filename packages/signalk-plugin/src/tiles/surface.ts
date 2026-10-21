@@ -119,13 +119,13 @@ interface Raster {
   /** Metres to the nearest sounded cell, and the distance that counts as measured. */
   near: Float32Array;
   measuredM: number;
-  /** At least 0 where the surface is drawn: where half the neighbourhood has a depth or
-   * within a cell of a sounded cell, grown a pixel, or in a small gap closed. In metres,
-   * scaled so it decides the edge, and the depth the bands within it. */
+  /** At least 0 where the surface is drawn, from `outline`: where half the
+   * neighbourhood has a depth or within a cell of a sounded cell. Scaled so it decides
+   * the edge, and the depth the bands within it. */
   edge: Float32Array;
-  /** At least 0 in the part of it interpolated, more than a cell from a sounded cell;
-   * the rest is measured. */
-  interpolated: Float32Array;
+  /** As `edge`, for the part of it within a cell of a sounded cell, which is measured;
+   * the rest is interpolated. */
+  measuredEdge: Float32Array;
 }
 
 interface Source {
@@ -272,24 +272,26 @@ export function surface(
     const d = m - K * sigma;
     depth[i] = m >= 0 ? Math.max(0, d) : d;
   }
-  // Grown a pixel all round, as the grid's surface is, so a lone pass a pixel wide
-  // survives the tracing at every zoom. Each pixel takes the largest of its neighbours',
-  // which moves an edge a pixel out and keeps where it falls between pixels, so it still
-  // curves as the depths do.
-  const measuredEdge = dilate(
-    near.map((d) => (Number.isFinite(d) ? measuredM - d : -1)),
+  // The surface is drawn where half of each pixel's blurred neighbourhood has a depth or
+  // within a cell of a sounded cell, and its measured part within a cell of one. Each is
+  // traced from a mask, as the grid's edges are, smoothed so it curves rather than
+  // following pixels or the round reach of each cell.
+  const notches = tileMetres(z, 0) / n <= 1.5 * CELL_M;
+  const sounded = near.map((d) => (d <= measuredM ? 1 : 0));
+  const interpolated = cover.map((c, i) => (c >= 0.5 && !sounded[i] ? 1 : 0));
+  const edge = outline(
+    sounded.map((v, i) => v || interpolated[i]),
     size,
+    notches,
   );
-  // Grown, interpolated water still stops a cell from a sounded cell: that water is
-  // measured whatever surrounds it.
-  const interpolated = dilate(
-    cover.map((c, i) => Math.min((c - 0.5) * 100, near[i] - measuredM)),
+  // Grown as the surface is, but never over interpolated water.
+  const measuredEdge = outline(
+    square(sounded, size, 1, true).map((v, i) => (interpolated[i] ? 0 : v)),
     size,
-  ).map((e, i) => Math.min(e, near[i] - measuredM));
-  const edge = measuredEdge.map((e, i) => Math.max(e, interpolated[i]));
-  // Closed only where a pixel is at most a cell and a half, by zoom alone, so
-  // neighbouring tiles close alike: zoomed out it would join water far apart.
-  close(edge, interpolated, depth, size, tileMetres(z, 0) / n <= 1.5 * CELL_M);
+    false,
+    false,
+  );
+  fill(edge, depth, size);
 
   // Carried past the interpolated pixels, a depth is never deeper than a published
   // sounding in its pixel or beside it, cell or unconfirmed shoal, as the grid
@@ -333,96 +335,80 @@ export function surface(
     near,
     measuredM,
     edge,
-    interpolated,
+    measuredEdge,
   };
 }
 
-/** The largest of each pixel's and its eight neighbours' values. */
-function dilate(values: Float32Array, size: number): Float32Array {
-  const out = new Float32Array(values.length).fill(-Infinity);
-  for (let py = 0; py < size; py++) {
-    for (let px = 0; px < size; px++) {
-      let v = -Infinity;
-      for (
-        let yy = Math.max(0, py - 1);
-        yy <= Math.min(size - 1, py + 1);
-        yy++
-      ) {
-        for (
-          let xx = Math.max(0, px - 1);
-          xx <= Math.min(size - 1, px + 1);
-          xx++
-        ) {
-          v = Math.max(v, values[yy * size + xx]);
-        }
+/** Whether any, or all, of the square of side 2r + 1 about each pixel is in `mask`. Past
+ * the raster's edge counts as in it for all, so an erosion doesn't eat in from there. */
+function square(mask: Float32Array, size: number, r: number, any: boolean) {
+  return mask.map((_, i) => {
+    const py = Math.floor(i / size);
+    const px = i % size;
+    for (let yy = py - r; yy <= py + r; yy++) {
+      for (let xx = px - r; xx <= px + r; xx++) {
+        const out = xx < 0 || yy < 0 || xx >= size || yy >= size;
+        const v = out ? !any : mask[yy * size + xx] === 1;
+        if (v === any) return any ? 1 : 0;
       }
-      out[py * size + px] = v;
     }
-  }
-  return out;
+    return any ? 0 : 1;
+  });
 }
 
 /**
- * Give each pixel drawn without a depth the nearest within FILL_PX, as where the surface
- * is grown zoomed out, with nothing blurred past it; and if `notches`, close the drawn
- * surface's gaps of up to MAX_GAP_PX pixels and notches up to NOTCH_PX
- * wide, which would trace as holes and sharp V's, as the grid's `outline` does. Their
- * pixels take the depth carried to them or the nearest, and are interpolated water.
+ * The edge of `mask`, at least 0 inside, for tracing: if `grow`, grown a pixel all round,
+ * as the grid's surface is, so a lone pass a pixel wide survives the tracing at every zoom; if
+ * `notches`, closed over gaps of up to MAX_GAP_PX pixels and notches up to NOTCH_PX wide,
+ * which would trace as holes and sharp V's, as the grid's `outline` does; and blurred a
+ * pixel, so its edge curves, and falls where the mask's does along a straight edge.
  */
-export function close(
-  edge: Float32Array,
-  interpolated: Float32Array,
-  depth: Float32Array,
+export function outline(
+  mask: Float32Array,
   size: number,
   notches: boolean,
-) {
-  const drawn = edge.map((e) => (e >= 0 ? 1 : 0));
-  // A close by a square NOTCH_PX + 1 wide. Past the raster's edge counts as drawn, so the
-  // erosion doesn't eat in from it.
-  const r = NOTCH_PX / 2;
-  const square = (src: Float32Array, any: boolean) =>
-    src.map((_, i) => {
-      const py = Math.floor(i / size);
-      const px = i % size;
-      for (let yy = py - r; yy <= py + r; yy++) {
-        for (let xx = px - r; xx <= px + r; xx++) {
-          const out = xx < 0 || yy < 0 || xx >= size || yy >= size;
-          const v = out ? !any : src[yy * size + xx] === 1;
-          if (v === any) return any ? 1 : 0;
-        }
-      }
-      return any ? 0 : 1;
-    });
-  // It fills every gap of fewer than (NOTCH_PX + 1)² pixels too, so all those of
-  // MAX_GAP_PX: an undrawn pixel it leaves has a whole square of undrawn pixels about it.
-  const closed = notches ? square(square(drawn, true), false) : drawn;
+  grow = true,
+): Float32Array {
+  let grown = grow ? square(mask, size, 1, true) : mask;
+  // A close by a square NOTCH_PX + 1 wide. It fills every gap of fewer than
+  // (NOTCH_PX + 1)² pixels too, so all those of MAX_GAP_PX: an undrawn pixel it leaves
+  // has a whole square of undrawn pixels about it.
+  if (notches) {
+    const r = NOTCH_PX / 2;
+    grown = square(square(grown, size, r, true), size, r, false);
+  }
+  const { cover } = blur(
+    grown.map((v) => (v ? 1 : NaN)),
+    size,
+    1,
+  );
+  return cover.map((c) => (c - 0.5) * 100);
+}
+
+/** Give each pixel inside `edge` without a depth the nearest within FILL_PX, the
+ * shoaler of two as near: where the surface is grown or closed past the depths blurred
+ * to it. */
+function fill(edge: Float32Array, depth: Float32Array, size: number) {
   const carried = depth.slice();
   for (let i = 0; i < edge.length; i++) {
-    if (!closed[i]) continue;
-    if (Number.isNaN(depth[i])) {
-      const py = Math.floor(i / size);
-      const px = i % size;
-      let best = Infinity;
-      for (let yy = py - FILL_PX; yy <= py + FILL_PX; yy++) {
-        for (let xx = px - FILL_PX; xx <= px + FILL_PX; xx++) {
-          if (xx < 0 || yy < 0 || xx >= size || yy >= size) continue;
-          const d2 = (xx - px) ** 2 + (yy - py) ** 2;
-          const d = carried[yy * size + xx];
-          // The shoaler of two as near.
-          if (
-            d2 <= FILL_PX * FILL_PX &&
-            !Number.isNaN(d) &&
-            (d2 < best || (d2 === best && d < depth[i]))
-          ) {
-            best = d2;
-            depth[i] = d;
-          }
+    if (edge[i] < 0 || !Number.isNaN(depth[i])) continue;
+    const py = Math.floor(i / size);
+    const px = i % size;
+    let best = Infinity;
+    for (let yy = py - FILL_PX; yy <= py + FILL_PX; yy++) {
+      for (let xx = px - FILL_PX; xx <= px + FILL_PX; xx++) {
+        if (xx < 0 || yy < 0 || xx >= size || yy >= size) continue;
+        const d2 = (xx - px) ** 2 + (yy - py) ** 2;
+        const d = carried[yy * size + xx];
+        if (
+          d2 <= FILL_PX * FILL_PX &&
+          !Number.isNaN(d) &&
+          (d2 < best || (d2 === best && d < depth[i]))
+        ) {
+          best = d2;
+          depth[i] = d;
         }
       }
-    }
-    if (!drawn[i] && !Number.isNaN(depth[i])) {
-      edge[i] = BAND_EPS_M;
-      interpolated[i] = BAND_EPS_M;
     }
   }
 }
@@ -672,8 +658,7 @@ export function buildTile(
     !Number.isNaN(depth[i]) && depth[i] <= MAX_AREA_DEPTH_M;
   // Just outside the surface, how far outside, so an edge falls between pixels rather
   // than on the last one with a depth, and a lone pixel draws as more than a point.
-  const outside = (i: number) =>
-    Number.isFinite(r.near[i]) ? Math.min(edge[i], -BAND_EPS_M) : -1;
+  const outside = (i: number) => Math.min(edge[i], -BAND_EPS_M);
 
   const DEPARE: Feature[] = [];
   const bands: [number, number][] = [
@@ -683,12 +668,18 @@ export function buildTile(
     ),
   ];
   for (const [lo, hi] of bands) {
-    // At least 0 inside the band, crossing 0 where the depth reaches either edge.
+    // At least 0 inside the band, crossing 0 where the depth reaches either edge. In
+    // centimetres, so near the surface's edge, its edge decides where the band stops and
+    // the bands reach it together.
     const polys = polygons(r, (i) =>
       // A band holds its lower edge, not its upper: a depth of exactly 0 m, which the
       // margin clamps shallow water to, is wet, not drying.
       has(i)
-        ? Math.min(depth[i] - lo, hi - depth[i] - BAND_EPS_M, edge[i])
+        ? Math.min(
+            100 * (depth[i] - lo),
+            100 * (hi - depth[i] - BAND_EPS_M),
+            edge[i],
+          )
         : outside(i),
     );
     if (polys.length) {
@@ -789,12 +780,10 @@ export function buildTile(
       : {}),
   };
   const M_QUAL: Feature[] = [];
-  // Coverage is split where the interpolated part's edge is: the two share it, so they
-  // neither overlap nor leave a gap, and their outer edge is the surface's, so they
-  // reach as far as its areas do. Interpolated water is never drawn as measured.
-  const side = (i: number) =>
-    edge[i] < 0 ? edge[i] : r.interpolated[i] >= 0 ? edge[i] : -edge[i];
-  const measured = polygons(r, (i) => (edge[i] < 0 ? edge[i] : -side(i)));
+  // Coverage is split along the measured part's edge: the two share it, so they neither
+  // overlap nor leave a gap, and their outer edge is the surface's, so they reach as
+  // far as its areas do.
+  const measured = polygons(r, (i) => Math.min(edge[i], r.measuredEdge[i]));
   if (measured.length) {
     M_QUAL.push({
       type: "Polygon",
@@ -802,7 +791,9 @@ export function buildTile(
       properties: { ...quality, kind: "measured" },
     });
   }
-  const between = polygons(r, (i) => (has(i) ? side(i) : outside(i)));
+  const between = polygons(r, (i) =>
+    has(i) ? Math.min(edge[i], -r.measuredEdge[i]) : outside(i),
+  );
   if (between.length) {
     M_QUAL.push({
       type: "Polygon",
