@@ -1,5 +1,6 @@
 """Track QC as SQL over each file: the reference the numpy QC must agree with."""
 
+from grid.catalog import POINT_ID
 from grid.cells import OTHER_PASS, SUPPORT
 from grid.qc import (
     ARRIVAL_SLACK_S,
@@ -51,7 +52,7 @@ def _speed(a: str, b: str) -> str:
 
 TRACK_QC = f"""
 WITH p AS (
-  SELECT p.point_id, p.file_id, p."row", p.time, p.lon, p.lat, p.depth_raw AS d, f.arrival
+  SELECT {POINT_ID} AS point_id, p.file_id, p."row", p.time, p.lon, p.lat, p.depth_raw AS d, f.arrival
   FROM lake.points p JOIN lake.files f USING (file_id) WHERE p.batch_id = $batch
 ),
 basic AS (

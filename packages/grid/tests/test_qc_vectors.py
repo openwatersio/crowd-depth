@@ -196,10 +196,11 @@ def reference_flags(con, soundings, arrival_s):
     con.execute("DELETE FROM lake.points; DELETE FROM lake.files")
     con.execute("INSERT INTO lake.files VALUES (1, make_timestamp(?))", [round(arrival_s * 1e6)])
     con.executemany(
-        "INSERT INTO lake.points VALUES (?, 1, ?, make_timestamp(?), ?, ?, ?, 1)",
-        [(i, i, round(t * 1e6), lon, lat, d) for i, (t, lon, lat, d) in enumerate(soundings)],
+        "INSERT INTO lake.points VALUES (1, ?, make_timestamp(?), ?, ?, ?, 1)",
+        [(i, round(t * 1e6), lon, lat, d) for i, (t, lon, lat, d) in enumerate(soundings)],
     )
-    return set(con.execute(reference_qc.TRACK_QC, {"batch": 1}).fetchall())
+    found = con.execute(reference_qc.TRACK_QC, {"batch": 1}).fetchall()
+    return {(point_id & 0xFFFFFFFF, flag, reason) for point_id, flag, reason in found}
 
 
 def qc_flags(soundings, arrival_s):
@@ -215,7 +216,7 @@ def lake():
     con = duckdb.connect()
     con.execute("ATTACH ':memory:' AS lake")
     con.execute(
-        """CREATE TABLE lake.points (point_id INTEGER, file_id BIGINT, "row" INTEGER,
+        """CREATE TABLE lake.points (file_id BIGINT, "row" INTEGER,
         time TIMESTAMP, lon DOUBLE, lat DOUBLE, depth_raw FLOAT, batch_id BIGINT)"""
     )
     con.execute("CREATE TABLE lake.files (file_id BIGINT, arrival TIMESTAMP)")
@@ -297,7 +298,7 @@ def test_changing_a_grid_definition_bumps_the_grid_version():
     # and `tide` holds tide.py's and catalog.py's.
     grid = {k: DEFINITIONS[k] for k in ("cells", "statistic", "surface", "tide")}
     digest = hashlib.sha256(json.dumps(grid, sort_keys=True).encode()).hexdigest()[:16]
-    assert (cells.GRID_VERSION, digest) == (9, "1da66efca7139c30")
+    assert (cells.GRID_VERSION, digest) == (10, "1da66efca7139c30")
 
 
 def test_spike_chunks_give_the_same_flags(monkeypatch):

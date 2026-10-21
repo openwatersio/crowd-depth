@@ -141,7 +141,7 @@ Keep the 1° tile as the unit for the surface, and tile at z8 web tiles with byt
 1. **Crop the surface to the data's extent** (or skip 512×512 blocks with no sounding within 200 m). This removes most of the 36–73 worker-hours of fixed cost and brings sparse tiles' memory far under 2 GB.
 2. **Make dense tiles incremental below 1°.** `cells.units` already splits dense tiles into 3″-row bands. Mark bands dirty (plus one band each side for consensus and σ's windows), and rebuild the surface in windows (for example 1/8° plus 200 m). Then daily cost follows the new data's footprint, not the harbor's history.
 3. **Grid each tile with a few pixels of margin and crop after the blur and guard,** and let consensus read across tile edges. Then re-measure the seams.
-4. **Make `placed` deterministic** (break ties on `point_id`), so unchanged inputs give unchanged bytes and change detection can trust hashes.
+4. **Make `placed` deterministic** (break ties on a key from the sounding's content and row), so unchanged inputs give unchanged bytes and change detection can trust hashes.
 5. **Read the tile's active points once per cells run,** not once per band unit, and fold `SOURCES` into it.
 6. **Build the low zooms hierarchically** before the planet's feature volume makes one run slow, and test that shoals survive at z4–z7.
 

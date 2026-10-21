@@ -78,7 +78,7 @@ POINTS = f"""
 CREATE OR REPLACE TEMP TABLE surface_points AS
 WITH wanted AS MATERIALIZED (
   SELECT * FROM (
-    SELECT p.point_id, p.unique_id AS vessel, p.depth AS d, p.sigma, p.lost_bottom,
+    SELECT p.point_id, p.content_key, p.unique_id AS vessel, p.depth AS d, p.sigma, p.lost_bottom,
       floor((p.lat - $lat0) * {BASE} / 2)::INTEGER AS py,
       floor((p.lon - $lon0) * {BASE} / $k / 2)::INTEGER AS px
     FROM corrected_points_in($partition, [$tile], $rlo, $rhi) p
@@ -98,7 +98,7 @@ flags AS (
     bool_or(flag = 'confirmed' AND reason = 'cell_shoal') AS confirmed,
     bool_or(flag = 'unconfirmed' AND reason <> '{UNJUDGED}') AND NOT bool_or(flag = 'confirmed')
       AS unconfirmed
-  FROM lake.qc_flags WHERE cell_id = $partition AND qc_version = {QC_VERSION}
+  FROM lake.qc_flags WHERE cell_id = $partition AND tile_id = $tile AND qc_version = {QC_VERSION}
     AND point_id IN (SELECT point_id FROM wanted)
   GROUP BY point_id
 ),
@@ -109,7 +109,7 @@ pts AS (
   FROM wanted w LEFT JOIN flags f USING (point_id) WHERE NOT coalesce(f.rejected, false)
 )
 SELECT a.*, NOT a.unconfirmed
-  AND hash(a.point_id) % greatest(1, ceil(n.n / {CELL_SAMPLE}))::UBIGINT = 0 AS keep
+  AND a.content_key % greatest(1, ceil(n.n / {CELL_SAMPLE}))::UBIGINT = 0 AS keep
 FROM pts a JOIN (SELECT py, px, vessel, count(*) AS n FROM pts GROUP BY ALL) n
   USING (py, px, vessel)
 """

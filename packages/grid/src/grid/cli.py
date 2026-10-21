@@ -10,6 +10,7 @@
     grid --store DIR_OR_S3_URL overlay --out DIR
     grid --store DIR_OR_S3_URL benchmark --surface DIR --out DIR [--bbox=W,S,E,N | --tiles=ID,...]
                                           [--source NAME]... [--cells] [--qc-version N]
+    grid --store DIR_OR_S3_URL compact
     grid --store DIR_OR_S3_URL stats
     grid cache [--prune]
 
@@ -25,7 +26,7 @@ import math
 import sys
 from pathlib import Path
 
-from . import benchmark, cache, calibrate, cells, overlay, qc, reference, tide
+from . import benchmark, cache, calibrate, catalog, cells, overlay, qc, reference, tide
 from .catalog import open_store
 from .ingest import Ingest, confirm_withdrawals
 from .objects import open_objects
@@ -147,6 +148,9 @@ def main(argv=None):
         default=qc.QC_VERSION,
         help="The QC flags that pick accepted soundings and confirmed shoals; default: this code's",
     )
+    sub.add_parser(
+        "compact", help="Rewrite each partition's points sorted by tile, once per store layout"
+    )
     sub.add_parser("stats", help="Count files by source and status")
     k = sub.add_parser("cache", help="Show the download cache's size by kind")
     k.add_argument(
@@ -219,6 +223,11 @@ def main(argv=None):
             table = benchmark.markdown(result)
             (args.out / "benchmark.md").write_text(table)
             print(table)
+        elif args.command == "compact":
+            # QC the batches a layout change left unchecked first, while each batch's
+            # points still sit together: once sorted by tile, each batch reads them all.
+            qc.run(con, missing_only=True)
+            print(f"compacted {catalog.compact(con, con.publish)} partitions")
         elif args.command == "confirm-withdrawals":
             print(f"confirmed {confirm_withdrawals(con, args.source)} held withdrawals")
         else:
