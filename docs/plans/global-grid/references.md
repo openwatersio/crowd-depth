@@ -102,3 +102,4 @@ The IHO site shows a cookie page to scripts, so these links may not resolve from
 - **GeoParquet 1.1.0**. [Specification](https://geoparquet.org/releases/v1.1.0/).
 - **PMTiles**. [Documentation](https://docs.protomaps.com/pmtiles/), [repository](https://github.com/protomaps/PMTiles).
 - **tippecanoe**. [Repository](https://github.com/felt/tippecanoe) (BSD-2-Clause).
+- **Potrace**. [Site](https://potrace.sourceforge.net/) (GPL-2.0-or-later), run as its own command, not linked, to trace the edge of coverage.

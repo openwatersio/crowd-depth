@@ -11,6 +11,7 @@ import rasterio.shutil
 import shapely
 import test_grid
 from pmtiles.reader import MmapSource, Reader
+from scipy.ndimage import binary_dilation
 from test_grid import CSIG
 from test_ingest import env  # noqa: F401  (env is a fixture)
 
@@ -254,6 +255,160 @@ def test_surface_bands_follow_the_surface(tmp_path):
     assert footprint.contains(shapely.Point(-78 + 0.955, 34 - 0.055))
     assert not footprint.contains(shapely.Point(-78 + 0.85, 34 - 0.1))
     assert not surfaced.contains(shapely.Point(-78 + 0.955, 34 - 0.055))
+
+
+def test_a_diagonal_surface_has_straight_edges_and_no_gaps(tmp_path):
+    # A track running south-east across a 1° tile of 100 pixels, 7 pixels wide, 3 m on
+    # its north side and 12 m on its south side, with a lone track's soundings beside it.
+    i, j = np.indices((100, 100))
+    depth = np.where(abs(i - j) <= 3, np.where(i < j, 3.0, 12.0), surface.NODATA)
+    depth = depth.astype(np.float32)
+    count = np.zeros_like(depth)
+    lone = [(k, k + 20) for k in range(10, 70)]
+    for r, c in lone:
+        count[r, c] = 1
+    write_surface(tmp_path / "t.tif", -78, 33, depth, np.zeros_like(depth), count)
+    bands, footprint, surfaced, *_ = overlay.surface_bands(tmp_path / "t.tif")
+    # Away from the tile's corners, the edge is a straight line, grown under a pixel past
+    # the last pixel's edge, never a stair of pixel corners.
+    px = 0.01
+    edge = shapely.intersection(surfaced.boundary, box(-77.8, 33.2, -78.2 + 1, 34 - 0.2))
+    x, y = shapely.get_coordinates(edge).T
+    across = (x + 78) - (34 - y)  # columns minus rows, in degrees
+    # A stair of pixels would have two points a pixel along each side, 240 in all.
+    assert len(across) < 60
+    assert np.abs(across).max() - np.abs(across).min() < 0.75 * px
+    assert 3.5 * px < np.abs(across).min() < 6 * px
+    # The bands fill the surface's outline, with no gaps or overlaps between them.
+    parts = list(bands.values())
+    assert shapely.union_all(parts).area == pytest.approx(surfaced.area, rel=1e-6)
+    assert sum(a.area for a in parts) == pytest.approx(surfaced.area, rel=1e-6)
+    # Every lone sounding's pixel is wholly inside the coverage.
+    for r, c in lone:
+        assert footprint.contains(
+            box(-78 + c * px, 34 - (r + 1) * px, -78 + (c + 1) * px, 34 - r * px)
+        )
+
+
+def test_a_one_pixel_diagonal_track_stays_one_piece(tmp_path):
+    # Pixels touching only at their corners, as a narrow track leaves them, in a surface
+    # grown a pixel all round as the overlay grows it.
+    depth = np.full((40, 40), surface.NODATA, dtype=np.float32)
+    depth[np.arange(5, 35), np.arange(5, 35)] = 12.0
+    write_surface(tmp_path / "t.tif", -78, 33, depth, np.zeros_like(depth), np.ones_like(depth))
+    _, _, surfaced, *_ = overlay.surface_bands(tmp_path / "t.tif")
+    assert len(shapely.get_parts(surfaced)) == 1
+    # A smooth strip, wider than the track's own pixels and never wider than them grown.
+    grown = binary_dilation(depth != surface.NODATA, structure=np.ones((3, 3), bool)).sum()
+    assert 30 < surfaced.area * 40**2 < grown
+
+
+def test_the_grown_edge_is_never_deeper_than_a_sounding_beside_it(tmp_path):
+    # 12 m water ending at column 48, and a 3 m sounding two pixels past it, where the
+    # interpolator left the water empty: the areas grown past the edge come no deeper
+    # than the sounding beside them.
+    depth = np.full((100, 100), 12.0, dtype=np.float32)
+    depth[:, 49:] = surface.NODATA
+    count = np.zeros_like(depth)
+    count[:, :49] = 1
+    write_surface(tmp_path / "t.tif", -78, 33, depth, np.zeros_like(depth), count)
+    shoal = ([-78 + 50.5 / 100], [34 - 50.5 / 100], [3.0])
+    bands, *_ = overlay.surface_bands(tmp_path / "t.tif", shoal)
+    beside = shapely.Point(-78 + 49.5 / 100, 34 - 50.5 / 100)
+    [(level, _)] = [(overlay.LEVELS[b], a) for b, a in bands.items() if a.contains(beside)]
+    assert level < 3
+    # Away from the sounding, the grown edge takes the water's own depth.
+    far = shapely.Point(-78 + 49.3 / 100, 34 - 10.5 / 100)
+    assert [overlay.LEVELS[b] for b, a in bands.items() if a.contains(far)] == [10]
+
+
+def test_the_grown_edge_of_interpolated_water_is_interpolated(tmp_path):
+    # A surface with no soundings in it is all interpolated, its grown edge included.
+    depth = np.full((100, 100), surface.NODATA, dtype=np.float32)
+    depth[20:80, 20:80] = 12.0
+    write_surface(tmp_path / "t.tif", -78, 33, depth, np.zeros_like(depth), np.zeros_like(depth))
+    _, _, surfaced, between, _ = overlay.surface_bands(tmp_path / "t.tif")
+    edge = shapely.Point(-78 + 80.3 / 100, 34 - 50.5 / 100)
+    assert surfaced.contains(edge) and between.contains(edge)
+    assert between.area == pytest.approx(surfaced.area, rel=1e-2)
+
+
+def test_a_one_pixel_interpolated_strip_stays_interpolated(tmp_path):
+    # Tracks in columns 30 and 34 with the surface between them: column 32 is two pixels
+    # from either, so interpolated, and is never drawn as measured.
+    depth = np.full((100, 100), surface.NODATA, dtype=np.float32)
+    depth[20:80, 30:35] = 12.0
+    count = np.zeros_like(depth)
+    count[20:80, [30, 34]] = 1
+    write_surface(tmp_path / "t.tif", -78, 33, depth, np.zeros_like(depth), count)
+    _, _, _, between, _ = overlay.surface_bands(tmp_path / "t.tif")
+    assert between.contains(shapely.Point(-78 + 32.5 / 100, 34 - 50.5 / 100))
+
+
+def test_nearby_soundings_reach_across_the_antimeridian(lake):
+    # The tile at 179°E, 10°N and its neighbor across the antimeridian at 180°W.
+    lake.execute("ALTER TABLE lake.cells ADD COLUMN cell_id SMALLINT")
+    lake.execute("ALTER TABLE lake.shoals ADD COLUMN tile_id INTEGER")
+    lake.execute("ALTER TABLE lake.shoals ADD COLUMN cell_id SMALLINT")
+    tile, east = tile_of(10, 179), tile_of(10, -180)
+    px = 1 / 5400
+    rows = [
+        (179.5, 10.5, 3.0, tile, surface.partition_of(10, 179)),  # in the tile
+        (-180 + px / 2, 10.5, 4.0, east, surface.partition_of(10, -180)),  # the pixel beside
+        (-180 + 5 * px, 10.5, 5.0, east, surface.partition_of(10, -180)),  # too far
+    ]
+    lake.executemany(
+        "INSERT INTO lake.cells (depth_lon, depth_lat, depth, tile_id, cell_id) VALUES (?, ?, ?, ?, ?)",
+        rows[:2],
+    )
+    lake.execute("INSERT INTO lake.shoals VALUES (?, ?, ?, ?, ?)", rows[2])
+    transform = rasterio.transform.from_origin(179, 11, px, px)
+    lon, _, depth = overlay.nearby_soundings(lake, tile, transform)
+    assert sorted(depth) == [3.0, 4.0]
+    # Across the line, a sounding is placed just east of the tile, where its pixel is.
+    assert max(lon) == pytest.approx(180 + px / 2)
+
+
+def test_holes_and_islands_in_holes_are_traced():
+    # A square of water around a 10-pixel hole, with a 4-pixel island inside the hole.
+    mask = np.zeros((40, 40), dtype=bool)
+    mask[5:35, 5:35] = True
+    mask[12:28, 12:28] = False
+    mask[18:22, 18:22] = True
+    traced = overlay.outline(mask, rasterio.Affine.identity())
+    parts = shapely.get_parts(traced)
+    assert len(parts) == 2 and traced.is_valid
+    outer = parts[np.argmax(shapely.area(parts))]
+    assert len(outer.interiors) == 1
+    assert outer.contains(shapely.Point(8, 8)) and not traced.contains(shapely.Point(14, 14))
+    assert traced.contains(shapely.Point(20, 20))
+
+
+def test_a_shoal_is_closed_only_away_from_the_surface_edge(tmp_path):
+    # A 3 m shoal in 12 m water: closed and prime in a whole tile, and beside a one-pixel
+    # gap that touches only its corner; open against the surface's edge.
+    shoal = (-78 + 0.505, 34 - 0.505, 3.0)
+    cases = {"whole": (None, True), "gap at a corner": ((49, 49), True)}
+    cases["edge"] = ((slice(None), slice(51, None)), False)
+    for name, (empty, prime) in cases.items():
+        depth = np.full((100, 100), 12.0, dtype=np.float32)
+        depth[50, 50] = 3.0
+        if empty is not None:
+            depth[empty] = surface.NODATA
+        write_surface(tmp_path / "t.tif", -78, 33, depth, np.zeros_like(depth), np.ones_like(depth))
+        bands, footprint, surfaced, *_ = overlay.surface_bands(tmp_path / "t.tif")
+        got = by_layer(
+            overlay.tile_areas(tuple(zip(shoal)), PROPERTIES, bands, footprint, surfaced)
+        )
+        assert ("SOUNDG" in got) == prime, name
+        # The bands fill the surface with no gaps or overlaps, and are only polygons.
+        parts = list(bands.values())
+        assert {a.geom_type for a in parts} <= {"Polygon", "MultiPolygon"}, name
+        assert shapely.union_all(parts).area == pytest.approx(surfaced.area, rel=1e-6), name
+        assert sum(a.area for a in parts) == pytest.approx(surfaced.area, rel=1e-6), name
+        # The surface's edge is never a contour: they meet only where a contour ends.
+        rim = surfaced.boundary.buffer(1e-6)
+        assert all(shapely.intersection(geometry(f), rim).length < 1e-5 for f in got["DEPCNT"])
 
 
 def tile_of(lat0, lon0):
