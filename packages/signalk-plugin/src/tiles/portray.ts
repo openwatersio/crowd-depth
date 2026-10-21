@@ -563,9 +563,17 @@ export function isolines(t: Traced, levels: number[]): Map<number, Point[][]> {
 function join(segments: [Point, Point][]): Point[][] {
   const id = (p: Point) => `${p[0]},${p[1]}`;
   const byStart = new Map<string, number[]>();
-  segments.forEach(
-    ([a], i) => byStart.get(id(a))?.push(i) ?? byStart.set(id(a), [i]),
-  );
+  const byEnd = new Map<string, number[]>();
+  const add = (m: Map<string, number[]>, p: Point, i: number) => {
+    const k = id(p);
+    const l = m.get(k);
+    if (l) l.push(i);
+    else m.set(k, [i]);
+  };
+  segments.forEach(([a, b], i) => {
+    add(byStart, a, i);
+    add(byEnd, b, i);
+  });
   const used = new Uint8Array(segments.length);
   const lines: Point[][] = [];
   for (let i = 0; i < segments.length; i++) {
@@ -579,6 +587,13 @@ function join(segments: [Point, Point][]): Point[][] {
       if (next === undefined) break;
       used[next] = 1;
       line.push(segments[next][1]);
+    }
+    // Back from its first segment too, which may sit midway along the line.
+    for (;;) {
+      const prev = byEnd.get(id(line[0]))?.find((j) => !used[j]);
+      if (prev === undefined) break;
+      used[prev] = 1;
+      line.unshift(segments[prev][0]);
     }
     lines.push(line);
   }

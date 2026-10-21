@@ -340,6 +340,39 @@ test("a contour closed round a bank stays closed", () => {
   for (const l of loops) expect(l.length).toBeGreaterThan(4);
 });
 
+test("a contour open at the outline is one line", () => {
+  // A hole deepening toward the south edge of the survey, so its contours are arcs
+  // from that edge round and back, well inside the tile.
+  const o = cellAt(LON, LAT);
+  const cells: Cell[] = [];
+  for (let r = 0; r < 25; r++) {
+    for (let c = 0; c < 25; c++) {
+      cells.push({
+        py: o.py + r,
+        px: o.px + c,
+        m: 14 - Math.hypot(c - 12, r + 6) / 2,
+        d: 0.2,
+        passes: 3,
+        first: 20000,
+        last: 20010,
+      });
+    }
+  }
+  const t = decode(buildTile(Z, tile.x, tile.y, cells, [])!);
+  const lines = features(t, "DEPCNT").filter(
+    (c) => c.properties.unit === "m" && c.properties.VALDCO >= 7,
+  );
+  expect(lines.length).toBeGreaterThan(1);
+  for (const c of lines) {
+    // Both of an arc's ends, not just one, on the outline past its middle.
+    const [line, ...rest] = c.loadGeometry();
+    expect(rest).toHaveLength(0);
+    const top = Math.min(...line.map((p) => p.y));
+    expect(line[0].y).toBeGreaterThan(top + 16);
+    expect(line[line.length - 1].y).toBeGreaterThan(top + 16);
+  }
+});
+
 test("fine contours keep the chart's deeper than 50 m", () => {
   const cells = [...lane(LON, () => 85), ...lane(LON + 0.001, () => 135)];
   const t = decode(buildTile(Z, tile.x, tile.y, cells, [])!);
@@ -408,4 +441,30 @@ test("zoomed out, a tile's areas follow a pass that changes its cells", async ()
   for (let k = 0; k < 20; k++) store.addPasses(pass(30));
   tiles.changed(lane(LON, () => 0).map((c) => cellCenter(c.py, c.px)));
   expect(await bands()).not.toEqual(before);
+});
+
+test("a pass drops the shared surface it reaches", async () => {
+  const at = tileAt(15);
+  const store = createCellStore(createDB(":memory:"));
+  const tiles = createTileService(store);
+  const pass = (depth: number) =>
+    lane(LON, () => depth).map((c) => ({
+      py: c.py,
+      px: c.px,
+      depth,
+      day: 20000,
+    }));
+  const bands = async (y: number) =>
+    features(decode((await tiles.get(15, at.x, y))!), "DEPARE").map(
+      (a) => a.properties.DRVAL1,
+    );
+  store.addPasses(pass(8));
+  const before = await bands(at.y);
+  for (let k = 0; k < 20; k++) store.addPasses(pass(30));
+  tiles.changed(lane(LON, () => 0).map((c) => cellCenter(c.py, c.px)));
+  // A tile beside it, not built yet, under the same ancestor.
+  const sibling = await bands(at.y ^ 1);
+  expect(before.length).toBeGreaterThan(0);
+  expect(sibling.length).toBeGreaterThan(0);
+  expect(Math.min(...sibling)).toBeGreaterThan(Math.max(...before));
 });

@@ -7,12 +7,8 @@ import { clearShared, readTile } from "./service.js";
 
 const db = new DatabaseSync(workerData.file, { readOnly: true });
 const store = createCellStore(db);
-// Changes whenever another connection commits, as a backfill does on a thread of its
-// own: then the surfaces kept for tiles to share are dropped.
-const version = db.prepare("PRAGMA data_version");
-let seen: unknown;
 
-parentPort!.on("message", ({ id, z, x, y, clear }) => {
+parentPort!.on("message", ({ id, z, x, y, share, clear }) => {
   if (clear) {
     clearShared(store, clear === true ? undefined : clear);
     return;
@@ -21,12 +17,9 @@ parentPort!.on("message", ({ id, z, x, y, clear }) => {
     // One read transaction, so a tile doesn't mix cells from before and after a write.
     db.exec("BEGIN");
     try {
-      const now = (version.get() as { data_version: number }).data_version;
-      if (now !== seen) clearShared(store);
-      seen = now;
       parentPort!.postMessage({
         id,
-        tile: readTile(store, z, x, y, workerData.detail),
+        tile: readTile(store, z, x, y, workerData.detail, share),
       });
     } finally {
       db.exec("COMMIT");

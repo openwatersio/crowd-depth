@@ -89,13 +89,17 @@ export function readTile(
   x: number,
   y: number,
   detail: Detail = "high",
+  share = true,
 ): Buffer | undefined {
-  const kept = sharedFor(store);
-  while (kept.size > SHARED_KEPT) kept.delete(kept.keys().next().value!);
+  const kept = share ? sharedFor(store) : undefined;
   const a = sharedTile(z, x, y);
   // The ancestor's cells to build its surface; once it's built, the tile's own, for its
   // soundings and quality.
-  const own = kept.has(`${a.z}/${a.x}/${a.y}`);
+  const own = kept?.has(`${a.z}/${a.x}/${a.y}`) ?? false;
+  // Room for the surface this tile will keep.
+  if (kept && !own && z > SHARED_ZOOM) {
+    while (kept.size >= SHARED_KEPT) kept.delete(kept.keys().next().value!);
+  }
   const b = own ? tileBounds(z, x, y) : tileBounds(a.z, a.x, a.y);
   const lat = Math.max(Math.abs(b.north), Math.abs(b.south));
   const dLat = MARGIN_M / M_PER_DEG_LAT;
@@ -152,12 +156,17 @@ function createTileWorker(file: string, detail: Detail) {
     );
   };
   return {
-    build(z: number, x: number, y: number): Promise<Buffer | undefined> {
+    build(
+      z: number,
+      x: number,
+      y: number,
+      share: boolean,
+    ): Promise<Buffer | undefined> {
       if (!worker) start();
       const id = next++;
       return new Promise((resolve, reject) => {
         waiting.set(id, { resolve, reject });
-        worker!.postMessage({ id, z, x, y });
+        worker!.postMessage({ id, z, x, y, share });
       });
     },
     clear(keys?: string[]) {
@@ -204,10 +213,11 @@ export function createTileService(
     const a = sharedTile(z, x, y);
     return workers[(a.x * 31 + a.y) % workers.length];
   };
+  let sharing = true;
   const build = (z: number, x: number, y: number) =>
     workers.length
-      ? worker(z, x, y).build(z, x, y)
-      : Promise.resolve(readTile(store, z, x, y, detail));
+      ? worker(z, x, y).build(z, x, y, sharing)
+      : Promise.resolve(readTile(store, z, x, y, detail, sharing));
   // Revisions count from the time the service started, so a client holding one from
   // before a restart is behind every revision this one keeps, and refetches everything.
   let rev = Date.now();
@@ -283,6 +293,15 @@ export function createTileService(
         }
       }
       if (now.size) publish([...now.values()]);
+    },
+
+    /** Share no surfaces between tiles while `on` is false, as while a backfill writes
+     * cells on a connection of its own and tells nothing until it ends: each tile is
+     * then built from the cells as they stand. */
+    share(on: boolean) {
+      sharing = on;
+      clearShared(store);
+      for (const w of workers) w.clear();
     },
 
     /** Drop every tile, as after a backfill or a rebuild. */

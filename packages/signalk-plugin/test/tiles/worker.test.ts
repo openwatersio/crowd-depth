@@ -74,10 +74,14 @@ test.skipIf(!existsSync(dist))(
       const [x, y] = [Math.floor(f.x), Math.floor(f.y)];
       store.addPasses(pass(8));
       tiles.changed([{ lon: -76.2, lat: 36.98 }]);
+      // A backfill starts, and a tile is built while it runs.
+      tiles.share(false);
       const before = await bands(x, y);
-      // Written as a backfill writes, which tells the tile service nothing until it ends.
-      for (let k = 0; k < 20; k++) store.addPasses(pass(30));
-      // A tile beside it, not built yet, cut from the same ancestor's surface.
+      // Written as a backfill writes, on its own connection, which tells the tile
+      // service only when it ends.
+      const backfill = createCellStore(createDB(file));
+      for (let k = 0; k < 20; k++) backfill.addPasses(pass(30));
+      // A tile beside it, not built yet, under the same ancestor.
       const sibling = await bands(x, y ^ 1);
       expect(before.length).toBeGreaterThan(0);
       expect(sibling.length).toBeGreaterThan(0);

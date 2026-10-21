@@ -34,7 +34,7 @@ and make navigation safer for everyone.
    navigation apps under a [CC0 public
    domain](https://creativecommons.org/publicdomain/zero/1.0/) dedication.
    Open Waters also builds openly licensed depth products from them.
-4. **See** — On a chartplotter that supports Signal K plotter extensions, such as Freeboard-SK 3.4 or later, the depths you record appear as a "My soundings" layer: depth areas, contours and soundings drawn the way Open Waters' crowd depth overlay draws them, filling in under the bow as you go.
+4. **See** — On a chartplotter that supports Signal K plotter extensions, such as Freeboard-SK 3.4 or later, the depths you record appear as a "My soundings" layer: depth areas, contours and soundings in the same colours as Open Waters' crowd depth overlay, with finer contours zoomed in, filling in under the bow as you go.
 
 You stay in control: sharing can be anonymous (a random UUID instead of your
 vessel name and MMSI), and you can disable the plugin at any time.

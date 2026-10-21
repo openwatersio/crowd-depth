@@ -464,16 +464,15 @@ export function buildTile(
   // kept for its other tiles. Zoomed out, a tile shares its surface with none.
   const a = sharedTile(z, x, y);
   const key = `${a.z}/${a.x}/${a.y}`;
-  // Only a tile cut from it keeps it: a tile at SHARED_ZOOM is built on its own.
-  const keep = z > SHARED_ZOOM ? shared : undefined;
-  let prepared = keep?.get(key);
-  if (prepared) {
+  // A tile at SHARED_ZOOM uses its surface when it's kept, but only a tile cut from it
+  // keeps it, so a view at SHARED_ZOOM doesn't push the others out.
+  const kept = z >= SHARED_ZOOM ? shared?.get(key) : undefined;
+  const prepared = kept ?? prepare(surface(a.z, a.x, a.y, cells, shoals));
+  if (kept || z > SHARED_ZOOM) {
     // The most recently used, kept longest.
-    keep!.delete(key);
-  } else {
-    prepared = prepare(surface(a.z, a.x, a.y, cells, shoals));
+    shared?.delete(key);
+    shared?.set(key, prepared);
   }
-  keep?.set(key, prepared);
   const n = rasterSize(z);
   const t = cut(prepared, (x - (a.x << a.k)) * n, (y - (a.y << a.k)) * n, n);
   const fine = detail === "high" && z >= FINE_ZOOM;
