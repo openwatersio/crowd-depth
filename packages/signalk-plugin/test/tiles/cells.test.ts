@@ -2,7 +2,6 @@ import { expect, test } from "vitest";
 import vectors from "../../../grid/tests/portrayal_vectors.json" with { type: "json" };
 import { createDB } from "../../src/storage.js";
 import {
-  CORRECTION_SIGMA_M,
   addPass,
   cellDepth,
   cellSigma,
@@ -38,7 +37,7 @@ test("a cell's estimate is a moving average of its passes, less k σ", () => {
   let cell = addPass(undefined, { py: 0, px: 0, depth: 10, day: 1 });
   expect(cell).toMatchObject({ m: 10, d: 0.3, passes: 1 });
   // One pass: σ is the correction uncertainty and the first deviation.
-  expect(cellSigma(cell)).toBeCloseTo(Math.hypot(CORRECTION_SIGMA_M, 0.375), 6);
+  expect(cellSigma(cell)).toBeCloseTo(Math.hypot(0.5, 1.0, 0.375), 6);
   expect(cellDepth(cell)).toBeCloseTo(10 - 1.75 * cellSigma(cell), 6);
 
   // A 1 m shoal shows within two passes and lets go in about twelve.

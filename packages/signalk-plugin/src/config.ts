@@ -298,7 +298,7 @@ export function schema(app: ServerAPI) {
             default: true,
             title: "Show my soundings on the chart",
             description:
-              "Draw the depths this boat records as a layer in chartplotters that support Signal K plotter extensions, such as Freeboard-SK 3.4 or later. The depths aren't reduced for tide and aren't for navigation.",
+              "Draw the depths this boat records as a layer in chartplotters that support Signal K plotter extensions, such as Freeboard-SK 3.4 or later. With signalk-tides installed, depths are reduced to chart datum by predicted tides where a station is in reach. Not for navigation.",
           },
           safetyDepth: {
             type: "number",

@@ -44,6 +44,14 @@
     "untided_sigma_m": 0.5,
     "uncalibrated_sigma_m": 1.0
   },
+  "tide": {
+    "cells_per_degree": 50,
+    "station_km": 50,
+    "chart_datums": ["MLLW", "LAT", "NLLW", "LLWLT", "MLWS", "TLT", "CD", "MSL"],
+    "lake_range_m": 0.15,
+    "predicted_sigma_m": 0.25,
+    "sigma_per_km": 0.005
+  },
   "portrayal": {
     "isobaths_m": [0, 2, 5, 10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 3000, 4000, 5000, 6000, 8000, 10000],
     "contour_tiers": [

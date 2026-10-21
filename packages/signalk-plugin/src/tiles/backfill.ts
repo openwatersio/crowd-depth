@@ -9,7 +9,14 @@ import { correctForSensorPosition } from "../streams/index.js";
 import { CellStore } from "./cells.js";
 import { Writable } from "stream";
 import { Worker } from "node:worker_threads";
-import { createCellWriter, getThrough, setThrough } from "./writer.js";
+import {
+  THROUGH_KEY,
+  createCellWriter,
+  getThrough,
+  setThrough,
+} from "./writer.js";
+import { DEFINITIONS } from "./geometry.js";
+import { Tides, withTide } from "./tide.js";
 
 /** How far back a store with no cells yet is filled from the plugin's source. */
 export const BACKFILL_PERIOD = Temporal.Duration.from({ hours: 30 * 24 });
@@ -29,6 +36,25 @@ export const DEPTH_SINCE_KEY = "depth_since";
  * synchronously, so without a pause a long backfill would hold up the whole
  * Signal K server. */
 const YIELD_EVERY = 1000;
+
+/** How long a backfill waits for signalk-tides, which may start after this plugin,
+ * before it goes on without tide. */
+export const TIDES_WAIT_MS = 60_000;
+
+/** Meta key for the tide the cells were built with: the tide's definitions where
+ * signalk-tides answered as the layer started, and null where it didn't. */
+export const TIDE_CONFIG_KEY = "config_tide";
+
+/** The {@link TIDE_CONFIG_KEY} value for cells built with or without tide. */
+export const tideConfig = (tided: boolean) =>
+  JSON.stringify(tided ? DEFINITIONS.tide : null);
+
+/** Whether the cells were built another way than `tided`, so a backfill rebuilds them. A
+ * store with no record is a new layer's, built this way from the start. */
+export function tideChanged(store: CellStore, tided: boolean) {
+  const builtWith = store.getMeta(TIDE_CONFIG_KEY);
+  return builtWith !== undefined && builtWith !== tideConfig(tided);
+}
 
 /** Size of each read from the source. */
 const WINDOW = Temporal.Duration.from({ hours: 1 });
@@ -113,16 +139,39 @@ export async function backfillCells({
   store,
   signal,
   file,
+  tides,
+  until = Temporal.Now.instant(),
 }: {
   app: ServerAPI;
   config: Config;
   source: BathymetrySource;
   store: CellStore;
   signal: AbortSignal;
+  /** Tide levels to reduce the soundings with; without them they stay untided. */
+  tides?: Tides;
+  /** When the live writer started, which a rebuild for a tide change backfills up to:
+   * it holds its passes from then on for the rebuild. */
+  until?: Temporal.Instant;
   /** The database file, for the cells to be written on a worker thread; without it,
    * as for an in-memory database, they're written on this one. */
   file?: string;
 }): Promise<void> {
+  // The cells are reduced if signalk-tides answered as the layer started, not merely if
+  // it's installed: a change either way, such as read-only access turned on for it,
+  // rebuilds them. The answer is the start's, so a start that finds it as the last did
+  // rebuilds nothing.
+  const tided =
+    tides !== undefined &&
+    (await tides.ready(TIDES_WAIT_MS, { signal }).catch(() => false));
+  if (signal.aborted) return;
+  if (tideChanged(store, tided)) {
+    app.debug("Tide changed: rebuilding the chart layer");
+    store.clear();
+    store.setMeta(THROUGH_KEY, "");
+    clearPendingBackfill(store);
+    addPendingBackfill(store, until);
+  }
+  store.setMeta(TIDE_CONFIG_KEY, tideConfig(tided));
   const rebuild = async () => {
     if (file) await rebuildOverviewsOnWorker(file, signal);
     else store.rebuildOverviews();
@@ -179,6 +228,8 @@ export async function backfillCells({
           }
         },
         transform(correctForSensorPosition(config)),
+        // On this thread, so the worker never waits on the server it would ask.
+        ...(tided && tides ? [withTide(tides)] : []),
         file
           ? createWorkerSink(file)
           : createCellWriter(store, { bulk: true, overviews: false }),
@@ -246,6 +297,7 @@ export function createWorkerSink(file: string): Writable {
         depth: data.depth,
         heading: data.heading,
         time: data.timestamp.epochMilliseconds,
+        tide: data.tide,
       });
       if (batch.length < WORKER_BATCH) return callback();
       const sending = batch;

@@ -48,8 +48,12 @@ export const MIN_ZOOM = 4;
 const LEVELS = P.isobaths_m.filter((l) => l <= MAX_AREA_DEPTH_M);
 const POSACC_M = 10;
 const TECSOU = 1;
-const INFORM =
-  "This boat's own soundings, recorded by its Crowd Depth plugin. Not reduced for tide or to chart datum, and not calibrated. Not for navigation.";
+const INFORM = {
+  tided:
+    "This boat's own soundings, recorded by its Crowd Depth plugin. Reduced to chart datum with predicted tides, and not calibrated. Not for navigation.",
+  untided:
+    "This boat's own soundings, recorded by its Crowd Depth plugin. Not reduced for tide or to chart datum, and not calibrated. Not for navigation.",
+};
 
 /** Raster pixels a side for a tile: at most 256, and none smaller than a cell. */
 export function rasterSize(z: number, _lat?: number): number {
@@ -565,6 +569,10 @@ export function buildTile(
   let last = -Infinity;
   let tvu = 0;
   let passes = 0;
+  // Over the margin too, whose cells the surface here is drawn from.
+  const tided =
+    cells.length > 0 &&
+    cells.every((c) => c.t !== undefined && !c.untidedBelow);
   for (const cell of cells) {
     const c = cellCenter(cell.py, cell.px);
     const f = tileFraction(c.lon, c.lat, z);
@@ -601,7 +609,11 @@ export function buildTile(
     TECSOU,
     // Passes, not soundings: the plugin keeps a cell's passes, not its soundings.
     passes,
-    INFORM,
+    // ponytail: one flag per tile, untided if any of its cells is. Station reach and
+    // signalk-tides' absence both cover whole stretches of water, so a tile seldom mixes;
+    // split the coverage by it if one does too often.
+    tided: tided ? 1 : 0,
+    INFORM: tided ? INFORM.tided : INFORM.untided,
     ...(Number.isFinite(first)
       ? { SURSTA: date(first), SUREND: date(last) }
       : {}),

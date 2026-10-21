@@ -15,7 +15,7 @@ from pathlib import Path
 import duckdb
 from botocore.exceptions import BotoCoreError, ClientError
 
-from .definitions import CELLS, STATISTIC
+from .definitions import CELLS, STATISTIC, TIDE
 from .objects import Conflict, LocalObjects
 from .sources import literal
 
@@ -136,13 +136,15 @@ MIN_DEPTH_M = -30
 # The 0.02° cell (about 2 km) that picks a sounding's tide station, counted within the
 # sounding's own 1° tile, so a point on a tile's edge or the antimeridian is in a cell
 # of its tile.
+# TIDE_CELL and tide.assign_cells are written for 0.02° tide cells.
+assert TIDE["cells_per_degree"] == 50
 TIDE_CELL = """(((p.tile_id // 360) * 50
     + greatest(least(floor((p.lat - (p.tile_id // 360 - 90)) * 50), 49), 0))::BIGINT * 18000
   + (p.tile_id % 360) * 50
   + greatest(least(floor((p.lon - (p.tile_id % 360 - 180)) * 50), 49), 0))"""
 # Metres of tide uncertainty per km between a sounding and its station: a starting
 # value, until held-out gauges measure it.
-TIDE_KM_SIGMA = 0.005
+TIDE_KM_SIGMA = TIDE["sigma_per_km"]
 # The uncertainty a correction that isn't made leaves in a depth, so uncorrected water
 # never reads as better known than corrected: tide left in (half a range of a metre or
 # two), and a vessel's offset left in (vessels read 0 to 3 m shallow in the Chesapeake).

@@ -17,6 +17,8 @@ import {
   Layer,
   addPendingBackfill,
   backfillCells,
+  tideChanged,
+  TIDES_WAIT_MS,
   clearPendingBackfill,
   getPendingBackfill,
   createCellStore,
@@ -28,6 +30,14 @@ import {
   THROUGH_KEY,
 } from "./tiles/index.js";
 import { DEFINITIONS } from "./tiles/geometry.js";
+import {
+  ApiError,
+  createTides,
+  httpJson,
+  tidesInstalled,
+  tidesUrl,
+  withTide,
+} from "./tiles/tide.js";
 import { createQCThread } from "./tiles/qc-thread.js";
 import { registerPlotterExtension } from "./plotterext/provider.js";
 import { DEFAULT_OWN_STYLE, TINTS, type OwnStyle } from "./tiles/style.js";
@@ -38,7 +48,7 @@ const DEPTH_CONFIG_KEY = "config_depth";
 
 /** How the plugin turns soundings into cells. Bump it when that changes, so cells built
  * the old way are rebuilt. */
-const LAYER_VERSION = 4;
+const LAYER_VERSION = 5;
 
 /** A backfill span longer than this holds live passes back until it's done. */
 const HOLD_FOR_HOURS = 1;
@@ -67,7 +77,8 @@ let routesRegistered = false;
 
 /** The settings the cells depend on: the depth path and offset, and the antenna to
  * transducer offset, QC and the cells' resolution, which place and judge each sounding.
- * The statistic's k and σs aren't among them: they're applied as tiles are drawn. */
+ * The statistic's k and σs aren't among them: they're applied as tiles are drawn, and
+ * the tide is the backfill's to check (`TIDE_CONFIG_KEY`), once signalk-tides answers. */
 export function cellConfig(config: Config) {
   const { distance, dx, dy } = getOffsets(config);
   return {
@@ -124,13 +135,47 @@ export function startChart({
     qc: qc?.run,
     onError: (err) => app.error(`Chart layer: ${err.message}`),
   });
+  // One for the live writer and the backfill, so they share what they've fetched. Without
+  // signalk-tides the soundings stay untided, and the tiles say so.
+  const tides = tidesInstalled(app)
+    ? createTides(httpJson(tidesUrl(app)))
+    : undefined;
+  // Asked once at start; signalk-tides may start after this plugin.
+  const tided = (tides?.ready(TIDES_WAIT_MS, { signal }) ?? Promise.reject())
+    .then(() => true)
+    .catch((err: unknown) => {
+      if (!tides) {
+        app.debug("signalk-tides isn't installed: the chart layer is untided");
+      } else if (
+        err instanceof ApiError &&
+        (err.status === 401 || err.status === 403)
+      ) {
+        // For the owner to fix.
+        app.error(
+          "Chart layer can't read signalk-tides without read-only access, so it's untided",
+        );
+      } else {
+        app.debug(
+          `signalk-tides isn't answering, so the chart layer is untided: ${err}`,
+        );
+      }
+      return false;
+    });
   // Until the backfill has run, so its older passes go into the cells first; only for
   // a span long enough for the order to matter, so a restart's short gap doesn't
   // freeze the layer while the source is found.
   const gap = getPendingBackfill(store);
-  if (gap && gap.to.since(gap.from).total("hours") > HOLD_FOR_HOURS) {
-    writer.hold(true);
-  }
+  const long =
+    gap !== undefined && gap.to.since(gap.from).total("hours") > HOLD_FOR_HOURS;
+  // A tide change rebuilds every cell from the backfill, so live passes wait for the
+  // start's tide check, a moment where signalk-tides answers, and through the rebuild
+  // if it finds one; nothing written meanwhile is cleared with the cells.
+  if (long || tides || tideChanged(store, false)) writer.hold(true);
+  void tided.then((answered) => {
+    if (!long && !tideChanged(store, answered) && !signal.aborted) {
+      writer.hold(false);
+    }
+  });
   const started: Layer = {
     tiles,
     provisional: writer.provisional,
@@ -151,6 +196,7 @@ export function startChart({
   pipeline(
     createLiveStream(app, config),
     transform(correctForSensorPosition(config)),
+    ...(tides ? [withTide(tides)] : []),
     writer,
     { signal },
   ).catch((err: unknown) => {
@@ -179,6 +225,8 @@ export function startChart({
         store,
         signal,
         file: db.location() ?? undefined,
+        tides,
+        until: startedAt,
       })
         .then(() => {
           // Stopped meanwhile: the writer is gone, and its held passes with it.
