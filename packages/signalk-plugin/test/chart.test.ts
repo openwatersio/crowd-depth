@@ -8,7 +8,7 @@ import { DatabaseSync } from "node:sqlite";
 import { Temporal } from "@js-temporal/polyfill";
 import { app, config } from "./helper.js";
 import { Config } from "../src/config.js";
-import { startChart, startChartSafely } from "../src/chart.js";
+import { ownStyle, startChart, startChartSafely } from "../src/chart.js";
 import { createDB } from "../src/storage.js";
 import { createSqliteSource } from "../src/sources/sqlite.js";
 import { Timeframe } from "../src/types.js";
@@ -37,6 +37,21 @@ const offsetConfig: Config = {
 };
 
 const at = (s: string) => Temporal.Instant.from(s);
+
+test("the layer's own style falls back to the default for hand-edited values", () => {
+  const chart = {
+    color: "#FFF",
+    shoalColor: "#00A0A0",
+    tint: "toString",
+    contours: "false",
+  };
+  expect(ownStyle({ ...config, chart } as unknown as Config)).toEqual({
+    accent: "#7b2cbf",
+    shoal: "#00A0A0",
+    tint: "normal",
+    contours: true,
+  });
+});
 
 test("backfills the tiles from the plugin's source with its correction", async () => {
   const db = createDB(":memory:");
