@@ -11,6 +11,7 @@ import contextlib
 import json
 import math
 import os
+import re
 import sqlite3
 import subprocess
 import tempfile
@@ -23,7 +24,14 @@ import rasterio.features
 import shapely
 import shapely.geometry
 from pmtiles.convert import mbtiles_to_pmtiles
-from scipy.ndimage import binary_dilation
+from scipy.ndimage import (
+    binary_closing,
+    binary_dilation,
+    binary_erosion,
+    distance_transform_edt,
+    label,
+    minimum_filter,
+)
 
 from . import cells, surface
 from .catalog import MIN_DEPTH_M, TIDE_CELL
@@ -237,6 +245,43 @@ WHERE cell_id = $partition AND tile_id = $tile AND depth <= $max
   AND abs(depth_lat) <= {MERCATOR_MAX_LAT}"""
 
 
+# Every published sounding, cell or shoal, in a tile or within a margin of it, from the
+# tile and its neighbors: the depths carried past the surface's edge are capped by them.
+# Longitudes are taken east of the tile's west edge, so a neighbor across the
+# antimeridian lines up with it.
+NEARBY_SOUNDINGS = """
+SELECT $lon0 + east AS lon, lat, d FROM (
+  SELECT (depth_lon - $lon0 + 540) % 360 - 180 AS east, depth_lat AS lat, depth AS d
+  FROM lake.cells
+  WHERE list_contains($partitions, cell_id) AND list_contains($tiles, tile_id)
+    AND depth IS NOT NULL
+  UNION ALL
+  SELECT (lon - $lon0 + 540) % 360 - 180, lat, depth FROM lake.shoals
+  WHERE list_contains($partitions, cell_id) AND list_contains($tiles, tile_id)
+) WHERE east BETWEEN -$margin_lon AND 1 + $margin_lon
+  AND lat BETWEEN $lat0 - $margin_lat AND $lat0 + 1 + $margin_lat"""
+
+
+def nearby_soundings(con, tile, transform):
+    """The published soundings in `tile`, or in the pixels beside it in its neighbors
+    (by `transform`, its surface's), as (lon, lat, depth)."""
+    lat0, lon0 = tile // 360 - 90, tile % 360 - 180
+    around = [(lat0 + dy, (lon0 + dx + 180) % 360 - 180) for dy in (-1, 0, 1) for dx in (-1, 0, 1)]
+    around = [(lat, lon) for lat, lon in around if -90 <= lat < 90]
+    got = con.execute(
+        NEARBY_SOUNDINGS,
+        {
+            "partitions": sorted({surface.partition_of(lat, lon) for lat, lon in around}),
+            "tiles": [(lat + 90) * 360 + lon + 180 for lat, lon in around],
+            "lon0": lon0,
+            "lat0": lat0,
+            "margin_lon": 1.5 * abs(transform.a),
+            "margin_lat": 1.5 * abs(transform.e),
+        },
+    ).fetchnumpy()
+    return got["lon"], got["lat"], got["d"]
+
+
 def areas(con, surfaces: Path):
     """Yield DEPARE, DEPCNT and M_QUAL features, and prime SOUNDG features, tile by tile.
 
@@ -254,35 +299,73 @@ def areas(con, surfaces: Path):
         first, last, count, tvu = con.execute(TILE_QUALITY, params).fetchone()
         got = con.execute(PRIME_CANDIDATES, params | {"max": PRIME_MAX_DEPTH_M}).fetchnumpy()
         candidates = got["lon"], got["lat"], got["depth"]
-        bands, footprint, surfaced, interpolated, interpolated_tvu = surface_bands(path)
+        with rasterio.open(path) as src:
+            nearby = nearby_soundings(con, tile, src.transform)
+        bands, footprint, surfaced, interpolated, interpolated_tvu = surface_bands(path, nearby)
         properties = quality(first, last, count, tvu)
         estimated = (interpolated, quality(first, last, 0, interpolated_tvu))
         yield from tile_areas(candidates, properties, bands, footprint, surfaced, estimated)
 
 
-def surface_bands(path):
+def surface_bands(path, soundings=None):
     """A tile surface's depth bands, {band: polygon} indexed into LEVELS; its coverage,
     where it has a depth or a sounding, grown by a pixel all round so a lone track's
-    soundings sit inside it; the surface itself, where it has a depth; the part of the
+    soundings sit inside it; the surface itself, grown the same way; the part of the
     surface interpolated, more than a pixel from any sounding; and that part's largest
     vertical uncertainty at 95%, as cells' `tvu`.
 
     Bands come from `gdal_contour -p`, which follows the surface between pixels rather
-    than around them. All water past MAX_AREA_DEPTH_M is one more band, kept for the
-    contour at its edge but never published: `gdal_contour -p` makes no polygon past
-    its last level.
+    than around them, on the surface's depths carried FILL_PX past its edge, and are cut
+    to the surface's `outline`. A carried depth is never deeper than one of `soundings`,
+    (lon, lat, depth) arrays of the published soundings in and beside the tile, in its
+    pixel or next to it, as the surface guards its own pixels. All water past
+    MAX_AREA_DEPTH_M is one more band, kept for the contour at its edge but never
+    published: `gdal_contour -p` makes no polygon past its last level.
     """
     levels = [lv for lv in LEVELS if lv <= MAX_AREA_DEPTH_M] + [MAX_DEPTH_M]
     with rasterio.open(path) as src:
         depth, count, sigma = src.read(1), src.read(3), src.read(4)
-        transform = src.transform
+        transform, profile = src.transform, src.profile
+    valid = depth != surface.NODATA
+    around = np.ones((3, 3), dtype=bool)
+    # Grown a pixel all round, as coverage is, so the two trace alike.
+    surfaced = outline(binary_dilation(valid, structure=around), transform)
     bands = {}
-    if (depth != surface.NODATA).any():
+    if valid.any():
+        # Each empty pixel near the surface takes its nearest pixel's depth, so the bands
+        # reach past the outline, which cuts them.
+        far, (rows, cols) = distance_transform_edt(~valid, return_indices=True)
+        grown = depth[rows, cols]
+        grown[far > FILL_PX] = surface.NODATA
+        if soundings is not None and len(soundings[2]):
+            lon, lat, d = (np.asarray(a, dtype=float) for a in soundings)
+            row, col = (np.asarray(a) for a in rasterio.transform.rowcol(transform, lon, lat))
+            # One in the pixel beside the tile caps the edge pixels next to it.
+            row, col = np.clip(row, 0, depth.shape[0] - 1), np.clip(col, 0, depth.shape[1] - 1)
+            cap = np.full(depth.shape, np.inf, dtype=np.float32)
+            np.minimum.at(cap, (row, col), d)
+            cap = minimum_filter(cap, footprint=around)
+            grown[~valid] = np.minimum(grown[~valid], cap[~valid])
+            del cap
+        reach = shapely.MultiPolygon(
+            [
+                shapely.geometry.shape(g)
+                for g, v in rasterio.features.shapes(
+                    (far <= FILL_PX).astype("uint8"), transform=transform
+                )
+                if v
+            ]
+        )
+        del far, rows, cols
         with tempfile.TemporaryDirectory(dir=os.environ.get("GRID_TEMP_DIR") or None) as tmp:
-            out = Path(tmp) / "bands.geojson"
+            src_path, out = Path(tmp) / "depth.tif", Path(tmp) / "bands.geojson"
+            profile.update(driver="GTiff", count=1, dtype="float32", nodata=surface.NODATA)
+            with rasterio.open(src_path, "w", **profile) as dst:
+                dst.write(grown, 1)
+            del grown
             subprocess.run(
                 ["gdal_contour", "-q", "-p", "-b", "1", "-amin", "lo", "-amax", "hi",
-                 "-fl", *map(str, levels), str(path), str(out)],
+                 "-fl", *map(str, levels), str(src_path), str(out)],
                 check=True,
             )  # fmt: skip
             features = json.loads(out.read_text())["features"]
@@ -290,33 +373,183 @@ def surface_bands(path):
             b = int(np.searchsorted(LEVELS, f["properties"]["lo"], side="right")) - 1
             part = shapely.make_valid(shapely.from_geojson(json.dumps(f["geometry"])))
             bands[b] = shapely.union(bands[b], part) if b in bands else part
-    valid = depth != surface.NODATA
-    around = np.ones((3, 3), dtype=bool)
-    covered = binary_dilation(valid | (count > 0), structure=around)
-    interpolated = valid & ~binary_dilation(count > 0, structure=around)
+        # Where the outline bulges past the depths' reach, as at a corner it rounds on the
+        # tile's edge, the shoalest band beside it takes the rest.
+        rest = shapely.get_parts(polygonal(shapely.difference(surfaced, reach)))
+        rest = rest[shapely.area(rest) > 1e-4 * abs(transform.a * transform.e)]
+        tree, taken = shapely.STRtree(rest), np.zeros(len(rest), dtype=bool)
+        for b in sorted(bands):
+            band = polygonal(shapely.intersection(surfaced, bands[b]))
+            near = tree.query(band, predicate="dwithin", distance=1e-6 * abs(transform.a))
+            near = near[~taken[near]]
+            taken[near] = True
+            bands[b] = shapely.union(band, shapely.MultiPolygon(list(rest[near])))
+        bands = {b: a for b, a in bands.items() if not a.is_empty}
+    # Where interpolation starts is drawn more loosely than the edge of the water, on the
+    # surface as it's grown, so the growth is measured only beside a sounding. It's grown a
+    # pixel into the measured part too: rounding would lose a strip a pixel wide, and
+    # interpolated water must never be drawn as measured.
+    far_from_soundings = ~binary_dilation(count > 0, structure=around)
+    grown_interpolated = binary_dilation(valid, structure=around) & far_from_soundings
+    grown_interpolated = binary_dilation(grown_interpolated, structure=around)
+    # Its uncertainty is the largest of the surface's pixels it's drawn over or beside.
+    interpolated = valid & binary_dilation(grown_interpolated, structure=around)
     d, s = depth[interpolated], sigma[interpolated]
     tvu = (
         float(np.maximum(cells.TOLERANCE_M + cells.TOLERANCE_PER_M * d, 1.96 * s).max())
         if len(d)
         else None
     )
-    return (
-        bands,
-        polygons(covered, transform),
-        polygons(valid, transform),
-        polygons(interpolated, transform),
-        tvu,
+    between = outline(grown_interpolated, transform, INTERPOLATED_TOLERANCE_PX)
+    between = polygonal(shapely.intersection(between, surfaced))
+    # Coverage is the surface, and the soundings off it grown a pixel all round and traced
+    # on their own: tracing them together would bend the surface's edge wherever a sounding
+    # sits beside it, and could cut a sounding's corner.
+    lone = binary_dilation((count > 0) & ~valid, structure=around)
+    footprint = polygonal(shapely.union(surfaced, outline(lone, transform)))
+    # Rounding can shave a sounding's pixel at a sharp tip; such a pixel joins whole. Only
+    # pixels within a few of the edge can be.
+    covered = binary_dilation(valid | (count > 0), structure=around)
+    rim = covered & ~binary_erosion(covered, structure=around, iterations=3)
+    row, col = np.nonzero((count > 0) & rim)
+    x0, y0 = rasterio.transform.xy(transform, row, col, offset="ul")
+    x1, y1 = rasterio.transform.xy(transform, row, col, offset="lr")
+    pixels = shapely.box(x0, y0, x1, y1)
+    shapely.prepare(footprint)
+    shaved = pixels[~shapely.covers(footprint, pixels)]
+    if len(shaved):
+        footprint = polygonal(shapely.union(footprint, shapely.union_all(shaved)))
+    return bands, footprint, surfaced, between, tvu
+
+
+# Pixels past the surface's edge its depths are carried, for the bands to reach its
+# outline, which is grown a pixel and fills small gaps.
+FILL_PX = 2
+# Potrace keeps a corner where a turn is sharper than this; past 4/3 it keeps none, but
+# then rounds a corner between long sides over half their length.
+POTRACE_ALPHAMAX = 1.2
+# The radius, in pixels, every corner is rounded to after tracing: a corner is unnatural
+# in bathymetry, and a fixed radius moves the edge a fraction of a pixel at most.
+CORNER_PX = 0.5
+POTRACE_OPTTOLERANCE = 1.0
+# Pixels a mask is carried past the raster's edge before tracing.
+PAD_PX = 4
+# Gaps in a mask this many pixels or smaller are filled, not traced.
+MAX_GAP_PX = 4
+# How far, in pixels, an outline's points may stray from its curve.
+EDGE_TOLERANCE_PX = 0.1
+INTERPOLATED_TOLERANCE_PX = 0.5
+
+
+def outline(mask, transform, tolerance=None):
+    """The edge of `mask` as one geometry, traced by Potrace as smooth curves rather than
+    pixel steps, with gaps of up to MAX_GAP_PX pixels and notches up to two pixels wide
+    filled. The mask's pixels past the raster's edge are taken to repeat its last, so the
+    edge meets the raster's edge square and stops there."""
+    if not mask.any():
+        return shapely.Polygon()
+    pad = PAD_PX
+    padded = np.pad(mask, pad, mode="edge")
+    # Inlets and notches a pixel or two wide would trace as sharp V's; they're filled.
+    padded = binary_closing(padded, structure=np.ones((3, 3), bool)) | padded
+    # Gaps of a few pixels, as between tracks, are filled rather than traced as holes.
+    gaps, n = label(~padded)
+    padded |= (np.bincount(gaps.ravel(), minlength=n + 1) <= MAX_GAP_PX)[gaps] & (gaps > 0)
+    tolerance = tolerance or EDGE_TOLERANCE_PX
+    # A step for each 30° a curve turns on the water's edge, each 60° on looser edges.
+    turn_step = np.pi / 6 if tolerance <= EDGE_TOLERANCE_PX else np.pi / 3
+    rows, cols = mask.shape
+    traced = potrace(padded, tolerance, turn_step)
+    # Closing then opening by a disc rounds concave and convex corners alike.
+    segments = int(np.ceil((np.pi / 2) / turn_step))
+    for r in (CORNER_PX, -2 * CORNER_PX, CORNER_PX):
+        traced = shapely.buffer(traced, r, quad_segs=segments)
+    # Every turn now has at least that radius, so dropping points within `tolerance` of
+    # the curve leaves no sharp angle.
+    traced = shapely.simplify(traced, tolerance)
+    shape = polygonal(shapely.clip_by_rect(traced, pad, pad, cols + pad, rows + pad))
+    # Traced shapes a fraction of a pixel apart, as an island in a hole, can cross.
+    if not shape.is_valid:
+        shape = polygonal(shapely.make_valid(shape))
+    a, b, c, d, e, f = transform[:6]
+    return shapely.transform(
+        shape, lambda xy: (xy - pad) @ np.array([[a, d], [b, e]]) + np.array([c, f])
     )
 
 
-def polygons(mask, transform):
-    """The pixels of `mask` as one geometry."""
-    pieces = [
-        shapely.geometry.shape(g)
-        for g, v in rasterio.features.shapes(mask.astype("uint8"), transform=transform)
-        if v
-    ]
-    return shapely.union_all(pieces) if pieces else shapely.Polygon()
+def potrace(mask, tolerance, turn_step):
+    """`mask` traced by Potrace, in pixels from its top left, its curves flattened to
+    within `tolerance` pixels and stepping at most `turn_step` radians at a time."""
+    rows, cols = mask.shape
+    with tempfile.TemporaryDirectory(dir=os.environ.get("GRID_TEMP_DIR") or None) as tmp:
+        bitmap, out = Path(tmp) / "mask.pbm", Path(tmp) / "mask.svg"
+        bitmap.write_bytes(b"P4\n%d %d\n" % (cols, rows) + np.packbits(mask, axis=1).tobytes())
+        subprocess.run(
+            ["potrace", "-b", "svg", "-t", "0", "-a", str(POTRACE_ALPHAMAX),
+             "-O", str(POTRACE_OPTTOLERANCE), "-o", str(out), str(bitmap)],
+            check=True,
+        )  # fmt: skip
+        paths = re.findall(r'<path d="([^"]*)"', out.read_text())
+    shapes = []
+    for d in paths:
+        rings = [
+            np.array(r) * [0.1, -0.1] + [0, rows] for r in svg_rings(d, tolerance * 10, turn_step)
+        ]
+        if not rings:
+            continue
+        # Each path is a shape and its holes; a shape inside a hole is a path of its own.
+        rings.sort(key=lambda r: -abs(shapely.area(shapely.Polygon(r))))
+        shapes.append(shapely.make_valid(shapely.Polygon(rings[0], rings[1:])))
+    return polygonal(shapely.GeometryCollection(shapes))
+
+
+def svg_rings(d, tolerance, turn_step):
+    """The closed rings of a Potrace SVG path, in its units: an absolute move, then
+    relative cubic Béziers, lines and moves, each ring closed by z. Each Bézier is cut
+    into as few even steps as keep it within `tolerance` (Wang's bound), so a gentle
+    curve takes few points, and a step for each `turn_step` radians it turns, so a short
+    tight turn is never cut to a spike."""
+    tokens = re.findall(r"[MmclzZ]|-?[\d.]+", d)
+    rings, ring, at, start, cmd, i = [], [], np.zeros(2), np.zeros(2), "", 0
+    while i < len(tokens):
+        if tokens[i] in "MmclzZ":
+            cmd = tokens[i]
+            i += 1
+            if cmd in "zZ":
+                rings.append(ring)
+                ring, at = [], start.copy()
+            continue
+        if cmd in "Mm":
+            at = np.array(tokens[i : i + 2], float) + (at if cmd == "m" else 0)
+            start, ring = at.copy(), [tuple(at)]
+            i += 2
+        elif cmd == "l":
+            at = at + np.array(tokens[i : i + 2], float)
+            ring.append(tuple(at))
+            i += 2
+        else:
+            p1, p2, p3 = at + np.array(tokens[i : i + 6], float).reshape(3, 2)
+            bend = max(np.linalg.norm(at - 2 * p1 + p2), np.linalg.norm(p1 - 2 * p2 + p3))
+            u0, u1 = p1 - at, p3 - p2
+            turn = np.arccos(
+                np.clip(u0 @ u1 / (np.linalg.norm(u0) * np.linalg.norm(u1) + 1e-12), -1, 1)
+            )
+            steps = max(
+                1, int(np.ceil(np.sqrt(0.75 * bend / tolerance))), int(np.ceil(turn / turn_step))
+            )
+            t = np.linspace(0, 1, steps + 1)[1:, None]
+            u = 1 - t
+            ring += map(tuple, u**3 * at + 3 * u * u * t * p1 + 3 * u * t * t * p2 + t**3 * p3)
+            at = p3
+            i += 6
+    return [r for r in rings if len(r) > 2]
+
+
+def polygonal(geometry):
+    """The polygons in `geometry`, one or many: where shapes only touch, cutting one
+    with another leaves lines and points too."""
+    parts = shapely.get_parts(shapely.get_parts(geometry))
+    return shapely.MultiPolygon(list(parts[shapely.get_type_id(parts) == 3]))
 
 
 def tile_areas(candidates, properties, bands, footprint, surfaced=None, interpolated=None):

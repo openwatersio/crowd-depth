@@ -146,7 +146,7 @@ changed.
 cd packages/grid
 ./docker.sh                            # tests, in the same image CI uses
 ./docker.sh uv run ruff check          # any command, in that image
-uv run pytest                          # tests on the host; those that need tippecanoe, gdal_grid or gdal_contour fail without them
+uv run pytest                          # tests on the host; those that need tippecanoe, gdal_grid, gdal_contour or potrace fail without them
 uv run ruff check && uv run ruff format --check
 uv run grid --store /tmp/grid ingest --prefix 2026/10/14   # one day of both sources into a local store
 uv run grid --store /tmp/grid qc       # rerun QC on every ingest batch (ingest runs it as it goes)
