@@ -429,3 +429,64 @@ test("neighbouring depth areas meet, with no gap or overlap between them", () =>
   expect(none / covered).toBeLessThan(0.005);
   expect(both / covered).toBeLessThan(0.005);
 });
+
+test("zoomed out, passes a few pixels apart stay apart", () => {
+  for (const z of [8, 10]) {
+    const f = tileFraction(LON, LAT, z);
+    const pm = (40075016.7 * Math.cos((LAT * Math.PI) / 180)) / 2 ** z / 256;
+    const dLon = (6 * pm) / (111320 * Math.cos((LAT * Math.PI) / 180));
+    const cells = [...lane(LON, () => 8), ...lane(LON + dLon, () => 8)];
+    const t = decode(
+      buildTile(z, Math.floor(f.x), Math.floor(f.y), cells, [])!,
+    );
+    expect(bandsAt(t, z, LON + dLon / 2, LAT), `z${z}`).toEqual([]);
+  }
+});
+
+test("contours lie on the edges their depth areas share", () => {
+  // A swath shoaling gently, then steeply: where the slope changes, a contour and its
+  // bands' edge part if they're traced differently.
+  const o = cellAt(LON, LAT);
+  const cells: Cell[] = [];
+  for (let r = 0; r < 30; r++) {
+    for (let c = 0; c < 12; c++) {
+      cells.push({
+        py: o.py + r,
+        px: o.px + c,
+        m: c < 6 ? 3 + 0.8 * c : 12 + 6 * (c - 6),
+        d: 0.2,
+        passes: 3,
+        first: 20000,
+        last: 20010,
+      });
+    }
+  }
+  const t = decode(buildTile(Z, tile.x, tile.y, cells, [])!);
+  const edges = features(t, "DEPARE").flatMap((a) =>
+    a
+      .loadGeometry()
+      .flatMap((r) => r.map((p, i) => [p, r[(i + 1) % r.length]])),
+  );
+  const toSegment = (
+    p: { x: number; y: number },
+    [a, b]: (typeof edges)[0],
+  ) => {
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const l = dx * dx + dy * dy;
+    const u = l
+      ? Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / l))
+      : 0;
+    return Math.hypot(p.x - a.x - u * dx, p.y - a.y - u * dy);
+  };
+  const lines = features(t, "DEPCNT").flatMap((c) => c.loadGeometry());
+  expect(lines.length).toBeGreaterThan(0);
+  for (const line of lines) {
+    for (const p of line) {
+      // Past the tile's edge, where the renderer clips them, both stop as they may.
+      if (p.x < 0 || p.y < 0 || p.x > EXTENT || p.y > EXTENT) continue;
+      // A tile unit or two apart at most, from rounding and corner cutting.
+      expect(Math.min(...edges.map((e) => toSegment(p, e)))).toBeLessThan(4);
+    }
+  }
+});

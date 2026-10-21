@@ -71,9 +71,9 @@ export function rasterSize(z: number, _lat?: number): number {
 
 /** The interpolation's reach past a tile's edges, in metres, and the blur's. */
 export const MARGIN_M = RADIUS_M + 4 * BLUR_M;
-/** Pixels the surface reaches past that: a pixel grown, one closed, and FILL_PX
- * carried. */
-const REACH_PX = 2 + FILL_PX;
+/** Pixels the surface reaches past that: a pixel grown, one closed, FILL_PX carried, and
+ * the edge's blur. */
+const REACH_PX = 2 + FILL_PX + 3;
 
 /** The margin a tile at zoom `z` reads beyond its edges, in metres: MARGIN_M, and
  * REACH_PX of its pixels, which zoomed out are wider than MARGIN_M. */
@@ -295,7 +295,7 @@ export function surface(
     drawn.map((v, i) => (v && near1[i] && !interpolated[i] ? 1 : 0)),
     size,
   );
-  fill(edge, depth, size);
+  fill(drawn, depth, size);
 
   // Carried past the interpolated pixels, a depth is never deeper than a published
   // sounding in its pixel or beside it, cell or unconfirmed shoal, as the grid
@@ -350,18 +350,29 @@ export function surface(
 /** Whether any, or all, of the square of side 2r + 1 about each pixel is in `mask`. Past
  * the raster's edge counts as in it for all, so an erosion doesn't eat in from there. */
 function square(mask: Float32Array, size: number, r: number, any: boolean) {
-  return mask.map((_, i) => {
-    const py = Math.floor(i / size);
-    const px = i % size;
-    for (let yy = py - r; yy <= py + r; yy++) {
-      for (let xx = px - r; xx <= px + r; xx++) {
-        const out = xx < 0 || yy < 0 || xx >= size || yy >= size;
-        const v = out ? !any : mask[yy * size + xx] === 1;
-        if (v === any) return any ? 1 : 0;
+  // A square is a row of r either side, then a column: two passes.
+  const pass = (src: Float32Array, horizontal: boolean) => {
+    const out = new Float32Array(src.length);
+    const step = horizontal ? 1 : size;
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const at = horizontal ? x : y;
+        const i = y * size + x;
+        let v = any ? 0 : 1;
+        for (let j = -r; j <= r; j++) {
+          const inside = at + j >= 0 && at + j < size;
+          const m = inside ? src[i + j * step] === 1 : !any;
+          if (m === any) {
+            v = any ? 1 : 0;
+            break;
+          }
+        }
+        out[i] = v;
       }
     }
-    return any ? 0 : 1;
-  });
+    return out;
+  };
+  return pass(pass(mask, true), false);
 }
 
 /** The edge of `mask`, as `shape` and `soften` draw it. */
@@ -392,24 +403,23 @@ function shape(mask: Float32Array, size: number, notches: boolean) {
  * quantile, which its log-odds over 1.7 is close to.
  */
 function soften(mask: Float32Array, size: number) {
-  const { cover } = blur(
-    mask.map((v) => (v ? 1 : NaN)),
-    size,
-    1,
-  );
-  return cover.map((c) => {
+  const g = gaussian(1, size);
+  const cover = convolve(convolve(mask, size, g, true), size, g, false);
+  return cover.map((w, i) => {
+    const c = w / (g.inside[i % size] * g.inside[Math.floor(i / size)]);
     const p = Math.min(Math.max(c, 1e-9), 1 - 1e-9);
     return Math.log(p / (1 - p)) / 1.7;
   });
 }
 
-/** Give each pixel inside `edge` without a depth the nearest within FILL_PX, the
- * shoaler of two as near: where the surface is grown or closed past the depths blurred
- * to it. */
-function fill(edge: Float32Array, depth: Float32Array, size: number) {
+/** Give each pixel of `drawn` without a depth the nearest within FILL_PX, the shoaler of
+ * two as near: where the surface is grown or closed past the depths blurred to it. Not
+ * where only its edge's blur reaches, which zoomed out would join water kilometres
+ * apart. */
+function fill(drawn: Float32Array, depth: Float32Array, size: number) {
   const carried = depth.slice();
-  for (let i = 0; i < edge.length; i++) {
-    if (edge[i] < 0 || !Number.isNaN(depth[i])) continue;
+  for (let i = 0; i < drawn.length; i++) {
+    if (!drawn[i] || !Number.isNaN(depth[i])) continue;
     const py = Math.floor(i / size);
     const px = i % size;
     let best = Infinity;
@@ -448,38 +458,11 @@ function blur(
       cover: values.map((v) => (Number.isNaN(v) ? 0 : 1)),
     };
   }
-  const r = Math.ceil(3 * sigma);
-  const kernel = Array.from({ length: 2 * r + 1 }, (_, i) =>
-    Math.exp(-((i - r) ** 2) / (2 * sigma * sigma)),
-  );
-  const pass = (src: Float32Array, wsrc: Float32Array, horizontal: boolean) => {
-    const out = new Float32Array(src.length);
-    const wout = new Float32Array(src.length);
-    for (let y = 0; y < size; y++) {
-      for (let x = 0; x < size; x++) {
-        let s = 0;
-        let w = 0;
-        for (let j = -r; j <= r; j++) {
-          const xx = horizontal ? x + j : x;
-          const yy = horizontal ? y : y + j;
-          if (xx < 0 || yy < 0 || xx >= size || yy >= size) continue;
-          const i = yy * size + xx;
-          s += kernel[j + r] * src[i];
-          w += kernel[j + r] * wsrc[i];
-        }
-        out[y * size + x] = s;
-        wout[y * size + x] = w;
-      }
-    }
-    return [out, wout];
-  };
+  const g = gaussian(sigma, size);
   const valid = values.map((v) => (Number.isNaN(v) ? 0 : 1));
   const zeroed = values.map((v) => (Number.isNaN(v) ? 0 : v));
-  const [h, wh] = pass(zeroed, valid, true);
-  const [v, wv] = pass(h, wh, false);
-  const ones = new Float32Array(values.length).fill(1);
-  const [, wo1] = pass(ones, ones, true);
-  const [, wo] = pass(wo1, wo1, false);
+  const v = convolve(convolve(zeroed, size, g, true), size, g, false);
+  const wv = convolve(convolve(valid, size, g, true), size, g, false);
   return {
     values: values.map((d, i) =>
       wv[i] <= 0
@@ -488,8 +471,50 @@ function blur(
           ? v[i] / wv[i]
           : Math.min(v[i] / wv[i], d),
     ),
-    cover: wv.map((w, i) => w / wo[i]),
+    // The share of the window inside the raster, a row's times a column's.
+    cover: wv.map(
+      (w, i) => w / (g.inside[i % size] * g.inside[Math.floor(i / size)]),
+    ),
   };
+}
+
+/** A gaussian kernel of `sigma` pixels, and how much of it falls inside a raster of
+ * `size` from each pixel of a row. */
+function gaussian(sigma: number, size: number) {
+  const r = Math.ceil(3 * sigma);
+  const kernel = new Float32Array(2 * r + 1).map((_, i) =>
+    Math.exp(-((i - r) ** 2) / (2 * sigma * sigma)),
+  );
+  const inside = new Float32Array(size).map((_, x) => {
+    let w = 0;
+    for (let j = -r; j <= r; j++)
+      if (x + j >= 0 && x + j < size) w += kernel[j + r];
+    return w;
+  });
+  return { r, kernel, inside };
+}
+
+/** `src` convolved with a kernel along rows, or columns; zero past the raster's edge. */
+function convolve(
+  src: Float32Array,
+  size: number,
+  { r, kernel }: { r: number; kernel: Float32Array },
+  horizontal: boolean,
+): Float32Array {
+  const out = new Float32Array(src.length);
+  const step = horizontal ? 1 : size;
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const at = horizontal ? x : y;
+      const lo = Math.max(-r, -at);
+      const hi = Math.min(r, size - 1 - at);
+      const i = y * size + x;
+      let s = 0;
+      for (let j = lo; j <= hi; j++) s += kernel[j + r] * src[i + j * step];
+      out[i] = s;
+    }
+  }
+  return out;
 }
 
 /** Polygons where `field` is at least 0 over the tile's own pixels, in tile
@@ -568,23 +593,18 @@ function smooth(points: Point[], closed: boolean, n = Infinity): Point[] {
 }
 
 /** The isoline at `level` between pixels that all have a depth, as lines in tile
- * coordinates. Marching squares interpolating the depth linearly between pixel centres,
- * as the bands' edges are, so a contour lies on the edge its bands share. */
-function isoline(r: Raster, level: number): Point[][] {
-  const { n, halo, size, depth } = r;
-  const v = (x: number, y: number) => depth[(y + halo) * size + x + halo];
-  const c = (x: number, y: number) => r.edge[(y + halo) * size + x + halo];
-  const corners = (x: number, y: number) => [
-    c(x, y),
-    c(x + 1, y),
-    c(x + 1, y + 1),
-    c(x, y + 1),
-  ];
+ * coordinates. Marching squares interpolating `from`, about how far a pixel is past the
+ * level in pixels, linearly between pixel centres, as the bands' edges are, so a contour lies
+ * on the edge its bands share. */
+function isoline(r: Raster, level: number, from: Float32Array): Point[][] {
+  const { n, halo, size, depth, edge } = r;
+  const at = (x: number, y: number) => (y + halo) * size + x + halo;
+  const v = (x: number, y: number) => from[at(x, y)];
   const scale = EXTENT / n;
   const segments: [Point, Point][] = [];
   // Pixel centres sit at +0.5; a crossing is where the depth between two reaches level.
   const mid = (ax: number, ay: number, bx: number, by: number): Point => {
-    const t = (level - v(ax, ay)) / (v(bx, by) - v(ax, ay));
+    const t = v(ax, ay) / (v(ax, ay) - v(bx, by));
     return [
       Math.round((ax + (bx - ax) * t + 0.5) * scale),
       Math.round((ay + (by - ay) * t + 0.5) * scale),
@@ -593,12 +613,14 @@ function isoline(r: Raster, level: number): Point[][] {
   const b = Math.min(BUFFER_PX, halo - 1);
   for (let y = -1 - b; y < n + b; y++) {
     for (let x = -1 - b; x < n + b; x++) {
-      const q = [v(x, y), v(x + 1, y), v(x + 1, y + 1), v(x, y + 1)];
-      if (q.some((d) => d === undefined || Number.isNaN(d))) continue;
-      if (corners(x, y).some((e) => !(e >= 0))) continue;
-      const b = q.map((d) => (d >= level ? 1 : 0));
-      const code = b[0] | (b[1] << 1) | (b[2] << 2) | (b[3] << 3);
+      const i = at(x, y);
+      const corners = [i, i + 1, i + size + 1, i + size];
+      let code = 0;
+      corners.forEach((j, k) => (code |= (from[j] >= 0 ? 1 : 0) << k));
       if (code === 0 || code === 15) continue;
+      if (corners.some((j) => Number.isNaN(depth[j]) || !(edge[j] >= 0))) {
+        continue;
+      }
       const top = mid(x, y, x + 1, y);
       const right = mid(x + 1, y, x + 1, y + 1);
       const bottom = mid(x, y + 1, x + 1, y + 1);
@@ -680,30 +702,49 @@ export function buildTile(
   // Each edge is traced from about its distance in pixels, a depth's from a level as how
   // far the depth is from it over how fast it changes there, so where two meet, as a
   // band's and the surface's, the lesser is where both are.
-  const gradient = (v: Float32Array) =>
-    v.map((_, i) => {
-      const px = i % r.size;
-      const g = (a: number, b: number, span: number) => {
-        const d = (v[b] - v[a]) / span;
-        return Number.isNaN(d) ? undefined : d;
-      };
-      const along = (prev: number, next: number, ok: [boolean, boolean]) =>
-        (ok[0] && ok[1] ? g(prev, next, 2) : undefined) ??
-        (ok[1] ? g(i, next, 1) : undefined) ??
-        (ok[0] ? g(prev, i, 1) : undefined) ??
-        0;
-      const dx = along(i - 1, i + 1, [px > 0, px < r.size - 1]);
-      const dy = along(i - r.size, i + r.size, [
-        i >= r.size,
-        i < v.length - r.size,
-      ]);
+  const size = r.size;
+  // A change along a row or column: centred where both neighbours have a value, else to
+  // whichever does.
+  const slope = (
+    v: Float32Array,
+    i: number,
+    step: number,
+    a: boolean,
+    b: boolean,
+  ) => {
+    const prev = a ? v[i - step] : NaN;
+    const next = b ? v[i + step] : NaN;
+    if (!Number.isNaN(prev) && !Number.isNaN(next)) return (next - prev) / 2;
+    if (!Number.isNaN(next)) return next - v[i];
+    if (!Number.isNaN(prev)) return v[i] - prev;
+    return 0;
+  };
+  const gradient = (v: Float32Array) => {
+    const g = new Float32Array(v.length);
+    for (let i = 0; i < v.length; i++) {
+      const px = i % size;
+      const dx = slope(v, i, 1, px > 0, px < size - 1);
+      const dy = slope(v, i, size, i >= size, i < v.length - size);
       // A floor, so flat water is far from every level.
-      return Math.max(Math.hypot(dx, dy), 0.01);
-    });
+      g[i] = Math.max(Math.hypot(dx, dy), 0.01);
+    }
+    return g;
+  };
   const gDepth = gradient(depth);
   const gWet = gradient(r.wet);
-  const from = (i: number, level: number) =>
-    level === 0 ? r.wet[i] / gWet[i] : (depth[i] - level) / gDepth[i];
+  // Each level's field once, for its bands and its contour.
+  const fields = new Map<number, Float32Array>();
+  const field = (level: number) => {
+    let f = fields.get(level);
+    if (!f) {
+      f =
+        level === 0
+          ? r.wet.map((w, i) => w / gWet[i])
+          : depth.map((d, i) => (d - level) / gDepth[i]);
+      fields.set(level, f);
+    }
+    return f;
+  };
 
   const DEPARE: Feature[] = [];
   const bands: [number, number][] = [
@@ -712,14 +753,23 @@ export function buildTile(
       (lo, i) => [lo, LEVELS[i + 1]] as [number, number],
     ),
   ];
+  // Bands and contours past the tile's depths are empty: none is traced.
+  let shoalest = Infinity;
+  let deepest = -Infinity;
+  depth.forEach((d, i) => {
+    if (!has(i)) return;
+    shoalest = Math.min(shoalest, d, r.wet[i]);
+    deepest = Math.max(deepest, d, r.wet[i]);
+  });
   for (const [lo, hi] of bands) {
+    if (hi <= shoalest || lo > deepest) continue;
+    const below = field(lo);
+    const above = field(hi);
     // At least 0 inside the band, crossing 0 where the depth reaches either edge.
     const polys = polygons(r, (i) =>
       // A band holds its lower edge, not its upper: a depth of exactly 0 m, which the
       // margin clamps shallow water to, is wet, not drying.
-      has(i)
-        ? Math.min(from(i, lo), -from(i, hi) - BAND_EPS_M, edge[i])
-        : outside(i),
+      has(i) ? Math.min(below[i], -above[i] - BAND_EPS_M, edge[i]) : outside(i),
     );
     if (polys.length) {
       DEPARE.push({
@@ -732,7 +782,8 @@ export function buildTile(
 
   const DEPCNT: Feature[] = [];
   for (const level of contourLevels(z)) {
-    const lines = isoline(r, level);
+    if (level < shoalest || level > deepest) continue;
+    const lines = isoline(r, level, field(level));
     if (lines.length) {
       DEPCNT.push({
         type: "LineString",
