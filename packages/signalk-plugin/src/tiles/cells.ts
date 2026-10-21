@@ -56,7 +56,8 @@ export interface Pass {
   tide?: number;
 }
 
-/** A sounding QC kept as an unconfirmed shoal: published, never in the surface. */
+/** A sounding QC kept as an unconfirmed shoal: published, never in the surface, but no
+ * depth carried past the surface's interpolated pixels is deeper than one beside it. */
 export interface Shoal {
   lon: number;
   lat: number;

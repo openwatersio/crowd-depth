@@ -119,12 +119,15 @@ interface Source {
  * within 200 m, with at least one in each quadrant and 40 m added to every distance, as
  * `gdal_grid invdistnn`; a gaussian blur clamped so no pixel reads deeper than it was
  * interpolated; then k × σ off, with σ from the nearest cell widened by its distance.
+ * Every depth the blur carries past the interpolated pixels is capped at the shoalest of
+ * `cells` and `shoals` in its pixel or beside it.
  */
 export function surface(
   z: number,
   x: number,
   y: number,
   cells: Cell[],
+  shoals: Shoal[] = [],
 ): Raster {
   const b = tileBounds(z, x, y);
   const lat = (b.north + b.south) / 2;
@@ -245,6 +248,38 @@ export function surface(
     );
     const d = m - K * sigma;
     depth[i] = m >= 0 ? Math.max(0, d) : d;
+  }
+
+  // Carried past the interpolated pixels, a depth is never deeper than a published
+  // sounding in its pixel or beside it, cell or unconfirmed shoal, as the grid
+  // overlay's carried depths.
+  const cap = new Float32Array(size * size).fill(Infinity);
+  for (const [i, s] of byPixel) cap[i] = Math.min(cap[i], s.depth);
+  for (const s of shoals) {
+    const f = tileFraction(s.lon, s.lat, z);
+    const sx = Math.floor((f.x - x) * n + halo);
+    const sy = Math.floor((f.y - y) * n + halo);
+    if (sx < 0 || sy < 0 || sx >= size || sy >= size) continue;
+    cap[sy * size + sx] = Math.min(cap[sy * size + sx], s.depth);
+  }
+  for (let py = 0; py < size; py++) {
+    for (let px = 0; px < size; px++) {
+      const i = py * size + px;
+      if (!Number.isNaN(median[i]) || Number.isNaN(depth[i])) continue;
+      for (
+        let yy = Math.max(0, py - 1);
+        yy <= Math.min(size - 1, py + 1);
+        yy++
+      ) {
+        for (
+          let xx = Math.max(0, px - 1);
+          xx <= Math.min(size - 1, px + 1);
+          xx++
+        ) {
+          depth[i] = Math.min(depth[i], cap[yy * size + xx]);
+        }
+      }
+    }
   }
   return { n, halo, size, pm, depth, cover, measured, near, measuredM };
 }
@@ -491,7 +526,7 @@ export function buildTile(
   shoals: Shoal[],
 ): Buffer | undefined {
   if (cells.length === 0 && shoals.length === 0) return undefined;
-  const r = surface(z, x, y, cells);
+  const r = surface(z, x, y, cells, shoals);
   const { depth } = r;
   const has = (i: number) =>
     !Number.isNaN(depth[i]) && depth[i] <= MAX_AREA_DEPTH_M;

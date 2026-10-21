@@ -311,8 +311,8 @@ export function createCellWriter(
     const count = all
       ? ruled.flags.length - offset
       : Math.min(FOLD_CHUNK, ruled.flags.length - offset);
-    // Every doubtful reading on the shoal side shows, as an unconfirmed sounding outside
-    // the surface: QC marks those `unconfirmed`. What it rejects or marks `noisy` is
+    // Every doubtful reading on the shoal side shows, as an unconfirmed sounding that only
+    // caps the depths carried past the surface: QC marks those `unconfirmed`. What it rejects or marks `noisy` is
     // bad data or the deep side, which drawn would show water deeper than it is.
     for (let k = 0; k < count; k++) {
       const s = buffer[judged + k];
