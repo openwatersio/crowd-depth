@@ -423,8 +423,9 @@ def surface_bands(path, soundings=None):
 
 
 # Pixels past the surface's edge its depths are carried, for the bands to reach its
-# outline, which is grown a pixel and fills small gaps.
-FILL_PX = 2
+# outline, which is grown a pixel and fills small gaps. Shared with the plugin's live
+# layer, as are MAX_GAP_PX and NOTCH_PX.
+FILL_PX = PORTRAYAL["fill_px"]
 # Potrace keeps a corner where a turn is sharper than this; past 4/3 it keeps none, but
 # then rounds a corner between long sides over half their length.
 POTRACE_ALPHAMAX = 1.2
@@ -435,7 +436,12 @@ POTRACE_OPTTOLERANCE = 1.0
 # Pixels a mask is carried past the raster's edge before tracing.
 PAD_PX = 4
 # Gaps in a mask this many pixels or smaller are filled, not traced.
-MAX_GAP_PX = 4
+MAX_GAP_PX = PORTRAYAL["max_gap_px"]
+# Notches in a mask this many pixels wide or narrower are closed, not traced.
+NOTCH_PX = PORTRAYAL["notch_px"]
+# The plugin's live layer closes with a square NOTCH_PX + 1 wide about each pixel, and
+# relies on it to fill every gap of MAX_GAP_PX too.
+assert NOTCH_PX % 2 == 0 and (NOTCH_PX + 1) ** 2 > MAX_GAP_PX, "see portrayal in definitions.json"
 # How far, in pixels, an outline's points may stray from its curve.
 EDGE_TOLERANCE_PX = 0.1
 INTERPOLATED_TOLERANCE_PX = 0.5
@@ -443,7 +449,7 @@ INTERPOLATED_TOLERANCE_PX = 0.5
 
 def outline(mask, transform, tolerance=None):
     """The edge of `mask` as one geometry, traced by Potrace as smooth curves rather than
-    pixel steps, with gaps of up to MAX_GAP_PX pixels and notches up to two pixels wide
+    pixel steps, with gaps of up to MAX_GAP_PX pixels and notches up to NOTCH_PX wide
     filled. The mask's pixels past the raster's edge are taken to repeat its last, so the
     edge meets the raster's edge square and stops there."""
     if not mask.any():
@@ -451,7 +457,7 @@ def outline(mask, transform, tolerance=None):
     pad = PAD_PX
     padded = np.pad(mask, pad, mode="edge")
     # Inlets and notches a pixel or two wide would trace as sharp V's; they're filled.
-    padded = binary_closing(padded, structure=np.ones((3, 3), bool)) | padded
+    padded = binary_closing(padded, structure=np.ones((NOTCH_PX + 1,) * 2, bool)) | padded
     # Gaps of a few pixels, as between tracks, are filled rather than traced as holes.
     gaps, n = label(~padded)
     padded |= (np.bincount(gaps.ravel(), minlength=n + 1) <= MAX_GAP_PX)[gaps] & (gaps > 0)

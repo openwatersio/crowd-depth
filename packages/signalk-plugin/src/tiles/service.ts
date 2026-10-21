@@ -11,7 +11,7 @@ import {
 } from "./geometry.js";
 import {
   CELL_M,
-  MARGIN_M,
+  marginM,
   MAX_ZOOM,
   MIN_ZOOM,
   buildTile,
@@ -40,7 +40,7 @@ const HISTORY = 500;
 export type TileId = [z: number, x: number, y: number];
 
 /** A tile built from the store: the cells under it and its margin, at the overview that
- * fits its pixels, and the unconfirmed shoals in it. */
+ * fits its pixels, and the unconfirmed shoals in it and its margin. */
 export function readTile(
   store: CellStore,
   z: number,
@@ -49,8 +49,8 @@ export function readTile(
 ): Buffer | undefined {
   const b = tileBounds(z, x, y);
   const lat = Math.max(Math.abs(b.north), Math.abs(b.south));
-  const dLat = MARGIN_M / M_PER_DEG_LAT;
-  const dLon = MARGIN_M / mPerDegLon(Math.min(lat, 85));
+  const dLat = marginM(z) / M_PER_DEG_LAT;
+  const dLon = marginM(z) / mPerDegLon(Math.min(lat, 85));
   return buildTile(
     z,
     x,
@@ -62,7 +62,8 @@ export function readTile(
       b.north + dLat,
       overviewLevel(z, (b.north + b.south) / 2),
     ),
-    store.shoals(b.west, b.south, b.east, b.north),
+    // Over the margin too, whose shoals cap the depths drawn beside them.
+    store.shoals(b.west - dLon, b.south - dLat, b.east + dLon, b.north + dLat),
   );
 }
 
@@ -197,9 +198,9 @@ export function createTileService(store: CellStore, file?: string) {
     changed(positions: Changed) {
       const now = new Map<string, TileId>();
       for (const { lon, lat } of positions) {
-        const dLat = MARGIN_M / M_PER_DEG_LAT;
-        const dLon = MARGIN_M / mPerDegLon(Math.min(Math.abs(lat), 85));
         for (let z = MIN_ZOOM; z <= MAX_ZOOM; z++) {
+          const dLat = marginM(z) / M_PER_DEG_LAT;
+          const dLon = marginM(z) / mPerDegLon(Math.min(Math.abs(lat), 85));
           const a = tileFraction(lon - dLon, lat + dLat, z);
           const b = tileFraction(lon + dLon, lat - dLat, z);
           const n = 2 ** z;
