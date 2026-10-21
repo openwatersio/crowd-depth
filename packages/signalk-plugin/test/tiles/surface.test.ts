@@ -2,8 +2,11 @@ import { expect, test } from "vitest";
 import { VectorTile } from "@mapbox/vector-tile";
 import { PbfReader as Pbf } from "pbf";
 import { Cell, cellDepth } from "../../src/tiles/cells.js";
-import { cellAt, tileFraction } from "../../src/tiles/geometry.js";
-import { buildTile, contourLevels } from "../../src/tiles/surface.js";
+import { cellAt, cellCenter, tileFraction } from "../../src/tiles/geometry.js";
+import { createDB } from "../../src/storage.js";
+import { createCellStore } from "../../src/tiles/index.js";
+import { readTile } from "../../src/tiles/service.js";
+import { buildTile, contourLevels, surface } from "../../src/tiles/surface.js";
 
 const Z = 14;
 const LON = -76.2;
@@ -70,7 +73,7 @@ test("water between two tracks within 200 m is interpolated, never past them", (
   expect(areas.map((a) => a.properties.DRVAL1)).toEqual([5, 10]);
 });
 
-test("an unconfirmed shoal publishes as a flagged sounding, outside the surface", () => {
+test("an unconfirmed shoal publishes as a flagged sounding, the interpolated surface drawn as if it weren't there", () => {
   const cells = [...lane(LON, () => 8), ...lane(LON + 0.001, () => 8)];
   const without = decode(buildTile(Z, tile.x, tile.y, cells, [])!);
   const shoal = { lon: LON + 0.0005, lat: LAT, depth: 1.2, time: 0 };
@@ -126,4 +129,67 @@ test("coverage says whether its water is reduced to chart datum", () => {
   const mixed = [...tided.slice(1), lane(LON, () => 8)[0]];
   expect(quality(mixed)).toMatchObject({ tided: 0 });
   expect(String(quality(mixed).INFORM)).toContain("Not reduced for tide");
+});
+
+/** 12 m water in an L three cells wide, from the cell at `lon`, `lat`. */
+function corner(lon = LON, lat = LAT) {
+  const o = cellAt(lon, lat);
+  const passes = [];
+  for (let r = 0; r < 30; r++) {
+    for (let c = 0; c < 30; c++) {
+      if (r < 3 || c < 3) passes.push({ py: o.py + r, px: o.px + c });
+    }
+  }
+  return { o, passes };
+}
+
+test("water carried past the surface is never deeper than a shoal beside it", () => {
+  // The blur carries the 12 m water into the L's inner corner, past the pixels the
+  // interpolation reaches; a 3 m shoal sits there.
+  const { o, passes } = corner();
+  const cells = passes.map((p) => ({
+    ...p,
+    m: 12,
+    d: 0.2,
+    passes: 3,
+    first: 20000,
+    last: 20010,
+  }));
+  const p = cellCenter(o.py + 3, o.px + 3);
+  const shoal = { lon: p.lon, lat: p.lat, depth: 3, time: 0 };
+  const without = surface(Z, tile.x, tile.y, cells);
+  const capped = surface(Z, tile.x, tile.y, cells, [shoal]);
+  const changed = [...capped.depth.keys()].filter(
+    (i) => !Object.is(capped.depth[i], without.depth[i]),
+  );
+  expect(changed.length).toBeGreaterThan(0);
+  for (const i of changed) expect(capped.depth[i]).toBeLessThanOrEqual(3);
+});
+
+test("a shoal just past a tile's edge caps the depths carried beside it", () => {
+  // The L's corner just west of a tile's edge, and its 3 m shoal outside the tile: the
+  // tile reads it over its margin.
+  const f = tileFraction(LON, LAT, Z);
+  const x = Math.floor(f.x) + 1;
+  const y = Math.floor(f.y);
+  const edgeLon = (x / 2 ** Z) * 360 - 180;
+  const { o, passes } = corner(edgeLon - 0.0007, LAT);
+  const store = createCellStore(createDB(":memory:"));
+  store.addPasses(passes.map((p) => ({ ...p, depth: 12, day: 20000 })));
+  const bands = () =>
+    features(decode(readTile(store, Z, x, y)!), "DEPARE").map(
+      (a) => a.properties.DRVAL1,
+    );
+  // Only 12 m water, less its margin.
+  expect(bands().every((lo) => lo >= 5)).toBe(true);
+  const p = cellCenter(o.py + 3, o.px + 3);
+  expect(tileFraction(p.lon, p.lat, Z).x).toBeLessThan(x);
+  store.addShoals([{ lon: p.lon, lat: p.lat, depth: 3, time: 0 }]);
+  // The water carried beside it, in this tile, is drawn no deeper than it.
+  expect(bands().some((lo) => lo < 3)).toBe(true);
+  // It publishes in its own tile, not this one.
+  const t = decode(readTile(store, Z, x, y)!);
+  expect(features(t, "SOUNDG").filter((s) => s.properties.unconfirmed)).toEqual(
+    [],
+  );
 });

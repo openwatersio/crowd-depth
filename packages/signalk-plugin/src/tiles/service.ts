@@ -40,7 +40,7 @@ const HISTORY = 500;
 export type TileId = [z: number, x: number, y: number];
 
 /** A tile built from the store: the cells under it and its margin, at the overview that
- * fits its pixels, and the unconfirmed shoals in it. */
+ * fits its pixels, and the unconfirmed shoals in it and its margin. */
 export function readTile(
   store: CellStore,
   z: number,
@@ -62,7 +62,8 @@ export function readTile(
       b.north + dLat,
       overviewLevel(z, (b.north + b.south) / 2),
     ),
-    store.shoals(b.west, b.south, b.east, b.north),
+    // Over the margin too, whose shoals cap the depths carried beside them.
+    store.shoals(b.west - dLon, b.south - dLat, b.east + dLon, b.north + dLat),
   );
 }
 
