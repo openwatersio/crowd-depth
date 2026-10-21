@@ -33,6 +33,8 @@ No depth scale factor is fitted: at 2–20 m it barely narrows the spread.
 """
 
 import bisect
+import hashlib
+import inspect
 import logging
 import math
 
@@ -76,12 +78,34 @@ MAX_SE_M = 0.5
 APPLIED = ("anchored", "crossover")
 # A file reading deeper than this, known but not corrected, is left out of the grid.
 DEEP_M = 0.5
-# A stray transit reading this much shallower than its own segment, and under half of
-# what its segment reads over the same seabed, has lost the bottom. On the Chesapeake 145
-# of the 157 strays past 2 m did: a median 0.2 m in 14 m, or a sounder stuck near 2.5 m
-# whatever the depth. The other 12 read as a moved sounder would.
-CONTRADICTED_M = 2.0
+# A sounder that has lost the bottom holds a narrow band of readings, wandering a step or
+# two of its resolution, for minutes to hours: on the Chesapeake 0.3 to 0.6 m or 2.4 to
+# 3.0 m, for up to 15 km, over seabed 7 to 25 m deep. A reading is lost where it's under
+# LOST_BOTTOM of what its segment reads over the seabed there, and LOST_MARGIN_M under it,
+# so a depth that is merely small isn't judged by a ratio. A window of STUCK_WINDOW
+# readings is stuck where STUCK_LOST of them read lost and the middle 80% of them span no
+# more than STUCK_SPAN_M, so the band's edges and a reading near the line don't break it.
+# A run counts from STUCK_RUN stuck windows across STUCK_REACH_M: a boat at its mooring,
+# reading a slip shallower than the survey's pixel around it, goes nowhere.
+STUCK_WINDOW = 30
+STUCK_LOST = 27
+STUCK_SPAN_M = 0.4
 LOST_BOTTOM = 0.5
+LOST_MARGIN_M = 2.0
+STUCK_RUN = 60
+STUCK_REACH_M = 200
+# The seabed a run is judged over: the survey's, or the median of the corrected depths of
+# at least CROWD_VESSELS vessels, whichever is shallower, so water that has shoaled since
+# the survey isn't mistaken for a lost bottom. Against the survey on the Chesapeake, three
+# vessels found 96% of the soundings it did, at 98% precision.
+CROWD_VESSELS = 3
+# A vessel's calendar month with MONTH_SHARE or more of its pixels reading lost (from
+# MONTH_PIXELS judged) is set aside whole: on the Chesapeake 14 months of 7 vessels, a
+# fifth of the stuck readings, at 61,000 good pixels. A vessel with any month at
+# STUCK_SHARE or more has its stuck runs found too; the others aren't searched.
+MONTH_SHARE = 0.2
+STUCK_SHARE = 0.05
+MONTH_PIXELS = 100
 # Of a store's calibrated segments, more than this share lost in one run is refused.
 MAX_LOST = 0.5
 GUARDED_SEGMENTS = 20
@@ -122,6 +146,65 @@ FROM cal_obs o JOIN (
 WHERE abs(o.m - r.depth) < {ANCHOR_DIFF_M}
 """
 
+# Stuck runs in one tile, for the vessels in `stuck_vessels`: each file's soundings in
+# order, its stuck windows (`unit_offsets`, `seabed_px`) joined where they overlap; a run
+# counts from STUCK_RUN stuck windows across STUCK_REACH_M, and starts and ends on a lost
+# reading, so a bank crossed just before the sounder sticks at its depth isn't in it.
+STUCK = f"""
+WITH p AS (
+  SELECT p.file_id, p.unique_id AS vessel, p.time, p.lon, p.lat, p.depth_raw AS raw,
+    p.depth_raw - coalesce(p.tide, 0) AS tr,
+    floor((p.lat - (p.tile_id // 360 - 90)) * {BASE} / 2)::INTEGER AS py,
+    floor((p.lon - (p.tile_id % 360 - 180)) * {BASE}
+      / {K_LIST}[p.tile_id // 360 - 90 + 91] / 2)::INTEGER AS px
+  FROM corrected_points_in($partition, [$tile], 0, {BASE}) p
+  WHERE p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M} AND p.time IS NOT NULL
+    AND (p.tide IS NOT NULL OR (p.tide_assigned AND p.tide_station IS NULL))
+    AND p.unique_id IN (SELECT vessel FROM stuck_vessels)
+    AND p.point_id NOT IN (
+      SELECT point_id FROM lake.qc_flags WHERE cell_id = $partition AND qc_version = {QC_VERSION}
+        AND list_contains({TRACK_REASONS}, reason) AND flag IN ('reject', 'unconfirmed', 'noisy')
+        -- A held depth is what a stuck sounder reads: in, or the run breaks around it.
+        AND NOT (flag = 'unconfirmed' AND reason = 'flatline'))
+),
+w AS (
+  SELECT p.*,
+    coalesce(tr < {LOST_BOTTOM} * (u.o + s.z) AND tr < u.o + s.z - {LOST_MARGIN_M}, false) AS lost,
+    row_number() OVER (PARTITION BY p.file_id ORDER BY time, raw) AS i
+  FROM p JOIN unit_offsets u USING (vessel, file_id)
+  LEFT JOIN seabed_px s ON s.tile_id = $tile AND s.py = p.py AND s.px = p.px
+),
+x AS (
+  -- Stuck: STUCK_LOST of the STUCK_WINDOW soundings up to it read lost, and their middle
+  -- 80% span no more than STUCK_SPAN_M.
+  SELECT *, count(*) OVER win = {STUCK_WINDOW} AND sum(lost::INTEGER) OVER win >= {STUCK_LOST}
+      AND quantile_cont(raw, 0.9) OVER win - quantile_cont(raw, 0.1) OVER win <= {STUCK_SPAN_M}
+      AS stuck
+  FROM w WINDOW win AS (PARTITION BY file_id ORDER BY time, raw
+    ROWS BETWEEN {STUCK_WINDOW - 1} PRECEDING AND CURRENT ROW)
+),
+m AS (
+  -- Every sounding of a stuck window, and no other: a boat's approach to its mooring, or
+  -- real depths around a flat stretch, stay out.
+  SELECT *, bool_or(stuck) OVER (PARTITION BY file_id ORDER BY time, raw
+      ROWS BETWEEN CURRENT ROW AND {STUCK_WINDOW - 1} FOLLOWING) AS member
+  FROM x
+),
+l AS (
+  SELECT *, i - row_number() OVER (PARTITION BY file_id ORDER BY time, raw) AS run
+  FROM m WHERE member
+)
+-- From its first lost reading to its last, so a true one before or after stays out.
+SELECT f.content_hash, l.vessel, $tile AS tile_id, min(l.time) FILTER (WHERE l.lost) AS t_start,
+  max(l.time) FILTER (WHERE l.lost) AS t_end
+FROM l JOIN lake.files f USING (file_id)
+GROUP BY f.content_hash, l.vessel, l.file_id, l.run
+HAVING count(*) FILTER (WHERE l.stuck) >= {STUCK_RUN} AND 6371000 * sqrt(
+  pow(radians(max(l.lat) FILTER (WHERE l.lost) - min(l.lat) FILTER (WHERE l.lost)), 2)
+  + pow(radians(max(l.lon) FILTER (WHERE l.lost) - min(l.lon) FILTER (WHERE l.lost))
+    * cos(radians(avg(l.lat))), 2)) >= {STUCK_REACH_M}
+"""
+
 
 def reduce(con):
     """Fill the temp table `cal_obs`, one tile at a time, so memory follows a tile."""
@@ -135,6 +218,69 @@ def reduce(con):
     for partition, tile in tiles:
         con.execute(REDUCE, {"partition": partition, "tile": tile})
     return len(tiles)
+
+
+def stuck_runs(con, offset, status):
+    """Runs of soundings whose sounder lost the bottom, as rows (content hash, vessel, tile,
+    start, end): every file of a month set aside, with no tile, and the stuck runs of the
+    vessels with a month at STUCK_SHARE. From segments whose offset is applied: only those
+    say what a vessel should read."""
+    applied = np.isin(status, APPLIED)
+    con.register("offsets_np", {"unit": np.flatnonzero(applied), "o": np.asarray(offset)[applied]})
+    con.execute(
+        """CREATE OR REPLACE TEMP TABLE unit_offsets AS
+        SELECT u.vessel, u.file_id, o.o FROM file_units u JOIN offsets_np o USING (unit)"""
+    )
+    con.unregister("offsets_np")
+    con.execute(
+        f"""CREATE OR REPLACE TEMP TABLE seabed_px AS
+        WITH survey AS (
+          SELECT tile_id, py, px, depth FROM lake.reference_pixels WHERE depth IS NOT NULL
+          QUALIFY row_number() OVER (PARTITION BY tile_id, py, px ORDER BY uncertainty, source) = 1
+        ),
+        crowd AS (
+          SELECT tile_id, py, px, median(z) AS z FROM (
+            SELECT o.tile_id, o.py, o.px, o.vessel, median(o.m - u.o) AS z
+            FROM cal_obs o JOIN unit_offsets u USING (vessel, file_id) GROUP BY ALL)
+          GROUP BY ALL HAVING count(*) >= {CROWD_VESSELS}
+        )
+        -- least() passes over a NULL: either alone, or the shallower of both.
+        SELECT tile_id, py, px, least(s.depth, c.z) AS z
+        FROM survey s FULL JOIN crowd c USING (tile_id, py, px)"""
+    )
+    # Each vessel's calendar months: the share of its file-pixel medians reading lost.
+    con.execute(
+        f"""CREATE OR REPLACE TEMP TABLE vessel_months AS
+        SELECT o.vessel, date_trunc('month', o.t) AS month, count(*) AS judged,
+          avg((o.m < {LOST_BOTTOM} * (s.z + u.o) AND o.m < s.z + u.o - {LOST_MARGIN_M})::INTEGER)
+            AS lost_share
+        FROM cal_obs o JOIN unit_offsets u USING (vessel, file_id)
+        JOIN seabed_px s USING (tile_id, py, px)
+        GROUP BY ALL HAVING count(*) >= {MONTH_PIXELS}"""
+    )
+    con.execute(
+        f"""CREATE OR REPLACE TEMP TABLE stuck_vessels AS
+        SELECT DISTINCT vessel FROM vessel_months WHERE lost_share >= {STUCK_SHARE}"""
+    )
+    # A month set aside whole: each of its judged files, in every tile.
+    runs = con.execute(
+        f"""SELECT DISTINCT f.content_hash, f.vessel, NULL::INTEGER, f.time_min, f.time_max
+        FROM cal_obs o JOIN unit_offsets USING (vessel, file_id) JOIN vessel_months m
+          ON m.vessel = o.vessel AND m.month = date_trunc('month', o.t)
+        JOIN lake.files f ON f.file_id = o.file_id
+        WHERE f.status = 'active' AND m.lost_share >= {MONTH_SHARE}"""
+    ).fetchall()
+    tiles = con.execute(
+        """SELECT DISTINCT p.cell_id, p.tile_id FROM lake.points p
+        WHERE p.tile_id IN (SELECT tile_id FROM cal_obs
+          WHERE vessel IN (SELECT vessel FROM stuck_vessels))
+        ORDER BY p.tile_id"""
+    ).fetchall()
+    # ponytail: a file's run is found and applied per tile, so one that crosses a tile edge
+    # is two; judge across tiles if the seams show
+    for partition, tile in tiles:
+        runs += con.execute(STUCK, {"partition": partition, "tile": tile}).fetchall()
+    return runs
 
 
 def units_for(con, segments):
@@ -359,6 +505,7 @@ def outliers(con, rows, offset, se, anchored):
             continue
         d = abs(e - offset[u])
         if d > STEP_M and d > STEP_SE * math.hypot(se[u], TRANSIT_SIGMA_M):
+            # The seabed it was judged over, for assign's lost-bottom test.
             out.append((file_id, vessel, float(e), float(offset[u]), hashes.get(file_id), float(z)))
     return out
 
@@ -460,7 +607,10 @@ def run(con, references=(), accept_losses=False) -> dict:
                 int(crossed[unit]),
             )
         )
-    dirty = publish(con, rows, stray, accept_losses)
+    # Judged by the offsets that will apply.
+    kept = np.array([np.nan if r[4] is None else r[4] for r in keep(con, rows)])
+    runs = stuck_runs(con, kept, status)
+    dirty = publish(con, rows, stray, accept_losses, runs)
     # The tide the offsets were solved against: once it changes, they are stale.
     con.execute("DELETE FROM lake.store_meta WHERE key = 'calibration_tide'")
     con.execute("INSERT INTO lake.store_meta VALUES ('calibration_tide', ?)", [cells.tides(con)])
@@ -473,18 +623,27 @@ def run(con, references=(), accept_losses=False) -> dict:
             for s in ("anchored", "crossover", "uncalibrated", "rejected")
         },
         "stray_transits": len(stray),
+        "stuck_runs": len(runs),
         "dirty_tiles": dirty,
     }
-    for table in ("cal_obs", "file_units", "xobs", "xrows"):
+    for table in (
+        "cal_obs",
+        "file_units",
+        "xobs",
+        "xrows",
+        "unit_offsets",
+        "seabed_px",
+        "vessel_months",
+        "stuck_vessels",
+    ):
         con.execute(f"DROP TABLE IF EXISTS {table}")
     log.info("calibrate: %s", totals)
     return totals
 
 
-def publish(con, rows, stray=(), accept_losses=False):
-    """Replace the calibration with `rows` and its stray transits with `stray`, keeping a
-    segment's published offset unless it moved by more than its standard error, then
-    give each file its segment's offset. Returns how many tiles that made stale."""
+def keep(con, rows):
+    """`rows` with each segment's published offset kept unless it moved by more than its
+    standard error."""
     old = {
         (v, s0, s1, st): (off, se)
         for v, s0, s1, off, se, st in con.execute(
@@ -497,6 +656,16 @@ def publish(con, rows, stray=(), accept_losses=False):
         if prev and off is not None and prev[0] is not None and abs(off - prev[0]) <= se:
             off, se = prev
         kept.append((v, seg, s0, s1, off, se, st, *rest))
+    return kept
+
+
+def publish(con, rows, stray=(), accept_losses=False, runs=()):
+    """Replace the calibration with `rows`, its stray transits with `stray` and its stuck
+    runs with `runs`, keeping a segment's published offset unless it moved by more than its
+    standard error, then give each file its segment's offset. Returns how many tiles that
+    made stale."""
+    old = con.execute("SELECT vessel, t_start, t_end, status FROM lake.calibration").fetchall()
+    kept = keep(con, rows)
     # A run that would drop most calibrated segments at once found too little to go on
     # (tide levels mid-rebuild, a reference outage), not a fleet that changed overnight.
     before = sum(st in APPLIED for *_, st in old)
@@ -506,6 +675,7 @@ def publish(con, rows, stray=(), accept_losses=False):
             f"calibration would apply {after} segments, down from {before}; check tide and"
             " references, and run `grid calibrate --accept-losses` if it should"
         )
+    was_settled = cells.settled(con)
     con.execute("BEGIN")
     try:
         con.execute("DELETE FROM lake.calibration")
@@ -518,25 +688,77 @@ def publish(con, rows, stray=(), accept_losses=False):
             con.executemany(
                 "INSERT INTO lake.calibration_outliers VALUES (?, ?, ?, ?, ?, ?)", stray
             )
+        con.execute("CREATE OR REPLACE TEMP TABLE old_runs AS SELECT * FROM lake.lost_runs")
+        con.execute("DELETE FROM lake.lost_runs")
+        if runs:
+            con.executemany("INSERT INTO lake.lost_runs VALUES (?, ?, ?, ?, ?)", runs)
+        # The tiles of soundings a run now takes, or no longer takes.
+        dirty = cells.stale(
+            con,
+            """SELECT p.tile_id FROM lake.points p JOIN lake.files f USING (file_id)
+            JOIN ((SELECT * FROM old_runs EXCEPT SELECT * FROM lake.lost_runs)
+              UNION ALL (SELECT * FROM lake.lost_runs EXCEPT SELECT * FROM old_runs)) r
+            ON r.content_hash = f.content_hash AND (r.tile_id IS NULL OR r.tile_id = p.tile_id)
+              AND p.time BETWEEN r.t_start AND r.t_end""",
+            {},
+            "calibration",
+            was_settled,
+        )
+        con.execute("DROP TABLE old_runs")
+        # The calibration these runs were found under: one that differs, from an older build
+        # or a run that stopped short, leaves them stale.
+        con.execute("DELETE FROM lake.store_meta WHERE key = 'stuck_runs'")
+        con.execute("INSERT INTO lake.store_meta VALUES ('stuck_runs', ?)", [calibrated_by(kept)])
         con.execute("COMMIT")
     except BaseException:
         con.execute("ROLLBACK")
         raise
-    return assign(con)
+    return dirty + assign(con, was_settled)
 
 
-def assign(con):
+def calibrated_by(rows) -> str:
+    """A fingerprint of calibration rows and the stuck-run rule: the runs are current while
+    neither changes. Offsets as the table stores them, in single precision."""
+    keys = sorted(
+        (v, seg, str(s0), str(s1), None if o is None else float(np.float32(o)), st)
+        for v, seg, s0, s1, o, _, st, *_ in rows
+    )
+    # The runs' queries, their constants, and the QC whose flags they read.
+    rule = (
+        STUCK,
+        inspect.getsource(stuck_runs),
+        CROWD_VESSELS,
+        MONTH_SHARE,
+        STUCK_SHARE,
+        MONTH_PIXELS,
+        QC_VERSION,
+    )
+    return hashlib.sha256(repr((rule, keys)).encode()).hexdigest()
+
+
+def runs_current(con) -> bool:
+    """Whether the stuck runs were found under this calibration, or there's none to find."""
+    rows = con.execute("SELECT * FROM lake.calibration").fetchall()
+    if not rows:
+        return True
+    marker = con.execute("SELECT value FROM lake.store_meta WHERE key = 'stuck_runs'").fetchone()
+    return bool(marker) and marker[0] == calibrated_by(rows)
+
+
+def assign(con, was_settled=None):
     """Give every active file its segment's offset, by its first sounding, and mark the
     tiles of files whose offset changed. Run before every cells build too, so a file that
     arrived since calibration takes its segment's offset. A stray transit takes no offset
     and reads as logged, uncalibrated. A file known to read deep that can't be corrected,
     a segment not applied whose offset is DEEP_M past zero by two standard errors or a
     stray transit measured as deep, is excluded: as logged it would publish too deep. A
-    stray transit that lost the bottom, CONTRADICTED_M shallower than its segment and under
-    LOST_BOTTOM of what its segment reads over that seabed, is marked lost_bottom: its
-    soundings publish as unconfirmed shoals but set no depths. Returns how many tiles were
-    marked."""
-    was_settled = cells.settled(con)
+    stray transit that lost the bottom, LOST_MARGIN_M shallower than its segment and under
+    LOST_BOTTOM of what its segment reads over that seabed, is marked lost_bottom whole;
+    stuck stretches inside other files are lake.lost_runs. Returns how many tiles were
+    marked. `was_settled`: whether the cells were settled before
+    the change this belongs to, as `publish` knows it."""
+    if was_settled is None:
+        was_settled = cells.settled(con)
     con.execute("BEGIN")
     try:
         # A store from before lost_bottom has NULL there, which is no change from false.
@@ -550,7 +772,7 @@ def assign(con):
             WITH stray AS (
               -- A stray transit, by file or by content, as ingest may move its soundings.
               SELECT file_id, max(transit_m) AS transit_m,
-                bool_or(transit_m - segment_m < {-CONTRADICTED_M}
+                bool_or(transit_m - segment_m < {-LOST_MARGIN_M}
                   AND seabed_m + transit_m < {LOST_BOTTOM} * (seabed_m + segment_m)) AS lost FROM (
                 SELECT file_id, transit_m, segment_m, seabed_m FROM lake.calibration_outliers
                 UNION ALL

@@ -186,8 +186,33 @@ def test_a_raster_unlike_its_checksum_is_skipped_not_read(monkeypatch):
     monkeypatch.setattr(reference, "uncached", {})
     [marker] = cache.path("reference", "bluetopo", SHA).glob("*.mismatch")
     os.utime(marker, (0, 0))
+    # A retry cut off isn't read remotely, unchecked.
+    serve(monkeypatch, files, cut=[LINK])
+    assert reference.rasters("bluetopo", (0, 0, 1, 1), {})[0] == [None]
+    monkeypatch.setattr(reference, "uncached", {})
+    asked = serve(monkeypatch, files)
     [path], _ = reference.rasters("bluetopo", (0, 0, 1, 1), {})
     assert Path(path).read_bytes() == RASTER
+    assert not marker.exists()
+
+
+def test_a_tile_touching_a_skipped_raster_records_nothing(monkeypatch, tmp_path):
+    good = []
+
+    def sample_raster(path, lon, lat, depth, relief, unc, shift_at):
+        good.append(path)
+        depth[:], relief[:], unc[:] = 5.0, 0.1, 0.5
+        return True
+
+    monkeypatch.setattr(reference, "rasters", lambda *a, **k: ([None, "good.tif"], []))
+    monkeypatch.setattr(reference, "sample_raster", sample_raster)
+    tile = 90 * 360 + 180  # 0° N, 0° E
+    with open_store(LocalObjects(tmp_path / "store")) as con:
+        con.execute("CREATE TEMP TABLE cal_obs AS SELECT ? AS tile_id, 1 AS py, 1 AS px", [tile])
+        # The raster that did verify is read, but nothing is kept: a later run tries again.
+        assert reference.sample_tile(con, tile, "bluetopo", {}, None) == (0, 0)
+        assert good == ["good.tif"]
+        assert con.execute("SELECT count(*) FROM lake.reference_pixels").fetchone()[0] == 0
 
 
 def test_a_damaged_cached_scheme_gives_way_to_an_older_one(monkeypatch):
@@ -202,6 +227,17 @@ def test_a_damaged_cached_scheme_gives_way_to_an_older_one(monkeypatch):
     assert path == older and stale
     # Removed, so the next run downloads it again.
     assert reference.cached_catalogs("bluetopo") == [older]
+
+
+def test_a_damaged_newest_scheme_is_downloaded_again(monkeypatch):
+    gpkg = scheme()
+    files = bucket_files(gpkg)
+    serve(monkeypatch, files)
+    reference.catalog("bluetopo")
+    [cached] = reference.cached_catalogs("bluetopo")
+    cached.write_bytes(gpkg[: len(gpkg) // 2])
+    path, *_, stale = reference.catalog("bluetopo")
+    assert path == cached and not stale and cached.read_bytes() == gpkg
 
 
 def test_a_scheme_of_another_shape_fails_loudly_and_is_kept(monkeypatch):
@@ -382,7 +418,14 @@ def test_a_recent_gauge_month_is_fetched_again(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "kept", [{"2026-01-01T00:00:00": 0.1}, [1, 2], [["2026-01-01T00:00:00", "x"]]]
+    "kept",
+    [
+        {"2026-01-01T00:00:00": 0.1},
+        [1, 2],
+        [["2026-01-01T00:00:00", "x"]],
+        [["2026-01-01T00:00:00", "nan"]],
+        [["2026-01-01T00:00:00", 99.0]],
+    ],
 )
 def test_a_cached_gauge_month_of_another_shape_is_fetched_again(tmp_path, kept):
     month = [("8574680", date(2026, 1, 1))]

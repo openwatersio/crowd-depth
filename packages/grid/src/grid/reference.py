@@ -68,13 +68,22 @@ def catalog(name):
     """A catalog's newest tile scheme, from the cache once fetched: its path, table, link
     and checksum columns, and whether it is stale. With the bucket out of reach, or its
     newest scheme damaged, it is the newest readable one cached, and stale: a newer one
-    may cover more. A cached scheme that isn't a whole database is removed; a whole one
-    NOAA changed the shape of fails the run."""
+    may cover more. A cached scheme that isn't a whole database is removed. A whole one
+    NOAA changed the shape of fails the run when it is the newest the bucket lists, and
+    is passed over when the bucket can't be listed."""
     bucket, prefix, column, checksum = CATALOGS[name]
     try:
         with urllib.request.urlopen(f"{bucket}/?list-type=2&prefix={prefix}", timeout=60) as r:
             key = max(re.findall(r"<Key>([^<]+\.gpkg)</Key>", r.read().decode()))
         path = cache.path("reference", name, "catalogs", key.rsplit("/", 1)[-1])
+        # A damaged copy of the newest scheme is downloaded again.
+        if path.exists():
+            try:
+                gpkg_table(path)
+            except (ValueError, sqlite3.DatabaseError) as e:
+                if damaged(e):
+                    log.warning("reference: %s damaged (%s); downloading again", path.name, e)
+                    path.unlink(missing_ok=True)
         if not path.exists():
             try:
                 download(f"{bucket}/{key}", path)
@@ -177,13 +186,15 @@ def fetch(name, link, sha):
     if link in uncached:
         return uncached[link]
     path = cache.path("reference", name, sha, link.rsplit("/", 1)[-1])
-    if path.exists():
+    # One this user can't read is a miss, like a missing one.
+    if os.access(path, os.R_OK):
         return str(path)
     # A raster found unlike its checksum is tried again a day later, not every run: NOAA
     # may list a raster before uploading it, or upload it before listing it.
     mismatch = path.with_name(path.name + ".mismatch")
     with contextlib.suppress(OSError):
-        if time.time() - mismatch.stat().st_mtime < MISMATCH_RETRY_S:
+        # Either way: a clock ahead of this one may have written it.
+        if abs(time.time() - mismatch.stat().st_mtime) < MISMATCH_RETRY_S:
             log.warning("reference: %s skipped, unlike its checksum a day ago", link)
             uncached[link] = None
             return None
@@ -195,9 +206,16 @@ def fetch(name, link, sha):
         uncached[link] = None
         return None
     except FETCH_ERRORS as e:
+        # One that didn't match before isn't read unchecked now.
+        if mismatch.exists():
+            log.warning("reference: %s skipped, unlike its checksum before (%s)", link, e)
+            uncached[link] = None
+            return None
         log.warning("reference: %s not cached (%s); read remotely", link, e)
         uncached[link] = remote
         return remote
+    with contextlib.suppress(OSError):
+        mismatch.unlink(missing_ok=True)
     log.info("reference: cached %s", link)
     return str(path)
 
