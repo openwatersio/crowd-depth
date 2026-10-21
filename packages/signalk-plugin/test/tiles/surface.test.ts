@@ -372,7 +372,7 @@ test("water between two tracks close together stays interpolated", () => {
 });
 
 test("a tile is tided by its own cells, not the rest of its ancestor's", () => {
-  // At z15, the tile's cells tided; one untided cell 2 km east, in the same z13 tile.
+  // At z15, the tile's cells tided; one untided cell 900 m east, in the same z14 tile.
   const z = 15;
   const f = tileFraction(LON, LAT, z);
   const x = Math.floor(f.x);
@@ -380,7 +380,7 @@ test("a tile is tided by its own cells, not the rest of its ancestor's", () => {
   const lonAt = (px: number) => ((x + px / 64) / 2 ** z) * 360 - 180;
   const cells: Cell[] = [
     ...lane(lonAt(32), () => 8).map((c) => ({ ...c, t: 0.25 })),
-    { ...lane(LON + 0.02, () => 8)[0] },
+    { ...lane(lonAt(32) + 0.01, () => 8)[0] },
   ];
   const t = decode(buildTile(z, x, y, cells, [])!);
   expect(features(t, "M_QUAL")[0].properties).toMatchObject({ tided: 1 });

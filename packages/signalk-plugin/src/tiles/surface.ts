@@ -21,8 +21,8 @@ import { EXTENT, Feature, Point, encodeTile } from "./mvt.js";
 import {
   Level,
   Prepared,
+  band,
   cut,
-  distance,
   isolines,
   polygons,
   prepare,
@@ -102,7 +102,7 @@ const INFORM = {
 export function rasterSize(z: number, _lat?: number): number {
   // Sized by zoom alone, as at the equator, so neighbouring tiles share a pixel grid and
   // their areas meet without a seam. Away from it pixels are finer than a cell. A power
-  // of two, so a tile's pixels are its parent's, and tiles from SHARED_ZOOM in share
+  // of two, so a tile's pixels are its parent's, and tiles past SHARED_ZOOM share
   // their parent's surface.
   const fit = tileMetres(z, 0) / CELL_M;
   return Math.min(256, 2 ** Math.max(0, Math.round(Math.log2(fit))));
@@ -114,7 +114,7 @@ const HALO_MIN_PX = 8;
 /** Tiles past this zoom are cut from their ancestor's surface at it: their pixels are
  * the same size, so the surface is built once for all of them, and they meet without a
  * seam. */
-export const SHARED_ZOOM = 13;
+export const SHARED_ZOOM = 14;
 
 // A tile's pixels are its ancestor's at SHARED_ZOOM, as `cut` takes them: so long as a
 // cell's size keeps their rasters powers of two apart.
@@ -172,8 +172,9 @@ export interface Raster {
   /** Metres to the nearest sounded cell, and the distance that counts as measured. */
   near: Float32Array;
   measuredM: number;
-  /** The shoalest sounding in each pixel or beside it, Infinity where there's none: a
-   * cell's, or past the interpolated pixels an unconfirmed shoal's too. */
+  /** Past the interpolated pixels, the shoalest sounding in each pixel or beside it, a
+   * cell's or an unconfirmed shoal's; Infinity where there's none, and over the
+   * interpolated pixels. */
   shoalest: Float32Array;
   /** The depth before the margin where it's at or above 0 m, which decides where water
    * is wet: the margin never makes it drying. */
@@ -365,6 +366,8 @@ export function surface(
       if (carried && !Number.isNaN(depth[i])) {
         depth[i] = Math.min(depth[i], shoalest[i]);
       }
+      // The interpolated pixels follow their cells as the grid's do, capped by none.
+      if (!carried) shoalest[i] = Infinity;
     }
   }
   const wet = depth.map((d, i) =>
@@ -461,7 +464,8 @@ export function buildTile(
   // kept for its other tiles. Zoomed out, a tile shares its surface with none.
   const a = sharedTile(z, x, y);
   const key = `${a.z}/${a.x}/${a.y}`;
-  const keep = a.z === SHARED_ZOOM ? shared : undefined;
+  // Only a tile cut from it keeps it: a tile at SHARED_ZOOM is built on its own.
+  const keep = z > SHARED_ZOOM ? shared : undefined;
   let prepared = keep?.get(key);
   if (prepared) {
     // The most recently used, kept longest.
@@ -480,13 +484,6 @@ export function buildTile(
     shoalest = Math.min(shoalest, t.depth[i], t.wet[i]);
     deepest = Math.max(deepest, t.depth[i], t.wet[i]);
   });
-  // A band's upper edge is the next one's lower: each traced once.
-  let previous: [number, Float64Array] | undefined;
-  const from = (level: number) => {
-    if (previous?.[0] !== level) previous = [level, distance(t, level)];
-    return previous[1];
-  };
-
   const DEPARE: Feature[] = [];
   const edges = fine ? FINE_EDGES : [DRYING_FLOOR_M, ...LEVELS];
   for (let k = 0; k < edges.length - 1; k++) {
@@ -494,11 +491,7 @@ export function buildTile(
     // Each edge a few millimetres shoaler than the band's: water at exactly a band's
     // depth, as water capped at a shoal's, is inside it, not on its edge.
     if (hi - EDGE_M <= shoalest || lo - EDGE_M > deepest) continue;
-    const below = from(lo - EDGE_M);
-    const above = from(hi - EDGE_M);
-    // At least 0 inside the band and the surface's extent.
-    const field = t.extent.map((e, i) => Math.min(e, below[i], -above[i]));
-    const polys = polygons(t, field);
+    const polys = polygons(t, band(t, lo - EDGE_M, hi - EDGE_M));
     if (polys.length) {
       DEPARE.push({
         type: "Polygon",

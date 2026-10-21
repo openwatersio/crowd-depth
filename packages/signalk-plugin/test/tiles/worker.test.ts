@@ -78,8 +78,9 @@ test.skipIf(!existsSync(dist))(
       // Written as a backfill writes, which tells the tile service nothing until it ends.
       for (let k = 0; k < 20; k++) store.addPasses(pass(30));
       // A tile beside it, not built yet, cut from the same ancestor's surface.
-      const sibling = await bands(x, y + 1);
+      const sibling = await bands(x, y ^ 1);
       expect(before.length).toBeGreaterThan(0);
+      expect(sibling.length).toBeGreaterThan(0);
       expect(Math.min(...sibling)).toBeGreaterThan(Math.max(...before));
     } finally {
       tiles.close();
