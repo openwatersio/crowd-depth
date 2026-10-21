@@ -14,6 +14,13 @@ export interface Level {
   major?: boolean;
 }
 
+/** How far from its pixel's centre a carried cap holds, pixels: over the pixels beside it
+ * too, since upsampling blends theirs with its own. Past that it rises CONE_M_PER_PX
+ * metres a pixel, as far as CONE_PX pixels about it, by when it's 3.8 m deeper, deeper
+ * than water beside a sounding seldom is. */
+const HOLD_PX = 1.6;
+const CONE_PX = 3;
+const CONE_M_PER_PX = 2;
 /** A blur of 1.5 pixels: enough to calm the cells' noise, little enough to keep a
  * channel's shape. */
 const SMOOTH_PX = 1.5;
@@ -59,9 +66,8 @@ export interface Prepared {
   wet: Float64Array;
   extent: Float64Array;
   measured: Float64Array;
-  /** Each pixel's softened cap, lowered to the least in its 3×3: blended between any
-   * four pixels about a sample, never deeper than the cap of the pixel it's in. */
-  bound: Float64Array;
+  /** Each pixel's softened cap past the interpolated pixels: Infinity where none. */
+  carried: Float64Array;
 }
 
 /** The smooth fields over the raster's tile and PAD_PX past it. */
@@ -111,28 +117,19 @@ export function prepare(r: Raster): Prepared {
   const grown = grow(sounded.map((v, i) => v || between[i]));
   const grownMeasured = grow(sounded).map((v, i) => (between[i] ? 0 : v));
 
-  // The depth blurred, then never deeper than the shoalest sounding in a pixel or beside
-  // it; pixels without one carry the shoalest beside them, so the bicubic has values
-  // past the edge.
-  // Past the interpolated pixels, never deeper than a sounding beside them; within
-  // them, never more than TOLERANCE_M deeper than the shoalest of the surface beside it,
-  // so the blur smooths it without carrying deep water over shoal.
+  // The depth blurred, then past the interpolated pixels never deeper than a sounding
+  // beside them; pixels without one carry the shoalest beside them, so the bicubic has
+  // values past the edge. Within them, never more than TOLERANCE_M deeper than the
+  // pixel's own surface depth, so the blur smooths it without carrying deep water over
+  // shoal; its own, not the shoalest beside it, whose squares the contours would trace.
   const raw = region((i) => r.depth[i]);
-  const cap = soften(
+  const carried = soften(
     region((i) => r.shoalest[i]),
     w,
-  ).map((c, i) => {
-    const x = i % w;
-    const y = (i - x) / w;
-    let least = Infinity;
-    for (let yy = Math.max(0, y - 1); yy <= Math.min(w - 1, y + 1); yy++) {
-      for (let xx = Math.max(0, x - 1); xx <= Math.min(w - 1, x + 1); xx++) {
-        const d = raw[yy * w + xx];
-        if (!Number.isNaN(d)) least = Math.min(least, d);
-      }
-    }
-    return Math.min(c, least + TOLERANCE_M);
-  });
+  );
+  const cap = carried.map((c, i) =>
+    Number.isNaN(raw[i]) ? c : Math.min(c, raw[i] + TOLERANCE_M),
+  );
   const smooth = (v: Float64Array) => {
     const blurred = gauss(v, w, SMOOTH_PX);
     return carry(
@@ -150,18 +147,7 @@ export function prepare(r: Raster): Prepared {
     Math.min(m, -interpolated[i]),
   );
 
-  const bound = cap.map((_, i) => {
-    const x = i % w;
-    const y = (i - x) / w;
-    let least = Infinity;
-    for (let yy = Math.max(0, y - 1); yy <= Math.min(w - 1, y + 1); yy++) {
-      for (let xx = Math.max(0, x - 1); xx <= Math.min(w - 1, x + 1); xx++) {
-        least = Math.min(least, cap[yy * w + xx]);
-      }
-    }
-    return least;
-  });
-  return { w, depth, wet, extent, measured, bound };
+  return { w, depth, wet, extent, measured, carried };
 }
 
 /** The tile `n` pixels a side whose pixels start at (`ox`, `oy`) past PAD_PX in `p`,
@@ -178,14 +164,38 @@ export function cut(p: Prepared, ox: number, oy: number, n: number): Traced {
   };
   const m = w * u;
   const scale = EXTENT / n;
-  // Each sample never deeper than the cap of a pixel about it: upsampling blends past a
-  // pixel's own depth.
-  const caps = upsample(
-    slice(p.bound).map((v) => Math.min(v, 1e4)),
-    w,
-    u,
-    false,
-  );
+  // Each sample never deeper than the cap of the pixel it's in or beside, since
+  // upsampling blends past a pixel's own depth: each cap holds over a disc and rises
+  // from there as a cone, so a cap that binds draws round, rather than as the square of
+  // pixels it covers.
+  const carried = slice(p.carried);
+  const caps = new Float64Array(m * m).fill(Infinity);
+  // Each cap stamped over the samples within CONE_PX of its pixel's centre.
+  const reach = CONE_PX + 0.5;
+  for (let qy = 0; qy < w; qy++) {
+    for (let qx = 0; qx < w; qx++) {
+      const v = carried[qy * w + qx];
+      if (v === Infinity) continue;
+      const [cx, cy] = [qx + 0.5, qy + 0.5];
+      const [x0, x1] = [
+        Math.max(0, Math.ceil((cx - reach) * u - 0.5)),
+        Math.min(m - 1, Math.floor((cx + reach) * u - 0.5)),
+      ];
+      const [y0, y1] = [
+        Math.max(0, Math.ceil((cy - reach) * u - 0.5)),
+        Math.min(m - 1, Math.floor((cy + reach) * u - 0.5)),
+      ];
+      for (let Y = y0; Y <= y1; Y++) {
+        const dy = (Y + 0.5) / u - cy;
+        for (let X = x0; X <= x1; X++) {
+          const d = Math.hypot((X + 0.5) / u - cx, dy);
+          if (d > reach) continue;
+          const c = v + CONE_M_PER_PX * Math.max(0, d - HOLD_PX);
+          if (c < caps[Y * m + X]) caps[Y * m + X] = c;
+        }
+      }
+    }
+  }
   const fine = upsample(slice(p.depth), w, u, true).map((d, i) =>
     Math.min(d, caps[i]),
   );
@@ -553,8 +563,15 @@ export function isolines(t: Traced, levels: number[]): Map<number, Point[][]> {
             ? simplifyRing(line, 1)
             : simplify(line, 1);
         })
-        // A loop round a single sample rounds to a point: not drawn.
-        .filter((line) => new Set(line.map(([x, y]) => `${x},${y}`)).size > 2),
+        // A loop round a single sample rounds to a point, or a line to a dot: not
+        // drawn. A straight line simplifies to its two ends, and is.
+        .filter((line) => {
+          const [a, b] = [line[0], line[line.length - 1]];
+          const closed = a[0] === b[0] && a[1] === b[1];
+          return (
+            new Set(line.map(([x, y]) => `${x},${y}`)).size > (closed ? 2 : 1)
+          );
+        }),
     ]),
   );
 }

@@ -92,6 +92,8 @@ test.each(["north", "east", "northeast"])(
       }
     }
   },
+  // Twelve zooms of tiles.
+  20_000,
 );
 
 test("every depth area is covered, as measured or interpolated, never both", () => {
@@ -190,4 +192,70 @@ test("zoomed out, passes a few pixels apart stay apart", () => {
     );
     expect(bandsAt(t, z, LON + dLon / 2, LAT), `z${z}`).toEqual([]);
   }
+});
+
+test("contours in shallow water don't follow the pixel grid", () => {
+  // A swath six cells wide heading northeast, its depths varying a few tenths about
+  // 3.6 m, about 1.5 m past the margin.
+  const o = cellAt(LON, LAT);
+  const cells: Cell[] = [];
+  for (let r = 0; r < 40; r++) {
+    for (let k = 0; k < 6; k++) {
+      cells.push({
+        py: o.py + r,
+        px: o.px + r + k,
+        m: 3.6 + 0.35 * Math.sin(r * 1.3 + k * 2.1),
+        d: 0.2,
+        passes: 3,
+        first: 20000,
+        last: 20010,
+      });
+    }
+  }
+  const z = 15;
+  const p = cellCenter(o.py + 20, o.px + 22);
+  const f = tileFraction(p.lon, p.lat, z);
+  const t = decode(buildTile(z, Math.floor(f.x), Math.floor(f.y), cells, [])!);
+  let longest = 0;
+  for (const c of features(t, "DEPCNT")) {
+    for (const line of c.loadGeometry()) {
+      for (let i = 1; i < line.length; i++) {
+        const [a, b] = [line[i - 1], line[i]];
+        if (a.x === b.x || a.y === b.y) {
+          longest = Math.max(longest, Math.hypot(b.x - a.x, b.y - a.y));
+        }
+      }
+    }
+  }
+  expect(features(t, "DEPCNT").length).toBeGreaterThan(0);
+  // A z15 pixel is 64 units: a straight run of a couple of pixels along the grid is
+  // the grid's, not the bottom's.
+  expect(longest).toBeLessThan(96);
+});
+
+test("straight contours across an even slope are drawn", () => {
+  // Water deepening evenly eastward, across the whole of a z15 tile and past it.
+  const z = 15;
+  const f = tileFraction(LON, LAT, z);
+  const o = cellAt(LON, LAT);
+  const cells: Cell[] = [];
+  for (let r = -60; r < 60; r++) {
+    for (let c = -20; c < 20; c++) {
+      cells.push({
+        py: o.py + r,
+        px: o.px + c,
+        m: 10 + c * 0.25,
+        d: 0.2,
+        passes: 3,
+        first: 20000,
+        last: 20010,
+      });
+    }
+  }
+  const t = decode(buildTile(z, Math.floor(f.x), Math.floor(f.y), cells, [])!);
+  const metres = features(t, "DEPCNT").filter((c) => c.properties.unit === "m");
+  const bands = features(t, "DEPARE").length;
+  expect(bands).toBeGreaterThan(2);
+  // A contour between each pair of neighbouring bands.
+  expect(metres.length).toBeGreaterThanOrEqual(bands - 1);
 });
