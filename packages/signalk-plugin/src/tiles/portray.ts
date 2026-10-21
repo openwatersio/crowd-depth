@@ -1,7 +1,7 @@
 // How a tile's surface is drawn: depth areas, contours and coverage, traced from one
 // smooth surface, as a chart of crowd soundings draws them (docs/plans/global-grid/
-// live-layer.md). The surface is blurred, never deeper than a sounding beside it, and
-// upsampled before it's traced, so its contours curve as the bottom does rather than
+// live-layer.md). The surface is blurred, never much deeper than the surface or an
+// unconfirmed shoal beside it, and upsampled before it's traced, so its contours curve as the bottom does rather than
 // following the cells.
 import { contours } from "d3-contour";
 import { EXTENT, Point } from "./mvt.js";
@@ -14,8 +14,8 @@ export interface Level {
   major?: boolean;
 }
 
-/** How far from its pixel's centre a carried cap holds, pixels: over the pixels beside it
- * too, since upsampling blends theirs with its own. Past that it rises CONE_M_PER_PX
+/** How far from its pixel's centre an unconfirmed shoal's cap holds, pixels: over the
+ * pixels beside it too, since upsampling blends theirs with its own. Past that it rises CONE_M_PER_PX
  * metres a pixel, as far as CONE_PX pixels about it, by when it's 3.8 m deeper, deeper
  * than water beside a sounding seldom is. */
 const HOLD_PX = 1.6;
@@ -66,8 +66,9 @@ export interface Prepared {
   wet: Float64Array;
   extent: Float64Array;
   measured: Float64Array;
-  /** Each pixel's softened cap past the interpolated pixels: Infinity where none. */
-  carried: Float64Array;
+  /** Each pixel's softened cap past the interpolated pixels from unconfirmed shoals:
+   * Infinity where none. */
+  shoal: Float64Array;
 }
 
 /** The smooth fields over the raster's tile and PAD_PX past it. */
@@ -117,8 +118,8 @@ export function prepare(r: Raster): Prepared {
   const grown = grow(sounded.map((v, i) => v || between[i]));
   const grownMeasured = grow(sounded).map((v, i) => (between[i] ? 0 : v));
 
-  // The depth blurred, then past the interpolated pixels never deeper than a sounding
-  // beside them; pixels without one carry the shoalest beside them, so the bicubic has
+  // The depth blurred, then past the interpolated pixels never deeper than the surface
+  // or an unconfirmed shoal beside them; pixels without one carry the shoalest beside them, so the bicubic has
   // values past the edge. Within them, never more than TOLERANCE_M deeper than the
   // pixel's own surface depth, so the blur smooths it without carrying deep water over
   // shoal; its own, not the shoalest beside it, whose squares the contours would trace.
@@ -147,7 +148,17 @@ export function prepare(r: Raster): Prepared {
     Math.min(m, -interpolated[i]),
   );
 
-  return { w, depth, wet, extent, measured, carried };
+  return {
+    w,
+    depth,
+    wet,
+    extent,
+    measured,
+    shoal: soften(
+      region((i) => r.shoal[i]),
+      w,
+    ),
+  };
 }
 
 /** The tile `n` pixels a side whose pixels start at (`ox`, `oy`) past PAD_PX in `p`,
@@ -164,11 +175,11 @@ export function cut(p: Prepared, ox: number, oy: number, n: number): Traced {
   };
   const m = w * u;
   const scale = EXTENT / n;
-  // Each sample never deeper than the cap of the pixel it's in or beside, since
-  // upsampling blends past a pixel's own depth: each cap holds over a disc and rises
-  // from there as a cone, so a cap that binds draws round, rather than as the square of
-  // pixels it covers.
-  const carried = slice(p.carried);
+  // Each sample never deeper than an unconfirmed shoal in the pixel it's in or beside,
+  // since upsampling blends past a pixel's own depth: each such cap holds over a disc
+  // and rises from there as a cone, so it draws round the shoal. The surface's own caps
+  // hold at the pixels, and the bicubic blends between them.
+  const carried = slice(p.shoal);
   const caps = new Float64Array(m * m).fill(Infinity);
   // Each cap stamped over the samples within CONE_PX of its pixel's centre.
   const reach = CONE_PX + 0.5;
@@ -263,9 +274,9 @@ function gauss(v: Float64Array, w: number, sigma: number, valid = true) {
 }
 
 /**
- * `cap`, the shoalest sounding in each pixel or beside it, softened so it doesn't draw
- * squares where it binds: each pixel takes the mean of its 3×3's own shoalest in their
- * 3×3s. Each of those holds the pixel's own, so the mean is never deeper than it.
+ * `cap`, the shoalest surface or unconfirmed shoal in each pixel or beside it, softened
+ * so it doesn't draw squares where it binds: each pixel takes the mean of its 3×3's own
+ * shoalest in their 3×3s. Each of those holds the pixel's own, so the mean is never deeper than it.
  */
 function soften(cap: Float64Array, w: number) {
   const around = (v: Float64Array, pick: (vals: number[]) => number) =>

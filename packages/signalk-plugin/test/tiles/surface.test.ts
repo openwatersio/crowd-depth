@@ -360,7 +360,7 @@ test("a contour open at the outline is one line", () => {
   }
   const t = decode(buildTile(Z, tile.x, tile.y, cells, [])!);
   const lines = features(t, "DEPCNT").filter(
-    (c) => c.properties.unit === "m" && c.properties.VALDCO >= 7,
+    (c) => c.properties.unit === "m" && c.properties.VALDCO >= 6,
   );
   expect(lines.length).toBeGreaterThan(1);
   for (const c of lines) {

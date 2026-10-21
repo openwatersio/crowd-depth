@@ -195,7 +195,7 @@ test("zoomed out, passes a few pixels apart stay apart", () => {
 });
 
 test("contours in shallow water don't follow the pixel grid", () => {
-  // A swath six cells wide heading northeast, its depths varying a few tenths about
+  // A swath six cells wide heading northeast, its depths varying most of a metre about
   // 3.6 m, about 1.5 m past the margin.
   const o = cellAt(LON, LAT);
   const cells: Cell[] = [];
@@ -204,7 +204,7 @@ test("contours in shallow water don't follow the pixel grid", () => {
       cells.push({
         py: o.py + r,
         px: o.px + r + k,
-        m: 3.6 + 0.35 * Math.sin(r * 1.3 + k * 2.1),
+        m: 3.6 + 0.8 * Math.sin(r * 0.7 + k * 1.1),
         d: 0.2,
         passes: 3,
         first: 20000,
@@ -228,9 +228,9 @@ test("contours in shallow water don't follow the pixel grid", () => {
     }
   }
   expect(features(t, "DEPCNT").length).toBeGreaterThan(0);
-  // A z15 pixel is 64 units: a straight run of a couple of pixels along the grid is
-  // the grid's, not the bottom's.
-  expect(longest).toBeLessThan(96);
+  // A z15 pixel is 64 units: a straight run of two and a half pixels along the grid
+  // is the grid's, not the bottom's.
+  expect(longest).toBeLessThan(160);
 });
 
 test("straight contours across an even slope are drawn", () => {

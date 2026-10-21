@@ -172,10 +172,12 @@ export interface Raster {
   /** Metres to the nearest sounded cell, and the distance that counts as measured. */
   near: Float32Array;
   measuredM: number;
-  /** Past the interpolated pixels, the shoalest sounding in each pixel or beside it, a
-   * cell's or an unconfirmed shoal's; Infinity where there's none, and over the
-   * interpolated pixels. */
+  /** Past the interpolated pixels, the shoalest of the interpolated surface and the
+   * unconfirmed shoals in each pixel or beside it; Infinity where there's none, and over
+   * the interpolated pixels. */
   shoalest: Float32Array;
+  /** The same, of the unconfirmed shoals alone. */
+  shoal: Float32Array;
   /** The depth before the margin where it's at or above 0 m, which decides where water
    * is wet: the margin never makes it drying. */
   wet: Float32Array;
@@ -195,7 +197,7 @@ interface Source {
  * `gdal_grid invdistnn`; a gaussian blur clamped so no pixel reads deeper than it was
  * interpolated; then k × σ off, with σ from the nearest cell widened by its distance.
  * Every depth the blur carries past the interpolated pixels is capped at the shoalest of
- * `cells` and `shoals` in its pixel or beside it.
+ * the interpolated surface and `shoals` in its pixel or beside it.
  */
 export function surface(
   z: number,
@@ -327,11 +329,13 @@ export function surface(
     depth[i] = m >= 0 ? Math.max(0, d) : d;
   }
 
-  // Carried past the interpolated pixels, a depth is never deeper than a published
-  // sounding in its pixel or beside it, cell or unconfirmed shoal, as the grid
-  // overlay's carried depths.
-  const byCell = new Float32Array(size * size).fill(Infinity);
-  for (const [i, s] of byPixel) byCell[i] = Math.min(byCell[i], s.depth);
+  // Carried past the interpolated pixels, a depth is never deeper than the surface it's
+  // carried from, in its pixel or beside it, or an unconfirmed shoal there. Not the
+  // cells': the surface between them is already allowed deeper than its shoalest cell,
+  // and an edge held to the cell would draw the difference as rings round it.
+  const bySurface = depth.map((d, i) =>
+    Number.isNaN(median[i]) || Number.isNaN(d) ? Infinity : d,
+  );
   const byShoal = new Float32Array(size * size).fill(Infinity);
   for (const s of shoals) {
     const f = tileFraction(s.lon, s.lat, z);
@@ -341,6 +345,7 @@ export function surface(
     byShoal[sy * size + sx] = Math.min(byShoal[sy * size + sx], s.depth);
   }
   const shoalest = new Float32Array(size * size).fill(Infinity);
+  const shoal = new Float32Array(size * size).fill(Infinity);
   for (let py = 0; py < size; py++) {
     for (let px = 0; px < size; px++) {
       const i = py * size + px;
@@ -356,18 +361,15 @@ export function surface(
           xx++
         ) {
           const j = yy * size + xx;
-          shoalest[i] = Math.min(
-            shoalest[i],
-            byCell[j],
-            carried ? byShoal[j] : Infinity,
-          );
+          shoalest[i] = Math.min(shoalest[i], bySurface[j], byShoal[j]);
+          shoal[i] = Math.min(shoal[i], byShoal[j]);
         }
       }
       if (carried && !Number.isNaN(depth[i])) {
         depth[i] = Math.min(depth[i], shoalest[i]);
       }
       // The interpolated pixels follow their cells as the grid's do, capped by none.
-      if (!carried) shoalest[i] = Infinity;
+      if (!carried) shoalest[i] = shoal[i] = Infinity;
     }
   }
   const wet = depth.map((d, i) =>
@@ -384,6 +386,7 @@ export function surface(
     near,
     measuredM,
     shoalest,
+    shoal,
     wet,
   };
 }
