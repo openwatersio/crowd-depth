@@ -49,6 +49,7 @@ test.skipIf(!existsSync(dist))(
     const { createCellStore } = await import("../../dist/tiles/cells.js");
     const { addPendingBackfill, backfillCells } =
       await import("../../dist/tiles/backfill.js");
+    const { historySpan } = await import("../../dist/config.js");
     const { app, config } = await import("../helper.js");
     const dir = mkdtempSync(join(tmpdir(), "crowd-depth-"));
     const file = join(dir, "bathymetry.sqlite");
@@ -69,7 +70,7 @@ test.skipIf(!existsSync(dist))(
         source.createWriter!(),
       );
       const store = createCellStore(db);
-      addPendingBackfill(store, start.add({ hours: 12 }));
+      addPendingBackfill(store, start.add({ hours: 12 }), historySpan(config));
       await backfillCells({
         app,
         config,
@@ -100,6 +101,7 @@ test.skipIf(!existsSync(dist))(
     const { createCellStore } = await import("../../dist/tiles/cells.js");
     const { addPendingBackfill, backfillCells } =
       await import("../../dist/tiles/backfill.js");
+    const { historySpan } = await import("../../dist/config.js");
     const { app, config } = await import("../helper.js");
     const dir = mkdtempSync(join(tmpdir(), "crowd-depth-"));
     const file = join(dir, "bathymetry.sqlite");
@@ -120,7 +122,7 @@ test.skipIf(!existsSync(dist))(
         source.createWriter!(),
       );
       const store = createCellStore(db);
-      addPendingBackfill(store, start.add({ hours: 12 }));
+      addPendingBackfill(store, start.add({ hours: 12 }), historySpan(config));
       const tides = {
         at: async () => ({ level: 1, sigma: 0.3 }),
         ready: async () => true,

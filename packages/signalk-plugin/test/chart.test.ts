@@ -7,11 +7,16 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Temporal } from "@js-temporal/polyfill";
 import { app, config } from "./helper.js";
-import { Config } from "../src/config.js";
-import { ownStyle, startChart, startChartSafely } from "../src/chart.js";
+import { Config, History, historySpan } from "../src/config.js";
+import {
+  cellConfig,
+  ownStyle,
+  startChart,
+  startChartSafely,
+} from "../src/chart.js";
 import { createDB } from "../src/storage.js";
 import { createSqliteSource } from "../src/sources/sqlite.js";
-import { Timeframe } from "../src/types.js";
+import { BathymetrySource, Timeframe } from "../src/types.js";
 import { correctForSensorPosition } from "../src/streams/index.js";
 import {
   CellStore,
@@ -22,6 +27,8 @@ import {
   getPendingBackfill,
   getThrough,
   registerLayerRoutes,
+  recordBackfillFailure,
+  startRebuild,
 } from "../src/tiles/index.js";
 
 /** The cell holding a position, if the store has one. */
@@ -75,7 +82,7 @@ test("backfills the tiles from the plugin's source with its correction", async (
   await pipeline(Readable.from(soundings), source.createWriter!());
 
   const store = createCellStore(db);
-  addPendingBackfill(store, at("2026-10-16T12:00:00Z"));
+  addPendingBackfill(store, at("2026-10-16T12:00:00Z"), historySpan(config));
   await backfillCells({
     app,
     config: offsetConfig,
@@ -112,7 +119,7 @@ test("backfill starts where the tiles left off", async () => {
   );
   const store = createCellStore(db);
   store.setMeta("through", "2026-10-16T09:00:00Z");
-  addPendingBackfill(store, at("2026-10-16T12:00:00Z"));
+  addPendingBackfill(store, at("2026-10-16T12:00:00Z"), historySpan(config));
 
   await backfillCells({
     app,
@@ -179,7 +186,7 @@ test("the backfill still runs after the live writer has moved the marker on", as
     source.createWriter!(),
   );
   const store = createCellStore(db);
-  addPendingBackfill(store, at("2026-10-16T12:00:00Z"));
+  addPendingBackfill(store, at("2026-10-16T12:00:00Z"), historySpan(config));
 
   const live = createCellWriter(store, { flushIntervalMs: 100000 });
   live.write(
@@ -207,12 +214,12 @@ test("the backfill still runs after the live writer has moved the marker on", as
 test("an interrupted backfill is widened, not lost, on the next start", () => {
   const store = createCellStore(createDB(":memory:"));
   store.setMeta("through", "2026-10-16T10:00:00Z");
-  addPendingBackfill(store, at("2026-10-16T12:00:00Z"));
+  addPendingBackfill(store, at("2026-10-16T12:00:00Z"), historySpan(config));
   const first = getPendingBackfill(store)!;
   expect(first.from.toString()).toBe("2026-10-16T10:00:00Z");
   // The live writer ran for a while before the plugin restarted.
   store.setMeta("through", "2026-10-16T13:00:00Z");
-  addPendingBackfill(store, at("2026-10-16T14:00:00Z"));
+  addPendingBackfill(store, at("2026-10-16T14:00:00Z"), historySpan(config));
   const second = getPendingBackfill(store)!;
   expect(second.from.toString()).toBe(first.from.toString());
   expect(second.to.toString()).toBe("2026-10-16T14:00:00Z");
@@ -373,7 +380,7 @@ test("after a depth reference change, the SQLite log only backfills newer soundi
     source.createWriter!(),
   );
   const store = createCellStore(db);
-  addPendingBackfill(store, at("2026-10-16T12:00:00Z"));
+  addPendingBackfill(store, at("2026-10-16T12:00:00Z"), historySpan(config));
   store.setMeta("depth_since", "2026-10-16T10:00:00Z");
 
   await backfillCells({
@@ -418,7 +425,7 @@ test("the backfill doesn't merge soundings past its span again", async () => {
   );
   const store = createCellStore(db);
   store.setMeta("through", "2026-10-16T11:00:00Z");
-  addPendingBackfill(store, at("2026-10-16T11:30:00Z"));
+  addPendingBackfill(store, at("2026-10-16T11:30:00Z"), historySpan(config));
 
   await backfillCells({
     app,
@@ -458,14 +465,36 @@ test("a failing backfill is retried on later starts, then given up", async () =>
   }
 });
 
-test("the backfill never reaches back more than 30 days", () => {
-  const store = createCellStore(createDB(":memory:"));
-  // The layer was off for three months.
-  store.setMeta("through", "2026-07-16T00:00:00Z");
-  addPendingBackfill(store, at("2026-10-16T00:00:00Z"));
-  expect(getPendingBackfill(store)!.from.toString()).toBe(
-    "2026-09-16T00:00:00Z",
-  );
+test("the backfill reaches back as far as the settings say, however long the layer was off", () => {
+  const backfillFrom = (history: History | undefined, through?: string) => {
+    const store = createCellStore(createDB(":memory:"));
+    if (through) store.setMeta("through", through);
+    const settings = { ...config, chart: { history } };
+    addPendingBackfill(
+      store,
+      at("2026-10-16T00:00:00Z"),
+      historySpan(settings),
+    );
+    return getPendingBackfill(store)!.from.toString();
+  };
+  // The layer was off for two years.
+  const through = "2024-10-16T00:00:00Z";
+  expect(backfillFrom("month", through)).toBe("2026-09-16T00:00:00Z");
+  expect(backfillFrom("year", through)).toBe("2025-10-16T00:00:00Z");
+  expect(backfillFrom(undefined, through)).toBe("2025-10-16T00:00:00Z");
+  expect(backfillFrom("all", through)).toBe(through);
+  // A new layer, from as far back as any source goes.
+  expect(backfillFrom("all")).toBe("2017-06-28T00:00:00Z");
+});
+
+test("changing how far back the layer fills rebuilds it", () => {
+  const position = (history?: string) =>
+    cellConfig({ ...config, chart: { history } } as Config).position;
+  expect(position("all")).not.toBe(position("year"));
+  expect(position("month")).not.toBe(position("year"));
+  // Unset, or hand-edited to something else, is the default.
+  expect(position()).toBe(position("year"));
+  expect(position("forever")).toBe(position("year"));
 });
 
 test("a chart that fails to start doesn't stop the plugin", () => {
@@ -536,7 +565,7 @@ test("a long SQLite backfill lets the server's event loop run", async () => {
     source.createWriter!(),
   );
   const store = createCellStore(db);
-  addPendingBackfill(store, at("2026-10-17T00:00:00Z"));
+  addPendingBackfill(store, at("2026-10-17T00:00:00Z"), historySpan(config));
 
   // Count turns of the event loop between the first and last sounding read,
   // which is before the writer's own pauses at the end.
@@ -623,7 +652,7 @@ test("a finished backfill isn't folded in again on the next start", async () => 
   );
   const store = createCellStore(db);
   const backfill = async (until: string) => {
-    addPendingBackfill(store, at(until));
+    addPendingBackfill(store, at(until), historySpan(config));
     await backfillCells({
       app,
       config,
@@ -638,6 +667,110 @@ test("a finished backfill isn't folded in again on the next start", async () => 
   // The sounder was off since: nothing live moved the marker.
   await backfill("2026-10-16T13:00:00Z");
   expect(cellAt(store, -76.2, 36.98 + 10 * 0.0003)).toEqual(first);
+});
+
+test("a fill stopped partway goes on from where it got to", async () => {
+  // A track up a meridian, a new cell every sounding.
+  const track = Array.from({ length: 900 }, (_, i) => ({
+    latitude: 36.98 + i * 0.0003,
+    longitude: -76.2,
+    depth: 5 + (i % 3) * 0.1,
+    timestamp: at("2026-10-16T08:00:00Z").add({ seconds: i * 10 }),
+    heading: 0,
+  }));
+  const fill = async (source: BathymetrySource, store: CellStore) =>
+    backfillCells({
+      app,
+      config,
+      source,
+      store,
+      signal: new AbortController().signal,
+    });
+  const db = createDB(":memory:");
+  const source = createSqliteSource(app, db);
+  await pipeline(Readable.from(track), source.createWriter!());
+  const clean = createCellStore(createDB(":memory:"));
+  startRebuild(clean);
+  addPendingBackfill(clean, at("2026-10-16T12:00:00Z"), historySpan(config));
+  await fill(source, clean);
+
+  const store = createCellStore(db);
+  startRebuild(store);
+  addPendingBackfill(store, at("2026-10-16T12:00:00Z"), historySpan(config));
+  // Stopped two thirds of the way through.
+  const failing: BathymetrySource = {
+    ...source,
+    createReader: async () =>
+      Readable.from(
+        (async function* () {
+          yield* track.slice(0, 600);
+          throw new Error("stopped");
+        })(),
+      ),
+  };
+  // Two starts that got nowhere before this one.
+  store.setMeta("backfill_failures", "2");
+  await expect(fill(failing, store)).rejects.toThrow("stopped");
+  const left = getPendingBackfill(store)!;
+  expect(Temporal.Instant.compare(left.from, track[200].timestamp)).toBe(1);
+  // Further than it was, so the failure doesn't count toward giving the span up.
+  expect(recordBackfillFailure(store)).toBe(true);
+  expect(store.getMeta("backfill_failures")).toBe("1");
+  // The next start finds the span where it got to.
+  addPendingBackfill(store, at("2026-10-16T12:00:00Z"), historySpan(config));
+  expect(getPendingBackfill(store)).toEqual(left);
+  await fill(source, store);
+  const cells = (s: CellStore) => s.cells(-76.3, 36.9, -76.1, 37.4);
+  expect(cells(store)).toEqual(cells(clean));
+});
+
+test("a long span is asked about a year at a time, each hour read once", async () => {
+  const store = createCellStore(createDB(":memory:"));
+  store.setMeta("backfill", "2024-01-01T00:00:00Z/2026-01-01T00:00:00Z");
+  const asked: Timeframe[] = [];
+  const read: Timeframe[] = [];
+  const source: BathymetrySource = {
+    // A provider rounding out to its own hours: the window either side of where
+    // one request ends and the next starts.
+    getAvailableTimeframes: async (span) => {
+      asked.push(span);
+      return [
+        new Timeframe(
+          span.from.subtract({ minutes: 30 }),
+          span.from.add({ minutes: 30 }),
+        ),
+        new Timeframe(
+          span.to.subtract({ minutes: 30 }),
+          span.to.add({ minutes: 30 }),
+        ),
+      ];
+    },
+    createReader: async (window) => {
+      read.push(window);
+      return undefined;
+    },
+  };
+  await backfillCells({
+    app,
+    config,
+    source,
+    store,
+    signal: new AbortController().signal,
+  });
+  expect(asked).toHaveLength(3);
+  for (const span of asked) {
+    expect(span.to.since(span.from).total("hours")).toBeLessThanOrEqual(
+      365 * 24,
+    );
+  }
+  const hours = read.reduce((n, w) => n + w.to.since(w.from).total("hours"), 0);
+  // Half an hour at each end of each request, nothing twice.
+  expect(hours).toBe(asked.length);
+  for (let i = 1; i < read.length; i++) {
+    expect(
+      Temporal.Instant.compare(read[i - 1].to, read[i].from),
+    ).toBeLessThanOrEqual(0);
+  }
 });
 
 test("a database from a preview build moves to cells", () => {
@@ -668,7 +801,7 @@ test("a database from a preview build moves to cells", () => {
 
 test("a backfill that fails partway still leaves its cells drawn zoomed out", async () => {
   const store = createCellStore(createDB(":memory:"));
-  addPendingBackfill(store, at("2026-10-16T12:00:00Z"));
+  addPendingBackfill(store, at("2026-10-16T12:00:00Z"), historySpan(config));
   const start = at("2026-10-16T08:00:00Z");
   const failing = {
     createWriter: () => undefined as never,

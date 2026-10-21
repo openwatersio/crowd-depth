@@ -1,4 +1,5 @@
 import { ServerAPI } from "@signalk/server-api";
+import { Temporal } from "@js-temporal/polyfill";
 import { DEFAULT_OWN_STYLE, TINTS, type Tint } from "./tiles/style.js";
 
 // Can this be inferred from the JSON schema?
@@ -40,8 +41,31 @@ export type Config = {
     tint?: Tint;
     /** Draw depth contours; on unless turned off. */
     contours?: boolean;
+    /** How far back the layer fills from the plugin's source. */
+    history?: History;
   };
 };
+
+/** The spans the layer can fill from, in days; all of the source's history for "all". */
+export const HISTORY_DAYS = { month: 30, year: 365, all: undefined };
+export type History = keyof typeof HISTORY_DAYS;
+export const DEFAULT_HISTORY: History = "year";
+
+/** The history setting, a hand-edited value that isn't one falling back to the default. */
+export function historySetting(config: Config): History {
+  const history = config.chart?.history;
+  return history && Object.hasOwn(HISTORY_DAYS, history)
+    ? history
+    : DEFAULT_HISTORY;
+}
+
+/** How far back the layer fills; undefined for all of it. */
+export function historySpan(config: Config): Temporal.Duration | undefined {
+  const days = HISTORY_DAYS[historySetting(config)];
+  return days === undefined
+    ? undefined
+    : Temporal.Duration.from({ hours: days * 24 });
+}
 
 /**
  * The source Signal K currently prioritizes for a path (its `$source`) plus the
@@ -337,6 +361,19 @@ export function schema(app: ServerAPI) {
             type: "boolean",
             default: DEFAULT_OWN_STYLE.contours,
             title: "Draw depth contours",
+          },
+          history: {
+            type: "string",
+            enum: Object.keys(HISTORY_DAYS),
+            enumNames: [
+              "The last 30 days",
+              "The last year",
+              "All recorded history",
+            ],
+            default: DEFAULT_HISTORY,
+            title: "Fill the layer from",
+            description:
+              "How far back the layer fills in from recorded soundings when it starts or rebuilds. A longer span takes longer to fill in, and new soundings wait for it, for up to 3 hours. Changing it rebuilds the layer.",
           },
         },
       },

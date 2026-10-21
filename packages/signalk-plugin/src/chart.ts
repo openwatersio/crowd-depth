@@ -5,7 +5,12 @@ import { DatabaseSync } from "node:sqlite";
 import { Temporal } from "@js-temporal/polyfill";
 import { transform } from "stream-transform";
 import { ServerAPI } from "@signalk/server-api";
-import { Config, depthReference } from "./config.js";
+import {
+  Config,
+  depthReference,
+  historySetting,
+  historySpan,
+} from "./config.js";
 import { BathymetrySource } from "./types.js";
 import {
   correctForSensorPosition,
@@ -19,15 +24,14 @@ import {
   backfillCells,
   tideChanged,
   TIDES_WAIT_MS,
-  clearPendingBackfill,
   getPendingBackfill,
   createCellStore,
   createCellWriter,
   createTileService,
+  startRebuild,
   recordBackfillFailure,
   registerLayerRoutes,
   DEPTH_SINCE_KEY,
-  THROUGH_KEY,
 } from "./tiles/index.js";
 import { DEFINITIONS } from "./tiles/geometry.js";
 import {
@@ -76,7 +80,8 @@ let current: Layer | undefined;
 let routesRegistered = false;
 
 /** The settings the cells depend on: the depth path and offset, and the antenna to
- * transducer offset, QC and the cells' resolution, which place and judge each sounding.
+ * transducer offset, QC and the cells' resolution, which place and judge each sounding,
+ * and how far back they're filled from.
  * The statistic's k and σs aren't among them: they're applied as tiles are drawn, and
  * the tide is the backfill's to check (`TIDE_CONFIG_KEY`), once signalk-tides answers. */
 export function cellConfig(config: Config) {
@@ -88,6 +93,7 @@ export function cellConfig(config: Config) {
       qc: DEFINITIONS.qc,
       rows: DEFINITIONS.cells.rows_per_degree,
       columns: DEFINITIONS.cells.column_steps_divide,
+      history: historySetting(config),
     }),
     depth: JSON.stringify({
       depthPath: `environment.depth.${config.path}`,
@@ -125,7 +131,7 @@ export function startChart({
 
   syncConfig(store, cellConfig(config), startedAt);
   // Before the live writer starts, so its marker doesn't hide the gap.
-  addPendingBackfill(store, startedAt);
+  addPendingBackfill(store, startedAt, historySpan(config));
 
   const tiles = createTileService(store, db.location() ?? undefined);
   // Off the main thread, given a database file to say the plugin is built and running.
@@ -264,9 +270,7 @@ function syncConfig(
   const previousDepth = store.getMeta(DEPTH_CONFIG_KEY);
   const depthChanged = previousDepth !== undefined && previousDepth !== depth;
   if (store.getMeta(POSITION_CONFIG_KEY) !== position || depthChanged) {
-    store.clear();
-    store.setMeta(THROUGH_KEY, "");
-    clearPendingBackfill(store);
+    startRebuild(store);
     if (depthChanged) store.setMeta(DEPTH_SINCE_KEY, startedAt.toString());
     store.setMeta(POSITION_CONFIG_KEY, position);
   }

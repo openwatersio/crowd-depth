@@ -23,7 +23,6 @@ export function createDB(filename: string): DatabaseSync {
         );
 
         CREATE INDEX IF NOT EXISTS idx_bathymetry_timestamp ON bathymetry(timestamp);
-        CREATE INDEX IF NOT EXISTS idx_bathymetry_location ON bathymetry(latitude, longitude);
       `);
     },
     () => {
@@ -121,6 +120,11 @@ export function createDB(filename: string): DatabaseSync {
         ALTER TABLE overviews ADD COLUMN t INTEGER;
         ALTER TABLE overviews ADD COLUMN u INTEGER;
       `);
+    },
+    () => {
+      // An index on position the first migration once made: nothing reads the log by
+      // position, and it took a third of the file.
+      db.exec("DROP INDEX IF EXISTS idx_bathymetry_location");
     },
   ]);
 

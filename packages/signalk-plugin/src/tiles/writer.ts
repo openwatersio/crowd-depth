@@ -173,6 +173,7 @@ export function createCellWriter(
     onChange = () => {},
     qc: runQC,
     onError = () => {},
+    progress,
   }: {
     flushIntervalMs?: number;
     bulk?: boolean;
@@ -183,6 +184,9 @@ export function createCellWriter(
     qc?: QCRunner;
     /** Told of trouble the writer goes on through. */
     onError?: (err: Error) => void;
+    /** A backfill's, told after each write of the oldest sounding it has yet to
+     * write, in microseconds. */
+    progress?: (micros: number) => void;
   } = {},
 ) {
   /** While QC's thread has failed, when to try it again. */
@@ -429,9 +433,11 @@ export function createCellWriter(
       unwritten = [];
       onChange([...cells.map((c) => cellCenter(c.py, c.px)), ...found]);
     }
-    if (!bulk && latest) {
+    if (latest) {
       const oldest = oldestHeld();
-      setThrough(store, Number.isFinite(oldest) ? oldest - 1 : latest);
+      if (!bulk) {
+        setThrough(store, Number.isFinite(oldest) ? oldest - 1 : latest);
+      } else progress?.(Number.isFinite(oldest) ? oldest : latest + 1000);
     }
   };
 
