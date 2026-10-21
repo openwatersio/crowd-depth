@@ -1,5 +1,6 @@
 import { Temporal } from "@js-temporal/polyfill";
 import { Readable, Writable } from "stream";
+import type { Tide } from "./tiles/tide.js";
 
 export type MaybePromise<T> = T | Promise<T>;
 
@@ -30,6 +31,8 @@ export type BathymetryData = {
   depth: number;
   timestamp: Temporal.Instant;
   heading?: number;
+  /** The water level above chart datum at the sounding, for the chart layer. */
+  tide?: Tide;
 };
 
 export interface BathymetrySource {

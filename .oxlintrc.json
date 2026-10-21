@@ -4,5 +4,10 @@
   "categories": {
     "correctness": "error"
   },
-  "ignorePatterns": ["dist", "packages/*/dist", "packages/grid"]
+  "ignorePatterns": [
+    "dist",
+    "packages/*/dist",
+    "packages/signalk-plugin/public",
+    "packages/grid"
+  ]
 }

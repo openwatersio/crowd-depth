@@ -1,4 +1,5 @@
 import { ServerAPI } from "@signalk/server-api";
+import { DEFAULT_OWN_STYLE, TINTS, type Tint } from "./tiles/style.js";
 
 // Can this be inferred from the JSON schema?
 export type Config = {
@@ -25,6 +26,20 @@ export type Config = {
   };
   sharing: {
     anonymous: boolean;
+  };
+  chart?: {
+    /** Offer the "My soundings" layer to chartplotters; on unless turned off. */
+    show?: boolean;
+    /** Depth areas and soundings shoaler than this, in metres, draw as unsafe. */
+    safetyDepth?: number;
+    /** The colour of the boat's own soundings, contours and tint, as `#rrggbb`. */
+    color?: string;
+    /** The colour of soundings shoaler than the safety depth, as `#rrggbb`. */
+    shoalColor?: string;
+    /** How strongly the water the boat sounded is tinted. */
+    tint?: Tint;
+    /** Draw depth contours; on unless turned off. */
+    contours?: boolean;
   };
 };
 
@@ -271,6 +286,57 @@ export function schema(app: ServerAPI) {
             title: "Share data anonymously",
             description:
               "If you do not wish to share your vessel name and MMSI, you can share anonymously with a unique UUID instead.",
+          },
+        },
+      },
+      chart: {
+        type: "object",
+        title: "Chart",
+        properties: {
+          show: {
+            type: "boolean",
+            default: true,
+            title: "Show my soundings on the chart",
+            description:
+              "Draw the depths this boat records as a layer in chartplotters that support Signal K plotter extensions, such as Freeboard-SK 3.4 or later. With signalk-tides installed, depths are reduced to chart datum by predicted tides where a station is in reach. Not for navigation.",
+          },
+          safetyDepth: {
+            type: "number",
+            default: 3,
+            minimum: 0,
+            title: "Safety depth (m)",
+            description:
+              "Depth areas and soundings shoaler than this draw as unsafe on the layer.",
+          },
+          color: {
+            type: "string",
+            format: "color",
+            default: DEFAULT_OWN_STYLE.accent,
+            title: "Colour of my soundings",
+            description:
+              "The colour of the layer's soundings, contours and tint. Pick one the chart under it doesn't use, so the layer stands out.",
+          },
+          shoalColor: {
+            type: "string",
+            format: "color",
+            default: DEFAULT_OWN_STYLE.shoal,
+            title: "Colour of my shoal soundings",
+            description:
+              "The colour of soundings shoaler than the safety depth. Pick one that stands apart from the colour of my soundings.",
+          },
+          tint: {
+            type: "string",
+            enum: Object.keys(TINTS),
+            enumNames: ["Off", "Faint", "Normal", "Strong"],
+            default: DEFAULT_OWN_STYLE.tint,
+            title: "Tint over sounded water",
+            description:
+              "How strongly the layer tints the water this boat has sounded, and half as strongly where it fills in between tracks.",
+          },
+          contours: {
+            type: "boolean",
+            default: DEFAULT_OWN_STYLE.contours,
+            title: "Draw depth contours",
           },
         },
       },

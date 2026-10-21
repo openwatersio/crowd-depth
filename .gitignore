@@ -5,6 +5,7 @@ tmp
 .vercel
 .wrangler
 tsconfig.tsbuildinfo
+packages/signalk-plugin/public
 packages/grid/.venv
 packages/grid/.preview
 __pycache__

@@ -8,5 +8,5 @@
     "declarationMap": true,
     "tsBuildInfoFile": "./dist/tsconfig.tsbuildinfo"
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts", "src/definitions.json"]
 }
