@@ -1,7 +1,9 @@
-// The live layer's MapLibre style: S-57 DEPARE, DEPCNT, SOUNDG and M_QUAL in Seascape's
-// day palette (openwatersio/seascape style/flavor.ts), so it reads as the global
-// overlay does. The depth unit is a `global-state` variable the runtime sets, and the
-// safety depth one whose default comes from the plugin's settings.
+// The live layer's MapLibre style: S-57 DEPARE, DEPCNT, SOUNDG and M_QUAL. Its depth
+// areas are in Seascape's day palette (openwatersio/seascape style/flavor.ts), so depths
+// read as the chart's do, but drawn over a chart in that palette, such as Seamap, they'd
+// vanish into it: its soundings, contours and the water the boat sounded itself are
+// drawn in a colour of their own. The depth unit is a `global-state` variable the
+// runtime sets, and the safety depth one whose default comes from the plugin's settings.
 import { MAX_ZOOM, MIN_ZOOM } from "./surface.js";
 
 /** Seascape's day flavor. */
@@ -18,11 +20,14 @@ const DAY = {
   bandEdges: [50, 20, 10, 5, 2],
   hazard: "#1f86cb",
   drying: "#58af9c",
-  contour: "#768c97",
-  label: "#768c97",
-  labelHalo: "rgba(255,255,255,0.5)",
-  soundingEmphasis: "#000",
+  labelHalo: "rgba(255,255,255,0.8)",
   provisional: "#f58231",
+  // The boat's own data, in a colour no chart in this palette uses for depths.
+  own: "#7b2cbf",
+  ownEmphasis: "#3c096c",
+  // Tint over the water the boat sounded, and fainter over what's interpolated.
+  ownMeasured: 0.14,
+  ownInterpolated: 0.07,
 };
 
 /** Small float error in stored band edges stays inside a band. */
@@ -87,11 +92,30 @@ export function buildStyle({
         },
       },
       {
+        id: "coverage",
+        type: "fill",
+        source: "cells",
+        "source-layer": "M_QUAL",
+        paint: {
+          "fill-color": DAY.own,
+          "fill-opacity": [
+            "case",
+            ["==", ["get", "kind"], "measured"],
+            DAY.ownMeasured,
+            DAY.ownInterpolated,
+          ],
+        },
+      },
+      {
         id: "depcnt",
         type: "line",
         source: "cells",
         "source-layer": "DEPCNT",
-        paint: { "line-color": DAY.contour, "line-width": 0.7 },
+        paint: {
+          "line-color": DAY.own,
+          "line-width": 1.2,
+          "line-opacity": 0.9,
+        },
       },
       {
         id: "depcnt-label",
@@ -116,7 +140,7 @@ export function buildStyle({
           "text-size": 10,
         },
         paint: {
-          "text-color": DAY.label,
+          "text-color": DAY.own,
           "text-halo-color": DAY.labelHalo,
           "text-halo-width": 1,
         },
@@ -128,20 +152,20 @@ export function buildStyle({
         "source-layer": "SOUNDG",
         layout: {
           "text-field": ["to-string", ["get", ["global-state", "depthLabel"]]],
-          "text-size": 11,
+          "text-size": 12,
           "text-allow-overlap": false,
         },
         paint: {
           "text-color": [
             "case",
             ["<", ["get", "VALSOU"], ["global-state", "safetyDepth"]],
-            DAY.soundingEmphasis,
-            DAY.label,
+            DAY.ownEmphasis,
+            DAY.own,
           ],
           // An unconfirmed shoal is a warning, not a measured depth: drawn fainter.
           "text-opacity": ["case", ["has", "unconfirmed"], 0.7, 1],
           "text-halo-color": DAY.labelHalo,
-          "text-halo-width": 1,
+          "text-halo-width": 1.5,
         },
       },
       {

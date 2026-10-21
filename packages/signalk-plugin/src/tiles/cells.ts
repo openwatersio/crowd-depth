@@ -424,7 +424,12 @@ export function createCellStore(db: DatabaseSync) {
                 const row = readBlock.get(...at) as Row | undefined;
                 const marked = [u || row?.u ? 1 : 0];
                 const was = readCell.get(cell.py, cell.px) as Row | undefined;
-                if (was?.m !== read.m || was.d !== read.d || was.t !== read.t) {
+                if (
+                  was?.m !== read.m ||
+                  was.d !== read.d ||
+                  was.t !== read.t ||
+                  was.passes !== read.passes
+                ) {
                   write(
                     writeBlock,
                     at,
@@ -435,7 +440,12 @@ export function createCellStore(db: DatabaseSync) {
                 }
                 if (row && cellDepth(fromRow(row)) < depth) {
                   const now = readCell.get(row.py, row.px) as Row | undefined;
-                  if (now?.m === row.m && now.d === row.d && now.t === row.t) {
+                  if (
+                    now?.m === row.m &&
+                    now.d === row.d &&
+                    now.t === row.t &&
+                    now.passes === row.passes
+                  ) {
                     // The live writer's pick stands.
                     if (marked[0] && !row.u)
                       write(writeBlock, at, fromRow(row), [1]);
