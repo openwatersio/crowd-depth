@@ -382,7 +382,11 @@ export function createCellStore(db: DatabaseSync) {
                 i + REBUILD_ROWS,
               )) {
                 const was = readCell.get(cell.py, cell.px) as Cell | undefined;
-                if (was?.m !== read.m || was.d !== read.d) {
+                if (
+                  was?.m !== read.m ||
+                  was.d !== read.d ||
+                  was.passes !== read.passes
+                ) {
                   write(
                     writeBlock,
                     at,
@@ -393,7 +397,12 @@ export function createCellStore(db: DatabaseSync) {
                 const row = readBlock.get(...at) as Cell | undefined;
                 if (row && cellDepth(fromRow(row)) < depth) {
                   const now = readCell.get(row.py, row.px) as Cell | undefined;
-                  if (now?.m === row.m && now.d === row.d) continue;
+                  if (
+                    now?.m === row.m &&
+                    now.d === row.d &&
+                    now.passes === row.passes
+                  )
+                    continue;
                   // A stale row hides from the live writer any cell it added since the
                   // read that's deeper than the row but shoaler than this pick.
                   write(

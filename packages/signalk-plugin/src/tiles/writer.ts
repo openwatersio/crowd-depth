@@ -333,7 +333,14 @@ export function createCellWriter(
     }
     // On its thread: the buffer only grows until the findings are back, so their
     // indexes still hold.
-    running = qc(buffer, arrival).then(
+    // A thread that can't start throws here, which counts as a failed run.
+    let asked: ReturnType<QCRunner>;
+    try {
+      asked = qc(buffer, arrival);
+    } catch (err) {
+      asked = Promise.reject(err as Error);
+    }
+    running = asked.then(
       (found) => {
         running = undefined;
         qcFailures = 0;
@@ -354,7 +361,7 @@ export function createCellWriter(
         qcDownUntil = Date.now() + QC_RETRY_MS;
         onError(
           new Error(
-            `QC thread failed, running QC on the server's for 10 minutes: ${err}`,
+            `QC thread failed, running QC on the server's for ${QC_RETRY_MS / 60_000} minutes: ${err}`,
           ),
         );
       },
