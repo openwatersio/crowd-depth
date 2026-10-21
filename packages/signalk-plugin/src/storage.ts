@@ -113,6 +113,15 @@ export function createDB(filename: string): DatabaseSync {
         ) WITHOUT ROWID;
       `);
     },
+    () => {
+      // Each cell's tide σ, in centimetres, NULL where it's untided, and whether an
+      // overview block holds an untided cell; see tiles/cells.ts.
+      db.exec(`
+        ALTER TABLE cells ADD COLUMN t INTEGER;
+        ALTER TABLE overviews ADD COLUMN t INTEGER;
+        ALTER TABLE overviews ADD COLUMN u INTEGER;
+      `);
+    },
   ]);
 
   return db;
