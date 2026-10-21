@@ -126,6 +126,9 @@ interface Raster {
   /** As `edge`, for the part of it within a cell of a sounded cell, which is measured;
    * the rest is interpolated. */
   measuredEdge: Float32Array;
+  /** The depth before the margin where it's at or above 0 m, which decides where water
+   * is wet: the margin never makes it drying. */
+  wet: Float32Array;
 }
 
 interface Source {
@@ -141,7 +144,7 @@ interface Source {
  * within 200 m, with at least one in each quadrant and 40 m added to every distance, as
  * `gdal_grid invdistnn`; a gaussian blur clamped so no pixel reads deeper than it was
  * interpolated; then k × σ off, with σ from the nearest cell widened by its distance.
- * Its edge is grown a pixel beside sounded cells and over small gaps and notches, and
+ * Its edge is grown a pixel all round and over small gaps and notches, and
  * every depth past the interpolated pixels is capped at the shoalest of `cells` and
  * `shoals` in its pixel or beside it.
  */
@@ -279,17 +282,18 @@ export function surface(
   const notches = tileMetres(z, 0) / n <= 1.5 * CELL_M;
   const sounded = near.map((d) => (d <= measuredM ? 1 : 0));
   const interpolated = cover.map((c, i) => (c >= 0.5 && !sounded[i] ? 1 : 0));
-  const edge = outline(
+  const drawn = shape(
     sounded.map((v, i) => v || interpolated[i]),
     size,
     notches,
   );
-  // Grown as the surface is, but never over interpolated water.
-  const measuredEdge = outline(
-    square(sounded, size, 1, true).map((v, i) => (interpolated[i] ? 0 : v)),
+  const edge = soften(drawn, size);
+  // What's drawn within a pixel of sounded water, but never over interpolated water: its
+  // outer edge is the surface's.
+  const near1 = square(sounded, size, 1, true);
+  const measuredEdge = soften(
+    drawn.map((v, i) => (v && near1[i] && !interpolated[i] ? 1 : 0)),
     size,
-    false,
-    false,
   );
   fill(edge, depth, size);
 
@@ -324,6 +328,9 @@ export function surface(
       }
     }
   }
+  const wet = depth.map((d, i) =>
+    d < 0 || Number.isNaN(blurred[i]) ? d : Math.max(d, blurred[i]),
+  );
   return {
     n,
     halo,
@@ -336,6 +343,7 @@ export function surface(
     measuredM,
     edge,
     measuredEdge,
+    wet,
   };
 }
 
@@ -356,33 +364,43 @@ function square(mask: Float32Array, size: number, r: number, any: boolean) {
   });
 }
 
+/** The edge of `mask`, as `shape` and `soften` draw it. */
+export function outline(mask: Float32Array, size: number, notches: boolean) {
+  return soften(shape(mask, size, notches), size);
+}
+
 /**
- * The edge of `mask`, at least 0 inside, for tracing: if `grow`, grown a pixel all round,
- * as the grid's surface is, so a lone pass a pixel wide survives the tracing at every zoom; if
- * `notches`, closed over gaps of up to MAX_GAP_PX pixels and notches up to NOTCH_PX wide,
- * which would trace as holes and sharp V's, as the grid's `outline` does; and blurred a
- * pixel, so its edge curves, and falls where the mask's does along a straight edge.
+ * `mask` grown a pixel all round, as the grid's surface is, so a lone pass a pixel wide
+ * survives the tracing at every zoom; and if `notches`, closed over gaps of up to
+ * MAX_GAP_PX pixels and notches up to NOTCH_PX wide, which would trace as holes and
+ * sharp V's, as the grid's `outline` does.
  */
-export function outline(
-  mask: Float32Array,
-  size: number,
-  notches: boolean,
-  grow = true,
-): Float32Array {
-  let grown = grow ? square(mask, size, 1, true) : mask;
+function shape(mask: Float32Array, size: number, notches: boolean) {
+  const grown = square(mask, size, 1, true);
+  if (!notches) return grown;
   // A close by a square NOTCH_PX + 1 wide. It fills every gap of fewer than
   // (NOTCH_PX + 1)² pixels too, so all those of MAX_GAP_PX: an undrawn pixel it leaves
   // has a whole square of undrawn pixels about it.
-  if (notches) {
-    const r = NOTCH_PX / 2;
-    grown = square(square(grown, size, r, true), size, r, false);
-  }
+  const r = NOTCH_PX / 2;
+  return square(square(grown, size, r, true), size, r, false);
+}
+
+/**
+ * The edge of `mask`, at least 0 inside, for tracing: blurred a pixel, so it curves, and
+ * falls where the mask's does along a straight edge. About the distance to the edge in
+ * pixels: a straight edge blurred by a gaussian of a pixel crosses each share at its
+ * quantile, which its log-odds over 1.7 is close to.
+ */
+function soften(mask: Float32Array, size: number) {
   const { cover } = blur(
-    grown.map((v) => (v ? 1 : NaN)),
+    mask.map((v) => (v ? 1 : NaN)),
     size,
     1,
   );
-  return cover.map((c) => (c - 0.5) * 100);
+  return cover.map((c) => {
+    const p = Math.min(Math.max(c, 1e-9), 1 - 1e-9);
+    return Math.log(p / (1 - p)) / 1.7;
+  });
 }
 
 /** Give each pixel inside `edge` without a depth the nearest within FILL_PX, the
@@ -659,6 +677,33 @@ export function buildTile(
   // Just outside the surface, how far outside, so an edge falls between pixels rather
   // than on the last one with a depth, and a lone pixel draws as more than a point.
   const outside = (i: number) => Math.min(edge[i], -BAND_EPS_M);
+  // Each edge is traced from about its distance in pixels, a depth's from a level as how
+  // far the depth is from it over how fast it changes there, so where two meet, as a
+  // band's and the surface's, the lesser is where both are.
+  const gradient = (v: Float32Array) =>
+    v.map((_, i) => {
+      const px = i % r.size;
+      const g = (a: number, b: number, span: number) => {
+        const d = (v[b] - v[a]) / span;
+        return Number.isNaN(d) ? undefined : d;
+      };
+      const along = (prev: number, next: number, ok: [boolean, boolean]) =>
+        (ok[0] && ok[1] ? g(prev, next, 2) : undefined) ??
+        (ok[1] ? g(i, next, 1) : undefined) ??
+        (ok[0] ? g(prev, i, 1) : undefined) ??
+        0;
+      const dx = along(i - 1, i + 1, [px > 0, px < r.size - 1]);
+      const dy = along(i - r.size, i + r.size, [
+        i >= r.size,
+        i < v.length - r.size,
+      ]);
+      // A floor, so flat water is far from every level.
+      return Math.max(Math.hypot(dx, dy), 0.01);
+    });
+  const gDepth = gradient(depth);
+  const gWet = gradient(r.wet);
+  const from = (i: number, level: number) =>
+    level === 0 ? r.wet[i] / gWet[i] : (depth[i] - level) / gDepth[i];
 
   const DEPARE: Feature[] = [];
   const bands: [number, number][] = [
@@ -668,18 +713,12 @@ export function buildTile(
     ),
   ];
   for (const [lo, hi] of bands) {
-    // At least 0 inside the band, crossing 0 where the depth reaches either edge. In
-    // centimetres, so near the surface's edge, its edge decides where the band stops and
-    // the bands reach it together.
+    // At least 0 inside the band, crossing 0 where the depth reaches either edge.
     const polys = polygons(r, (i) =>
       // A band holds its lower edge, not its upper: a depth of exactly 0 m, which the
       // margin clamps shallow water to, is wet, not drying.
       has(i)
-        ? Math.min(
-            100 * (depth[i] - lo),
-            100 * (hi - depth[i] - BAND_EPS_M),
-            edge[i],
-          )
+        ? Math.min(from(i, lo), -from(i, hi) - BAND_EPS_M, edge[i])
         : outside(i),
     );
     if (polys.length) {
@@ -783,7 +822,15 @@ export function buildTile(
   // Coverage is split along the measured part's edge: the two share it, so they neither
   // overlap nor leave a gap, and their outer edge is the surface's, so they reach as
   // far as its areas do.
-  const measured = polygons(r, (i) => Math.min(edge[i], r.measuredEdge[i]));
+  // Within a pixel of the surface's edge, its edge, signed by the part a pixel is in;
+  // further in, the measured part's own edge.
+  const split = (i: number) =>
+    edge[i] < 1
+      ? r.measuredEdge[i] >= 0
+        ? edge[i]
+        : -edge[i]
+      : r.measuredEdge[i];
+  const measured = polygons(r, (i) => (edge[i] < 0 ? edge[i] : split(i)));
   if (measured.length) {
     M_QUAL.push({
       type: "Polygon",
@@ -792,7 +839,7 @@ export function buildTile(
     });
   }
   const between = polygons(r, (i) =>
-    has(i) ? Math.min(edge[i], -r.measuredEdge[i]) : outside(i),
+    has(i) ? (edge[i] < 0 ? edge[i] : -split(i)) : outside(i),
   );
   if (between.length) {
     M_QUAL.push({

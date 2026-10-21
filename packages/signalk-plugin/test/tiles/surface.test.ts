@@ -295,8 +295,9 @@ test("every depth area is covered, as measured or interpolated, never both", () 
     }
   }
   expect(drawn).toBeGreaterThan(0);
-  // Rounding to tile coordinates, and the corner cutting, leave slivers at most.
-  expect(uncovered / drawn).toBeLessThan(0.002);
+  // Slivers at most, where measured and interpolated water meet at the surface's edge,
+  // which in two short passes is much of it.
+  expect(uncovered / drawn).toBeLessThan(0.01);
   expect(both / drawn).toBeLessThan(0.002);
 });
 
@@ -371,4 +372,60 @@ test("a shoal just past a tile's edge caps the depths carried beside it", () => 
   expect(features(t, "SOUNDG").filter((g) => g.properties.unconfirmed)).toEqual(
     [],
   );
+});
+
+test("neighbouring depth areas meet, with no gap or overlap between them", () => {
+  // A swath 12 cells wide shoaling 1.5 m a cell, across several bands.
+  const o = cellAt(LON, LAT);
+  const cells: Cell[] = [];
+  for (let r = 0; r < 30; r++) {
+    for (let c = 0; c < 12; c++) {
+      cells.push({
+        py: o.py + r,
+        px: o.px + c,
+        m: 2 + 1.5 * c,
+        d: 0.2,
+        passes: 3,
+        first: 20000,
+        last: 20010,
+      });
+    }
+  }
+  const t = decode(buildTile(Z, tile.x, tile.y, cells, [])!);
+  const inside = (
+    rings: { x: number; y: number }[][],
+    x: number,
+    y: number,
+  ) => {
+    let c = false;
+    for (const r of rings) {
+      for (let i = 0, j = r.length - 1; i < r.length; j = i++) {
+        if (
+          r[i].y > y !== r[j].y > y &&
+          x < ((r[j].x - r[i].x) * (y - r[i].y)) / (r[j].y - r[i].y) + r[i].x
+        ) {
+          c = !c;
+        }
+      }
+    }
+    return c;
+  };
+  const areas = features(t, "DEPARE").map((f) => f.loadGeometry());
+  expect(areas.length).toBeGreaterThan(2);
+  const coverage = features(t, "M_QUAL").map((f) => f.loadGeometry());
+  let covered = 0;
+  let none = 0;
+  let both = 0;
+  for (let y = 0; y < EXTENT; y += 8) {
+    for (let x = 0; x < EXTENT; x += 8) {
+      if (!coverage.some((c) => inside(c, x, y))) continue;
+      covered++;
+      const n = areas.filter((a) => inside(a, x, y)).length;
+      if (n === 0) none++;
+      if (n > 1) both++;
+    }
+  }
+  expect(covered).toBeGreaterThan(0);
+  expect(none / covered).toBeLessThan(0.005);
+  expect(both / covered).toBeLessThan(0.005);
 });
