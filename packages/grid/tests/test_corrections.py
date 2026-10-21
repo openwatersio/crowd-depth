@@ -308,6 +308,30 @@ def test_offsets_per_step_segment_from_anchors_and_crossings(env, tmp_path, monk
     ]
 
 
+def test_calibration_reads_a_dense_tile_in_bands_as_it_would_whole(env, monkeypatch):  # noqa: F811
+    # Two vessels over rows 4990-5010: across a band edge (5004), with both rows of the
+    # pixels beside an odd row (4995) sounded, so a band that split a pixel would show.
+    for n, vessel in ((1, "AQM-A"), (2, "AQM-B")):
+        cover = [(r, c) for r in range(4990, 5011) for c in range(n, 40, 3)]
+        put(
+            env,
+            n,
+            [(i * 2, *at(r, c), 9.0 + 0.1 * (i % 3)) for i, (r, c) in enumerate(cover)],
+            vessel,
+        )
+    env.run("noaa")
+    with open_store(env.store) as con:
+        untided(con)
+        calibrate.reduce(con)
+        whole = sorted(con.execute("FROM cal_obs").fetchall())
+        monkeypatch.setattr(cells, "BATCH_POINTS", 1)
+        [(partition,)] = con.execute("SELECT DISTINCT cell_id FROM lake.points").fetchall()
+        assert len(cells.units(con, partition, [], rows=18)) > 1
+        calibrate.reduce(con)
+        banded = sorted(con.execute("FROM cal_obs").fetchall())
+    assert len(whole) > 100 and banded == whole
+
+
 def test_a_noisy_tracks_soundings_dont_calibrate_its_vessel(env, tmp_path, monkeypatch):  # noqa: F811
     # A sounder hunting between 6 and 13 m over the surveyed 10 m: its 13 m side is noise
     # and its 6 m side unconfirmed shoals, so nothing it logged reaches calibration.
