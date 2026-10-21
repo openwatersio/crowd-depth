@@ -16,6 +16,7 @@ Supporting notes:
 - [Point store layout](store-layout.md), [Track QC as pure functions](qc-functions.md) and [Per-tile pipeline](per-tile-pipeline.md): spikes on the Chesapeake set.
 - [Live layer](live-layer.md): the plugin's own-boat layer, drawn on top of the overlay with the same QC, corrections and portrayal.
 - [Vessel calibration](vessel-calibration.md): per-vessel offsets against BlueTopo and from crossings, on the Chesapeake set.
+- [Water level beyond the tide](water-level.md): global sources for the sea level and weather that tide predictions miss, and what each adds to calibration in the Chesapeake.
 - [Surface statistic](surface-statistic.md) and [Speckle in busy channels](channel-speckle.md): the grid against NOAA BlueTopo in Thimble Shoal Channel, Tangier Sound and Pocomoke Sound.
 
 ## Goals
