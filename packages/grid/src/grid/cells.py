@@ -24,7 +24,7 @@ from .qc import HAZARD_M, MAX_DEPTH_M, QC_VERSION, SHALLOW_M, TRACK_REASONS
 
 log = logging.getLogger(__name__)
 
-GRID_VERSION = 8
+GRID_VERSION = 9
 BATCH_POINTS = 5_000_000
 BASE = CELLS["rows_per_degree"]  # base rows per 1° tile
 MIN_VESSELS = 2
@@ -283,8 +283,8 @@ pts AS (
     -- QC rejects these too; cells never trust that QC saw every point. Judged on the raw
     -- depth: a corrected one may honestly be negative, a drying height.
     AND a.depth_raw > 0 AND a.depth_raw <= {MAX_DEPTH_M} AND a.depth >= {MIN_DEPTH_M}
-    -- A transit its own vessel's calibration shows has lost the bottom sets no depths and
-    -- votes in no consensus, as a reject: it publishes as shoals.
+    -- A run calibration found its sounder had lost the bottom sets no depths and votes in
+    -- no consensus, as a reject: it publishes as shoals.
     AND NOT a.excluded AND NOT a.lost_bottom AND NOT a.awaiting_tide
 ),
 idx AS (
@@ -482,7 +482,7 @@ FROM corrected_points_in($partition, $tiles, $rlo, $rhi) p
 """
 
 # Active soundings that are still unconfirmed shoals, neither confirmed nor rejected since,
-# with their base cells. A transit that lost the bottom adds its soundings QC didn't reject,
+# with their base cells. A run whose sounder lost the bottom adds its soundings QC didn't reject,
 # as unconfirmed shoals, where they're shallower than HAZARD_M. The soundings are the
 # deduplicated ones the cells are built from, so a copy dedupe dropped can't hold a cell
 # open.
@@ -495,8 +495,10 @@ SELECT p.tile_id, p.r,
 FROM tile_points p
 -- A segment too deep to correct publishes nothing, its shoals included.
 WHERE NOT p.excluded AND NOT p.awaiting_tide
-  -- A transit that lost the bottom warns of no hazard from deeper than HAZARD_M.
-  AND NOT (p.lost_bottom AND p.depth >= {HAZARD_M}) AND (p.point_id IN (
+  -- A run whose sounder lost the bottom warns of no hazard from deeper than HAZARD_M, nor from
+  -- a reading under SHALLOW_M, a sounder's junk.
+  AND NOT (p.lost_bottom AND (p.depth >= {HAZARD_M} OR p.depth_raw < {SHALLOW_M}))
+  AND (p.point_id IN (
   SELECT point_id FROM lake.qc_flags
   WHERE cell_id = $partition AND flag = 'unconfirmed' AND qc_version = {QC_VERSION}
   EXCEPT
@@ -559,7 +561,9 @@ def inputs(con) -> str:
             FROM lake.files),
           (SELECT coalesce(sum(hash(batch_id, qc_version)::HUGEINT), 0) FROM lake.qc_batches),
           (SELECT coalesce(sum(hash(file_id, vessel, offset_m, se_m, excluded,
-              coalesce(lost_bottom, false))::HUGEINT), 0) FROM lake.file_offsets)"""
+              coalesce(lost_bottom, false))::HUGEINT), 0) FROM lake.file_offsets)
+          + (SELECT coalesce(sum(hash(content_hash, vessel, tile_id, t_start, t_end)::HUGEINT), 0)
+            FROM lake.lost_runs)"""
     ).fetchall()
     return f"{files}:{batches}:{offsets}:{tides(con)}:{QC_VERSION}:{GRID_VERSION}"
 

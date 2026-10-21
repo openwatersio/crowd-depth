@@ -411,7 +411,7 @@ def test_contradicted_shoals_dont_vote_and_unjudged_ones_do(env, tmp_path, reaso
     assert (depth != surface.NODATA).any() == drawn and count[count > 0].sum() == 120
 
 
-@pytest.mark.parametrize("depth, counted", [(10.0, 120), (40.0, 0)])
+@pytest.mark.parametrize("depth, counted", [(10.0, 120), (40.0, 0), (0.3, 0)])
 def test_a_transit_that_lost_the_bottom_never_votes(env, tmp_path, depth, counted):  # noqa: F811
     put_tracks(env, parallel(depth))
     test_grid.build(env)
@@ -419,8 +419,8 @@ def test_a_transit_that_lost_the_bottom_never_votes(env, tmp_path, depth, counte
     with open_store(env.store) as con:
         # Calibration found both vessels' transits read far under the seabed.
         con.execute(
-            "INSERT INTO lake.file_offsets SELECT file_id, vessel, NULL, NULL, false, true"
-            " FROM lake.files"
+            "INSERT INTO lake.lost_runs SELECT DISTINCT f.content_hash, f.vessel, p.tile_id,"
+            " f.time_min, f.time_max FROM lake.files f JOIN lake.points p USING (file_id)"
         )
         [(partition,)] = con.execute("SELECT DISTINCT cell_id FROM lake.cells").fetchall()
         path = surface.build_tile(con, tile, partition, tmp_path)

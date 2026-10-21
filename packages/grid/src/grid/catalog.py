@@ -114,6 +114,11 @@ CREATE TABLE IF NOT EXISTS lake.file_offsets (
   file_id BIGINT, vessel VARCHAR, offset_m FLOAT, se_m FLOAT, excluded BOOLEAN,
   lost_bottom BOOLEAN
 );
+-- Runs of a file's soundings whose sounder lost the bottom, in one tile or, with no tile,
+-- in all of them; by content, as ingest may move the soundings to another file.
+CREATE TABLE IF NOT EXISTS lake.lost_runs (
+  content_hash VARCHAR, vessel VARCHAR, tile_id INTEGER, t_start TIMESTAMP, t_end TIMESTAMP
+);
 -- Tiles whose cells a correction change has made stale, until `cells --changed` rebuilds them.
 CREATE TABLE IF NOT EXISTS lake.tile_changes (tile_id INTEGER, reason VARCHAR, changed TIMESTAMP);
 """
@@ -222,7 +227,8 @@ CREATE OR REPLACE TEMP MACRO active_points_in(cell, tiles, rlo, rhi) AS TABLE {
 -- uncertainty, the tide's widened by the station's distance. A correction that doesn't
 -- apply is NULL and leaves the depth as it is, and its uncertainty as UNTIDED_SIGMA or
 -- UNCALIBRATED_SIGMA. `excluded` marks a vessel segment known to read too deep to use, and
--- `lost_bottom` a transit its own vessel's calibration shows reading far too shallow.
+-- `lost_bottom` a sounding calibration found its sounder had lost the bottom for: a stray
+-- transit that read far too shallow, a stuck run, or a month a vessel mostly read so.
 CREATE OR REPLACE TEMP MACRO corrected_points_in(cell, tiles, rlo, rhi) AS TABLE
 WITH c AS (
   SELECT tide_cell, station_id, km FROM lake.tide_cells
@@ -233,7 +239,12 @@ l AS (SELECT * FROM lake.tide_levels WHERE station_id IN (SELECT station_id FROM
 p AS (
   SELECT p.*, c.tide_cell IS NOT NULL AS tide_assigned, c.station_id AS tide_station,
     coalesce(o.excluded, false) AS excluded,
-    coalesce(o.lost_bottom, false) AS lost_bottom,
+    coalesce(o.lost_bottom, false) OR EXISTS (
+      SELECT 1 FROM lake.lost_runs r JOIN lake.files f USING (content_hash)
+      WHERE f.file_id = p.file_id AND r.vessel = p.unique_id
+        AND (r.tile_id IS NULL OR r.tile_id = p.tile_id)
+        AND p.time BETWEEN r.t_start AND r.t_end
+    ) AS lost_bottom,
     l.level + l.slope * epoch(p.time - l.slot) AS tide,
     sqrt(l.sigma ^ 2 + (c.km * {TIDE_KM_SIGMA}) ^ 2) AS tide_sigma, o.offset_m, o.se_m
   FROM active_points_in(cell, tiles, rlo, rhi) p
@@ -521,6 +532,7 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
                         "cells_built",
                         "calibration",
                         "calibration_outliers",
+                        "lost_runs",
                         "file_offsets",
                         "tile_changes",
                         "tide_cells",

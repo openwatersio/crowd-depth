@@ -144,9 +144,12 @@ def test_vessels_count_as_the_surface_takes_them(store):
 def test_transits_that_lost_the_bottom_dont_count(store):
     objects, surface_dir = store
     with open_store(objects) as con:
-        # Calibration found B's and C's transits read far under the seabed.
+        # Calibration found B's and C's soundings read far under the seabed.
+        con.execute("UPDATE lake.files SET content_hash = 'h'")
+        con.execute("UPDATE lake.points SET time = TIMESTAMP '2026-01-01 12:00'")
         con.executemany(
-            "INSERT INTO lake.file_offsets VALUES (1, ?, NULL, NULL, false, true)", [("B",), ("C",)]
+            "INSERT INTO lake.lost_runs VALUES ('h', ?, ?, '2026-01-01 11:00', '2026-01-01 13:00')",
+            [("B", TILE), ("C", TILE)],
         )
     with open_store(objects, write=False) as con:
         result = benchmark.run(con, surface_dir, qc_version=7)
