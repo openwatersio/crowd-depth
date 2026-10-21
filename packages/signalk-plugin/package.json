@@ -60,7 +60,7 @@
     "@types/d3-contour": "^3.0.6",
     "@types/express": "^5.0.6",
     "@types/geojson": "^7946.0.16",
-    "esbuild": "^0.27.7",
+    "esbuild": "^0.28.1",
     "pbf": "^5.1.2",
     "publint": "^0.3.16",
     "signalk-plotterext-bus": "^0.20.0"
