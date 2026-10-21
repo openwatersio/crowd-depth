@@ -12,6 +12,7 @@ import {
   registerLayerRoutes,
 } from "../../src/tiles/index.js";
 import { thin } from "../../src/tiles/api.js";
+import { DEFAULT_OWN_STYLE } from "../../src/tiles/style.js";
 import { cellAt, cellCenter, tileFraction } from "../../src/tiles/geometry.js";
 
 interface Res {
@@ -38,7 +39,7 @@ const response = (): Res => {
 
 type Req = { params?: Record<string, string>; query?: Record<string, string> };
 
-function serve() {
+function serve(own = DEFAULT_OWN_STYLE) {
   const handlers = new Map<string, (req: Req, res: Res) => unknown>();
   const app = {
     get: (path: string, handler: (req: Req, res: Res) => void) =>
@@ -51,6 +52,7 @@ function serve() {
     provisional: () => [{ time: 1, lon: -76.2, lat: 36.98, depth: 4.37 }],
     stored: () => [],
     safetyDepth: 3,
+    own,
   }));
   const get = async (path: string, req: Req = {}) => {
     const res = response();
@@ -65,9 +67,37 @@ test("serves the style, with the tiles under the extension's route", async () =>
   const style = (await get(STYLE_PATH)).body as {
     sources: { cells: { tiles: string[] } };
     state: Record<string, { default: unknown }>;
+    layers: { id: string }[];
   };
   expect(style.sources.cells.tiles).toEqual([`${TILES_PATH}/{z}/{x}/{y}.pbf`]);
   expect(style.state.safetyDepth.default).toBe(3);
+  expect(style.state.ownColor.default).toBe("#7b2cbf");
+  expect(style.state.ownShoal.default).toBe("#3c096c");
+  expect(style.state.ownTint.default).toBe(1);
+  expect(style.layers.map((l) => l.id)).toContain("depcnt");
+  // The layers draw with the state, not colours of their own.
+  const layers = JSON.stringify(style.layers);
+  for (const key of ["ownColor", "ownShoal", "ownTint"]) {
+    expect(layers).toContain(`["global-state","${key}"]`);
+  }
+});
+
+test("draws the boat's own data in the colour, tint and contours set", async () => {
+  const { get } = serve({
+    accent: "#00a0a0",
+    shoal: "#004040",
+    tint: "strong",
+    contours: false,
+  });
+  const style = (await get(STYLE_PATH)).body as {
+    state: Record<string, { default: unknown }>;
+    layers: { id: string }[];
+  };
+  expect(style.state.ownColor.default).toBe("#00a0a0");
+  expect(style.state.ownShoal.default).toBe("#004040");
+  expect(style.state.ownTint.default).toBe(2);
+  expect(style.layers.map((l) => l.id)).not.toContain("depcnt");
+  expect(style.layers.map((l) => l.id)).not.toContain("depcnt-label");
 });
 
 test("serves a tile as MVT bytes, and nothing where there are no cells", async () => {

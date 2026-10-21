@@ -4,7 +4,7 @@ import { ASSET_BASE } from "../plotterext/manifest.js";
 import type { Sounding } from "../qc.js";
 import { MAX_ZOOM, MIN_ZOOM, depthLabels } from "./surface.js";
 import type { TileService } from "./service.js";
-import { buildStyle } from "./style.js";
+import { buildStyle, type OwnStyle } from "./style.js";
 
 /** The style, tiles and change feed, under the extension's top-level route. */
 export const STYLE_PATH = `${ASSET_BASE}/style.json`;
@@ -28,6 +28,7 @@ export interface Layer {
   provisional: () => Sounding[];
   stored: () => number[];
   safetyDepth: number;
+  own: OwnStyle;
 }
 
 /** The server API also carries Express's route methods, which the typed
@@ -94,6 +95,7 @@ export function registerLayerRoutes(
         buildStyle({
           tiles: `${TILES_PATH}/{z}/{x}/{y}.pbf`,
           safetyDepth: layer.safetyDepth,
+          own: layer.own,
         }),
       );
     }),

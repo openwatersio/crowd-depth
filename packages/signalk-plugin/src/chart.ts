@@ -30,6 +30,7 @@ import {
 import { DEFINITIONS } from "./tiles/geometry.js";
 import { createQCThread } from "./tiles/qc-thread.js";
 import { registerPlotterExtension } from "./plotterext/provider.js";
+import { DEFAULT_OWN_STYLE, TINTS, type OwnStyle } from "./tiles/style.js";
 
 /** Meta keys for the configuration the cells were built with. */
 const POSITION_CONFIG_KEY = "config_position";
@@ -44,6 +45,21 @@ const HOLD_FOR_HOURS = 1;
 
 /** The safety depth the layer draws with until the owner sets one, in metres. */
 export const DEFAULT_SAFETY_DEPTH_M = 3;
+
+const HEX = /^#[0-9a-f]{6}$/i;
+
+/** The boat's own colours, tint and contours from the settings, a hand-edited value
+ * that isn't one falling back to the default. */
+export function ownStyle(config: Config): OwnStyle {
+  const { color, shoalColor, tint, contours } = config.chart ?? {};
+  const d = DEFAULT_OWN_STYLE;
+  return {
+    accent: color && HEX.test(color) ? color : d.accent,
+    shoal: shoalColor && HEX.test(shoalColor) ? shoalColor : d.shoal,
+    tint: tint && Object.hasOwn(TINTS, tint) ? tint : d.tint,
+    contours: typeof contours === "boolean" ? contours : d.contours,
+  };
+}
 
 /** What the routes and the plotter extension read; replaced on each start. */
 let current: Layer | undefined;
@@ -120,6 +136,7 @@ export function startChart({
     provisional: writer.provisional,
     stored: writer.stored,
     safetyDepth: config.chart?.safetyDepth ?? DEFAULT_SAFETY_DEPTH_M,
+    own: ownStyle(config),
   };
   current = started;
   // Only this start's own state: an older start can end after a newer one
