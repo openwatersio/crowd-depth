@@ -67,6 +67,7 @@ async function loadUnits(): Promise<void> {
       values: {
         depthLabel: feet ? "depth_ft" : "depth_m",
         metresPerUnit: feet ? M_PER_FT : 1,
+        contourUnit: feet ? "ft" : "m",
       },
     });
   } catch {

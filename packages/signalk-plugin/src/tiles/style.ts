@@ -5,7 +5,10 @@
 // drawn in a colour of their own. The depth unit is a `global-state` variable the
 // runtime sets; the safety depth and the boat's own colours and tint are ones whose
 // defaults come from the plugin's settings.
+import { DEFINITIONS } from "./geometry.js";
 import { MAX_ZOOM, MIN_ZOOM } from "./surface.js";
+
+const P = DEFINITIONS.portrayal;
 
 /** Seascape's day flavor. */
 const DAY = {
@@ -50,7 +53,7 @@ export const DEFAULT_OWN_STYLE: OwnStyle = {
   contours: true,
 };
 
-/** Small float error in stored band edges stays inside a band. */
+/** Small float error in a safety depth set on a band edge stays inside the band. */
 const EPS = 0.01;
 
 export function buildStyle({
@@ -62,10 +65,32 @@ export function buildStyle({
   safetyDepth: number;
   own?: OwnStyle;
 }) {
-  const band: unknown[] = ["step", ["get", "DRVAL1"], DAY.bandColors[5]];
+  // The chart's band colours at their lower edges, blended between, so metre bands
+  // shade evenly and the chart's bands keep their colours.
+  const band: unknown[] = [
+    "interpolate",
+    ["linear"],
+    ["get", "DRVAL1"],
+    0,
+    DAY.bandColors[5],
+  ];
   [...DAY.bandEdges].reverse().forEach((edge, i) => {
-    band.push(edge - EPS, DAY.bandColors[4 - i]);
+    band.push(edge, DAY.bandColors[4 - i]);
+    // The chart's levels between these edges, as 30 m, keep their band's colour.
+    const next = [...DAY.bandEdges].reverse()[i + 1];
+    for (const l of P.isobaths_m) {
+      if (l > edge && next !== undefined && l < next)
+        band.push(l, DAY.bandColors[4 - i]);
+    }
   });
+  // A contour in the other unit than the user's isn't drawn; one of every five, or
+  // the chart's isobaths, which have no unit, are drawn bold and labelled.
+  const otherUnit = [
+    "all",
+    ["has", "unit"],
+    ["!=", ["get", "unit"], ["global-state", "contourUnit"]],
+  ];
+  const major = ["any", ["!", ["has", "unit"]], ["has", "major"]];
   const shallow = [
     "<",
     ["get", "DRVAL1"],
@@ -82,6 +107,8 @@ export function buildStyle({
       depthLabel: { default: "depth_m" },
       // Metres per the user's depth unit, for contour labels.
       metresPerUnit: { default: 1 },
+      // The unit of the fine contours drawn: `m` or `ft`.
+      contourUnit: { default: "m" },
       ownColor: { default: own.accent },
       ownShoal: { default: own.shoal },
       ownTint: { default: TINTS[own.tint] },
@@ -142,8 +169,8 @@ export function buildStyle({
         "source-layer": "DEPCNT",
         paint: {
           "line-color": ["global-state", "ownColor"],
-          "line-width": 1.2,
-          "line-opacity": 0.9,
+          "line-width": ["case", major, 1.2, 0.6],
+          "line-opacity": ["case", otherUnit, 0, major, 0.9, 0.35],
         },
       },
       {
@@ -154,17 +181,22 @@ export function buildStyle({
         layout: {
           "symbol-placement": "line",
           "text-field": [
-            "number-format",
-            // Floored, as soundings are, so a label never reads deeper than the contour.
+            "case",
+            ["any", otherUnit, ["!", major]],
+            "",
             [
-              "floor",
+              "number-format",
+              // Floored, as soundings are, so a label never reads deeper than the contour.
               [
-                "+",
-                ["/", ["get", "VALDCO"], ["global-state", "metresPerUnit"]],
-                1e-9,
+                "floor",
+                [
+                  "+",
+                  ["/", ["get", "VALDCO"], ["global-state", "metresPerUnit"]],
+                  1e-9,
+                ],
               ],
+              { "max-fraction-digits": 0 },
             ],
-            { "max-fraction-digits": 0 },
           ],
           "text-size": 10,
         },

@@ -127,7 +127,11 @@ export function startChart({
   // Before the live writer starts, so its marker doesn't hide the gap.
   addPendingBackfill(store, startedAt);
 
-  const tiles = createTileService(store, db.location() ?? undefined);
+  const tiles = createTileService(
+    store,
+    db.location() ?? undefined,
+    config.chart?.contourDetail === "standard" ? "standard" : "high",
+  );
   // Off the main thread, given a database file to say the plugin is built and running.
   const qc = db.location() ? createQCThread() : undefined;
   const writer = createCellWriter(store, {
