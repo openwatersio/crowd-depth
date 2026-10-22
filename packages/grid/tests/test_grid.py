@@ -1055,3 +1055,44 @@ def test_a_bbox_names_the_tiles_it_touches():
     tiles = bbox("-77.5,36.8,-75.5,39.7")
     assert len(tiles) == 4 * 3
     assert (36 + 90) * 360 + (-78 + 180) in tiles and (39 + 90) * 360 + (-76 + 180) in tiles
+
+
+JEMALLOC_DECAY = """
+import ctypes, sys
+import grid, _duckdb
+lib = ctypes.CDLL(_duckdb.__file__)
+if not hasattr(lib, "duckdb_je_mallctl"):
+    # Linux builds bundle it: a missing symbol there means the conf may not apply.
+    sys.exit(1 if sys.platform == "linux" else 3)
+for name in (b"opt.dirty_decay_ms", b"opt.muzzy_decay_ms"):
+    value, size = ctypes.c_ssize_t(), ctypes.c_size_t(ctypes.sizeof(ctypes.c_ssize_t))
+    assert lib.duckdb_je_mallctl(name, ctypes.byref(value), ctypes.byref(size), None, 0) == 0
+    print(value.value)
+"""
+
+
+@pytest.mark.parametrize(
+    "conf, decay",
+    [(None, ["0", "1000"]), ("", ["0", "1000"]), ("dirty_decay_ms:500", ["500", "1000"])],
+)
+def test_jemalloc_returns_freed_pages_at_once(conf, decay):
+    import os
+    import subprocess
+    import sys
+
+    # A fresh process: jemalloc reads its conf once, when DuckDB loads.
+    environ = {k: v for k, v in os.environ.items() if k != "DUCKDB_JE_MALLOC_CONF"}
+    if conf is not None:
+        environ["DUCKDB_JE_MALLOC_CONF"] = conf
+    run = subprocess.run(
+        [sys.executable, "-c", JEMALLOC_DECAY],
+        check=False,
+        env=environ,
+        capture_output=True,
+        text=True,
+    )
+    if run.returncode == 3:
+        pytest.skip("this DuckDB build doesn't bundle jemalloc")
+    assert run.returncode == 0, run.stderr
+    # An operator's own setting wins; the rest is DuckDB's.
+    assert run.stdout.split() == decay
