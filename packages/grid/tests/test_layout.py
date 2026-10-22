@@ -121,3 +121,27 @@ def test_a_store_at_a_later_layout_is_refused(env):  # noqa: F811
         con.execute("UPDATE lake.store_meta SET value = 'sorted-9' WHERE key = 'layout'")
     with pytest.raises(RuntimeError, match="layout sorted-9"), open_store(env.store):
         pass
+
+
+def test_a_store_of_another_hash_scheme_is_refused_before_it_migrates(env):  # noqa: F811
+    env.noaa.put(noaa_key(1), noaa_csv(ROWS))
+    env.run("noaa")
+    with open_store(env.store) as con:
+        con.execute("ALTER TABLE lake.points ADD COLUMN point_id BLOB")
+        con.execute("DELETE FROM lake.store_meta WHERE key = 'layout'")
+        con.execute("UPDATE lake.store_meta SET value = 'md5-sum-1' WHERE key = 'hash'")
+
+    def catalogs():
+        # Every catalog and the pointer; the lock changes hands on any write open.
+        return sorted(
+            (o.key, o.etag) for o in env.store.list("catalog/")[0] if o.key != "catalog/lock"
+        )
+
+    before = catalogs()
+    # The scheme is checked before the layout, by readers and writers alike.
+    with pytest.raises(RuntimeError, match="hashes with md5-sum-1"):
+        env.query("SELECT 1")
+    with pytest.raises(RuntimeError, match="hashes with md5-sum-1"), open_store(env.store):
+        pass
+    # Nothing published: the store is as its own build left it.
+    assert catalogs() == before

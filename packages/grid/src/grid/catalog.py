@@ -437,8 +437,8 @@ def connect(
     # Partitioning is set once, when a table is created.
     for table in PARTITIONED.keys() - existing:
         con.execute(f"ALTER TABLE lake.{table} SET PARTITIONED BY ({PARTITIONED[table]})")
-    migrate_layout(con, write)
     check_hash_scheme(con)
+    migrate_layout(con, write)
     con.execute(ACTIVE_POINTS)
     return con
 
@@ -469,7 +469,11 @@ def check_hash_scheme(con):
             raise RuntimeError("store predates hash scheme records; rebuild it")
         con.execute("INSERT INTO lake.store_meta VALUES ('hash', ?)", [STORE_SCHEME])
     elif scheme[0] != STORE_SCHEME:
-        raise RuntimeError(f"store hashes with {scheme[0]}, this build with {STORE_SCHEME}")
+        # The scheme alone is a store from before LAYOUT, which migrate_layout brings over;
+        # anything else is refused before the migration touches it.
+        layout = con.execute("SELECT value FROM lake.store_meta WHERE key = 'layout'").fetchone()
+        if scheme[0] != HASH_SCHEME or layout:
+            raise RuntimeError(f"store hashes with {scheme[0]}, this build with {STORE_SCHEME}")
 
 
 # Points and flags sorted by tile within each 10° partition, so a tile reads a few row
