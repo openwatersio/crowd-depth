@@ -3,21 +3,30 @@
 // S-57 overlay layers (overlay.py), for one vessel.
 //
 // The grid works on its 2/3″ pixels per 1° tile. A chart tile here is a square raster in
-// Web Mercator of at most 256 pixels a side, none finer than a cell, so at the cells'
-// zoom a pixel is about a cell; zoomed out, a pixel holds the shoalest of its cells, as
+// Web Mercator of at most 256 pixels a side, the power of two nearest a cell, so at the
+// cells' zoom a pixel is about a cell; zoomed out, a pixel holds the shoalest of its cells, as
 // the grid aggregates. Distances are in metres, so the radius, smoothing and blur mean
 // what they mean in the grid at every zoom.
-import { contours } from "d3-contour";
 import { Cell, Shoal, cellDepth, cellSigma } from "./cells.js";
 import {
   DEFINITIONS,
   M_PER_DEG_LAT,
   cellCenter,
+  mPerDegLon,
   tileBounds,
   tileFraction,
   tileMetres,
 } from "./geometry.js";
 import { EXTENT, Feature, Point, encodeTile } from "./mvt.js";
+import {
+  Level,
+  Prepared,
+  band,
+  cut,
+  isolines,
+  polygons,
+  prepare,
+} from "./portray.js";
 
 const {
   interpolation_radius_m: RADIUS_M,
@@ -38,14 +47,48 @@ const MIN_POINTS = 3;
 const MAX_AREA_DEPTH_M = 200;
 /** The deepest band's floor below chart datum, as the grid's drying band. */
 const DRYING_FLOOR_M = -30;
-/** Keeps a band's upper edge out of it, a millimetre: too little to see. */
-const BAND_EPS_M = 0.001;
+/** How finely depths are drawn: contours every metre and every foot, or the chart's
+ * isobaths. */
+export type Detail = "high" | "standard";
+/** The zoom fine contours start at: zoomed out further, they'd run together, and the
+ * chart's isobaths are drawn. */
+export const FINE_ZOOM = 13;
+/** How much shoaler than a band's depths its edges are traced, so a band holds its
+ * lower depth and not its upper: too little to see. */
+const EDGE_M = 0.005;
 /** Soundings per tile side, as the grid's lattice. */
 const SOUNDINGS_PER_SIDE = 8;
 /** The finest zoom built; clients overzoom past it, as the grid's overlay. */
 export const MAX_ZOOM = 15;
 export const MIN_ZOOM = 4;
 const LEVELS = P.isobaths_m.filter((l) => l <= MAX_AREA_DEPTH_M);
+/** Depths finely drawn reach as deep as this; past it, the chart's isobaths. */
+const FINE_MAX_M = 50;
+/** Bands finely drawn: every metre to FINE_MAX_M, then the chart's. */
+const FINE_EDGES = [
+  DRYING_FLOOR_M,
+  ...Array.from({ length: FINE_MAX_M + 1 }, (_, m) => m),
+  ...LEVELS.filter((l) => l > FINE_MAX_M),
+];
+/** Contours finely drawn: every metre, and every foot, each fifth one major; and the
+ * drying line, in either unit. */
+const FINE_CONTOURS: Level[] = [
+  { m: 0 },
+  ...Array.from({ length: FINE_MAX_M }, (_, k) => ({
+    m: k + 1,
+    unit: "m" as const,
+    major: (k + 1) % 5 === 0,
+  })),
+  ...Array.from({ length: Math.floor(FINE_MAX_M / P.m_per_ft) }, (_, k) => ({
+    m: (k + 1) * P.m_per_ft,
+    unit: "ft" as const,
+    major: (k + 1) % 5 === 0,
+  })),
+  // Deeper, the chart's, in either unit.
+  ...P.isobaths_m
+    .filter((l) => l > FINE_MAX_M && l <= MAX_AREA_DEPTH_M)
+    .map((m) => ({ m })),
+];
 const POSACC_M = 10;
 const TECSOU = 1;
 const INFORM = {
@@ -55,11 +98,36 @@ const INFORM = {
     "This boat's own soundings, recorded by its Crowd Depth plugin. Not reduced for tide or to chart datum, and not calibrated. Not for navigation.",
 };
 
-/** Raster pixels a side for a tile: at most 256, and none smaller than a cell. */
+/** Raster pixels a side for a tile: at most 256, and a pixel about a cell. */
 export function rasterSize(z: number, _lat?: number): number {
   // Sized by zoom alone, as at the equator, so neighbouring tiles share a pixel grid and
-  // their areas meet without a seam. Away from it pixels are finer than a cell.
-  return Math.max(1, Math.min(256, Math.round(tileMetres(z, 0) / CELL_M)));
+  // their areas meet without a seam. Away from it pixels are finer than a cell. A power
+  // of two, so a tile's pixels are its parent's, and tiles past SHARED_ZOOM share
+  // their parent's surface.
+  const fit = tileMetres(z, 0) / CELL_M;
+  return Math.min(256, 2 ** Math.max(0, Math.round(Math.log2(fit))));
+}
+
+/** The least a raster reaches past its tile, in pixels: as far as it's traced. */
+const HALO_MIN_PX = 8;
+
+/** Tiles past this zoom are cut from their ancestor's surface at it: their pixels are
+ * the same size, so the surface is built once for all of them, and they meet without a
+ * seam. */
+export const SHARED_ZOOM = 14;
+
+// A tile's pixels are its ancestor's at SHARED_ZOOM, as `cut` takes them: so long as a
+// cell's size keeps their rasters powers of two apart.
+for (let z = SHARED_ZOOM + 1; z <= MAX_ZOOM; z++) {
+  if (rasterSize(z) * 2 ** (z - SHARED_ZOOM) !== rasterSize(SHARED_ZOOM)) {
+    throw new Error(`zoom ${z} tiles can't be cut from zoom ${SHARED_ZOOM}'s`);
+  }
+}
+
+/** A tile's ancestor at SHARED_ZOOM, past it; else the tile itself. */
+export function sharedTile(z: number, x: number, y: number) {
+  const k = Math.max(0, z - SHARED_ZOOM);
+  return { z: z - k, x: x >> k, y: y >> k, k };
 }
 
 /** The margin a tile reads beyond its edges, in metres: the interpolation's reach and
@@ -88,7 +156,7 @@ export function contourLevels(z: number): number[] {
   );
 }
 
-interface Raster {
+export interface Raster {
   n: number;
   halo: number;
   size: number;
@@ -104,6 +172,15 @@ interface Raster {
   /** Metres to the nearest sounded cell, and the distance that counts as measured. */
   near: Float32Array;
   measuredM: number;
+  /** Past the interpolated pixels, the shoalest of the interpolated surface and the
+   * unconfirmed shoals in each pixel or beside it; Infinity where there's none, and over
+   * the interpolated pixels. */
+  shoalest: Float32Array;
+  /** The same, of the unconfirmed shoals alone. */
+  shoal: Float32Array;
+  /** The depth before the margin where it's at or above 0 m, which decides where water
+   * is wet: the margin never makes it drying. */
+  wet: Float32Array;
 }
 
 interface Source {
@@ -120,7 +197,7 @@ interface Source {
  * `gdal_grid invdistnn`; a gaussian blur clamped so no pixel reads deeper than it was
  * interpolated; then k × σ off, with σ from the nearest cell widened by its distance.
  * Every depth the blur carries past the interpolated pixels is capped at the shoalest of
- * `cells` and `shoals` in its pixel or beside it.
+ * the interpolated surface and `shoals` in its pixel or beside it.
  */
 export function surface(
   z: number,
@@ -133,7 +210,9 @@ export function surface(
   const lat = (b.north + b.south) / 2;
   const n = rasterSize(z, lat);
   const pm = tileMetres(z, lat) / n;
-  const halo = Math.ceil(MARGIN_M / pm);
+  // At least as far as a tile is traced past its edges, zoomed out where the margin is
+  // less than a pixel or two.
+  const halo = Math.max(Math.ceil(MARGIN_M / pm), HALO_MIN_PX);
   const size = n + 2 * halo;
   const at = (lon: number, la: number) => {
     const f = tileFraction(lon, la, z);
@@ -250,22 +329,27 @@ export function surface(
     depth[i] = m >= 0 ? Math.max(0, d) : d;
   }
 
-  // Carried past the interpolated pixels, a depth is never deeper than a published
-  // sounding in its pixel or beside it, cell or unconfirmed shoal, as the grid
-  // overlay's carried depths.
-  const cap = new Float32Array(size * size).fill(Infinity);
-  for (const [i, s] of byPixel) cap[i] = Math.min(cap[i], s.depth);
+  // Carried past the interpolated pixels, a depth is never deeper than the surface it's
+  // carried from, in its pixel or beside it, or an unconfirmed shoal there. Not the
+  // cells': the surface between them is already allowed deeper than its shoalest cell,
+  // and an edge held to the cell would draw the difference as rings round it.
+  const bySurface = depth.map((d, i) =>
+    Number.isNaN(median[i]) || Number.isNaN(d) ? Infinity : d,
+  );
+  const byShoal = new Float32Array(size * size).fill(Infinity);
   for (const s of shoals) {
     const f = tileFraction(s.lon, s.lat, z);
     const sx = Math.floor((f.x - x) * n + halo);
     const sy = Math.floor((f.y - y) * n + halo);
     if (sx < 0 || sy < 0 || sx >= size || sy >= size) continue;
-    cap[sy * size + sx] = Math.min(cap[sy * size + sx], s.depth);
+    byShoal[sy * size + sx] = Math.min(byShoal[sy * size + sx], s.depth);
   }
+  const shoalest = new Float32Array(size * size).fill(Infinity);
+  const shoal = new Float32Array(size * size).fill(Infinity);
   for (let py = 0; py < size; py++) {
     for (let px = 0; px < size; px++) {
       const i = py * size + px;
-      if (!Number.isNaN(median[i]) || Number.isNaN(depth[i])) continue;
+      const carried = Number.isNaN(median[i]);
       for (
         let yy = Math.max(0, py - 1);
         yy <= Math.min(size - 1, py + 1);
@@ -276,12 +360,35 @@ export function surface(
           xx <= Math.min(size - 1, px + 1);
           xx++
         ) {
-          depth[i] = Math.min(depth[i], cap[yy * size + xx]);
+          const j = yy * size + xx;
+          shoalest[i] = Math.min(shoalest[i], bySurface[j], byShoal[j]);
+          shoal[i] = Math.min(shoal[i], byShoal[j]);
         }
       }
+      if (carried && !Number.isNaN(depth[i])) {
+        depth[i] = Math.min(depth[i], shoalest[i]);
+      }
+      // The interpolated pixels follow their cells as the grid's do, capped by none.
+      if (!carried) shoalest[i] = shoal[i] = Infinity;
     }
   }
-  return { n, halo, size, pm, depth, cover, measured, near, measuredM };
+  const wet = depth.map((d, i) =>
+    d < 0 || Number.isNaN(blurred[i]) ? d : Math.max(d, blurred[i]),
+  );
+  return {
+    n,
+    halo,
+    size,
+    pm,
+    depth,
+    cover,
+    measured,
+    near,
+    measuredM,
+    shoalest,
+    shoal,
+    wet,
+  };
 }
 
 /**
@@ -345,178 +452,6 @@ function blur(
   };
 }
 
-/** Polygons where `field` is at least 0 over the tile's own pixels, in tile
- * coordinates. The field is interpolated linearly between pixel centres, so edges follow
- * the depths rather than the pixels; NaN is outside. */
-function polygons(r: Raster, field: (i: number) => number): Point[][][] {
-  const { n, halo, size } = r;
-  // Traced a few pixels past the tile's edges, which the renderer clips, so an edge
-  // that falls between this tile's pixels and the next tile's is drawn where the
-  // depths put it, not along the tile's edge.
-  const b = Math.min(BUFFER_PX, halo);
-  const m = n + 2 * b;
-  const values = new Array<number>(m * m);
-  let any = false;
-  for (let y = 0; y < m; y++) {
-    for (let x = 0; x < m; x++) {
-      const v = field((y + halo - b) * size + x + halo - b);
-      values[y * m + x] = v;
-      if (v >= 0) any = true;
-    }
-  }
-  if (!any) return [];
-  const scale = EXTENT / n;
-  const [shape] = contours().size([m, m]).thresholds([0])(values);
-  return shape.coordinates.map((poly) =>
-    poly.map((ring) =>
-      smooth(ring.slice(0, -1) as Point[], true, m).map(
-        ([x, y]) =>
-          [Math.round((x - b) * scale), Math.round((y - b) * scale)] as Point,
-      ),
-    ),
-  );
-}
-
-/** Pixels past each edge a tile's areas and contours are traced over, drawn in the
- * tile's buffer. */
-const BUFFER_PX = 3;
-
-/** Points on the edge of the traced grid, in the tile's buffer, which smoothing leaves
- * where they are. */
-const onEdge = ([x, y]: Point, n: number) =>
-  x <= 0 || y <= 0 || x >= n || y >= n;
-
-/**
- * Round off the corners a raster of 20 m cells leaves: two passes of Chaikin's corner
- * cutting, each replacing a corner with points a quarter of the way along its two sides.
- * It cuts the same way whichever way a line runs, so two bands' shared edge stays shared.
- * Points on the tile's edge stay put.
- */
-function smooth(points: Point[], closed: boolean, n = Infinity): Point[] {
-  let pts = points;
-  for (let pass = 0; pass < 2 && pts.length > 2; pass++) {
-    const out: Point[] = [];
-    const count = closed ? pts.length : pts.length - 1;
-    if (!closed) out.push(pts[0]);
-    for (let i = 0; i < count; i++) {
-      const a = pts[i];
-      const b = pts[(i + 1) % pts.length];
-      if (onEdge(a, n) && onEdge(b, n)) {
-        out.push(a, b);
-        continue;
-      }
-      out.push(
-        onEdge(a, n)
-          ? a
-          : [0.75 * a[0] + 0.25 * b[0], 0.75 * a[1] + 0.25 * b[1]],
-        onEdge(b, n)
-          ? b
-          : [0.25 * a[0] + 0.75 * b[0], 0.25 * a[1] + 0.75 * b[1]],
-      );
-    }
-    if (!closed) out.push(pts[pts.length - 1]);
-    pts = out;
-  }
-  return closed ? [...pts, pts[0]] : pts;
-}
-
-/** The isoline at `level` between pixels that all have a depth, as lines in tile
- * coordinates. Marching squares interpolating the depth linearly between pixel centres,
- * as the bands' edges are, so a contour lies on the edge its bands share. */
-function isoline(r: Raster, level: number): Point[][] {
-  const { n, halo, size, depth } = r;
-  const v = (x: number, y: number) => depth[(y + halo) * size + x + halo];
-  const c = (x: number, y: number) => {
-    const i = (y + halo) * size + x + halo;
-    return Math.max((r.cover[i] - 0.5) * 100, r.measuredM - r.near[i]);
-  };
-  const corners = (x: number, y: number) => [
-    c(x, y),
-    c(x + 1, y),
-    c(x + 1, y + 1),
-    c(x, y + 1),
-  ];
-  const scale = EXTENT / n;
-  const segments: [Point, Point][] = [];
-  // Pixel centres sit at +0.5; a crossing is where the depth between two reaches level.
-  const mid = (ax: number, ay: number, bx: number, by: number): Point => {
-    const t = (level - v(ax, ay)) / (v(bx, by) - v(ax, ay));
-    return [
-      Math.round((ax + (bx - ax) * t + 0.5) * scale),
-      Math.round((ay + (by - ay) * t + 0.5) * scale),
-    ];
-  };
-  const b = Math.min(BUFFER_PX, halo - 1);
-  for (let y = -1 - b; y < n + b; y++) {
-    for (let x = -1 - b; x < n + b; x++) {
-      const q = [v(x, y), v(x + 1, y), v(x + 1, y + 1), v(x, y + 1)];
-      if (q.some((d) => d === undefined || Number.isNaN(d))) continue;
-      if (corners(x, y).some((e) => !(e >= 0))) continue;
-      const b = q.map((d) => (d >= level ? 1 : 0));
-      const code = b[0] | (b[1] << 1) | (b[2] << 2) | (b[3] << 3);
-      if (code === 0 || code === 15) continue;
-      const top = mid(x, y, x + 1, y);
-      const right = mid(x + 1, y, x + 1, y + 1);
-      const bottom = mid(x, y + 1, x + 1, y + 1);
-      const left = mid(x, y, x, y + 1);
-      const cases: Record<number, [Point, Point][]> = {
-        1: [[left, top]],
-        2: [[top, right]],
-        3: [[left, right]],
-        4: [[right, bottom]],
-        5: [
-          [left, top],
-          [right, bottom],
-        ],
-        6: [[top, bottom]],
-        7: [[left, bottom]],
-        8: [[bottom, left]],
-        9: [[bottom, top]],
-        10: [
-          [top, right],
-          [bottom, left],
-        ],
-        11: [[bottom, right]],
-        12: [[right, left]],
-        13: [[right, top]],
-        14: [[top, left]],
-      };
-      segments.push(...cases[code]);
-    }
-  }
-  return join(segments).map((line) =>
-    smooth(line, false, EXTENT).map(
-      ([x, y]) => [Math.round(x), Math.round(y)] as Point,
-    ),
-  );
-}
-
-/** Join segments that share ends into lines. */
-function join(segments: [Point, Point][]): Point[][] {
-  const id = (p: Point) => `${p[0]},${p[1]}`;
-  const byStart = new Map<string, number[]>();
-  segments.forEach(
-    ([a], i) => byStart.get(id(a))?.push(i) ?? byStart.set(id(a), [i]),
-  );
-  const used = new Uint8Array(segments.length);
-  const lines: Point[][] = [];
-  for (let i = 0; i < segments.length; i++) {
-    if (used[i]) continue;
-    used[i] = 1;
-    const line = [...segments[i]];
-    for (;;) {
-      const next = byStart
-        .get(id(line[line.length - 1]))
-        ?.find((j) => !used[j]);
-      if (next === undefined) break;
-      used[next] = 1;
-      line.push(segments[next][1]);
-    }
-    lines.push(line);
-  }
-  return lines;
-}
-
 /** The S-57 layers of one tile: DEPARE, DEPCNT, SOUNDG and M_QUAL. */
 export function buildTile(
   z: number,
@@ -524,38 +459,41 @@ export function buildTile(
   y: number,
   cells: Cell[],
   shoals: Shoal[],
+  detail: Detail = "high",
+  shared?: Map<string, Prepared>,
 ): Buffer | undefined {
   if (cells.length === 0 && shoals.length === 0) return undefined;
-  const r = surface(z, x, y, cells, shoals);
-  const { depth } = r;
-  const has = (i: number) =>
-    !Number.isNaN(depth[i]) && depth[i] <= MAX_AREA_DEPTH_M;
-  // At least 0 where half the neighbourhood has a depth, or within a cell of a sounded
-  // cell, so the boat's own track always draws: the surface's edge, in metres. Scaled so
-  // it decides the edge, and the depth the bands within it.
-  const edge = (i: number) =>
-    Math.max((r.cover[i] - 0.5) * 100, r.measuredM - r.near[i]);
-  // Just outside the surface, how far outside, so an edge falls between pixels rather
-  // than on the last one with a depth, and a lone pixel draws as more than a point.
-  const outside = (i: number) =>
-    Number.isFinite(r.near[i]) ? Math.min(edge(i), -BAND_EPS_M) : -1;
-
+  // Cut from the ancestor's surface past SHARED_ZOOM, which `cells` and `shoals` cover,
+  // kept for its other tiles. Zoomed out, a tile shares its surface with none.
+  const a = sharedTile(z, x, y);
+  const key = `${a.z}/${a.x}/${a.y}`;
+  // A tile at SHARED_ZOOM uses its surface when it's kept, but only a tile cut from it
+  // keeps it, so a view at SHARED_ZOOM doesn't push the others out.
+  const kept = z >= SHARED_ZOOM ? shared?.get(key) : undefined;
+  const prepared = kept ?? prepare(surface(a.z, a.x, a.y, cells, shoals));
+  if (kept || z > SHARED_ZOOM) {
+    // The most recently used, kept longest.
+    shared?.delete(key);
+    shared?.set(key, prepared);
+  }
+  const n = rasterSize(z);
+  const t = cut(prepared, (x - (a.x << a.k)) * n, (y - (a.y << a.k)) * n, n);
+  const fine = detail === "high" && z >= FINE_ZOOM;
+  let shoalest = Infinity;
+  let deepest = -Infinity;
+  t.extent.forEach((e, i) => {
+    if (e < 0) return;
+    shoalest = Math.min(shoalest, t.depth[i], t.wet[i]);
+    deepest = Math.max(deepest, t.depth[i], t.wet[i]);
+  });
   const DEPARE: Feature[] = [];
-  const bands: [number, number][] = [
-    [DRYING_FLOOR_M, 0],
-    ...LEVELS.slice(0, -1).map(
-      (lo, i) => [lo, LEVELS[i + 1]] as [number, number],
-    ),
-  ];
-  for (const [lo, hi] of bands) {
-    // At least 0 inside the band, crossing 0 where the depth reaches either edge.
-    const polys = polygons(r, (i) =>
-      // A band holds its lower edge, not its upper: a depth of exactly 0 m, which the
-      // margin clamps shallow water to, is wet, not drying.
-      has(i)
-        ? Math.min(depth[i] - lo, hi - depth[i] - BAND_EPS_M, edge(i))
-        : outside(i),
-    );
+  const edges = fine ? FINE_EDGES : [DRYING_FLOOR_M, ...LEVELS];
+  for (let k = 0; k < edges.length - 1; k++) {
+    const [lo, hi] = [edges[k], edges[k + 1]];
+    // Each edge a few millimetres shoaler than the band's: water at exactly a band's
+    // depth, as water capped at a shoal's, is inside it, not on its edge.
+    if (hi - EDGE_M <= shoalest || lo - EDGE_M > deepest) continue;
+    const polys = polygons(t, band(t, lo - EDGE_M, hi - EDGE_M));
     if (polys.length) {
       DEPARE.push({
         type: "Polygon",
@@ -566,13 +504,25 @@ export function buildTile(
   }
 
   const DEPCNT: Feature[] = [];
-  for (const level of contourLevels(z)) {
-    const lines = isoline(r, level);
+  const levels: Level[] = fine
+    ? FINE_CONTOURS
+    : contourLevels(z).map((m) => ({ m }));
+  const traced = isolines(
+    t,
+    levels.filter((l) => l.m >= shoalest && l.m <= deepest).map((l) => l.m),
+  );
+  for (const level of levels) {
+    const lines = traced.get(level.m) ?? [];
     if (lines.length) {
       DEPCNT.push({
         type: "LineString",
         lines,
-        properties: { VALDCO: level, QUAPOS: 4 },
+        properties: {
+          VALDCO: level.m,
+          QUAPOS: 4,
+          ...(level.unit ? { unit: level.unit } : {}),
+          ...(level.major ? { major: 1 } : {}),
+        },
       });
     }
   }
@@ -604,10 +554,26 @@ export function buildTile(
   let last = -Infinity;
   let tvu = 0;
   let passes = 0;
-  // Over the margin too, whose cells the surface here is drawn from.
+  // Over the tile's own margin too, whose cells its surface is drawn from: not the rest of
+  // an ancestor's that `cells` may hold.
+  const bounds = tileBounds(z, x, y);
+  const dLat = MARGIN_M / M_PER_DEG_LAT;
+  const dLon =
+    MARGIN_M /
+    mPerDegLon(
+      Math.min(Math.max(Math.abs(bounds.north), Math.abs(bounds.south)), 85),
+    );
+  const own = cells.filter((c) => {
+    const p = cellCenter(c.py, c.px);
+    return (
+      p.lat >= bounds.south - dLat &&
+      p.lat <= bounds.north + dLat &&
+      p.lon >= bounds.west - dLon &&
+      p.lon <= bounds.east + dLon
+    );
+  });
   const tided =
-    cells.length > 0 &&
-    cells.every((c) => c.t !== undefined && !c.untidedBelow);
+    own.length > 0 && own.every((c) => c.t !== undefined && !c.untidedBelow);
   for (const cell of cells) {
     const c = cellCenter(cell.py, cell.px);
     const f = tileFraction(c.lon, c.lat, z);
@@ -654,9 +620,11 @@ export function buildTile(
       : {}),
   };
   const M_QUAL: Feature[] = [];
-  // Coverage edges follow the distance to the nearest sounded cell.
-  const measured = polygons(r, (i) =>
-    Number.isFinite(r.near[i]) ? r.measuredM - r.near[i] : -1,
+  // Measured water and interpolated, split along one edge, so they neither overlap nor
+  // leave a gap.
+  const measured = polygons(
+    t,
+    t.extent.map((e, i) => Math.min(e, t.measured[i])),
   );
   if (measured.length) {
     M_QUAL.push({
@@ -665,8 +633,9 @@ export function buildTile(
       properties: { ...quality, kind: "measured" },
     });
   }
-  const between = polygons(r, (i) =>
-    has(i) ? Math.min(r.near[i] - r.measuredM, edge(i)) : outside(i),
+  const between = polygons(
+    t,
+    t.extent.map((e, i) => Math.min(e, -t.measured[i])),
   );
   if (between.length) {
     M_QUAL.push({

@@ -40,6 +40,8 @@ export type Config = {
     tint?: Tint;
     /** Draw depth contours; on unless turned off. */
     contours?: boolean;
+    /** Contours every metre and every foot zoomed in, or the chart's isobaths. */
+    contourDetail?: "high" | "standard";
   };
 };
 
@@ -337,6 +339,18 @@ export function schema(app: ServerAPI) {
             type: "boolean",
             default: DEFAULT_OWN_STYLE.contours,
             title: "Draw depth contours",
+          },
+          contourDetail: {
+            type: "string",
+            enum: ["high", "standard"],
+            enumNames: [
+              "High: every metre or foot, zoomed in",
+              "Standard: the chart's isobaths",
+            ],
+            default: "high",
+            title: "Contour detail",
+            description:
+              "High draws a contour every metre, or every foot, with every fifth one bold, from zoom 13 in; zoomed out, and at Standard, the layer draws the chart's isobaths.",
           },
         },
       },
