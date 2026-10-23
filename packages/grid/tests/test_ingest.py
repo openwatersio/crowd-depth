@@ -339,9 +339,18 @@ def test_incomplete_listing_withdraws_nothing(env, monkeypatch):
     assert env.files()[noaa_key(1)] == ("active", None)
 
 
-def test_publish_keeps_the_thread_count(tmp_path):
-    # The flush runs on one thread; the rest of the run gets its threads back.
+def test_the_flush_runs_on_one_thread_and_publish_keeps_the_rest(tmp_path):
+    seen = []
     with open_store(LocalObjects(tmp_path / "store")) as con:
+
+        class Spy:
+            def execute(self, sql, *args):
+                if sql.startswith("CALL ducklake_flush_inlined_data"):
+                    seen.append(con.execute("SELECT current_setting('threads')").fetchone()[0])
+                return con.execute(sql, *args)
+
+        catalog.flush_inlined(Spy())
+        assert seen == [1]
         con.execute("SET threads = 3")
         con.publish()
         assert con.execute("SELECT current_setting('threads')").fetchone()[0] == 3
