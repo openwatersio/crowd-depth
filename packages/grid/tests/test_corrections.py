@@ -13,7 +13,7 @@ from rasterio.warp import transform_bounds
 from test_grid import LAT0, LON0, T0, at, put
 from test_ingest import env  # noqa: F401  (a fixture)
 
-from grid import calibrate, catalog, cells, cli, overlay, tide
+from grid import calibrate, catalog, cells, cli, ingest, overlay, tide
 from grid import reference as reference_mod
 from grid.catalog import open_store
 
@@ -1018,9 +1018,7 @@ def test_a_stuck_run_follows_its_soundings_to_a_copy(env, tmp_path, monkeypatch)
             {"new": new, "old": old},
         )
         con.execute("UPDATE lake.files SET status = 'withdrawn' WHERE file_id = $old", {"old": old})
-        con.execute(
-            "UPDATE lake.points SET file_id = $new WHERE file_id = $old", {"new": new, "old": old}
-        )
+        ingest.take_over(con, old, new)
     assert (
         before > 60
         and sum(c for u, _, c in corrected(env, "lost_bottom") if u == "AQM-T") == before
@@ -1100,9 +1098,7 @@ def test_a_stray_transit_stays_uncalibrated_in_a_copy(env, tmp_path, monkeypatch
             {"new": new, "old": old},
         )
         con.execute("UPDATE lake.files SET status = 'withdrawn' WHERE file_id = $old", {"old": old})
-        con.execute(
-            "UPDATE lake.points SET file_id = $new WHERE file_id = $old", {"new": new, "old": old}
-        )
+        ingest.take_over(con, old, new)
         calibrate.assign(con)
     for u, _, raw, _, ofs, depth in corrected(env):
         if u == "AQM-T" and raw > 10:

@@ -18,13 +18,13 @@ from pathlib import Path
 import numpy as np
 
 from . import catalog, definitions, qc, statistic
-from .catalog import BASE_ROW, MIN_DEPTH_M, checkpoint
+from .catalog import BASE_ROW, MIN_DEPTH_M, POINT_ID, checkpoint
 from .definitions import CELLS, QC
 from .qc import HAZARD_M, MAX_DEPTH_M, QC_VERSION, SHALLOW_M, TRACK_REASONS
 
 log = logging.getLogger(__name__)
 
-GRID_VERSION = 9
+GRID_VERSION = 10
 BATCH_POINTS = 5_000_000
 BASE = CELLS["rows_per_degree"]  # base rows per 1° tile
 MIN_VESSELS = 2
@@ -100,8 +100,8 @@ FROM {source} s JOIN levels l ON l.tile_id = s.tile_id AND l.r1 = s.r // 3 AND l
 CELL = ["tile_id", "level", "cr", "cc"]
 # About how many soundings a cell's median, spread and vessels' medians are taken from. These
 # aggregates hold their values in memory, and a boat logging at its mooring fills one
-# cell for as long as it logs. Larger cells are sampled by point id, the same sample
-# every run; min, max, counts and confirmed shoals still use every sounding.
+# cell for as long as it logs. Larger cells are sampled by content key (catalog.CONTENT_KEY),
+# the same sample every run; min, max, counts and confirmed shoals still use every sounding.
 CELL_SAMPLE = 1_000_000
 
 
@@ -112,7 +112,7 @@ def sample(source: str, keys: list[str], name: str) -> str:
     """
     k = ", ".join(keys)
     return f"""(SELECT s.*,
-      hash(s.point_id) % greatest(1, ceil(n.n / {CELL_SAMPLE}))::UBIGINT = 0 AS {name}
+      s.content_key % greatest(1, ceil(n.n / {CELL_SAMPLE}))::UBIGINT = 0 AS {name}
     FROM {source} s JOIN (SELECT {k}, count(*) AS n FROM {source} GROUP BY ALL) n USING ({k}))"""
 
 
@@ -268,11 +268,12 @@ WITH flags AS (
   SELECT point_id, CASE WHEN reason = 'flatline' THEN 'reject' ELSE flag END AS flag,
     flag = 'unconfirmed' AND reason = 'track_noise' AS hunting
   FROM lake.qc_flags
-  WHERE cell_id = $partition AND qc_version = {QC_VERSION} AND list_contains({TRACK_REASONS}, reason)
-    AND flag IN ('reject', 'unconfirmed', 'noisy')
+  WHERE cell_id = $partition AND list_contains($tiles, tile_id) AND qc_version = {QC_VERSION}
+    AND list_contains({TRACK_REASONS}, reason) AND flag IN ('reject', 'unconfirmed', 'noisy')
 ),
 pts AS (
-  SELECT a.point_id, a.tile_id, a.cell_id, a.unique_id AS vessel, a.time, a.lon, a.lat,
+  SELECT a.point_id, a.content_key, a.tile_id, a.cell_id, a.unique_id AS vessel, a.time,
+    a.lon, a.lat,
     a.depth AS d, a.depth_raw AS raw, coalesce(f.hunting, false) AS hunting, a.tide IS NOT NULL AS tided, a.offset_m IS NOT NULL AS calibrated, a.sigma,
     f.flag,
     a.tile_id // 360 - 90 AS lat0, a.tile_id % 360 - 180 AS lon0,
@@ -422,10 +423,11 @@ SELECT * FROM (
 CREATE OR REPLACE TEMP TABLE placed AS
 -- A sounding at least as deep as the cell's depth comes first, so the label is never
 -- deeper than what was read at its spot. Ties go to the earliest and then the least
--- point_id, not to whichever thread saw one first, so unchanged soundings always place
--- a cell's sounding in the same spot.
+-- content_key, not to whichever thread or file saw one first, so unchanged soundings
+-- always place a cell's sounding in the same spot.
 SELECT a.tile_id, a.level, a.cr, a.cc,
-  arg_min({{'lon': a.lon, 'lat': a.lat}}, (a.d < s.depth, abs(a.d - s.depth), a.time, a.point_id))
+  arg_min({{'lon': a.lon, 'lat': a.lat}},
+    (a.d < s.depth, abs(a.d - s.depth), a.time, a.content_key))
     FILTER (WHERE a.time IS NOT NULL) AS at
 FROM accepted a JOIN stats s USING (tile_id, level, cr, cc) GROUP BY ALL;
 DROP TABLE accepted;
@@ -476,7 +478,8 @@ WHERE outlier = 'shoal' AND point_id IN (SELECT point_id FROM confirmed)
 # whole tile, since dedupe only drops a sounding's twins, which share its position and
 # so its row.
 TILE_POINTS = f"""
-SELECT point_id, tile_id, cell_id, unique_id, time, lon, lat, depth_raw, depth, tide, offset_m,
+SELECT point_id, content_key, tile_id, cell_id, unique_id, time, lon, lat, depth_raw, depth,
+  tide, offset_m,
   sigma, excluded, lost_bottom, awaiting_tide, {BASE_ROW} AS r
 FROM corrected_points_in($partition, $tiles, $rlo, $rhi) p
 """
@@ -500,14 +503,17 @@ WHERE NOT p.excluded AND NOT p.awaiting_tide
   AND NOT (p.lost_bottom AND (p.depth >= {HAZARD_M} OR p.depth_raw < {SHALLOW_M}))
   AND (p.point_id IN (
   SELECT point_id FROM lake.qc_flags
-  WHERE cell_id = $partition AND flag = 'unconfirmed' AND qc_version = {QC_VERSION}
+  WHERE cell_id = $partition AND list_contains($tiles, tile_id) AND flag = 'unconfirmed'
+    AND qc_version = {QC_VERSION}
   EXCEPT
   SELECT point_id FROM lake.qc_flags
-  WHERE cell_id = $partition AND flag IN ('confirmed', 'reject') AND qc_version = {QC_VERSION})
+  WHERE cell_id = $partition AND list_contains($tiles, tile_id)
+    AND flag IN ('confirmed', 'reject') AND qc_version = {QC_VERSION})
   OR p.lost_bottom AND p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M}
     AND p.depth >= {MIN_DEPTH_M} AND p.point_id NOT IN (
       SELECT point_id FROM lake.qc_flags
-      WHERE cell_id = $partition AND flag = 'reject' AND qc_version = {QC_VERSION}))
+      WHERE cell_id = $partition AND list_contains($tiles, tile_id) AND flag = 'reject'
+        AND qc_version = {QC_VERSION}))
 """
 
 
@@ -657,10 +663,10 @@ def clear(con, partition, tiles):
     con.execute("COMMIT")
 
 
-def classify(con, partition, rlo, rhi, first):
+def classify(con, partition, tiles, rlo, rhi, first):
     """Cell-level flags for one band of `tile_points`, and its accepted soundings added to
     `group_accepted`."""
-    params = {"partition": partition, "rlo": rlo, "rhi": rhi}
+    params = {"partition": partition, "tiles": tiles, "rlo": rlo, "rhi": rhi}
     # Each step commits on its own, so a replaced or dropped table's space is freed
     # at once. A group's flags and cells are complete only once `build` finishes it.
     for statement in filter(str.strip, CLASSIFY.split(";\n")):
@@ -673,8 +679,8 @@ def classify(con, partition, rlo, rhi, first):
     con.execute("DROP TABLE accepted")
     con.execute(
         f"""INSERT INTO lake.qc_flags BY NAME
-        SELECT q.*, $partition::SMALLINT AS cell_id, {QC_VERSION} AS qc_version
-        FROM ({CELL_FLAGS}) q""",
+        SELECT q.*, t.tile_id, $partition::SMALLINT AS cell_id, {QC_VERSION} AS qc_version
+        FROM ({CELL_FLAGS}) q JOIN tile_points t USING (point_id)""",
         {"partition": partition},
     )
 
@@ -725,7 +731,7 @@ judged AS (
     WHEN n3 >= {SHOAL_CHECK_VESSELS} THEN m3 END AS m
   FROM others
 )
-SELECT a.point_id, a.d FROM group_accepted a JOIN judged j
+SELECT a.point_id, a.tile_id, a.d FROM group_accepted a JOIN judged j
   ON j.tile_id = a.tile_id AND j.py = a.r // 2 AND j.px = a.c // 2 AND j.vessel = a.vessel
 WHERE a.outlier = 'shoal' AND a.d < j.m - {tolerance("j.m")};
 """
@@ -746,7 +752,8 @@ def check_shoals(con, partition):
     )
     con.execute(
         f"""INSERT INTO lake.qc_flags BY NAME
-        SELECT point_id, CASE WHEN d < {HAZARD_M} THEN 'unconfirmed' ELSE 'reject' END AS flag,
+        SELECT point_id, tile_id,
+          CASE WHEN d < {HAZARD_M} THEN 'unconfirmed' ELSE 'reject' END AS flag,
           'consensus_shoal' AS reason,
           $partition::SMALLINT AS cell_id, {QC_VERSION} AS qc_version FROM outvoted""",
         params,
@@ -878,16 +885,17 @@ def build(con, tiles: list[int] | None = None) -> dict:
             # Every point's old cell-level flags, active or not.
             con.execute(
                 f"""DELETE FROM lake.qc_flags WHERE cell_id = $partition
+                AND list_contains($tiles, tile_id)
                 AND qc_version = {QC_VERSION} AND list_contains({CELL_REASONS}, reason)
                 AND point_id IN (
-                  SELECT point_id FROM lake.points p
+                  SELECT {POINT_ID} FROM lake.points p
                   WHERE cell_id = $partition AND list_contains($tiles, tile_id)
                     AND {BASE_ROW} BETWEEN $rlo AND $rhi - 1)""",
                 params,
             )
         # Flags band by band, then σ from every band's votes, then each band's cells.
         for i, (rlo, rhi) in enumerate(bands):
-            classify(con, partition, rlo, rhi, first=not i)
+            classify(con, partition, unit_tiles, rlo, rhi, first=not i)
         check_shoals(con, partition)
         sigmas(con)
         for rlo, rhi in bands:
@@ -895,7 +903,7 @@ def build(con, tiles: list[int] | None = None) -> dict:
         con.unregister("pixel_sigma")
         con.execute("DROP TABLE group_accepted")
         # Shoals follow every band's flags.
-        con.execute(SHOALS, {"partition": partition})
+        con.execute(SHOALS, {"partition": partition, "tiles": unit_tiles})
         con.execute(
             f"""INSERT INTO lake.shoals
             SELECT tile_id, r, lon, lat, depth, $partition FROM shoals

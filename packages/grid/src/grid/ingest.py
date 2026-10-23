@@ -9,9 +9,9 @@ Statuses and reasons in `files`:
 - withdrawn: gone from its source (rule 3).
 - invalid: can't be parsed or holds impossible values.
 
-The points of one content hash live with exactly one file (`has_points`), so a
-point_id, derived from the content hash and row, is never stored twice. When
-that file leaves, a copy takes its points over instead of storing them again.
+The points of one content hash live with exactly one file (`has_points`), so no
+sounding is stored twice. When that file leaves, a copy takes its points, and
+their flags, over instead of storing them again.
 """
 
 import contextlib
@@ -61,13 +61,11 @@ class Row:
     has_points: bool
 
 
-# A loaded file's soundings as points, with their 1° tile and 10° partition cell.
-# Points are written in the order files arrive, one track after another, so each row
-# group holds a few compact tracks and its tile statistics still prune reads. Sorting
-# a whole batch by tile would hold it in memory past the limit; compaction can sort.
+# A loaded file's soundings as points, with their 1° tile and 10° partition cell. Each
+# batch is written sorted by tile (catalog.SORTED), so its row groups prune by tile.
 ADD_POINTS = """
 INSERT INTO pending BY NAME
-SELECT unhex(substr(sha256($hash || ':' || "row"), 1, 32)) AS point_id, $file_id AS file_id,
+SELECT $file_id AS file_id,
   "row"::INTEGER AS "row", unique_id, platform, provider, time, time_raw, lon, lat,
   depth AS depth_raw,
   least(floor(lat)::INTEGER + 90, 179) * 360 + least(floor(lon)::INTEGER + 180, 359) AS tile_id,
@@ -75,6 +73,18 @@ SELECT unhex(substr(sha256($hash || ':' || "row"), 1, 32)) AS point_id, $file_id
     AS cell_id
 FROM file_points
 """
+
+
+def take_over(con, old: int, new: int):
+    """Move file `old`'s points to file `new`, with their flags, which are keyed by file and
+    row (catalog.POINT_ID)."""
+    con.execute("UPDATE lake.points SET file_id = ? WHERE file_id = ?", [new, old])
+    con.execute(
+        """UPDATE lake.qc_flags SET point_id = ($1::BIGINT << 32) | (point_id & 4294967295)
+        WHERE point_id BETWEEN $2::BIGINT << 32 AND ($2::BIGINT << 32) | 4294967295
+          AND cell_id IN (SELECT DISTINCT cell_id FROM lake.points WHERE file_id = $1)""",
+        [new, old],
+    )
 
 
 class Ingest:
@@ -299,7 +309,7 @@ class Ingest:
             fresh = h not in self.holders
             status, reason, by, has_points = self.place(fid, h)
             if fresh:
-                self.sql(ADD_POINTS, {"hash": h, "file_id": fid})
+                self.sql(ADD_POINTS, {"file_id": fid})
                 self.pending += parsed.count
                 self.hold(h, fid, status, reason)
             self.counts["new" if status == "active" else "copy"] += 1
@@ -336,7 +346,7 @@ class Ingest:
         # The holder is withdrawn or replaced: this file takes its points over. Their
         # `row` stays the holder's row, which is this file's row only if both list
         # the soundings in the same order.
-        self.sql("UPDATE lake.points SET file_id = ? WHERE file_id = ?", [fid, holder_id])
+        take_over(self.con, holder_id, fid)
         self.sql("UPDATE pending SET file_id = ? WHERE file_id = ?", [fid, holder_id])
         self.sql("UPDATE lake.files SET has_points = false WHERE file_id = ?", [holder_id])
         del self.hash_of[holder_id]
@@ -520,8 +530,9 @@ class Ingest:
     def holding_group(self, group, files) -> set:
         newer, older = zip(*group)
         ids = sorted(files)
-        # ponytail: points aren't sorted by file_id, so the id range prunes row groups only
-        # as far as files arrived together; sort points by file_id within a batch if not
+        # ponytail: points are sorted by tile, so the id range prunes row groups only among a
+        # run's own files, before they merge; elsewhere it reads every row group's file_id.
+        # Judge cover against the run's new files and per-file summaries if that grows slow
         return set(
             self.sql(
                 """WITH pairs AS (SELECT unnest($newer) AS newer, unnest($older) AS older),

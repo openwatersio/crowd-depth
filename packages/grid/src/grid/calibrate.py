@@ -127,8 +127,9 @@ WHERE p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M} AND p.time IS NOT NULL
   -- count it twice once the level arrives.
   AND (p.tide IS NOT NULL OR (p.tide_assigned AND p.tide_station IS NULL))
   AND p.point_id NOT IN (
-    SELECT point_id FROM lake.qc_flags WHERE cell_id = $partition AND qc_version = {QC_VERSION}
-      AND list_contains({TRACK_REASONS}, reason) AND flag IN ('reject', 'unconfirmed', 'noisy'))
+    SELECT point_id FROM lake.qc_flags WHERE cell_id = $partition AND list_contains($tiles, tile_id)
+      AND qc_version = {QC_VERSION} AND list_contains({TRACK_REASONS}, reason)
+      AND flag IN ('reject', 'unconfirmed', 'noisy'))
 GROUP BY ALL
 """
 
@@ -156,8 +157,9 @@ WITH p AS (
   WHERE p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M} AND p.time IS NOT NULL
     AND (p.tide IS NOT NULL OR (p.tide_assigned AND p.tide_station IS NULL))
     AND p.point_id NOT IN (
-      SELECT point_id FROM lake.qc_flags WHERE cell_id = $partition AND qc_version = {QC_VERSION}
-        AND list_contains({TRACK_REASONS}, reason) AND flag IN ('reject', 'unconfirmed', 'noisy')
+      SELECT point_id FROM lake.qc_flags WHERE cell_id = $partition AND tile_id = $tile
+        AND qc_version = {QC_VERSION} AND list_contains({TRACK_REASONS}, reason)
+        AND flag IN ('reject', 'unconfirmed', 'noisy')
         -- A held depth is what a stuck sounder reads: in, or the run breaks around it.
         AND NOT (flag = 'unconfirmed' AND reason = 'flatline'))
 ),
