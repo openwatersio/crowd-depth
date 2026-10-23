@@ -5,6 +5,7 @@ import { expect, test } from "vitest";
 import { Temporal } from "@js-temporal/polyfill";
 import definitions from "../../src/definitions.json" with { type: "json" };
 import { createDB } from "../../src/storage.js";
+import { historySpan } from "../../src/config.js";
 import {
   addPass,
   cellDepth,
@@ -405,7 +406,7 @@ test("a backfill rebuilds the cells when signalk-tides starts or stops answering
     });
   const cells = () => store.cells(-76.3, 36.9, -76.1, 38);
 
-  addPendingBackfill(store, start.add({ hours: 12 }));
+  addPendingBackfill(store, start.add({ hours: 12 }), historySpan(config));
   await run(fake(false));
   expect(cells()[0].t).toBeUndefined();
   expect(store.getMeta(TIDE_CONFIG_KEY)).toBe("null");

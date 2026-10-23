@@ -105,6 +105,7 @@ test.skipIf(!existsSync(dist))(
     const { createCellStore } = await import("../../dist/tiles/cells.js");
     const { addPendingBackfill, backfillCells } =
       await import("../../dist/tiles/backfill.js");
+    const { historySpan } = await import("../../dist/config.js");
     const { app, config } = await import("../helper.js");
     const dir = mkdtempSync(join(tmpdir(), "crowd-depth-"));
     const file = join(dir, "bathymetry.sqlite");
@@ -125,7 +126,7 @@ test.skipIf(!existsSync(dist))(
         source.createWriter!(),
       );
       const store = createCellStore(db);
-      addPendingBackfill(store, start.add({ hours: 12 }));
+      addPendingBackfill(store, start.add({ hours: 12 }), historySpan(config));
       await backfillCells({
         app,
         config,
@@ -156,6 +157,7 @@ test.skipIf(!existsSync(dist))(
     const { createCellStore } = await import("../../dist/tiles/cells.js");
     const { addPendingBackfill, backfillCells } =
       await import("../../dist/tiles/backfill.js");
+    const { historySpan } = await import("../../dist/config.js");
     const { app, config } = await import("../helper.js");
     const dir = mkdtempSync(join(tmpdir(), "crowd-depth-"));
     const file = join(dir, "bathymetry.sqlite");
@@ -176,7 +178,7 @@ test.skipIf(!existsSync(dist))(
         source.createWriter!(),
       );
       const store = createCellStore(db);
-      addPendingBackfill(store, start.add({ hours: 12 }));
+      addPendingBackfill(store, start.add({ hours: 12 }), historySpan(config));
       const tides = {
         at: async () => ({ level: 1, sigma: 0.3 }),
         ready: async () => true,
@@ -228,4 +230,91 @@ test.skipIf(!existsSync(dist))(
       thread.close();
     }
   },
+);
+
+test.skipIf(!existsSync(dist))(
+  "a fill on the worker thread stopped partway goes on from where it got to",
+  async () => {
+    const { Readable } = await import("node:stream");
+    const { pipeline } = await import("node:stream/promises");
+    const { Temporal } = await import("@js-temporal/polyfill");
+    const { createDB } = await import("../../dist/storage.js");
+    const { createSqliteSource } = await import("../../dist/sources/sqlite.js");
+    const { createCellStore } = await import("../../dist/tiles/cells.js");
+    const { Timeframe } = await import("../../dist/types.js");
+    const {
+      addPendingBackfill,
+      backfillCells,
+      getPendingBackfill,
+      startRebuild,
+    } = await import("../../dist/tiles/backfill.js");
+    const { historySpan } = await import("../../dist/config.js");
+    const { app, config } = await import("../helper.js");
+    const dir = mkdtempSync(join(tmpdir(), "crowd-depth-"));
+    const file = join(dir, "bathymetry.sqlite");
+    const db = createDB(file);
+    try {
+      const start = Temporal.Instant.from("2026-10-16T00:00:00Z");
+      const until = start.add({ hours: 24 });
+      // Up a meridian, a new cell every sounding, enough for several of the worker's
+      // batches before it stops.
+      const track = Array.from({ length: 6000 }, (_, i) => ({
+        latitude: 36.98 + i * 0.0003,
+        longitude: -76.2,
+        depth: 5 + (i % 3) * 0.1,
+        timestamp: start.add({ seconds: i * 10 }),
+        heading: 0,
+      }));
+      const source = createSqliteSource(app, db);
+      await pipeline(Readable.from(track), source.createWriter!());
+      const fill = (
+        store: ReturnType<typeof createCellStore>,
+        from: typeof source,
+        on?: string,
+      ) =>
+        backfillCells({
+          app,
+          config,
+          source: from,
+          store,
+          signal: new AbortController().signal,
+          ...(on && { file: on }),
+        });
+
+      const clean = createCellStore(createDB(":memory:"));
+      startRebuild(clean);
+      addPendingBackfill(clean, until, historySpan(config));
+      await fill(clean, source);
+
+      const store = createCellStore(db);
+      startRebuild(store);
+      addPendingBackfill(store, until, historySpan(config));
+      const failing = {
+        ...source,
+        getAvailableTimeframes: async () => [new Timeframe(start, until)],
+        createReader: async () =>
+          Readable.from(
+            (async function* () {
+              yield* track.slice(0, 4500);
+              throw new Error("stopped");
+            })(),
+          ),
+      };
+      await expect(fill(store, failing, file)).rejects.toThrow("stopped");
+      const left = getPendingBackfill(store)!;
+      expect(Temporal.Instant.compare(left.from, track[1000].timestamp)).toBe(
+        1,
+      );
+      addPendingBackfill(store, until, historySpan(config));
+      await fill(store, source, file);
+      const cells = (s: ReturnType<typeof createCellStore>) =>
+        s.cells(-76.3, 36.9, -76.1, 39);
+      expect(cells(store)).toHaveLength(6000);
+      expect(cells(store)).toEqual(cells(clean));
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+  60_000,
 );

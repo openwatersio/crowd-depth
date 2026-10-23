@@ -32,27 +32,25 @@ export function createSqliteSource(
       const toMs = timeframe.to.epochMilliseconds;
       const bucketMs = windowSize.total("milliseconds");
 
-      const stmt = db.prepare(
-        `
-          SELECT CAST(((timestamp - :from) / :bucket) AS INTEGER) AS idx
-          FROM bathymetry
-          WHERE timestamp >= :from AND timestamp < :to
-          GROUP BY idx
-          ORDER BY idx
-        `,
+      // From each window with data to the next, one index lookup apiece: grouping every
+      // sounding in a year of them would hold the server up for many seconds.
+      const next = db.prepare(
+        `SELECT min(timestamp) AS t FROM bathymetry WHERE timestamp >= ? AND timestamp < ?`,
       );
-
-      const rows = stmt.all({ from: fromMs, to: toMs, bucket: bucketMs }) as {
-        idx: number;
-      }[];
-
-      return rows.map(({ idx }) => {
-        const start = Temporal.Instant.fromEpochMilliseconds(
-          fromMs + idx * bucketMs,
+      const windows: Timeframe[] = [];
+      let at = fromMs;
+      for (;;) {
+        const { t } = next.get(at, toMs) as { t: number | null };
+        if (t === null) return windows;
+        const start = fromMs + Math.floor((t - fromMs) / bucketMs) * bucketMs;
+        windows.push(
+          new Timeframe(
+            Temporal.Instant.fromEpochMilliseconds(start),
+            Temporal.Instant.fromEpochMilliseconds(start + bucketMs),
+          ),
         );
-        const end = start.add(windowSize);
-        return new Timeframe(start, end);
-      });
+        at = start + bucketMs;
+      }
     },
   };
 }
