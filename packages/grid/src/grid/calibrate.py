@@ -111,7 +111,8 @@ MAX_LOST = 0.5
 GUARDED_SEGMENTS = 20
 
 # Each vessel's median tide-reduced depth per file per calibration pixel (two base rows
-# by two base columns), from soundings track QC accepted. Read a tile at a time.
+# by two base columns), from soundings track QC accepted. Read a unit of tiles or a band
+# of one at a time, whose rows hold whole pixels.
 REDUCE = f"""
 INSERT INTO cal_obs
 SELECT p.tile_id, floor((p.lat - (p.tile_id // 360 - 90)) * {BASE} / 2)::INTEGER AS py,
@@ -119,7 +120,7 @@ SELECT p.tile_id, floor((p.lat - (p.tile_id // 360 - 90)) * {BASE} / 2)::INTEGER
     / {K_LIST}[p.tile_id // 360 - 90 + 91] / 2)::INTEGER AS px,
   p.unique_id AS vessel, p.file_id, min(p.time) AS t,
   median(p.depth_raw - coalesce(p.tide, 0))::FLOAT AS m
-FROM corrected_points_in($partition, [$tile], 0, {BASE}) p
+FROM corrected_points_in($partition, $tiles, $rlo, $rhi) p
 WHERE p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M} AND p.time IS NOT NULL
   -- Tide-reduced, or where `grid tide` found no station in reach: one whose level is
   -- still to come, or in a cell tide hasn't seen, would leave the tide in the offset and
@@ -131,36 +132,29 @@ WHERE p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M} AND p.time IS NOT NULL
 GROUP BY ALL
 """
 
-# Rows at anchor-quality reference pixels, with the difference from the reference: at
-# each pixel, the reference with the least uncertainty there.
+# Rows at anchor-quality reference pixels (`anchor_px`), with the difference from the
+# reference.
 ANCHOR_ROWS = f"""
 SELECT o.vessel, o.file_id, o.t, o.tile_id, o.py, o.px, o.m - r.depth AS e, r.depth AS z
-FROM cal_obs o JOIN (
-  -- Among the references that would anchor here, so one that wouldn't can't hide one
-  -- that would.
-  SELECT * FROM lake.reference_pixels
-  WHERE depth BETWEEN {ANCHOR_DEPTH_M[0]} AND {ANCHOR_DEPTH_M[1]}
-    AND uncertainty < {ANCHOR_UNCERTAINTY_M} AND relief < {ANCHOR_RELIEF_M}
-  QUALIFY row_number() OVER (PARTITION BY tile_id, py, px ORDER BY uncertainty, source) = 1
-) r USING (tile_id, py, px)
+FROM cal_obs o JOIN anchor_px r USING (tile_id, py, px)
 WHERE abs(o.m - r.depth) < {ANCHOR_DIFF_M}
 """
 
-# Stuck runs in one tile, for the vessels in `stuck_vessels`: each file's soundings in
-# order, its stuck windows (`unit_offsets`, `seabed_px`) joined where they overlap; a run
-# counts from STUCK_RUN stuck windows across STUCK_REACH_M, and starts and ends on a lost
-# reading, so a bank crossed just before the sounder sticks at its depth isn't in it.
+# Stuck runs in one tile, for the vessels in `$vessels`: each file's soundings in order
+# (ties broken by row, so a run comes out the same every time), its stuck windows
+# (`unit_offsets`, `seabed_px`) joined where they overlap; a run counts from STUCK_RUN
+# stuck windows across STUCK_REACH_M, and starts and ends on a lost reading, so a bank
+# crossed just before the sounder sticks at its depth isn't in it.
 STUCK = f"""
 WITH p AS (
-  SELECT p.file_id, p.unique_id AS vessel, p.time, p.lon, p.lat, p.depth_raw AS raw,
+  SELECT p.file_id, p.row, p.unique_id AS vessel, p.time, p.lon, p.lat, p.depth_raw AS raw,
     p.depth_raw - coalesce(p.tide, 0) AS tr,
     floor((p.lat - (p.tile_id // 360 - 90)) * {BASE} / 2)::INTEGER AS py,
     floor((p.lon - (p.tile_id % 360 - 180)) * {BASE}
       / {K_LIST}[p.tile_id // 360 - 90 + 91] / 2)::INTEGER AS px
-  FROM corrected_points_in($partition, [$tile], 0, {BASE}) p
+  FROM corrected_points_in($partition, [$tile], 0, {BASE}, vessels := $vessels) p
   WHERE p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M} AND p.time IS NOT NULL
     AND (p.tide IS NOT NULL OR (p.tide_assigned AND p.tide_station IS NULL))
-    AND p.unique_id IN (SELECT vessel FROM stuck_vessels)
     AND p.point_id NOT IN (
       SELECT point_id FROM lake.qc_flags WHERE cell_id = $partition AND qc_version = {QC_VERSION}
         AND list_contains({TRACK_REASONS}, reason) AND flag IN ('reject', 'unconfirmed', 'noisy')
@@ -170,7 +164,7 @@ WITH p AS (
 w AS (
   SELECT p.*,
     coalesce(tr < {LOST_BOTTOM} * (u.o + s.z) AND tr < u.o + s.z - {LOST_MARGIN_M}, false) AS lost,
-    row_number() OVER (PARTITION BY p.file_id ORDER BY time, raw) AS i
+    row_number() OVER (PARTITION BY p.file_id ORDER BY time, raw, row) AS i
   FROM p JOIN unit_offsets u USING (vessel, file_id)
   LEFT JOIN seabed_px s ON s.tile_id = $tile AND s.py = p.py AND s.px = p.px
 ),
@@ -180,18 +174,18 @@ x AS (
   SELECT *, count(*) OVER win = {STUCK_WINDOW} AND sum(lost::INTEGER) OVER win >= {STUCK_LOST}
       AND quantile_cont(raw, 0.9) OVER win - quantile_cont(raw, 0.1) OVER win <= {STUCK_SPAN_M}
       AS stuck
-  FROM w WINDOW win AS (PARTITION BY file_id ORDER BY time, raw
+  FROM w WINDOW win AS (PARTITION BY file_id ORDER BY time, raw, row
     ROWS BETWEEN {STUCK_WINDOW - 1} PRECEDING AND CURRENT ROW)
 ),
 m AS (
   -- Every sounding of a stuck window, and no other: a boat's approach to its mooring, or
   -- real depths around a flat stretch, stay out.
-  SELECT *, bool_or(stuck) OVER (PARTITION BY file_id ORDER BY time, raw
+  SELECT *, bool_or(stuck) OVER (PARTITION BY file_id ORDER BY time, raw, row
       ROWS BETWEEN CURRENT ROW AND {STUCK_WINDOW - 1} FOLLOWING) AS member
   FROM x
 ),
 l AS (
-  SELECT *, i - row_number() OVER (PARTITION BY file_id ORDER BY time, raw) AS run
+  SELECT *, i - row_number() OVER (PARTITION BY file_id ORDER BY time, raw, row) AS run
   FROM m WHERE member
 )
 -- From its first lost reading to its last, so a true one before or after stays out.
@@ -207,17 +201,53 @@ HAVING count(*) FILTER (WHERE l.stuck) >= {STUCK_RUN} AND 6371000 * sqrt(
 
 
 def reduce(con):
-    """Fill the temp table `cal_obs`, one tile at a time, so memory follows a tile."""
+    """Fill the temp table `cal_obs` in cells' units of work, so memory follows a unit
+    rather than the densest tile. Returns how many tiles it read."""
     con.execute(
         """CREATE OR REPLACE TEMP TABLE cal_obs (tile_id INTEGER, py INTEGER, px INTEGER,
         vessel VARCHAR, file_id BIGINT, t TIMESTAMP, m FLOAT)"""
     )
-    tiles = con.execute(
-        "SELECT DISTINCT cell_id, tile_id FROM lake.points ORDER BY tile_id"
-    ).fetchall()
-    for partition, tile in tiles:
-        con.execute(REDUCE, {"partition": partition, "tile": tile})
+    partitions = [
+        p for (p,) in con.execute("SELECT DISTINCT cell_id FROM lake.points ORDER BY 1").fetchall()
+    ]
+    tiles = set()
+    for partition in partitions:
+        # Bands of 18 base rows: an even number, so no pixel is split between two.
+        for unit, rlo, rhi in cells.units(con, partition, [], rows=18):
+            con.execute(REDUCE, {"partition": partition, "tiles": unit, "rlo": rlo, "rhi": rhi})
+            tiles.update(unit)
     return len(tiles)
+
+
+def reference_px(con):
+    """The temp tables `anchor_px`, the reference that would anchor at each pixel, and
+    `survey_px`, the depth of each pixel a reference has one for: at each pixel, the
+    reference with the least uncertainty there. Picked once per run and a tile at a time,
+    so memory follows a tile's reference pixels rather than every one."""
+    best = "QUALIFY row_number() OVER (PARTITION BY py, px ORDER BY uncertainty, source) = 1"
+    con.execute(
+        """CREATE OR REPLACE TEMP TABLE anchor_px (tile_id INTEGER, py INTEGER, px INTEGER,
+        depth FLOAT)"""
+    )
+    con.execute("CREATE OR REPLACE TEMP TABLE survey_px AS FROM anchor_px LIMIT 0")
+    # Only tiles calibration has medians in: no other pixel is joined.
+    tiles = con.execute("SELECT DISTINCT tile_id FROM cal_obs ORDER BY 1").fetchall()
+    for (tile,) in tiles:
+        con.execute(
+            f"""INSERT INTO anchor_px
+            -- Among the references that would anchor here, so one that wouldn't can't hide
+            -- one that would.
+            SELECT tile_id, py, px, depth FROM lake.reference_pixels
+            WHERE tile_id = $tile AND depth BETWEEN {ANCHOR_DEPTH_M[0]} AND {ANCHOR_DEPTH_M[1]}
+              AND uncertainty < {ANCHOR_UNCERTAINTY_M} AND relief < {ANCHOR_RELIEF_M}
+            {best}""",
+            {"tile": tile},
+        )
+        con.execute(
+            f"""INSERT INTO survey_px SELECT tile_id, py, px, depth FROM lake.reference_pixels
+            WHERE tile_id = $tile AND depth IS NOT NULL {best}""",
+            {"tile": tile},
+        )
 
 
 def stuck_runs(con, offset, status):
@@ -234,11 +264,7 @@ def stuck_runs(con, offset, status):
     con.unregister("offsets_np")
     con.execute(
         f"""CREATE OR REPLACE TEMP TABLE seabed_px AS
-        WITH survey AS (
-          SELECT tile_id, py, px, depth FROM lake.reference_pixels WHERE depth IS NOT NULL
-          QUALIFY row_number() OVER (PARTITION BY tile_id, py, px ORDER BY uncertainty, source) = 1
-        ),
-        crowd AS (
+        WITH crowd AS (
           SELECT tile_id, py, px, median(z) AS z FROM (
             SELECT o.tile_id, o.py, o.px, o.vessel, median(o.m - u.o) AS z
             FROM cal_obs o JOIN unit_offsets u USING (vessel, file_id) GROUP BY ALL)
@@ -246,7 +272,7 @@ def stuck_runs(con, offset, status):
         )
         -- least() passes over a NULL: either alone, or the shallower of both.
         SELECT tile_id, py, px, least(s.depth, c.z) AS z
-        FROM survey s FULL JOIN crowd c USING (tile_id, py, px)"""
+        FROM survey_px s FULL JOIN crowd c USING (tile_id, py, px)"""
     )
     # Each vessel's calendar months: the share of its file-pixel medians reading lost.
     con.execute(
@@ -270,17 +296,29 @@ def stuck_runs(con, offset, status):
         JOIN lake.files f ON f.file_id = o.file_id
         WHERE f.status = 'active' AND m.lost_share >= {MONTH_SHARE}"""
     ).fetchall()
-    tiles = con.execute(
-        """SELECT DISTINCT p.cell_id, p.tile_id FROM lake.points p
-        WHERE p.tile_id IN (SELECT tile_id FROM cal_obs
-          WHERE vessel IN (SELECT vessel FROM stuck_vessels))
-        ORDER BY p.tile_id"""
-    ).fetchall()
     # ponytail: a file's run is found and applied per tile, so one that crosses a tile edge
     # is two; judge across tiles if the seams show
-    for partition, tile in tiles:
-        runs += con.execute(STUCK, {"partition": partition, "tile": tile}).fetchall()
+    # One vessel of one tile at a time, so memory follows the largest vessel's soundings in a
+    # tile rather than every searched vessel's. ponytail: one vessel's years at its mooring
+    # still go in at once; band by file time if a liveaboard outgrows the limit
+    for partition, tile, vessel in stuck_pairs(con):
+        runs += con.execute(
+            STUCK, {"partition": partition, "tile": tile, "vessels": [vessel]}
+        ).fetchall()
     return runs
+
+
+def stuck_pairs(con):
+    """(partition, tile, vessel) for each vessel in `stuck_vessels` with soundings in a tile
+    any of them has medians in: a vessel whose soundings in a tile are all held depths has
+    none of its own there, and is searched all the same."""
+    return con.execute(
+        """SELECT DISTINCT cell_id, tile_id, unique_id FROM lake.points
+        WHERE unique_id IN (SELECT vessel FROM stuck_vessels)
+          AND tile_id IN (SELECT tile_id FROM cal_obs
+            WHERE vessel IN (SELECT vessel FROM stuck_vessels))
+        ORDER BY ALL"""
+    ).fetchall()
 
 
 def units_for(con, segments):
@@ -568,6 +606,7 @@ def run(con, references=(), accept_losses=False) -> dict:
     if not names:
         log.info("calibrate: no tide-reduced soundings to calibrate")
         return {"tiles": tiles, "segments": 0}
+    reference_px(con)
     crossings(con)
     anchor, anchor_se, *_ = anchors(con, len(names))
     first, _, _ = solve(con, len(names), anchor, anchor_se)
@@ -628,6 +667,8 @@ def run(con, references=(), accept_losses=False) -> dict:
     }
     for table in (
         "cal_obs",
+        "anchor_px",
+        "survey_px",
         "file_units",
         "xobs",
         "xrows",

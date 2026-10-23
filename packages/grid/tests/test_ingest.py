@@ -526,6 +526,29 @@ def test_rule5_noaa_soundings_inside_openwaters_span_are_dropped(env):
     assert len(env.active()) == 6
 
 
+def test_a_vessel_filter_keeps_that_vessels_active_points_alone(env):
+    env.ow.put(ow_key(1), geojson(ROWS[:2]))
+    env.noaa.put(
+        noaa_key(1),
+        noaa_csv([(1, -78.1, 33.1, 4.8), (5, -78.5, 33.5, 5.5)], "SIGNALK-" + VESSEL),
+    )
+    env.noaa.put(noaa_key(2), noaa_csv(ROWS))
+    env.noaa.put(noaa_key(3), noaa_csv(ROWS))  # an overlapping copy, deduped
+    env.run()
+    [(cell,)] = env.query("SELECT DISTINCT cell_id FROM lake.points")
+    columns = "source, unique_id, time, depth_raw, file_id"
+    for vessel in {v for (v,) in env.query("SELECT DISTINCT unique_id FROM lake.points")}:
+        expected = env.query(
+            f"SELECT {columns} FROM active_points WHERE unique_id = ? ORDER BY ALL", [vessel]
+        )
+        for macro in ("active_points_in", "corrected_points_in"):
+            got = env.query(
+                f"SELECT {columns} FROM {macro}(?, [], 0, 10800, vessels := [?]) ORDER BY ALL",
+                [cell, vessel],
+            )
+            assert expected and got == expected
+
+
 def test_vessel_identity_comes_from_key(env):
     env.ow.put(ow_key(1), geojson(ROWS, body_vessel="0d00140f-0371-4208-a099-cf2f76e557e3"))
     env.ow.put(ow_key(2), geojson(ROWS))

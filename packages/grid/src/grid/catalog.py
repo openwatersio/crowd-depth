@@ -217,10 +217,13 @@ ACTIVE_POINTS = f"""
 CREATE OR REPLACE TEMP VIEW active_points AS {ACTIVE.format(where="true")};
 -- The same for one unit of cell work: a 10° partition, optionally some of its tiles
 -- and a band of base rows, filtered before the dedupe so the work is the unit's alone.
-CREATE OR REPLACE TEMP MACRO active_points_in(cell, tiles, rlo, rhi) AS TABLE {
+-- `vessels`, optionally, keeps only theirs: every step of the dedupe is within a vessel,
+-- so leaving the others out first changes nothing but the cost.
+CREATE OR REPLACE TEMP MACRO active_points_in(cell, tiles, rlo, rhi, vessels := []::VARCHAR[]) AS TABLE {
     ACTIVE.format(
         where="p.cell_id = cell AND (len(tiles) = 0 OR list_contains(tiles, p.tile_id))"
         f" AND {BASE_ROW} BETWEEN rlo AND rhi - 1"
+        " AND (len(vessels) = 0 OR list_contains(vessels, p.unique_id))"
     )
 };
 -- Those points with their corrections: `tide`, the level above chart datum at the
@@ -231,7 +234,7 @@ CREATE OR REPLACE TEMP MACRO active_points_in(cell, tiles, rlo, rhi) AS TABLE {
 -- UNCALIBRATED_SIGMA. `excluded` marks a vessel segment known to read too deep to use, and
 -- `lost_bottom` a sounding calibration found its sounder had lost the bottom for: a stray
 -- transit that read far too shallow, a stuck run, or a month a vessel mostly read so.
-CREATE OR REPLACE TEMP MACRO corrected_points_in(cell, tiles, rlo, rhi) AS TABLE
+CREATE OR REPLACE TEMP MACRO corrected_points_in(cell, tiles, rlo, rhi, vessels := []::VARCHAR[]) AS TABLE
 WITH c AS (
   SELECT tide_cell, station_id, km FROM lake.tide_cells
   WHERE len(tiles) = 0 OR list_contains(tiles, tile_id)
@@ -249,7 +252,7 @@ p AS (
     ) AS lost_bottom,
     l.level + l.slope * epoch(p.time - l.slot) AS tide,
     sqrt(l.sigma ^ 2 + (c.km * {TIDE_KM_SIGMA}) ^ 2) AS tide_sigma, o.offset_m, o.se_m
-  FROM active_points_in(cell, tiles, rlo, rhi) p
+  FROM active_points_in(cell, tiles, rlo, rhi, vessels := vessels) p
   LEFT JOIN c ON c.tide_cell = {TIDE_CELL}
   LEFT JOIN l ON l.station_id = c.station_id AND l.slot = time_bucket(INTERVAL 30 MINUTE, p.time)
   LEFT JOIN lake.file_offsets o ON o.file_id = p.file_id AND o.vessel = p.unique_id

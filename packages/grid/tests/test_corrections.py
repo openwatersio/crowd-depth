@@ -1,5 +1,6 @@
 import contextlib
 import math
+import re
 import shutil
 import sqlite3
 from datetime import date, datetime, timedelta
@@ -306,6 +307,30 @@ def test_offsets_per_step_segment_from_anchors_and_crossings(env, tmp_path, monk
     assert env.query("SELECT DISTINCT tile_id, reason FROM lake.tile_changes") == [
         (TILE, "calibration")
     ]
+
+
+def test_calibration_reads_a_dense_tile_in_bands_as_it_would_whole(env, monkeypatch):  # noqa: F811
+    # Two vessels over rows 4990-5010: across a band edge (5004), with both rows of the
+    # pixels beside an odd row (4995) sounded, so a band that split a pixel would show.
+    for n, vessel in ((1, "AQM-A"), (2, "AQM-B")):
+        cover = [(r, c) for r in range(4990, 5011) for c in range(n, 40, 3)]
+        put(
+            env,
+            n,
+            [(i * 2, *at(r, c), 9.0 + 0.1 * (i % 3)) for i, (r, c) in enumerate(cover)],
+            vessel,
+        )
+    env.run("noaa")
+    with open_store(env.store) as con:
+        untided(con)
+        calibrate.reduce(con)
+        whole = sorted(con.execute("FROM cal_obs").fetchall())
+        monkeypatch.setattr(cells, "BATCH_POINTS", 1)
+        [(partition,)] = con.execute("SELECT DISTINCT cell_id FROM lake.points").fetchall()
+        assert len(cells.units(con, partition, [], rows=18)) > 1
+        calibrate.reduce(con)
+        banded = sorted(con.execute("FROM cal_obs").fetchall())
+    assert len(whole) > 100 and banded == whole
 
 
 def test_a_noisy_tracks_soundings_dont_calibrate_its_vessel(env, tmp_path, monkeypatch):  # noqa: F811
@@ -878,6 +903,35 @@ def test_a_stuck_run_holds_through_a_stray_reading(env, tmp_path, monkeypatch): 
     ]
     calibrated(env, fleet, reference(tmp_path / "ref.tif", (0, 240)), monkeypatch)
     assert env.query("SELECT count(*) FROM lake.lost_runs") == [(1,)]
+
+
+def test_stuck_runs_are_searched_where_a_vessel_holds_only_held_depths(env):  # noqa: F811
+    # Two searched vessels over two tiles: B has medians only in the first, and A only in
+    # the second, so each tile is searched for both.
+    second = TILE + 1
+    put(env, 1, [(i, *at(5000, i), 5.0) for i in range(10)], "AQM-A")
+    put(env, 2, [(i, *at(5000, cells.BASE + i), 5.0) for i in range(10)], "AQM-A")
+    put(env, 3, [(i, *at(5000, i), 5.0) for i in range(10)], "AQM-B")
+    put(env, 4, [(i, *at(5000, cells.BASE + i), 5.0) for i in range(10)], "AQM-B")
+    env.run("noaa")
+    with open_store(env.store) as con:
+        con.execute(
+            "CREATE TEMP TABLE cal_obs AS SELECT * FROM (VALUES (?, 'AQM-A'), (?, 'AQM-B'))"
+            " t(tile_id, vessel)",
+            [second, TILE],
+        )
+        con.execute(
+            "CREATE TEMP TABLE stuck_vessels AS SELECT 'AQM-A' AS vessel UNION SELECT 'AQM-B'"
+        )
+        got = {(t, v) for _, t, v in calibrate.stuck_pairs(con)}
+    assert got == {(t, v) for t in (TILE, second) for v in ("AQM-A", "AQM-B")}
+
+
+def test_stuck_run_windows_order_soundings_the_same_every_time():
+    # Soundings of one file can share a time and depth: ordered by those alone, which of
+    # them a window holds, and so the runs found, could change from run to run.
+    orders = re.findall(r"ORDER BY ([^)\n]*?)(?:\s+ROWS|\)|\n)", calibrate.STUCK)
+    assert len(orders) == 4 and all(o.strip() == "time, raw, row" for o in orders), orders
 
 
 def test_a_sounder_holding_one_depth_is_a_stuck_run(env, tmp_path, monkeypatch):  # noqa: F811

@@ -511,22 +511,23 @@ WHERE NOT p.excluded AND NOT p.awaiting_tide
 """
 
 
-def units(con, partition: int, tiles: list[int]) -> list[tuple[list[int], int, int]]:
+def units(con, partition: int, tiles: list[int], rows=9) -> list[tuple[list[int], int, int]]:
     """A partition's work in units of about BATCH_POINTS points: (tiles, first base row, end row).
 
-    Small tiles are grouped whole. A denser tile is split into bands of 3″ rows (9 base
-    rows), so every cell, and the levels and outliers judged within it, falls in one band.
+    Small tiles are grouped whole. A denser tile is split into bands of `rows` base rows,
+    by default 3″, so every cell, and the levels and outliers judged within it, falls in
+    one band.
     """
-    rows = con.execute(
-        f"""SELECT tile_id, {BASE_ROW} // 9 AS r9, count(*) AS n
+    counts = con.execute(
+        f"""SELECT tile_id, {BASE_ROW} // $rows AS band, count(*) AS n
         FROM lake.points p
         WHERE cell_id = $partition AND (len($tiles) = 0 OR list_contains($tiles, tile_id))
         GROUP BY ALL ORDER BY ALL""",
-        {"partition": partition, "tiles": tiles},
+        {"partition": partition, "tiles": tiles, "rows": rows},
     ).fetchall()
     by_tile = {}
-    for tile, r9, n in rows:
-        by_tile.setdefault(tile, []).append((r9, n))
+    for tile, band, n in counts:
+        by_tile.setdefault(tile, []).append((band, n))
     result, group, size = [], [], 0
     for tile, bands in by_tile.items():
         total = sum(n for _, n in bands)
@@ -538,13 +539,13 @@ def units(con, partition: int, tiles: list[int]) -> list[tuple[list[int], int, i
             size += total
             continue
         start, size_band = 0, 0
-        for r9, n in bands:
-            # ponytail: one 3″ row over the budget still runs alone
+        for band, n in bands:
+            # ponytail: one band of `rows` over the budget still runs alone
             if size_band and size_band + n > BATCH_POINTS:
-                result.append(([tile], start * 9, r9 * 9))
-                start, size_band = r9, 0
+                result.append(([tile], start * rows, band * rows))
+                start, size_band = band, 0
             size_band += n
-        result.append(([tile], start * 9, BASE))
+        result.append(([tile], start * rows, BASE))
     if group:
         result.append((group, 0, BASE))
     return result
