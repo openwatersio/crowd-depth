@@ -603,6 +603,20 @@ def checkpoint(con):
         con.publish()
 
 
+def flush_inlined(con):
+    """Move the rows inlined so far to Parquet, so the catalog each run downloads stays small."""
+    # DuckLake (ac7595b0, the build DuckDB 1.5.6 installs) finishes each table's flush on
+    # its own thread and records it in a list with no lock, which now and then corrupts
+    # memory and crashes the process. On one thread the tables finish in turn. DuckLake
+    # main locks the list; drop this once the installed build has that lock.
+    threads = con.execute("SELECT current_setting('threads')").fetchone()[0]
+    con.execute("SET threads = 1")
+    try:
+        con.execute("CALL ducklake_flush_inlined_data('lake')")
+    finally:
+        con.execute(f"SET threads = {threads}")
+
+
 @contextmanager
 def open_store(store, write=True, ttl=timedelta(minutes=10)):
     """Yield a connection to the catalog the pointer names, and publish its result on success.
@@ -639,8 +653,7 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
                 nonlocal base, cutoff
                 if not write:
                     raise RuntimeError("a read-only store publishes nothing")
-                # Moves rows inlined so far to Parquet, so the catalog each run downloads stays small.
-                con.execute("CALL ducklake_flush_inlined_data('lake')")
+                flush_inlined(con)
                 if final:
                     # Rebuilds delete and reinsert cells, their flags and shoals, the
                     # calibration and the cells' marker, and DuckLake deletes by writing

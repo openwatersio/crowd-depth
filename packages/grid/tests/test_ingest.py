@@ -336,6 +336,23 @@ def test_incomplete_listing_withdraws_nothing(env, monkeypatch):
     assert env.files()[noaa_key(1)] == ("active", None)
 
 
+def test_the_flush_runs_on_one_thread_and_publish_keeps_the_rest(tmp_path):
+    seen = []
+    with open_store(LocalObjects(tmp_path / "store")) as con:
+
+        class Spy:
+            def execute(self, sql, *args):
+                if sql.startswith("CALL ducklake_flush_inlined_data"):
+                    seen.append(con.execute("SELECT current_setting('threads')").fetchone()[0])
+                return con.execute(sql, *args)
+
+        catalog.flush_inlined(Spy())
+        assert seen == [1]
+        con.execute("SET threads = 3")
+        con.publish()
+        assert con.execute("SELECT current_setting('threads')").fetchone()[0] == 3
+
+
 def test_a_run_that_fails_keeps_what_it_published(env, monkeypatch):
     # Every file is a checkpoint; the third file can't be downloaded, as an R2 error
     # late in a long import.
