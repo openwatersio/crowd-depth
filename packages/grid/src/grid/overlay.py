@@ -21,6 +21,7 @@ from pathlib import Path
 import numpy as np
 import rasterio
 import rasterio.features
+import rasterio.windows
 import shapely
 import shapely.geometry
 from pmtiles.convert import mbtiles_to_pmtiles
@@ -324,8 +325,26 @@ def surface_bands(path, soundings=None):
     """
     levels = [lv for lv in LEVELS if lv <= MAX_AREA_DEPTH_M] + [MAX_DEPTH_M]
     with rasterio.open(path) as src:
-        depth, count, sigma = src.read(1), src.read(3), src.read(4)
-        transform, profile = src.transform, src.profile
+        depth, count = src.read(1), src.read(3)
+        # Worked on the window the tile's depths and soundings reach, WINDOW_PX past them:
+        # outside it every band is empty, and nothing here looks further than that.
+        # By rows and columns that hold any, not by pixel: a covered tile has 29M pixels.
+        data = (depth != surface.NODATA) | (count > 0)
+        rows, cols = np.flatnonzero(data.any(axis=1)), np.flatnonzero(data.any(axis=0))
+        del data
+        if len(rows):
+            r0, c0 = max(rows[0] - WINDOW_PX, 0), max(cols[0] - WINDOW_PX, 0)
+            r1 = min(rows[-1] + 1 + WINDOW_PX, depth.shape[0])
+            c1 = min(cols[-1] + 1 + WINDOW_PX, depth.shape[1])
+        else:
+            r0, c0, r1, c1 = 0, 0, 1, 1
+        window = rasterio.windows.Window(c0, r0, c1 - c0, r1 - r0)
+        tile_shape = depth.shape
+        # Copies, so the whole tile's bands are freed while the window is worked.
+        depth, count = depth[r0:r1, c0:c1].copy(), count[r0:r1, c0:c1].copy()
+        sigma = src.read(4, window=window)
+        transform = src.window_transform(window)
+        profile = src.profile | {"width": c1 - c0, "height": r1 - r0, "transform": transform}
     valid = depth != surface.NODATA
     around = np.ones((3, 3), dtype=bool)
     # Grown a pixel all round, as coverage is, so the two trace alike.
@@ -340,8 +359,12 @@ def surface_bands(path, soundings=None):
         if soundings is not None and len(soundings[2]):
             lon, lat, d = (np.asarray(a, dtype=float) for a in soundings)
             row, col = (np.asarray(a) for a in rasterio.transform.rowcol(transform, lon, lat))
-            # One in the pixel beside the tile caps the edge pixels next to it.
-            row, col = np.clip(row, 0, depth.shape[0] - 1), np.clip(col, 0, depth.shape[1] - 1)
+            # One in the pixel beside the tile caps the edge pixels next to it; the window
+            # is the only part of the tile with pixels to cap.
+            row = np.clip(row + r0, 0, tile_shape[0] - 1) - r0
+            col = np.clip(col + c0, 0, tile_shape[1] - 1) - c0
+            inside = (row >= 0) & (row < depth.shape[0]) & (col >= 0) & (col < depth.shape[1])
+            row, col, d = row[inside], col[inside], d[inside]
             cap = np.full(depth.shape, np.inf, dtype=np.float32)
             np.minimum.at(cap, (row, col), d)
             cap = minimum_filter(cap, footprint=around)
@@ -425,6 +448,9 @@ def surface_bands(path, soundings=None):
 # Pixels past the surface's edge its depths are carried, for the bands to reach its
 # outline, which is grown a pixel and fills small gaps.
 FILL_PX = 2
+# Pixels past a tile's depths and soundings its bands are worked to: wider than the
+# furthest anything looks, coverage grown a pixel and then eroded three for its rim.
+WINDOW_PX = 16
 # Potrace keeps a corner where a turn is sharper than this; past 4/3 it keeps none, but
 # then rounds a corner between long sides over half their length.
 POTRACE_ALPHAMAX = 1.2
@@ -436,6 +462,9 @@ POTRACE_OPTTOLERANCE = 1.0
 PAD_PX = 4
 # Gaps in a mask this many pixels or smaller are filled, not traced.
 MAX_GAP_PX = 4
+# The window reaches past everything that looks beyond the data: the carried depths and
+# the cap beside them, the rim's growth and erosion, and the tracer's padding and gaps.
+assert WINDOW_PX > max(FILL_PX + 1, 1 + 3, PAD_PX + MAX_GAP_PX), "WINDOW_PX is too narrow"
 # How far, in pixels, an outline's points may stray from its curve.
 EDGE_TOLERANCE_PX = 0.1
 INTERPOLATED_TOLERANCE_PX = 0.5
