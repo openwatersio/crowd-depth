@@ -63,11 +63,11 @@
     "esbuild": "^0.28.2",
     "pbf": "^5.1.2",
     "publint": "^0.3.25",
-    "signalk-plotterext-bus": "^0.21.0"
+    "signalk-plotterext-bus": "^0.23.0"
   },
   "dependencies": {
     "@js-temporal/polyfill": "^0.5",
-    "@signalk/server-api": "^2.33.0",
+    "@signalk/server-api": "^2.34.0",
     "cron": "^4.3.4",
     "csv-parse": "^7.0.3",
     "d3-contour": "^4.0.2",
