@@ -1,6 +1,7 @@
 import { availableParallelism } from "node:os";
 import { Worker } from "node:worker_threads";
 import { CellStore, OVERVIEW_LEVELS } from "./cells.js";
+import type { Prepared } from "./portray.js";
 import type { Changed } from "./writer.js";
 import {
   M_PER_DEG_LAT,
@@ -16,6 +17,9 @@ import {
   MIN_ZOOM,
   buildTile,
   rasterSize,
+  Detail,
+  SHARED_ZOOM,
+  sharedTile,
 } from "./surface.js";
 
 /** The coarsest overview whose blocks are no larger than a tile's pixels. */
@@ -39,15 +43,64 @@ const HISTORY = 500;
 
 export type TileId = [z: number, x: number, y: number];
 
-/** A tile built from the store: the cells under it and its margin, at the overview that
- * fits its pixels, and the unconfirmed shoals in it and its margin. */
+/** The surfaces tiles past SHARED_ZOOM are cut from, by store, the last few built in
+ * this thread; dropped when their cells change. */
+const shared = new WeakMap<CellStore, Map<string, Prepared>>();
+const SHARED_KEPT = 4;
+
+const sharedFor = (store: CellStore) => {
+  let m = shared.get(store);
+  if (!m) shared.set(store, (m = new Map()));
+  return m;
+};
+
+/** Drop the surfaces tiles share, those of the ancestors `keys` (`z/x/y`), or all of
+ * them, as when their cells change. */
+export function clearShared(store: CellStore, keys?: string[]) {
+  const m = sharedFor(store);
+  if (keys) for (const k of keys) m.delete(k);
+  else m.clear();
+}
+
+/** The ancestors at SHARED_ZOOM whose surfaces a change at `positions` reaches. */
+function sharedKeys(positions: Changed): string[] {
+  const keys = new Set<string>();
+  for (const { lon, lat } of positions) {
+    const dLat = MARGIN_M / M_PER_DEG_LAT;
+    const dLon = MARGIN_M / mPerDegLon(Math.min(Math.abs(lat), 85));
+    const a = tileFraction(lon - dLon, lat + dLat, SHARED_ZOOM);
+    const b = tileFraction(lon + dLon, lat - dLat, SHARED_ZOOM);
+    const n = 2 ** SHARED_ZOOM;
+    for (let x = Math.floor(a.x); x <= Math.floor(b.x); x++) {
+      for (let y = Math.floor(a.y); y <= Math.floor(b.y); y++) {
+        keys.add(`${SHARED_ZOOM}/${((x % n) + n) % n}/${y}`);
+      }
+    }
+  }
+  return [...keys];
+}
+
+/** A tile built from the store: the cells under it, or under the ancestor it's cut from,
+ * and its margin, at the overview that fits its pixels, and the unconfirmed shoals in it
+ * and its margin. */
 export function readTile(
   store: CellStore,
   z: number,
   x: number,
   y: number,
+  detail: Detail = "high",
+  share = true,
 ): Buffer | undefined {
-  const b = tileBounds(z, x, y);
+  const kept = share ? sharedFor(store) : undefined;
+  const a = sharedTile(z, x, y);
+  // The ancestor's cells to build its surface; once it's built, the tile's own, for its
+  // soundings and quality.
+  const own = kept?.has(`${a.z}/${a.x}/${a.y}`) ?? false;
+  // Room for the surface this tile will keep.
+  if (kept && !own && z > SHARED_ZOOM) {
+    while (kept.size >= SHARED_KEPT) kept.delete(kept.keys().next().value!);
+  }
+  const b = own ? tileBounds(z, x, y) : tileBounds(a.z, a.x, a.y);
   const lat = Math.max(Math.abs(b.north), Math.abs(b.south));
   const dLat = MARGIN_M / M_PER_DEG_LAT;
   const dLon = MARGIN_M / mPerDegLon(Math.min(lat, 85));
@@ -60,17 +113,19 @@ export function readTile(
       b.south - dLat,
       b.east + dLon,
       b.north + dLat,
-      overviewLevel(z, (b.north + b.south) / 2),
+      overviewLevel(a.z, (b.north + b.south) / 2),
     ),
     // Over the margin too, whose shoals cap the depths carried beside them.
     store.shoals(b.west - dLon, b.south - dLat, b.east + dLon, b.north + dLat),
+    detail,
+    kept,
   );
 }
 
 /** Build tiles on a worker thread reading the database file, so a tile's interpolation
  * doesn't hold up the server: the database is in WAL mode, so the worker reads while
  * the plugin writes. */
-function createTileWorker(file: string) {
+function createTileWorker(file: string, detail: Detail) {
   let worker: Worker | undefined;
   let next = 0;
   const waiting = new Map<
@@ -79,7 +134,7 @@ function createTileWorker(file: string) {
   >();
   const start = () => {
     worker = new Worker(new URL("./tile-worker.js", import.meta.url), {
-      workerData: { file },
+      workerData: { file, detail },
     });
     worker.unref();
     worker.on("message", ({ id, tile, error }) => {
@@ -101,13 +156,21 @@ function createTileWorker(file: string) {
     );
   };
   return {
-    build(z: number, x: number, y: number): Promise<Buffer | undefined> {
+    build(
+      z: number,
+      x: number,
+      y: number,
+      share: boolean,
+    ): Promise<Buffer | undefined> {
       if (!worker) start();
       const id = next++;
       return new Promise((resolve, reject) => {
         waiting.set(id, { resolve, reject });
-        worker!.postMessage({ id, z, x, y });
+        worker!.postMessage({ id, z, x, y, share });
       });
+    },
+    clear(keys?: string[]) {
+      worker?.postMessage({ clear: keys ?? true });
     },
     close() {
       void worker?.terminate();
@@ -127,7 +190,11 @@ export type TileService = ReturnType<typeof createTileService>;
  * Given the database `file`, tiles are built on a worker thread; otherwise, as for an
  * in-memory database, in turn on this one.
  */
-export function createTileService(store: CellStore, file?: string) {
+export function createTileService(
+  store: CellStore,
+  file?: string,
+  detail: Detail = "high",
+) {
   const cache = new Map<string, Buffer | null>();
   /** Bumped when a tile changes, so a build that started before isn't cached. */
   const stamps = new Map<string, number>();
@@ -135,13 +202,22 @@ export function createTileService(store: CellStore, file?: string) {
   // A few threads, leaving a core for the server: a chart asks for a view's tiles at
   // once, and each takes up to a second or so on a Pi.
   const workers = file
-    ? Array.from({ length: tileThreads() }, () => createTileWorker(file))
+    ? Array.from({ length: tileThreads() }, () =>
+        createTileWorker(file, detail),
+      )
     : [];
   let turn = 0;
+  // Tiles cut from one ancestor's surface go to one worker, which builds it once.
+  const worker = (z: number, x: number, y: number) => {
+    if (z < SHARED_ZOOM) return workers[turn++ % workers.length];
+    const a = sharedTile(z, x, y);
+    return workers[(a.x * 31 + a.y) % workers.length];
+  };
+  let sharing = true;
   const build = (z: number, x: number, y: number) =>
     workers.length
-      ? workers[turn++ % workers.length].build(z, x, y)
-      : Promise.resolve(readTile(store, z, x, y));
+      ? worker(z, x, y).build(z, x, y, sharing)
+      : Promise.resolve(readTile(store, z, x, y, detail, sharing));
   // Revisions count from the time the service started, so a client holding one from
   // before a restart is behind every revision this one keeps, and refetches everything.
   let rev = Date.now();
@@ -196,6 +272,9 @@ export function createTileService(store: CellStore, file?: string) {
 
     /** Mark the tiles within the surface's margin of changed cells as changed. */
     changed(positions: Changed) {
+      const keys = sharedKeys(positions);
+      clearShared(store, keys);
+      for (const w of workers) w.clear(keys);
       const now = new Map<string, TileId>();
       for (const { lon, lat } of positions) {
         const dLat = MARGIN_M / M_PER_DEG_LAT;
@@ -216,8 +295,19 @@ export function createTileService(store: CellStore, file?: string) {
       if (now.size) publish([...now.values()]);
     },
 
+    /** Share no surfaces between tiles while `on` is false, as while a backfill writes
+     * cells on a connection of its own and tells nothing until it ends: each tile is
+     * then built from the cells as they stand. */
+    share(on: boolean) {
+      sharing = on;
+      clearShared(store);
+      for (const w of workers) w.clear();
+    },
+
     /** Drop every tile, as after a backfill or a rebuild. */
     reset() {
+      clearShared(store);
+      for (const w of workers) w.clear();
       cache.clear();
       for (const k of building.keys()) stamps.set(k, (stamps.get(k) ?? 0) + 1);
       building.clear();

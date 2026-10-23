@@ -36,7 +36,7 @@ and make navigation safer for everyone.
    navigation apps under a [CC0 public
    domain](https://creativecommons.org/publicdomain/zero/1.0/) dedication.
    Open Waters also builds openly licensed depth products from them.
-4. **See** — On a chartplotter that supports Signal K plotter extensions, such as Freeboard-SK 3.4 or later, the depths you record appear as a "My soundings" layer: depth areas, contours and soundings drawn the way Open Waters' crowd depth overlay draws them, filling in under the bow as you go.
+4. **See** — On a chartplotter that supports Signal K plotter extensions, such as Freeboard-SK 3.4 or later, the depths you record appear as a "My soundings" layer: depth areas, contours and soundings in the same colours as Open Waters' crowd depth overlay, with finer contours zoomed in, filling in under the bow as you go.
 
 You stay in control: sharing can be anonymous (a random UUID instead of your
 vessel name and MMSI), and you can disable the plugin at any time.
@@ -101,10 +101,11 @@ Universal](https://creativecommons.org/publicdomain/zero/1.0/).
 - **Tint over sounded water** — Off, faint, normal or strong (normal by default).
 - **Draw depth contours** — Draw the layer's depth contours (on by default).
 - **Fill the layer from** — The last 30 days, the last year or all recorded history (the last year by default): how far back the layer fills in from recorded soundings when it starts or rebuilds. Changing it rebuilds the layer.
+- **Contour detail** — High draws a contour every metre, or every foot, from zoom 13 in, with every fifth one bold and labelled (the default). Standard draws the chart's depth contours. Zoomed out, both draw the chart's.
 
 ## My soundings on the chart
 
-On a chartplotter that supports Signal K plotter extensions, Crowd Depth draws the depths your boat records as a "My soundings" layer: depth areas, contours and soundings, in the same style and by the same rules as Open Waters' crowd depth overlay. It fills in under the bow as you go.
+On a chartplotter that supports Signal K plotter extensions, Crowd Depth draws the depths your boat records as a "My soundings" layer: depth areas, contours and soundings, by the same rules as Open Waters' crowd depth overlay, and zoomed in, with finer contours. It fills in under the bow as you go.
 
 > [!WARNING]
 > The layer shows your own sounder's depths, quality checked, reduced to chart datum only with predicted tides where a station is in reach, and only as accurate as your sensor offsets. **Do not use it for navigation.**
@@ -116,7 +117,7 @@ On a chartplotter that supports Signal K plotter extensions, Crowd Depth draws t
 
 ### Using it
 
-The layer appears in the chartplotter's chart list as **My soundings**, with its own show and hide and opacity controls. Its depth areas use the same colours as Open Waters' charts, and its soundings, contours and a faint tint over the water are violet, strongest where the boat sounded itself, so it stands out over a chart drawn in those colours. Soundings shoaler than the safety depth are a darker violet. In the plugin's settings you can pick other colours if your chart uses violet, make the tint fainter or stronger or turn it off, and leave out the contours. The chartplotter's opacity control applies on top. Saving the settings restarts the plugin, and the change shows the next time the chartplotter loads the layer. Depths are labelled in metres or feet, as you've chosen in the chartplotter. Soundings the boat has just recorded show as orange dots, labelled with the depth the sounder read, less the tide where there is one, before the quality checks have judged them and before the safety margin the layer's areas and soundings carry, until they're folded into the layer: usually within a minute of leaving a spot. While the layer first fills in a long stretch of history, new soundings stay orange until it's done, for up to 3 hours, so older passes go in first. The layer redraws at most every 30 seconds, so it doesn't flicker as it fills in. At a mooring, where the depth holds steady, they can stay orange for up to an hour, until the checks can tell a steady depth from a stuck sounder. A sounder reading one depth for a long way is held until it has covered a kilometre, as the checks need to judge it, or until about an hour of soundings at 10 a second is waiting.
+The layer appears in the chartplotter's chart list as **My soundings**, with its own show and hide and opacity controls. Its depth areas shade from the deep blue of shallow water to the pale blue of deep water, through the colours Open Waters' charts use for their depth bands, and its soundings, contours and a faint tint over the water are violet, strongest where the boat sounded itself, so it stands out over a chart drawn in those colours. Soundings shoaler than the safety depth are a darker violet. In the plugin's settings you can pick other colours if your chart uses violet, make the tint fainter or stronger or turn it off, and leave out the contours. The chartplotter's opacity control applies on top. Saving the settings restarts the plugin, and the change shows the next time the chartplotter loads the layer. Depths are labelled in metres or feet, as you've chosen in the chartplotter. Soundings the boat has just recorded show as orange dots, labelled with the depth the sounder read, less the tide where there is one, before the quality checks have judged them and before the safety margin the layer's areas and soundings carry, until they're folded into the layer: usually within a minute of leaving a spot. While the layer first fills in a long stretch of history, new soundings stay orange until it's done, for up to 3 hours, so older passes go in first. The layer redraws at most every 30 seconds, so it doesn't flicker as it fills in. At a mooring, where the depth holds steady, they can stay orange for up to an hour, until the checks can tell a steady depth from a stuck sounder. A sounder reading one depth for a long way is held until it has covered a kilometre, as the checks need to judge it, or until about an hour of soundings at 10 a second is waiting.
 
 ### What it shows
 

@@ -39,6 +39,62 @@ test.skipIf(!existsSync(dist))(
 );
 
 test.skipIf(!existsSync(dist))(
+  "tiles that share an ancestor's surface draw cells a backfill writes",
+  async () => {
+    const { createDB } = await import("../../dist/storage.js");
+    const { createCellStore } = await import("../../dist/tiles/cells.js");
+    const { createTileService } = await import("../../dist/tiles/service.js");
+    const { cellAt, tileFraction } =
+      await import("../../dist/tiles/geometry.js");
+    const { VectorTile } = await import("@mapbox/vector-tile");
+    const { PbfReader } = await import("pbf");
+    const dir = mkdtempSync(join(tmpdir(), "crowd-depth-"));
+    const file = join(dir, "bathymetry.sqlite");
+    const db = createDB(file);
+    const store = createCellStore(db);
+    const tiles = createTileService(store, file);
+    const pass = (depth: number) =>
+      Array.from({ length: 60 }, (_, i) => ({
+        ...cellAt(-76.2, 36.975 + i / 5400),
+        depth,
+        day: 20000,
+      }));
+    const bands = async (x: number, y: number) => {
+      const t = await tiles.get(15, x, y);
+      const l = t && new VectorTile(new PbfReader(t)).layers.DEPARE;
+      return l
+        ? Array.from(
+            { length: l.length },
+            (_, i) => l.feature(i).properties.DRVAL1,
+          )
+        : [];
+    };
+    try {
+      const f = tileFraction(-76.2, 36.98, 15);
+      const [x, y] = [Math.floor(f.x), Math.floor(f.y)];
+      store.addPasses(pass(8));
+      tiles.changed([{ lon: -76.2, lat: 36.98 }]);
+      // A backfill starts, and a tile is built while it runs.
+      tiles.share(false);
+      const before = await bands(x, y);
+      // Written as a backfill writes, on its own connection, which tells the tile
+      // service only when it ends.
+      const backfill = createCellStore(createDB(file));
+      for (let k = 0; k < 20; k++) backfill.addPasses(pass(30));
+      // A tile beside it, not built yet, under the same ancestor.
+      const sibling = await bands(x, y ^ 1);
+      expect(before.length).toBeGreaterThan(0);
+      expect(sibling.length).toBeGreaterThan(0);
+      expect(Math.min(...sibling)).toBeGreaterThan(Math.max(...before));
+    } finally {
+      tiles.close();
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+test.skipIf(!existsSync(dist))(
   "a backfill writes its cells and overviews on a worker thread",
   async () => {
     const { Readable } = await import("node:stream");

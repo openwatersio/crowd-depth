@@ -133,7 +133,11 @@ export function startChart({
   // Before the live writer starts, so its marker doesn't hide the gap.
   addPendingBackfill(store, startedAt, historySpan(config));
 
-  const tiles = createTileService(store, db.location() ?? undefined);
+  const tiles = createTileService(
+    store,
+    db.location() ?? undefined,
+    config.chart?.contourDetail === "standard" ? "standard" : "high",
+  );
   // Off the main thread, given a database file to say the plugin is built and running.
   const qc = db.location() ? createQCThread() : undefined;
   const writer = createCellWriter(store, {
@@ -224,6 +228,9 @@ export function startChart({
           await setTimeout(wait, undefined, { signal }).catch(() => {});
         if (signal.aborted) return;
       }
+      // Its cells reach the tiles only when it ends, so meanwhile tiles share no
+      // surface built before them.
+      tiles.share(false);
       return backfillCells({
         app,
         config,
@@ -239,11 +246,13 @@ export function startChart({
           if (signal.aborted) return;
           writer.hold(false);
           tiles.reset();
+          tiles.share(true);
         })
         .catch((err: unknown) => {
           if (signal.aborted) return;
           writer.hold(false);
           tiles.reset();
+          tiles.share(true);
           // The span stays for the next start, a few times at most; the live
           // layer goes on either way.
           const retry = recordBackfillFailure(store);

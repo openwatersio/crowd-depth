@@ -43,6 +43,8 @@ export type Config = {
     contours?: boolean;
     /** How far back the layer fills from the plugin's source. */
     history?: History;
+    /** Contours every metre and every foot zoomed in, or the chart's isobaths. */
+    contourDetail?: "high" | "standard";
   };
 };
 
@@ -374,6 +376,18 @@ export function schema(app: ServerAPI) {
             title: "Fill the layer from",
             description:
               "How far back the layer fills in from recorded soundings when it starts or rebuilds. A longer span takes longer to fill in, and new soundings wait for it, for up to 3 hours. Changing it rebuilds the layer.",
+          },
+          contourDetail: {
+            type: "string",
+            enum: ["high", "standard"],
+            enumNames: [
+              "High: every metre or foot, zoomed in",
+              "Standard: the chart's isobaths",
+            ],
+            default: "high",
+            title: "Contour detail",
+            description:
+              "High draws a contour every metre, or every foot, with every fifth one bold, from zoom 13 in; zoomed out, and at Standard, the layer draws the chart's isobaths.",
           },
         },
       },
