@@ -14,9 +14,9 @@ interpolated, and its σ widens with its distance from the nearest sounding.
 
 Each tile is a cloud-optimized GeoTIFF with four bands: depth (positive down), the
 distance in metres to the nearest sounding, the soundings in the pixel, and σ. The whole
-tile is interpolated, but only blocks with a sounding within the search radius are
-blurred, guarded, measured and written; the rest are left out of the file, and read
-as no data in every band.
+tile is worked in 512-pixel blocks: only the extent of the blocks with a sounding within
+the search radius is interpolated, and only those blocks are blurred, guarded, measured
+and written; the rest are left out of the file, and read as no data in every band.
 """
 
 import contextlib
@@ -242,38 +242,44 @@ def build_tile(con, tile_id: int, partition: int, out: Path):
     )
     out.mkdir(parents=True, exist_ok=True)
     path = out / f"{tile_id}.tif"
+    # A pixel has a depth only within the search radius of a point, and then has one of
+    # the tile's own soundings within it too: the quadrant facing into the tile needs one.
+    # So only blocks within that reach of a point have data, and a block's depths and
+    # distances depend only on pixels within that reach of it, or within the blur's (4σ),
+    # whichever is wider.
+    reach = (math.ceil(RADIUS_M / dy) + 1, math.ceil(RADIUS_M / dx) + 1)
+    blur_px = math.ceil(4 * SIGMA_PX)
+    halo = (max(reach[0], blur_px), max(reach[1], blur_px))
+    # Blocks around the votes, and around every sounded pixel, so the soundings band
+    # reaches each.
+    at = (np.concatenate([ROWS - 1 - upy, ROWS - 1 - cpy]), np.concatenate([upx, cpx]))
+    # A point's reach touches at most two blocks each way, so its four corners' blocks
+    # are every block it reaches.
+    assert 2 * max(reach) < BLOCK, "the search radius reaches past a block"
+    blocks = set()
+    for sr_ in (-1, 1):
+        for sc_ in (-1, 1):
+            r = np.clip(at[0] + sr_ * reach[0], 0, ROWS - 1) // BLOCK
+            c = np.clip(at[1] + sc_ * reach[1], 0, cols - 1) // BLOCK
+            blocks |= set(zip(r.tolist(), c.tolist()))
+    windows = {}
+    for br, bc in sorted(blocks):
+        r0, c0 = br * BLOCK, bc * BLOCK
+        r1, c1 = min(r0 + BLOCK, ROWS), min(c0 + BLOCK, cols)
+        wr0, wc0 = max(r0 - halo[0], 0), max(c0 - halo[1], 0)
+        wr1, wc1 = min(r1 + halo[0], ROWS), min(c1 + halo[1], cols)
+        windows[br, bc] = (r0, c0, r1, c1, wr0, wc0, wr1, wc1)
+    # Interpolated only over the windows' extent: every pixel outside it is no data.
+    extent = tuple(
+        f(w[i] for w in windows.values()) for f, i in ((min, 4), (min, 5), (max, 6), (max, 7))
+    )
     with tempfile.TemporaryDirectory(dir=os.environ.get("GRID_TEMP_DIR") or None) as tmp:
         # A tile whose soundings are all contradicted shoals has no votes: nothing to draw.
         grid = (
-            interpolate(Path(tmp), upx, upy, medians, scale_x, scale_y, cols) if len(upx) else None
+            interpolate(Path(tmp), upx, upy, medians, scale_x, scale_y, cols, extent)
+            if len(upx)
+            else None
         )
-        # A pixel has a depth only within the search radius of a point, and then has one
-        # of the tile's own soundings within it too: the quadrant facing into the tile
-        # needs one. So only blocks within that reach of a point have data, and a block's
-        # depths and distances depend only on pixels within that reach of it, or within
-        # the blur's (4σ), whichever is wider.
-        reach = (math.ceil(RADIUS_M / dy) + 1, math.ceil(RADIUS_M / dx) + 1)
-        blur_px = math.ceil(4 * SIGMA_PX)
-        halo = (max(reach[0], blur_px), max(reach[1], blur_px))
-        # Blocks around the votes, and around every sounded pixel, so the soundings band
-        # reaches each.
-        at = (np.concatenate([ROWS - 1 - upy, ROWS - 1 - cpy]), np.concatenate([upx, cpx]))
-        # A point's reach touches at most two blocks each way, so its four corners'
-        # blocks are every block it reaches.
-        assert 2 * max(reach) < BLOCK, "the search radius reaches past a block"
-        blocks = set()
-        for sr_ in (-1, 1):
-            for sc_ in (-1, 1):
-                r = np.clip(at[0] + sr_ * reach[0], 0, ROWS - 1) // BLOCK
-                c = np.clip(at[1] + sc_ * reach[1], 0, cols - 1) // BLOCK
-                blocks |= set(zip(r.tolist(), c.tolist()))
-        windows = {}
-        for br, bc in sorted(blocks):
-            r0, c0 = br * BLOCK, bc * BLOCK
-            r1, c1 = min(r0 + BLOCK, ROWS), min(c0 + BLOCK, cols)
-            wr0, wc0 = max(r0 - halo[0], 0), max(c0 - halo[1], 0)
-            wr1, wc1 = min(r1 + halo[0], ROWS), min(c1 + halo[1], cols)
-            windows[br, bc] = (r0, c0, r1, c1, wr0, wc0, wr1, wc1)
         # The blurred surface first, block by block, for σ's spread around it where a
         # window is too thin for a plane, as the statistic was measured.
         central = {
@@ -283,7 +289,9 @@ def build_tile(con, tile_id: int, partition: int, out: Path):
         with contextlib.ExitStack() as stack:
             src = stack.enter_context(rasterio.open(grid)) if grid else None
             for key, (r0, c0, r1, c1, wr0, wc0, wr1, wc1) in windows.items() if src else ():
-                window = src.read(1, window=Window(wc0, wr0, wc1 - wc0, wr1 - wr0))
+                window = src.read(
+                    1, window=Window(wc0 - extent[1], wr0 - extent[0], wc1 - wc0, wr1 - wr0)
+                )
                 central[key] = blur(window)[r0 - wr0 : r1 - wr0, c0 - wc0 : c1 - wc0]
         rows_at, cols_at = ROWS - 1 - upy, upx
         inside = (rows_at >= 0) & (rows_at < ROWS) & (cols_at >= 0) & (cols_at < cols)
@@ -327,9 +335,9 @@ def build_tile(con, tile_id: int, partition: int, out: Path):
     return path
 
 
-def interpolate(tmp, px, py, values, scale_x, scale_y, cols):
-    """`values` at pixels (px, py) interpolated over the tile with `gdal_grid`; the
-    raster's path."""
+def interpolate(tmp, px, py, values, scale_x, scale_y, cols, extent):
+    """`values` at pixels (px, py) interpolated with `gdal_grid` over the tile's rows and
+    columns `extent` (first row, first column, end row, end column); the raster's path."""
     points = tmp / "points.csv"
     # Each pixel's centre, in metres.
     np.savetxt(
@@ -344,11 +352,13 @@ def interpolate(tmp, px, py, values, scale_x, scale_y, cols):
 <GeometryField encoding="PointFromColumns" x="x" y="y" z="d"/></OGRVRTLayer></OGRVRTDataSource>"""
     )
     grid = tmp / "grid.tif"
+    r0, c0, r1, c1 = extent
+    dx, dy = scale_x / cols, scale_y / ROWS
     subprocess.run(
         [
             "gdal_grid", "-q", "-a", ALGORITHM, "-zfield", "d", "-l", "points",
-            "-txe", "0", str(scale_x), "-tye", str(scale_y), "0",
-            "-outsize", str(cols), str(ROWS), "-ot", "Float32", str(vrt), str(grid),
+            "-txe", str(c0 * dx), str(c1 * dx), "-tye", str((ROWS - r0) * dy), str((ROWS - r1) * dy),
+            "-outsize", str(c1 - c0), str(r1 - r0), "-ot", "Float32", str(vrt), str(grid),
         ],
         check=True,
     )  # fmt: skip
