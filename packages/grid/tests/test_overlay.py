@@ -16,7 +16,7 @@ from test_grid import CSIG
 from test_ingest import env  # noqa: F401  (env is a fixture)
 
 from grid import cells, overlay, qc, statistic, surface
-from grid.catalog import open_store
+from grid.catalog import POINT_ID, open_store
 from grid.overlay import M_PER_FATHOM, M_PER_FT, depths
 
 
@@ -554,8 +554,8 @@ def test_contradicted_shoals_dont_vote_and_unjudged_ones_do(env, tmp_path, reaso
         # As if every sounding were an unconfirmed shoal: contradicted by its cell, or in
         # a cell with no accepted median to judge it against.
         con.execute(
-            "INSERT INTO lake.qc_flags SELECT point_id, 'unconfirmed', ?, ?, cell_id"
-            " FROM lake.points",
+            f"INSERT INTO lake.qc_flags SELECT {POINT_ID}, 'unconfirmed', ?, ?, cell_id,"
+            " tile_id FROM lake.points p",
             [reason, qc.QC_VERSION],
         )
         con.execute("DELETE FROM lake.qc_flags WHERE flag <> 'unconfirmed'")

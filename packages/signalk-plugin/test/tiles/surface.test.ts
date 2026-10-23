@@ -2,8 +2,15 @@ import { expect, test } from "vitest";
 import { VectorTile } from "@mapbox/vector-tile";
 import { PbfReader as Pbf } from "pbf";
 import { Cell, cellDepth } from "../../src/tiles/cells.js";
-import { cellAt, tileFraction } from "../../src/tiles/geometry.js";
-import { buildTile, contourLevels } from "../../src/tiles/surface.js";
+import { cellAt, cellCenter, tileFraction } from "../../src/tiles/geometry.js";
+import { createDB } from "../../src/storage.js";
+import { createCellStore } from "../../src/tiles/index.js";
+import {
+  clearShared,
+  createTileService,
+  readTile,
+} from "../../src/tiles/service.js";
+import { buildTile, contourLevels, surface } from "../../src/tiles/surface.js";
 
 const Z = 14;
 const LON = -76.2;
@@ -22,6 +29,11 @@ function lane(lon: number, m: (i: number) => number): Cell[] {
 }
 
 const decode = (buf: Buffer) => new VectorTile(new Pbf(buf));
+
+const tileAt = (z: number) => {
+  const f = tileFraction(LON, LAT, z);
+  return { x: Math.floor(f.x), y: Math.floor(f.y) };
+};
 
 const features = (t: VectorTile, layer: string) => {
   const l = t.layers[layer];
@@ -64,13 +76,33 @@ test("water between two tracks within 200 m is interpolated, never past them", (
   }
   const kinds = features(t, "M_QUAL").map((f) => f.properties.kind);
   expect(kinds).toEqual(["measured", "interpolated"]);
-  // The 10 m contour runs between them: their depths less the margin are 6 and 14 m.
+  // Contours run between them every metre and every foot, their depths less the margin
+  // 6 to 14 m, the 10 m one of every five; standard detail draws the chart's 10 m alone.
+  const metres = features(t, "DEPCNT").filter((f) => f.properties.unit === "m");
+  expect(metres.map((f) => f.properties.VALDCO)).toEqual(
+    expect.arrayContaining([7, 8, 9, 10, 11, 12]),
+  );
+  expect(
+    metres.filter((f) => f.properties.major).map((f) => f.properties.VALDCO),
+  ).toEqual([10]);
+  const standard = decode(buildTile(Z, tile.x, tile.y, cells, [], "standard")!);
   expect(contourLevels(Z)).toContain(10);
-  expect(features(t, "DEPCNT").map((f) => f.properties.VALDCO)).toEqual([10]);
-  expect(areas.map((a) => a.properties.DRVAL1)).toEqual([5, 10]);
+  expect(features(standard, "DEPCNT").map((f) => f.properties.VALDCO)).toEqual([
+    10,
+  ]);
+  // Bands a metre each, from the shoal lane's 6 m to the deep one's 12 m.
+  for (const a of areas) {
+    expect(a.properties.DRVAL2 - a.properties.DRVAL1).toBe(1);
+  }
+  const los = areas.map((a) => a.properties.DRVAL1);
+  expect(Math.min(...los)).toBeLessThanOrEqual(6);
+  expect(Math.max(...los)).toBeGreaterThanOrEqual(12);
+  expect(features(standard, "DEPARE").map((a) => a.properties.DRVAL1)).toEqual([
+    5, 10,
+  ]);
 });
 
-test("an unconfirmed shoal publishes as a flagged sounding, outside the surface", () => {
+test("an unconfirmed shoal publishes as a flagged sounding, the interpolated surface drawn as if it weren't there", () => {
   const cells = [...lane(LON, () => 8), ...lane(LON + 0.001, () => 8)];
   const without = decode(buildTile(Z, tile.x, tile.y, cells, [])!);
   const shoal = { lon: LON + 0.0005, lat: LAT, depth: 1.2, time: 0 };
@@ -126,4 +158,313 @@ test("coverage says whether its water is reduced to chart datum", () => {
   const mixed = [...tided.slice(1), lane(LON, () => 8)[0]];
   expect(quality(mixed)).toMatchObject({ tided: 0 });
   expect(String(quality(mixed).INFORM)).toContain("Not reduced for tide");
+});
+
+/** 12 m water in an L three cells wide, from the cell at `lon`, `lat`. */
+function corner(lon = LON, lat = LAT) {
+  const o = cellAt(lon, lat);
+  const passes = [];
+  for (let r = 0; r < 30; r++) {
+    for (let c = 0; c < 30; c++) {
+      if (r < 3 || c < 3) passes.push({ py: o.py + r, px: o.px + c });
+    }
+  }
+  return { o, passes };
+}
+
+test("water carried past the surface is never deeper than a shoal beside it", () => {
+  // The blur carries the 12 m water into the L's inner corner, past the pixels the
+  // interpolation reaches; a 3 m shoal sits there.
+  const { o, passes } = corner();
+  const cells = passes.map((p) => ({
+    ...p,
+    m: 12,
+    d: 0.2,
+    passes: 3,
+    first: 20000,
+    last: 20010,
+  }));
+  const p = cellCenter(o.py + 3, o.px + 3);
+  const shoal = { lon: p.lon, lat: p.lat, depth: 3, time: 0 };
+  const without = surface(Z, tile.x, tile.y, cells);
+  const capped = surface(Z, tile.x, tile.y, cells, [shoal]);
+  const changed = [...capped.depth.keys()].filter(
+    (i) => !Object.is(capped.depth[i], without.depth[i]),
+  );
+  expect(changed.length).toBeGreaterThan(0);
+  for (const i of changed) expect(capped.depth[i]).toBeLessThanOrEqual(3);
+});
+
+test("a shoal just past a tile's edge caps the depths carried beside it", () => {
+  // A lane of 12 m water two and a half pixels inside a tile, and a 2.5 m shoal half a
+  // pixel outside it, past the surface its ancestor shares too: the tile reads it over
+  // its margin, and the water grown past the lane beside it is drawn no deeper.
+  const f = tileFraction(LON, LAT, Z);
+  const x = (Math.floor(f.x) + 1) & ~1;
+  const y = Math.floor(f.y);
+  const n = 2 ** Z;
+  const lonAt = (px: number) => ((x + px / 128) / n) * 360 - 180;
+  const store = createCellStore(createDB(":memory:"));
+  store.addPasses(
+    Array.from({ length: 30 }, (_, i) => ({
+      ...cellAt(lonAt(2.5), LAT - 0.003 + i / 5400),
+      depth: 12,
+      day: 20000,
+    })),
+  );
+  const bands = () =>
+    features(decode(readTile(store, Z, x, y)!), "DEPARE").map(
+      (a) => a.properties.DRVAL1,
+    );
+  // Only 12 m water, less its margin.
+  expect(bands().every((lo) => lo >= 5)).toBe(true);
+  store.addShoals(
+    Array.from({ length: 30 }, (_, i) => ({
+      lon: lonAt(-0.5),
+      lat: LAT - 0.003 + i / 5400,
+      depth: 2.5,
+      time: 0,
+    })),
+  );
+  // As the tile service does when the shoals are written.
+  clearShared(store);
+  expect(bands().some((lo) => lo <= 2)).toBe(true);
+  // Read over the margin, as cells are.
+  const asked: number[][] = [];
+  readTile(
+    {
+      ...store,
+      cells: (...b: Parameters<typeof store.cells>) => (
+        asked.push(b),
+        store.cells(...b)
+      ),
+      shoals: (...b: Parameters<typeof store.shoals>) => (
+        asked.push(b),
+        store.shoals(...b)
+      ),
+    },
+    Z,
+    x,
+    y,
+  );
+  expect(asked[1]).toEqual(asked[0].slice(0, 4));
+  // They publish in their own tile, not this one.
+  const t = decode(readTile(store, Z, x, y)!);
+  expect(features(t, "SOUNDG").filter((s) => s.properties.unconfirmed)).toEqual(
+    [],
+  );
+});
+
+/** The DEPARE bands, by DRVAL1, whose areas hold a point in tile coordinates. */
+function bandsHolding(t: VectorTile, x: number, y: number) {
+  return features(t, "DEPARE")
+    .filter((a) => {
+      let c = false;
+      for (const r of a.loadGeometry()) {
+        for (let i = 0, j = r.length - 1; i < r.length; j = i++) {
+          if (
+            r[i].y > y !== r[j].y > y &&
+            x < ((r[j].x - r[i].x) * (y - r[i].y)) / (r[j].y - r[i].y) + r[i].x
+          ) {
+            c = !c;
+          }
+        }
+      }
+      return c;
+    })
+    .map((a) => a.properties.DRVAL1);
+}
+
+test("upsampled, water beside a shoal is still no deeper than it", () => {
+  // At z15, upsampled: a lane of 12 m water two and a half pixels inside the tile, and
+  // 2.5 m shoals half a pixel outside it.
+  const [z, x, y] = [15, 9448, 12756];
+  const lonAt = (px: number) => ((x + px / 64) / 2 ** z) * 360 - 180;
+  const lat = (i: number) => 36.977 + i / 5400;
+  const cells: Cell[] = Array.from({ length: 30 }, (_, i) => ({
+    ...cellAt(lonAt(2.5), lat(i)),
+    m: 12,
+    d: 0.2,
+    passes: 3,
+    first: 20000,
+    last: 20010,
+  }));
+  const shoals = Array.from({ length: 30 }, (_, i) => ({
+    lon: lonAt(-0.5),
+    lat: lat(i),
+    depth: 2.5,
+    time: 0,
+  }));
+  const t = decode(buildTile(z, x, y, cells, shoals)!);
+  // In the tile's first pixel, beside the shoals, no area is deeper.
+  const unit = 4096 / 64;
+  let seen = 0;
+  for (let ty = 0; ty < 4096; ty += 8) {
+    for (let tx = 0; tx < unit; tx += 4) {
+      for (const lo of bandsHolding(t, tx, ty)) {
+        seen++;
+        expect(lo, `${tx},${ty}`).toBeLessThan(2.5);
+      }
+    }
+  }
+  expect(seen).toBeGreaterThan(0);
+});
+
+test("a contour closed round a bank stays closed", () => {
+  // A 3 m bank in 9 m water, well inside the tile.
+  const o = cellAt(LON, LAT);
+  const cells: Cell[] = [];
+  for (let r = 0; r < 25; r++) {
+    for (let c = 0; c < 25; c++) {
+      const bank = (r - 12) ** 2 + (c - 12) ** 2 < 16;
+      cells.push({
+        py: o.py + r,
+        px: o.px + c,
+        m: bank ? 5 : 11,
+        d: 0.2,
+        passes: 3,
+        first: 20000,
+        last: 20010,
+      });
+    }
+  }
+  const t = decode(buildTile(Z, tile.x, tile.y, cells, [])!);
+  const loops = features(t, "DEPCNT")
+    .filter((c) => c.properties.unit === "m")
+    .flatMap((c) => c.loadGeometry())
+    .filter((l) => {
+      const [a, b] = [l[0], l[l.length - 1]];
+      return a.x === b.x && a.y === b.y;
+    });
+  expect(loops.length).toBeGreaterThan(0);
+  for (const l of loops) expect(l.length).toBeGreaterThan(4);
+});
+
+test("a contour open at the outline is one line", () => {
+  // A hole deepening toward the south edge of the survey, so its contours are arcs
+  // from that edge round and back, well inside the tile.
+  const o = cellAt(LON, LAT);
+  const cells: Cell[] = [];
+  for (let r = 0; r < 25; r++) {
+    for (let c = 0; c < 25; c++) {
+      cells.push({
+        py: o.py + r,
+        px: o.px + c,
+        m: 14 - Math.hypot(c - 12, r + 6) / 2,
+        d: 0.2,
+        passes: 3,
+        first: 20000,
+        last: 20010,
+      });
+    }
+  }
+  const t = decode(buildTile(Z, tile.x, tile.y, cells, [])!);
+  const lines = features(t, "DEPCNT").filter(
+    (c) => c.properties.unit === "m" && c.properties.VALDCO >= 6,
+  );
+  expect(lines.length).toBeGreaterThan(1);
+  for (const c of lines) {
+    // Both of an arc's ends, not just one, on the outline past its middle.
+    const [line, ...rest] = c.loadGeometry();
+    expect(rest).toHaveLength(0);
+    const top = Math.min(...line.map((p) => p.y));
+    expect(line[0].y).toBeGreaterThan(top + 16);
+    expect(line[line.length - 1].y).toBeGreaterThan(top + 16);
+  }
+});
+
+test("fine contours keep the chart's deeper than 50 m", () => {
+  const cells = [...lane(LON, () => 85), ...lane(LON + 0.001, () => 135)];
+  const t = decode(buildTile(Z, tile.x, tile.y, cells, [])!);
+  expect(features(t, "DEPCNT").map((c) => c.properties.VALDCO)).toContain(100);
+});
+
+test("zoomed out, cells past one edge of a tile don't draw at its other", () => {
+  // Cells just past the tile's east edge, in its margin.
+  const z = 8;
+  const f = tileFraction(LON, LAT, z);
+  const x = Math.floor(f.x);
+  const y = Math.floor(f.y);
+  const east = ((x + 1) / 2 ** z) * 360 - 180;
+  const cells = lane(east + 0.002, () => 8);
+  const buf = buildTile(z, x, y, cells, []);
+  const areas = buf ? features(decode(buf), "DEPARE") : [];
+  for (const a of areas) {
+    for (const r of a.loadGeometry()) {
+      for (const p of r) expect(p.x).toBeGreaterThan(2048);
+    }
+  }
+});
+
+test("water between two tracks close together stays interpolated", () => {
+  const cells = [...lane(LON, () => 10), ...lane(LON + 0.0005, () => 10)];
+  const t = decode(buildTile(13, tileAt(13).x, tileAt(13).y, cells, [])!);
+  expect(features(t, "M_QUAL").map((m) => m.properties.kind)).toContain(
+    "interpolated",
+  );
+});
+
+test("a tile is tided by its own cells, not the rest of its ancestor's", () => {
+  // At z15, the tile's cells tided; one untided cell 900 m east, in the same z14 tile.
+  const z = 15;
+  const f = tileFraction(LON, LAT, z);
+  const x = Math.floor(f.x);
+  const y = Math.floor(f.y);
+  const lonAt = (px: number) => ((x + px / 64) / 2 ** z) * 360 - 180;
+  const cells: Cell[] = [
+    ...lane(lonAt(32), () => 8).map((c) => ({ ...c, t: 0.25 })),
+    { ...lane(lonAt(32) + 0.01, () => 8)[0] },
+  ];
+  const t = decode(buildTile(z, x, y, cells, [])!);
+  expect(features(t, "M_QUAL")[0].properties).toMatchObject({ tided: 1 });
+});
+
+test("zoomed out, a tile's areas follow a pass that changes its cells", async () => {
+  const z = 12;
+  const at = tileAt(z);
+  const store = createCellStore(createDB(":memory:"));
+  const tiles = createTileService(store);
+  const pass = (depth: number) =>
+    lane(LON, () => depth).map((c) => ({
+      py: c.py,
+      px: c.px,
+      depth,
+      day: 20000,
+    }));
+  store.addPasses(pass(8));
+  const bands = async () =>
+    features(decode((await tiles.get(z, at.x, at.y))!), "DEPARE").map(
+      (a) => a.properties.DRVAL1,
+    );
+  const before = await bands();
+  // The same water read much deeper on later passes.
+  for (let k = 0; k < 20; k++) store.addPasses(pass(30));
+  tiles.changed(lane(LON, () => 0).map((c) => cellCenter(c.py, c.px)));
+  expect(await bands()).not.toEqual(before);
+});
+
+test("a pass drops the shared surface it reaches", async () => {
+  const at = tileAt(15);
+  const store = createCellStore(createDB(":memory:"));
+  const tiles = createTileService(store);
+  const pass = (depth: number) =>
+    lane(LON, () => depth).map((c) => ({
+      py: c.py,
+      px: c.px,
+      depth,
+      day: 20000,
+    }));
+  const bands = async (y: number) =>
+    features(decode((await tiles.get(15, at.x, y))!), "DEPARE").map(
+      (a) => a.properties.DRVAL1,
+    );
+  store.addPasses(pass(8));
+  const before = await bands(at.y);
+  for (let k = 0; k < 20; k++) store.addPasses(pass(30));
+  tiles.changed(lane(LON, () => 0).map((c) => cellCenter(c.py, c.px)));
+  // A tile beside it, not built yet, under the same ancestor.
+  const sibling = await bands(at.y ^ 1);
+  expect(before.length).toBeGreaterThan(0);
+  expect(sibling.length).toBeGreaterThan(0);
+  expect(Math.min(...sibling)).toBeGreaterThan(Math.max(...before));
 });

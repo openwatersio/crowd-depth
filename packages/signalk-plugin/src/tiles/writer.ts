@@ -173,6 +173,7 @@ export function createCellWriter(
     onChange = () => {},
     qc: runQC,
     onError = () => {},
+    progress,
   }: {
     flushIntervalMs?: number;
     bulk?: boolean;
@@ -183,6 +184,9 @@ export function createCellWriter(
     qc?: QCRunner;
     /** Told of trouble the writer goes on through. */
     onError?: (err: Error) => void;
+    /** A backfill's, told after each write of the oldest sounding it has yet to
+     * write, in microseconds. */
+    progress?: (micros: number) => void;
   } = {},
 ) {
   /** While QC's thread has failed, when to try it again. */
@@ -311,8 +315,8 @@ export function createCellWriter(
     const count = all
       ? ruled.flags.length - offset
       : Math.min(FOLD_CHUNK, ruled.flags.length - offset);
-    // Every doubtful reading on the shoal side shows, as an unconfirmed sounding outside
-    // the surface: QC marks those `unconfirmed`. What it rejects or marks `noisy` is
+    // Every doubtful reading on the shoal side shows, as an unconfirmed sounding that only
+    // caps the depths carried past the surface: QC marks those `unconfirmed`. What it rejects or marks `noisy` is
     // bad data or the deep side, which drawn would show water deeper than it is.
     for (let k = 0; k < count; k++) {
       const s = buffer[judged + k];
@@ -429,9 +433,11 @@ export function createCellWriter(
       unwritten = [];
       onChange([...cells.map((c) => cellCenter(c.py, c.px)), ...found]);
     }
-    if (!bulk && latest) {
+    if (latest) {
       const oldest = oldestHeld();
-      setThrough(store, Number.isFinite(oldest) ? oldest - 1 : latest);
+      if (!bulk) {
+        setThrough(store, Number.isFinite(oldest) ? oldest - 1 : latest);
+      } else progress?.(Number.isFinite(oldest) ? oldest : latest + 1000);
     }
   };
 

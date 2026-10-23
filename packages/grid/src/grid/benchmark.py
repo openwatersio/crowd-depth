@@ -73,7 +73,7 @@ flags AS (
     bool_or(flag = 'unconfirmed' AND reason <> 'cell_unjudged') AND NOT bool_or(flag = 'confirmed')
       AS unconfirmed,
     bool_or(flag = 'confirmed' AND reason = 'cell_shoal') AS shoal
-  FROM lake.qc_flags WHERE cell_id = $partition AND qc_version = $qc_version
+  FROM lake.qc_flags WHERE cell_id = $partition AND tile_id = $tile AND qc_version = $qc_version
     AND point_id IN (SELECT point_id FROM pts)
   GROUP BY point_id
 )
@@ -254,13 +254,20 @@ def run(con, surface_dir, tiles=None, sources=(), qc_version=QC_VERSION, with_ce
         raise ValueError("no reference pixels in these tiles")
     p = {k: np.concatenate([q[k] for q in parts]) for k in parts[0]}
     # The flags on the scored tiles' own soundings: another tile's in the same partition
-    # say nothing about these. The partitions only let both tables prune their files.
+    # say nothing about these.
     scored = sorted(found)
     partitions = sorted({partition_of(t // 360 - 90, t % 360 - 180) for t in scored})
     flagged = con.execute(
-        """SELECT count(*) FROM lake.qc_flags q JOIN lake.points p USING (point_id)
-        WHERE q.qc_version = $v AND list_contains($parts, q.cell_id)
-          AND list_contains($parts, p.cell_id) AND list_contains($tiles, p.tile_id)""",
+        """SELECT count(*) FROM lake.qc_flags
+        WHERE qc_version = $v AND list_contains($parts, cell_id) AND list_contains($tiles, tile_id)""",
+        {"v": qc_version, "parts": partitions, "tiles": scored},
+    ).fetchone()[0]
+    # Batches QC hasn't run on at this version, as after a store's layout changes: their
+    # soundings' flags are missing, not clean.
+    unchecked = con.execute(
+        """SELECT count(DISTINCT batch_id) FROM lake.points
+        WHERE list_contains($parts, cell_id) AND list_contains($tiles, tile_id)
+          AND batch_id NOT IN (SELECT batch_id FROM lake.qc_batches WHERE qc_version = $v)""",
         {"v": qc_version, "parts": partitions, "tiles": scored},
     ).fetchone()[0]
     sources_seen, counts = np.unique(p["source"], return_counts=True)
@@ -271,6 +278,7 @@ def run(con, surface_dir, tiles=None, sources=(), qc_version=QC_VERSION, with_ce
         "tiles_without_surface": missing,
         "qc_version": qc_version,
         "qc_flags_at_version": flagged,
+        "batches_without_qc": unchecked,
         "sources": sorted(set(p["source"])),
         "reference_pixels": {str(k): int(n) for k, n in zip(sources_seen, counts)},
         "caveat": "Calibration anchors vessel offsets on these references: the 'anchor'"
@@ -304,6 +312,14 @@ def markdown(result):
     ]
     if result["tiles_without_surface"]:
         lines += ["", f"No surface COG for tiles {result['tiles_without_surface']}."]
+    if result.get("batches_without_qc"):
+        lines += [
+            "",
+            (
+                f"{result['batches_without_qc']:,} batches have no QC at this version: their"
+                " soundings count as accepted. Run `grid qc` first."
+            ),
+        ]
     if not result["qc_flags_at_version"]:
         lines += ["", "No QC flags at this version: every sounding counts as accepted."]
     near = result["estimates"]["surface"]["classes"]["confirmed_shoal"]["within 1 pixel"]

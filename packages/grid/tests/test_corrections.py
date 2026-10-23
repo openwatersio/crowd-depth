@@ -1,5 +1,6 @@
 import contextlib
 import math
+import re
 import shutil
 import sqlite3
 from datetime import date, datetime, timedelta
@@ -12,7 +13,7 @@ from rasterio.warp import transform_bounds
 from test_grid import LAT0, LON0, T0, at, put
 from test_ingest import env  # noqa: F401  (a fixture)
 
-from grid import calibrate, catalog, cells, cli, overlay, tide
+from grid import calibrate, catalog, cells, cli, ingest, overlay, tide
 from grid import reference as reference_mod
 from grid.catalog import open_store
 
@@ -904,6 +905,35 @@ def test_a_stuck_run_holds_through_a_stray_reading(env, tmp_path, monkeypatch): 
     assert env.query("SELECT count(*) FROM lake.lost_runs") == [(1,)]
 
 
+def test_stuck_runs_are_searched_where_a_vessel_holds_only_held_depths(env):  # noqa: F811
+    # Two searched vessels over two tiles: B has medians only in the first, and A only in
+    # the second, so each tile is searched for both.
+    second = TILE + 1
+    put(env, 1, [(i, *at(5000, i), 5.0) for i in range(10)], "AQM-A")
+    put(env, 2, [(i, *at(5000, cells.BASE + i), 5.0) for i in range(10)], "AQM-A")
+    put(env, 3, [(i, *at(5000, i), 5.0) for i in range(10)], "AQM-B")
+    put(env, 4, [(i, *at(5000, cells.BASE + i), 5.0) for i in range(10)], "AQM-B")
+    env.run("noaa")
+    with open_store(env.store) as con:
+        con.execute(
+            "CREATE TEMP TABLE cal_obs AS SELECT * FROM (VALUES (?, 'AQM-A'), (?, 'AQM-B'))"
+            " t(tile_id, vessel)",
+            [second, TILE],
+        )
+        con.execute(
+            "CREATE TEMP TABLE stuck_vessels AS SELECT 'AQM-A' AS vessel UNION SELECT 'AQM-B'"
+        )
+        got = {(t, v) for _, t, v in calibrate.stuck_pairs(con)}
+    assert got == {(t, v) for t in (TILE, second) for v in ("AQM-A", "AQM-B")}
+
+
+def test_stuck_run_windows_order_soundings_the_same_every_time():
+    # Soundings of one file can share a time and depth: ordered by those alone, which of
+    # them a window holds, and so the runs found, could change from run to run.
+    orders = re.findall(r"ORDER BY ([^)\n]*?)(?:\s+ROWS|\)|\n)", calibrate.STUCK)
+    assert len(orders) == 4 and all(o.strip() == "time, raw, row" for o in orders), orders
+
+
 def test_a_sounder_holding_one_depth_is_a_stuck_run(env, tmp_path, monkeypatch):  # noqa: F811
     # It wanders, then holds 0.8 m to the centimetre for its last 70 soundings, over 1 km:
     # QC's flatline, unconfirmed, and still part of the run. Calibration's pixels leave the
@@ -988,9 +1018,7 @@ def test_a_stuck_run_follows_its_soundings_to_a_copy(env, tmp_path, monkeypatch)
             {"new": new, "old": old},
         )
         con.execute("UPDATE lake.files SET status = 'withdrawn' WHERE file_id = $old", {"old": old})
-        con.execute(
-            "UPDATE lake.points SET file_id = $new WHERE file_id = $old", {"new": new, "old": old}
-        )
+        ingest.take_over(con, old, new)
     assert (
         before > 60
         and sum(c for u, _, c in corrected(env, "lost_bottom") if u == "AQM-T") == before
@@ -1070,9 +1098,7 @@ def test_a_stray_transit_stays_uncalibrated_in_a_copy(env, tmp_path, monkeypatch
             {"new": new, "old": old},
         )
         con.execute("UPDATE lake.files SET status = 'withdrawn' WHERE file_id = $old", {"old": old})
-        con.execute(
-            "UPDATE lake.points SET file_id = $new WHERE file_id = $old", {"new": new, "old": old}
-        )
+        ingest.take_over(con, old, new)
         calibrate.assign(con)
     for u, _, raw, _, ofs, depth in corrected(env):
         if u == "AQM-T" and raw > 10:

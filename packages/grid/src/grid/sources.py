@@ -286,7 +286,7 @@ def content_hash(con, source: str) -> str:
     and provider, so identical resubmissions hash alike. The source is in it because
     NOAA's CSV of a Signal K submission can hold exactly the soundings of the R2 copy:
     rule 1 skips copies within a source, and rule 5 decides between sources. It also
-    keeps point ids distinct across sources.
+    keeps content keys (catalog.CONTENT_KEY) distinct across sources.
     """
     n, upper, lower = con.execute(
         """SELECT count(*), sum(md5_number_upper(line)::HUGEINT), sum(md5_number_lower(line)::HUGEINT)

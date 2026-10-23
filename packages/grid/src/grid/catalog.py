@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS lake.files (
   status VARCHAR, reason VARCHAR, superseded_by BIGINT
 );
 CREATE TABLE IF NOT EXISTS lake.points (
-  point_id BLOB, file_id BIGINT, "row" INTEGER, unique_id VARCHAR, platform VARCHAR, provider VARCHAR,
+  file_id BIGINT, "row" INTEGER, unique_id VARCHAR, platform VARCHAR, provider VARCHAR,
   time TIMESTAMP, time_raw VARCHAR, lon DOUBLE, lat DOUBLE, depth_raw FLOAT,
   tile_id INTEGER, cell_id SMALLINT, batch_id BIGINT
 );
@@ -62,8 +62,10 @@ CREATE TABLE IF NOT EXISTS lake.store_meta (key VARCHAR, value VARCHAR);
 -- Tiles whose cells are built, the inputs fingerprint they were built from and a digest
 -- of the cells, so a build that stopped partway resumes where it was.
 CREATE TABLE IF NOT EXISTS lake.cells_built (tile_id INTEGER, inputs VARCHAR, digest VARCHAR);
+-- A flag's sounding is its point_id (POINT_ID), with its tile so a tile's flags read alone.
 CREATE TABLE IF NOT EXISTS lake.qc_flags (
-  point_id BLOB, flag VARCHAR, reason VARCHAR, qc_version INTEGER, cell_id SMALLINT
+  point_id BIGINT, flag VARCHAR, reason VARCHAR, qc_version INTEGER, cell_id SMALLINT,
+  tile_id INTEGER
 );
 CREATE TABLE IF NOT EXISTS lake.cells (
   tile_id INTEGER, level TINYINT, "row" INTEGER, col INTEGER,
@@ -162,6 +164,14 @@ UNCALIBRATED_SIGMA = STATISTIC["uncalibrated_sigma_m"]
 _ROWS = CELLS["rows_per_degree"]
 BASE_ROW = f"least(floor((p.lat - (p.tile_id // 360 - 90)) * {_ROWS})::INTEGER, {_ROWS - 1})"
 
+# A sounding is its file and row, packed into one key: both stay under 2^31. A copy
+# taking a file's points over moves them, and their flags, to its file_id.
+POINT_ID = '(p.file_id::BIGINT << 32) | p."row"'
+
+# A sounding by its content alone, the same whichever file holds it: what samples and
+# ties are picked by, so a copy taking a file's points over changes neither.
+CONTENT_KEY = 'hash(f.content_hash, p."row")'
+
 # Partitioned by the 10° cell, so the cells build reads only its partition's rows.
 PARTITIONED = {"points": "cell_id", "cells": "cell_id", "qc_flags": "cell_id", "shoals": "cell_id"}
 
@@ -178,9 +188,10 @@ PARTITIONED = {"points": "cell_id", "cells": "cell_id", "qc_flags": "cell_id", "
 # follows the number of files, not soundings: a boat logging for years at its mooring
 # shares only the minutes where its uploads overlap.
 # ponytail: the sweep runs for every query; keep it in a table if the files grow slow
-ACTIVE = """
+ACTIVE = f"""
 WITH f AS (
-  SELECT file_id, source, vessel, time_min, time_max FROM lake.files WHERE status = 'active'
+  SELECT file_id, source, vessel, time_min, time_max, content_hash FROM lake.files
+  WHERE status = 'active'
 ),
 ow AS (SELECT vessel, time_min, time_max FROM f WHERE source = 'openwaters'),
 ends AS (
@@ -197,11 +208,11 @@ sweep AS (
 ),
 shared AS (SELECT source, vessel, t AS t0, t_next AS t1 FROM sweep WHERE open >= 2),
 p AS (
-  SELECT p.*, f.source, EXISTS (
+  SELECT p.*, {POINT_ID} AS point_id, {CONTENT_KEY} AS content_key, f.source, EXISTS (
       SELECT 1 FROM shared s WHERE s.source = f.source AND s.vessel = f.vessel
         AND p.time BETWEEN s.t0 AND s.t1) AS twinned
   FROM lake.points p JOIN f USING (file_id)
-  WHERE {where} AND NOT (f.source = 'noaa' AND EXISTS (
+  WHERE {{where}} AND NOT (f.source = 'noaa' AND EXISTS (
     SELECT 1 FROM ow WHERE ow.vessel = p.unique_id AND p.time >= date_trunc('second', ow.time_min)
     AND p.time < date_trunc('second', ow.time_max) + INTERVAL 1 SECOND))
 )
@@ -386,7 +397,9 @@ class Lock:
             log.warning("releasing the catalog lock failed", exc_info=True)
 
 
-def connect(catalog_path: str, data_url: str, temp_dir: str) -> duckdb.DuckDBPyConnection:
+def connect(
+    catalog_path: str, data_url: str, temp_dir: str, write=True
+) -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
     # A fixed budget per process, so several can run side by side; work past it
     # spills to disk instead of growing.
@@ -421,10 +434,11 @@ def connect(catalog_path: str, data_url: str, temp_dir: str) -> duckdb.DuckDBPyC
     }
     con.execute(SCHEMA)
     con.execute(MIGRATIONS)
-    check_hash_scheme(con)
     # Partitioning is set once, when a table is created.
     for table in PARTITIONED.keys() - existing:
         con.execute(f"ALTER TABLE lake.{table} SET PARTITIONED BY ({PARTITIONED[table]})")
+    check_hash_scheme(con)
+    migrate_layout(con, write)
     con.execute(ACTIVE_POINTS)
     return con
 
@@ -441,9 +455,10 @@ def attach(con, catalog_path: str, data_url: str):
     )
 
 
-# Content hashes and the point ids derived from them must all come from one scheme, or
-# rule 1 misses copies and points are stored twice. Change this with any change to how
-# sources.content_hash or ingest.ADD_POINTS derives them.
+# Content hashes must all come from one scheme, or rule 1 misses copies and points are
+# stored twice. Change this with any change to how sources.content_hash derives them. A
+# store records it with its layout (LAYOUT), so a build that keys points another way
+# refuses the store too: builds before LAYOUT check for the scheme alone.
 HASH_SCHEME = "md5-sum-2"
 
 
@@ -452,9 +467,111 @@ def check_hash_scheme(con):
     if scheme is None:
         if con.execute("SELECT count(*) FROM lake.files").fetchone()[0]:
             raise RuntimeError("store predates hash scheme records; rebuild it")
-        con.execute("INSERT INTO lake.store_meta VALUES ('hash', ?)", [HASH_SCHEME])
-    elif scheme[0] != HASH_SCHEME:
-        raise RuntimeError(f"store hashes with {scheme[0]}, this build with {HASH_SCHEME}")
+        con.execute("INSERT INTO lake.store_meta VALUES ('hash', ?)", [STORE_SCHEME])
+    elif scheme[0] != STORE_SCHEME:
+        # The scheme alone is a store from before LAYOUT, which migrate_layout brings over;
+        # anything else is refused before the migration touches it.
+        layout = con.execute("SELECT value FROM lake.store_meta WHERE key = 'layout'").fetchone()
+        if scheme[0] != HASH_SCHEME or layout:
+            raise RuntimeError(f"store hashes with {scheme[0]}, this build with {STORE_SCHEME}")
+
+
+# Points and flags sorted by tile within each 10° partition, so a tile reads a few row
+# groups of its own rather than the partition's ingest order, which reads the store 6.8
+# times over in a full rebuild (store-layout.md). Every insert is written sorted, and
+# `compact` rewrites a partition into sorted files of about TARGET_FILE_SIZE.
+LAYOUT = "sorted-1"
+STORE_SCHEME = f"{HASH_SCHEME}/{LAYOUT}"
+SORTED = {"points": "tile_id, lat, lon", "qc_flags": "tile_id, point_id"}
+TARGET_FILE_SIZE = "256MB"
+ROW_GROUP_ROWS = 122_880
+
+
+def migrate_layout(con, write=True):
+    """Bring a store to LAYOUT in the catalog alone: drop the stored point_id, which
+    POINT_ID replaces, rekey qc_flags, whose flags QC and the next cells build write again,
+    and set each table's sort. `compact` rewrites the points themselves. A read-only open
+    refuses a store from before LAYOUT, whose flags exist only once QC runs again."""
+    done = con.execute("SELECT value FROM lake.store_meta WHERE key = 'layout'").fetchone()
+    if done and done[0] == LAYOUT:
+        return
+    if done:
+        raise RuntimeError(f"store is at layout {done[0]}, this build at {LAYOUT}")
+    if not write and con.execute("SELECT count(*) FROM lake.files").fetchone()[0]:
+        raise RuntimeError(f"store predates layout {LAYOUT}; run `grid compact` first")
+
+    def columns(table):
+        return {
+            c
+            for (c,) in con.execute(
+                "SELECT column_name FROM duckdb_columns() WHERE database_name = 'lake'"
+                " AND table_name = ?",
+                [table],
+            ).fetchall()
+        }
+
+    con.execute("BEGIN")
+    try:
+        if "point_id" in columns("points"):
+            con.execute("ALTER TABLE lake.points DROP COLUMN point_id")
+        if "tile_id" not in columns("qc_flags"):
+            con.execute("DROP TABLE lake.qc_flags")
+            con.execute(SCHEMA)
+            con.execute("ALTER TABLE lake.qc_flags SET PARTITIONED BY (cell_id)")
+            con.execute("DELETE FROM lake.qc_batches")
+        for table, order in SORTED.items():
+            con.execute(f"ALTER TABLE lake.{table} SET SORTED BY ({order})")
+        con.execute("CALL ducklake_set_option('lake', 'target_file_size', ?)", [TARGET_FILE_SIZE])
+        con.execute(
+            "CALL ducklake_set_option('lake', 'parquet_row_group_size', ?)", [str(ROW_GROUP_ROWS)]
+        )
+        con.execute("DELETE FROM lake.store_meta WHERE key = 'layout'")
+        con.execute("INSERT INTO lake.store_meta VALUES ('layout', ?)", [LAYOUT])
+        # So builds that key points by a stored point_id refuse the store.
+        con.execute(
+            "UPDATE lake.store_meta SET value = $new WHERE key = 'hash'"
+            " AND (value = $scheme OR starts_with(value, $scheme || '/'))",
+            {"new": STORE_SCHEME, "scheme": HASH_SCHEME},
+        )
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+
+
+def compact(con, publish=None) -> int:
+    """Rewrite each partition's points not yet compacted at LAYOUT into sorted files, one
+    partition per transaction, so a stopped run resumes at the next. Returns how many it
+    rewrote. The old files stay until snapshots expire, RETAIN after the run."""
+    done = {
+        v
+        for (v,) in con.execute(
+            "SELECT value FROM lake.store_meta WHERE key = 'compacted'"
+        ).fetchall()
+    }
+    cells = [
+        c
+        for (c,) in con.execute("SELECT DISTINCT cell_id FROM lake.points ORDER BY 1").fetchall()
+        if f"{LAYOUT}:{c}" not in done
+    ]
+    for cell in cells:
+        # The rows written now get higher row ids, which tell them from the old ones.
+        [(last,)] = con.execute("SELECT max(rowid) FROM lake.points").fetchall()
+        con.execute("BEGIN")
+        try:
+            con.execute(
+                "INSERT INTO lake.points SELECT * FROM lake.points WHERE cell_id = ?", [cell]
+            )
+            con.execute("DELETE FROM lake.points WHERE cell_id = ? AND rowid <= ?", [cell, last])
+            con.execute("INSERT INTO lake.store_meta VALUES ('compacted', ?)", [f"{LAYOUT}:{cell}"])
+            con.execute("COMMIT")
+        except BaseException:
+            con.execute("ROLLBACK")
+            raise
+        log.info("compacted partition %s", cell)
+        if publish:
+            publish()
+    return len(cells)
 
 
 class Session:
@@ -515,7 +632,7 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
             data_url = store.url + "lake/"
             if isinstance(store, LocalObjects):
                 Path(data_url).mkdir(parents=True, exist_ok=True)
-            con = connect(str(local), data_url, spill)
+            con = connect(str(local), data_url, spill, write)
             cutoff = datetime.now(UTC) - RETAIN
 
             def publish(final=False):
@@ -528,8 +645,11 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
                     # Rebuilds delete and reinsert cells, their flags and shoals, the
                     # calibration and the cells' marker, and DuckLake deletes by writing
                     # delete files, so the replaced files stay live until rewritten.
-                    # ponytail: points' delete files wait for compaction, which is still to come
+                    # Small files, a run's inserts, merge into sorted ones.
+                    for table in SORTED:
+                        con.execute(f"CALL ducklake_merge_adjacent_files('lake', '{table}')")
                     for table in (
+                        "points",
                         "cells",
                         "qc_flags",
                         "shoals",

@@ -127,8 +127,9 @@ WHERE p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M} AND p.time IS NOT NULL
   -- count it twice once the level arrives.
   AND (p.tide IS NOT NULL OR (p.tide_assigned AND p.tide_station IS NULL))
   AND p.point_id NOT IN (
-    SELECT point_id FROM lake.qc_flags WHERE cell_id = $partition AND qc_version = {QC_VERSION}
-      AND list_contains({TRACK_REASONS}, reason) AND flag IN ('reject', 'unconfirmed', 'noisy'))
+    SELECT point_id FROM lake.qc_flags WHERE cell_id = $partition AND list_contains($tiles, tile_id)
+      AND qc_version = {QC_VERSION} AND list_contains({TRACK_REASONS}, reason)
+      AND flag IN ('reject', 'unconfirmed', 'noisy'))
 GROUP BY ALL
 """
 
@@ -156,8 +157,9 @@ WITH p AS (
   WHERE p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M} AND p.time IS NOT NULL
     AND (p.tide IS NOT NULL OR (p.tide_assigned AND p.tide_station IS NULL))
     AND p.point_id NOT IN (
-      SELECT point_id FROM lake.qc_flags WHERE cell_id = $partition AND qc_version = {QC_VERSION}
-        AND list_contains({TRACK_REASONS}, reason) AND flag IN ('reject', 'unconfirmed', 'noisy')
+      SELECT point_id FROM lake.qc_flags WHERE cell_id = $partition AND tile_id = $tile
+        AND qc_version = {QC_VERSION} AND list_contains({TRACK_REASONS}, reason)
+        AND flag IN ('reject', 'unconfirmed', 'noisy')
         -- A held depth is what a stuck sounder reads: in, or the run breaks around it.
         AND NOT (flag = 'unconfirmed' AND reason = 'flatline'))
 ),
@@ -296,23 +298,29 @@ def stuck_runs(con, offset, status):
         JOIN lake.files f ON f.file_id = o.file_id
         WHERE f.status = 'active' AND m.lost_share >= {MONTH_SHARE}"""
     ).fetchall()
-    pairs = con.execute(
-        """SELECT p.cell_id, o.tile_id, o.vessel
-        FROM (SELECT DISTINCT tile_id, vessel FROM cal_obs
-          WHERE vessel IN (SELECT vessel FROM stuck_vessels)) o
-        JOIN (SELECT DISTINCT cell_id, tile_id FROM lake.points) p USING (tile_id)
-        ORDER BY ALL"""
-    ).fetchall()
     # ponytail: a file's run is found and applied per tile, so one that crosses a tile edge
     # is two; judge across tiles if the seams show
     # One vessel of one tile at a time, so memory follows the largest vessel's soundings in a
     # tile rather than every searched vessel's. ponytail: one vessel's years at its mooring
     # still go in at once; band by file time if a liveaboard outgrows the limit
-    for partition, tile, vessel in pairs:
+    for partition, tile, vessel in stuck_pairs(con):
         runs += con.execute(
             STUCK, {"partition": partition, "tile": tile, "vessels": [vessel]}
         ).fetchall()
     return runs
+
+
+def stuck_pairs(con):
+    """(partition, tile, vessel) for each vessel in `stuck_vessels` with soundings in a tile
+    any of them has medians in: a vessel whose soundings in a tile are all held depths has
+    none of its own there, and is searched all the same."""
+    return con.execute(
+        """SELECT DISTINCT cell_id, tile_id, unique_id FROM lake.points
+        WHERE unique_id IN (SELECT vessel FROM stuck_vessels)
+          AND tile_id IN (SELECT tile_id FROM cal_obs
+            WHERE vessel IN (SELECT vessel FROM stuck_vessels))
+        ORDER BY ALL"""
+    ).fetchall()
 
 
 def units_for(con, segments):

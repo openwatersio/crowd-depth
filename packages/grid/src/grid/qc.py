@@ -25,7 +25,7 @@ from datetime import UTC, datetime
 
 import numpy as np
 
-from .catalog import checkpoint
+from .catalog import POINT_ID, checkpoint
 from .definitions import QC
 
 log = logging.getLogger(__name__)
@@ -372,12 +372,13 @@ def run_batch(con, batch_id: int, fresh=False):
             f"""DELETE FROM lake.qc_flags WHERE qc_version = {QC_VERSION}
             AND list_contains({TRACK_REASONS}, reason)
             AND cell_id IN (SELECT DISTINCT cell_id FROM lake.points WHERE batch_id = $batch)
-            AND point_id IN (SELECT point_id FROM lake.points WHERE batch_id = $batch)""",
+            AND point_id IN (SELECT {POINT_ID} FROM lake.points p WHERE batch_id = $batch)""",
             params,
         )
     con.execute(
-        """CREATE OR REPLACE TEMP TABLE qc_points AS
-        SELECT p.point_id, p.cell_id, p.file_id, p."row", epoch_us(p.time) AS t, p.lon, p.lat,
+        f"""CREATE OR REPLACE TEMP TABLE qc_points AS
+        SELECT {POINT_ID} AS point_id, p.cell_id, p.tile_id, p.file_id, p."row",
+          epoch_us(p.time) AS t, p.lon, p.lat,
           p.depth_raw AS d, epoch_us(f.arrival) AS arrival
         FROM lake.points p JOIN lake.files f USING (file_id) WHERE p.batch_id = $batch""",
         params,
@@ -403,7 +404,7 @@ def run_batch(con, batch_id: int, fresh=False):
         con.register("qc_found", {k: np.concatenate(v) for k, v in found.items()})
         con.execute(
             f"""INSERT INTO lake.qc_flags BY NAME
-            SELECT q.point_id, q.cell_id, {[f for f, _ in CHECKS]}[f."check"] AS flag,
+            SELECT q.point_id, q.cell_id, q.tile_id, {[f for f, _ in CHECKS]}[f."check"] AS flag,
               {[r for _, r in CHECKS]}[f."check"] AS reason, {QC_VERSION} AS qc_version
             FROM qc_found f JOIN qc_points q USING (file_id, "row")"""
         )

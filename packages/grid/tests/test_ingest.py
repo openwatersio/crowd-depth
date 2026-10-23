@@ -204,20 +204,18 @@ def test_max_files_bounds_a_run(env):
     assert len(env.files()) == 3
 
 
-def test_point_ids_are_stable(env, tmp_path):
+def test_file_ids_and_rows_are_stable(env, tmp_path):
     env.noaa.put(noaa_key(1), noaa_csv(ROWS))
     env.run("noaa")
-    ids = env.query("SELECT point_id FROM lake.points ORDER BY row")
+    ids = env.query('SELECT file_id, "row" FROM lake.points ORDER BY "row"')
     other = LocalObjects(tmp_path / "other")
     with open_store(other) as con:
         Ingest(con, "noaa", env.noaa).run()
-        assert con.execute("SELECT point_id FROM lake.points ORDER BY row").fetchall() == ids
+        assert (
+            con.execute('SELECT file_id, "row" FROM lake.points ORDER BY "row"').fetchall() == ids
+        )
     assert len(set(ids)) == 3
-    # Changing point ids means stored flags stop matching: bump catalog.HASH_SCHEME.
-    assert ids[0][0].hex() == POINT_ID_0
-
-
-POINT_ID_0 = "fea3484842780615fc6a719c99fb5fb5"
+    assert ids == [(1, 0), (1, 1), (1, 2)]
 
 
 def test_implausible_times_stay_out_of_file_spans(env):
@@ -283,7 +281,8 @@ def test_rule3_withdrawal_and_return(env):
     for n in (1, 2, 3):
         env.noaa.put(noaa_key(n), noaa_csv(ROWS, unique_id=f"AQM-{n}"))
     env.run("noaa")
-    ids = env.query("SELECT point_id FROM lake.points WHERE unique_id = 'AQM-1' ORDER BY row")
+    ids_sql = 'SELECT file_id, "row" FROM lake.points WHERE unique_id = \'AQM-1\' ORDER BY "row"'
+    ids = env.query(ids_sql)
     body = env.noaa.get(noaa_key(1))[0]
     env.noaa.delete(noaa_key(1))
     assert not env.run("noaa")
@@ -294,9 +293,7 @@ def test_rule3_withdrawal_and_return(env):
     assert env.query("SELECT file_id, status FROM lake.files WHERE key = ?", [noaa_key(1)]) == [
         (1, "active")
     ]
-    assert (
-        env.query("SELECT point_id FROM lake.points WHERE unique_id = 'AQM-1' ORDER BY row") == ids
-    )
+    assert env.query(ids_sql) == ids
 
 
 def test_withdrawal_guard_holds_until_two_listings_agree_and_confirmed(env):
@@ -818,7 +815,7 @@ def test_rule5_identical_noaa_copy_defers_to_openwaters(env):
     env.run("noaa", "openwaters")
     assert env.files() == {noaa_key(1): ("active", None), ow_key(1): ("active", None)}
     assert {s for (s,) in env.query("SELECT source FROM active_points")} == {"openwaters"}
-    assert env.query("SELECT count(DISTINCT point_id) FROM lake.points") == [(6,)]
+    assert env.query('SELECT count(DISTINCT (file_id, "row")) FROM lake.points') == [(6,)]
 
 
 def test_rule5_covers_noaa_seconds_around_millisecond_spans(env):
@@ -885,10 +882,10 @@ def test_lock_survives_a_brief_outage(tmp_path, monkeypatch):
 def test_stores_record_and_check_their_hash_scheme(tmp_path, monkeypatch):
     store = LocalObjects(tmp_path)
     with open_store(store) as con:
-        assert con.execute("SELECT value FROM lake.store_meta").fetchall() == [
-            (catalog.HASH_SCHEME,)
+        assert con.execute("SELECT value FROM lake.store_meta WHERE key = 'hash'").fetchall() == [
+            (catalog.STORE_SCHEME,)
         ]
-    monkeypatch.setattr(catalog, "HASH_SCHEME", "another")
+    monkeypatch.setattr(catalog, "STORE_SCHEME", "another")
     with pytest.raises(RuntimeError, match="hashes with"), open_store(store, write=False):
         pass
 

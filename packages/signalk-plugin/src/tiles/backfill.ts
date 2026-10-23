@@ -3,7 +3,8 @@ import { setImmediate } from "node:timers/promises";
 import { Temporal } from "@js-temporal/polyfill";
 import { transform } from "stream-transform";
 import { ServerAPI } from "@signalk/server-api";
-import { Config } from "../config.js";
+import { Config, historySpan } from "../config.js";
+import { BATHY_EPOCH } from "../constants.js";
 import { BathymetryData, BathymetrySource, Timeframe } from "../types.js";
 import { correctForSensorPosition } from "../streams/index.js";
 import { CellStore } from "./cells.js";
@@ -17,9 +18,6 @@ import {
 } from "./writer.js";
 import { DEFINITIONS } from "./geometry.js";
 import { Tides, withTide } from "./tide.js";
-
-/** How far back a store with no cells yet is filled from the plugin's source. */
-export const BACKFILL_PERIOD = Temporal.Duration.from({ hours: 30 * 24 });
 
 /** Meta key set while a backfill's cells are without their overviews. */
 const OVERVIEWS_STALE_KEY = "overviews_stale";
@@ -56,6 +54,9 @@ export function tideChanged(store: CellStore, tided: boolean) {
   return builtWith !== undefined && builtWith !== tideConfig(tided);
 }
 
+/** How much of the span the source is asked about at once, for the windows with data. */
+const AVAILABILITY_SPAN = Temporal.Duration.from({ hours: 365 * 24 });
+
 /** Size of each read from the source. */
 const WINDOW = Temporal.Duration.from({ hours: 1 });
 
@@ -68,30 +69,24 @@ export function getPendingBackfill(store: CellStore): Timeframe | undefined {
 
 /**
  * Record the span the live writer didn't see, before it starts writing: since
- * it last recorded, or {@link BACKFILL_PERIOD} for a new store, up to `until`,
- * never more than {@link BACKFILL_PERIOD} back. A span left from a backfill
- * that didn't finish is widened, not replaced, so an interrupted backfill is
- * run again in full.
+ * it last recorded, or `span` back for a new store, up to `until`, never more
+ * than `span` back; all of the source's history without one. A span left from a
+ * backfill that didn't finish goes on from as far as it got, up to `until`.
  */
-export function addPendingBackfill(store: CellStore, until: Temporal.Instant) {
-  // Never more than BACKFILL_PERIOD back, however long the layer was off.
-  const earliest = until.subtract(BACKFILL_PERIOD);
-  const through = getThrough(store);
-  let from =
-    through && Temporal.Instant.compare(through, earliest) > 0
-      ? through
-      : earliest;
-  let to = until;
+export function addPendingBackfill(
+  store: CellStore,
+  until: Temporal.Instant,
+  span: Temporal.Duration | undefined,
+) {
   const pending = getPendingBackfill(store);
-  if (pending) {
-    if (Temporal.Instant.compare(pending.from, from) < 0) {
-      from =
-        Temporal.Instant.compare(pending.from, earliest) > 0
-          ? pending.from
-          : earliest;
-    }
-    if (Temporal.Instant.compare(pending.to, to) > 0) to = pending.to;
-  }
+  // Never more than the span back, however long the layer was off.
+  const earliest = span ? until.subtract(span) : BATHY_EPOCH;
+  let from = pending?.from ?? getThrough(store) ?? earliest;
+  if (Temporal.Instant.compare(from, earliest) < 0) from = earliest;
+  const to =
+    pending && Temporal.Instant.compare(pending.to, until) > 0
+      ? pending.to
+      : until;
   if (Temporal.Instant.compare(from, to) >= 0) return;
   store.setMeta(PENDING_KEY, `${from}/${to}`);
 }
@@ -100,6 +95,32 @@ export function addPendingBackfill(store: CellStore, until: Temporal.Instant) {
 export function clearPendingBackfill(store: CellStore) {
   store.setMeta(PENDING_KEY, "");
   store.setMeta(FAILURES_KEY, "");
+}
+
+/** Move the pending span's start up to `micros`, the oldest sounding a backfill has
+ * yet to write, so one that is stopped goes on from there rather than folding in
+ * again what it wrote. A backfill getting somewhere starts its failures afresh: only
+ * starts in a row that get nowhere give the span up. */
+export function advancePendingBackfill(store: CellStore, micros: number) {
+  const pending = getPendingBackfill(store);
+  if (!pending) return;
+  const from = Temporal.Instant.fromEpochMilliseconds(
+    Math.floor(micros / 1000),
+  );
+  if (
+    Temporal.Instant.compare(from, pending.from) > 0 &&
+    Temporal.Instant.compare(from, pending.to) < 0
+  ) {
+    store.setMeta(PENDING_KEY, `${from}/${pending.to}`);
+    store.setMeta(FAILURES_KEY, "");
+  }
+}
+
+/** Clear the cells for the backfill to build afresh. */
+export function startRebuild(store: CellStore) {
+  store.clear();
+  store.setMeta(THROUGH_KEY, "");
+  clearPendingBackfill(store);
 }
 
 /** Meta key for how many starts in a row the pending span has failed. */
@@ -166,10 +187,8 @@ export async function backfillCells({
   if (signal.aborted) return;
   if (tideChanged(store, tided)) {
     app.debug("Tide changed: rebuilding the chart layer");
-    store.clear();
-    store.setMeta(THROUGH_KEY, "");
-    clearPendingBackfill(store);
-    addPendingBackfill(store, until);
+    startRebuild(store);
+    addPendingBackfill(store, until, historySpan(config));
   }
   store.setMeta(TIDE_CONFIG_KEY, tideConfig(tided));
   const rebuild = async () => {
@@ -203,11 +222,25 @@ export async function backfillCells({
     }
   }
 
-  // Sources round windows out to whole hours; soundings past the span were
+  // Asked a year at a time, so all of a boat's history isn't one request to the
+  // provider. Sources round windows out to whole hours, so each is clamped to its
+  // year: one crossing into the next is read once. Soundings past the span were
   // already written live.
-  const windows = (await source.getAvailableTimeframes(pending, WINDOW)).map(
-    (window) => window.clamp(pending),
-  );
+  const windows: Timeframe[] = [];
+  for (
+    let from = pending.from;
+    Temporal.Instant.compare(from, pending.to) < 0;
+  ) {
+    const next = from.add(AVAILABILITY_SPAN);
+    const year = new Timeframe(
+      from,
+      Temporal.Instant.compare(next, pending.to) < 0 ? next : pending.to,
+    );
+    for (const window of await source.getAvailableTimeframes(year, WINDOW)) {
+      windows.push(window.clamp(year));
+    }
+    from = year.to;
+  }
   if (windows.length > 0) {
     app.debug(`Backfilling chart cells from ${windows.length} windows`);
     // Its cells get their overviews at the end; until then they're marked missing,
@@ -232,7 +265,11 @@ export async function backfillCells({
         ...(tided && tides ? [withTide(tides)] : []),
         file
           ? createWorkerSink(file)
-          : createCellWriter(store, { bulk: true, overviews: false }),
+          : createCellWriter(store, {
+              bulk: true,
+              overviews: false,
+              progress: (micros) => advancePendingBackfill(store, micros),
+            }),
         { signal },
       );
       // The worker rebuilt them as it finished.

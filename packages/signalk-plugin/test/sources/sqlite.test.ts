@@ -4,6 +4,10 @@ import { Readable } from "stream";
 import { pipeline } from "stream/promises";
 import { app } from "../helper.js";
 import { createDB } from "../../src/storage.js";
+import { DatabaseSync } from "node:sqlite";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Temporal } from "@js-temporal/polyfill";
 import { Timeframe } from "../../src/types.js";
 
@@ -166,4 +170,57 @@ test("getAvailableTimeframes returns empty for no data", async () => {
     windowSize,
   );
   expect(windows).toHaveLength(0);
+});
+
+const indexes = (db: DatabaseSync) =>
+  (
+    db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'bathymetry'",
+      )
+      .all() as { name: string }[]
+  ).map(({ name }) => name);
+
+test("the log keeps no index on position", () => {
+  const dir = mkdtempSync(join(tmpdir(), "crowd-depth-"));
+  try {
+    const file = join(dir, "bathymetry.sqlite");
+    const db = createDB(file);
+    expect(indexes(db)).toEqual(["idx_bathymetry_timestamp"]);
+    // Back to a log from user_version 6, with the index.
+    db.exec(`
+      CREATE INDEX idx_bathymetry_location ON bathymetry(latitude, longitude);
+      PRAGMA user_version = 6;
+    `);
+    db.close();
+    const reopened = createDB(file);
+    expect(indexes(reopened)).toEqual(["idx_bathymetry_timestamp"]);
+    reopened.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("getAvailableTimeframes counts windows from the span's start, up to its end", async () => {
+  const db = createDB(":memory:");
+  const source = createSqliteSource(app, db);
+  await pipeline(
+    Readable.from([
+      point("2025-01-01T00:20:00Z"),
+      point("2025-01-01T03:40:00Z"),
+      point("2025-01-01T05:10:00Z"), // at the span's end: not in it
+    ]),
+    source.createWriter!(),
+  );
+  const windows = await source.getAvailableTimeframes!(
+    new Timeframe(
+      Temporal.Instant.from("2025-01-01T00:10:00Z"),
+      Temporal.Instant.from("2025-01-01T05:10:00Z"),
+    ),
+    Temporal.Duration.from({ hours: 1 }),
+  );
+  expect(windows.map((w) => `${w.from}/${w.to}`)).toEqual([
+    "2025-01-01T00:10:00Z/2025-01-01T01:10:00Z",
+    "2025-01-01T03:10:00Z/2025-01-01T04:10:00Z",
+  ]);
 });

@@ -18,6 +18,10 @@ COLS = math.ceil(BASE / surface.PIXEL_BASE)
 PY = 100  # every reference pixel is on this row, px 0 to 100
 
 
+def point_id(row, file_id=1):
+    return file_id << 32 | row
+
+
 def lonlat(px):
     return LON0 + (px + 0.5) * 2 / BASE, LAT0 + (PY + 0.5) * 2 / BASE
 
@@ -56,8 +60,7 @@ def store(tmp_path):
         (1, None, None, None, "bluetopo"),  # no depth: ignored
     ]
     # Soundings: pixel 0 has a rejected vessel, pixel 1 three vessels, pixel 10 a confirmed shoal.
-    points = [(b"a0", "A", 0), (b"b0", "B", 0), (b"a1", "A", 1), (b"b1", "B", 1), (b"c1", "C", 1)]
-    points += [(b"s", "A", 10)]
+    points = [(0, "A", 0), (1, "B", 0), (2, "A", 1), (3, "B", 1), (4, "C", 1), (5, "A", 10)]
     with open_store(store) as con:
         con.executemany(
             "INSERT INTO lake.reference_pixels VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -66,13 +69,16 @@ def store(tmp_path):
         con.execute("INSERT INTO lake.files (file_id, status) VALUES (1, 'active')")
         con.executemany(
             """INSERT INTO lake.points
-              (point_id, file_id, unique_id, lon, lat, depth_raw, tile_id, cell_id)
-            VALUES (?, 1, ?, ?, ?, 10, ?, ?)""",
-            [(pid, v, *lonlat(px), TILE, PARTITION) for pid, v, px in points],
+              (file_id, "row", unique_id, lon, lat, depth_raw, tile_id, cell_id)
+            VALUES (1, ?, ?, ?, ?, 10, ?, ?)""",
+            [(row, v, *lonlat(px), TILE, PARTITION) for row, v, px in points],
         )
         con.executemany(
-            "INSERT INTO lake.qc_flags VALUES (?, ?, ?, 7, ?)",
-            [(b"b0", "reject", "spike", PARTITION), (b"s", "confirmed", "cell_shoal", PARTITION)],
+            "INSERT INTO lake.qc_flags VALUES (?, ?, ?, 7, ?, ?)",
+            [
+                (point_id(1), "reject", "spike", PARTITION, TILE),
+                (point_id(5), "confirmed", "cell_shoal", PARTITION, TILE),
+            ],
         )
         con.execute(
             """INSERT INTO lake.cells (tile_id, depth, depth_lon, depth_lat, cell_id)
@@ -126,11 +132,11 @@ def test_vessels_count_as_the_surface_takes_them(store):
         # Pixel 1's B and C are on noisy tracks, which don't vote; pixel 0's A is a shoal no
         # cell could judge, which does.
         con.executemany(
-            "INSERT INTO lake.qc_flags VALUES (?, ?, ?, 7, ?)",
+            "INSERT INTO lake.qc_flags VALUES (?, ?, ?, 7, ?, ?)",
             [
-                (b"b1", "noisy", "track_noise", PARTITION),
-                (b"c1", "noisy", "track_noise", PARTITION),
-                (b"a0", "unconfirmed", "cell_unjudged", PARTITION),
+                (point_id(3), "noisy", "track_noise", PARTITION, TILE),
+                (point_id(4), "noisy", "track_noise", PARTITION, TILE),
+                (point_id(0), "unconfirmed", "cell_unjudged", PARTITION, TILE),
             ],
         )
     with open_store(objects, write=False) as con:
@@ -162,15 +168,22 @@ def test_without_flags_at_the_version_every_sounding_counts(store):
     with open_store(objects) as con:
         # Another tile's flag in the same partition says nothing about this tile's soundings.
         con.execute(
-            "INSERT INTO lake.points (point_id, file_id, tile_id, cell_id) VALUES ('o', 1, ?, ?)",
+            'INSERT INTO lake.points (file_id, "row", tile_id, cell_id) VALUES (1, 99, ?, ?)',
             [TILE + 1, PARTITION],
         )
-        con.execute("INSERT INTO lake.qc_flags VALUES ('o', 'reject', 'spike', 99, ?)", [PARTITION])
+        con.execute(
+            "INSERT INTO lake.qc_flags VALUES (?, 'reject', 'spike', 99, ?, ?)",
+            [point_id(99), PARTITION, TILE + 1],
+        )
+        con.execute("UPDATE lake.points SET batch_id = 1")  # as ingest writes them
     with open_store(objects, write=False) as con:
         result = benchmark.run(con, surface_dir, qc_version=99)
     assert result["qc_flags_at_version"] == 0
     assert result["estimates"]["surface"]["classes"]["vessels"]["2–3"]["pixels"] == 2
     assert "No QC flags" in benchmark.markdown(result)
+    # Nor has QC run on the tile's soundings at that version: their flags are missing.
+    assert result["batches_without_qc"] == 1
+    assert "Run `grid qc` first" in benchmark.markdown(result)
 
 
 def test_a_surface_off_the_reference_grid_is_refused(store, tmp_path):

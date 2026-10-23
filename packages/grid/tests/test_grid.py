@@ -50,8 +50,8 @@ def flags(env):  # noqa: F811
     return sorted(
         (flag, reason, d)
         for flag, reason, d in env.query(
-            """SELECT q.flag, q.reason, p.depth_raw FROM lake.qc_flags q
-            JOIN lake.points p USING (point_id)"""
+            f"""SELECT q.flag, q.reason, p.depth_raw FROM lake.qc_flags q
+            JOIN lake.points p ON q.point_id = {catalog.POINT_ID}"""
         )
     )
 
@@ -372,7 +372,8 @@ def test_shoals_are_the_soundings_nothing_confirmed_or_rejected():
     con.execute("ATTACH ':memory:' AS lake")
     con.execute(
         """CREATE TABLE lake.qc_flags (
-          point_id INTEGER, flag VARCHAR, reason VARCHAR, qc_version INTEGER, cell_id SMALLINT)"""
+          point_id BIGINT, flag VARCHAR, reason VARCHAR, qc_version INTEGER, cell_id SMALLINT,
+          tile_id INTEGER)"""
     )
     tile = (LAT0 + 90) * 360 + LON0 + 180
     con.execute(
@@ -383,23 +384,26 @@ def test_shoals_are_the_soundings_nothing_confirmed_or_rejected():
     )
     v = qc.QC_VERSION
     con.executemany(
-        "INSERT INTO lake.qc_flags VALUES (?, ?, ?, ?, 1)",
+        "INSERT INTO lake.qc_flags VALUES (?, ?, ?, ?, 1, ?)",
         [
-            (1, "unconfirmed", "spike", v),  # still a shoal
-            (2, "unconfirmed", "spike", v),
-            (2, "confirmed", "cell_confirmed", v),
-            (3, "unconfirmed", "spike", v),
-            (3, "reject", "consensus_shoal", v),
-            (4, "unconfirmed", "spike", v - 1),  # an older QC's
-            # 5: a sounding of a transit that lost the bottom, a shoal with no flag of its own
-            (6, "reject", "spike", v),  # lost the bottom, but rejected anyway
+            (*flag, tile)
+            for flag in [
+                (1, "unconfirmed", "spike", v),  # still a shoal
+                (2, "unconfirmed", "spike", v),
+                (2, "confirmed", "cell_confirmed", v),
+                (3, "unconfirmed", "spike", v),
+                (3, "reject", "consensus_shoal", v),
+                (4, "unconfirmed", "spike", v - 1),  # an older QC's
+                # 5: a sounding of a transit that lost the bottom, a shoal with no flag of its own
+                (6, "reject", "spike", v),  # lost the bottom, but rejected anyway
+            ]
         ],
     )
     # 7: lost the bottom, but reading deeper than HAZARD_M: no hazard to warn of.
     con.execute("UPDATE tile_points SET depth = ? WHERE point_id = 7", [qc.HAZARD_M + 5.0])
     # 8: lost the bottom, reading under SHALLOW_M: a sounder's junk, no hazard either.
     con.execute("UPDATE tile_points SET depth_raw = 0.3, depth = 0.3 WHERE point_id = 8")
-    con.execute(cells.SHOALS, {"partition": 1})
+    con.execute(cells.SHOALS, {"partition": 1, "tiles": [tile]})
     assert con.execute("SELECT tile_id, r, c FROM shoals").fetchall() == [(tile, 5000, 7)] * 2
 
 
@@ -492,7 +496,7 @@ def test_each_other_vessel_votes_once_around_a_shoal():
     con = duckdb.connect()
     con.execute(
         """CREATE TABLE group_accepted (point_id INTEGER, r INTEGER, c INTEGER, vessel VARCHAR,
-        d DOUBLE, outlier VARCHAR, tile_id INTEGER DEFAULT 1)"""
+        d DOUBLE, outlier VARCHAR, tile_id INTEGER DEFAULT 1, content_key UBIGINT DEFAULT 0)"""
     )
     con.executemany(
         "INSERT INTO group_accepted (point_id, r, c, vessel, d, outlier) VALUES (?, ?, ?, ?, ?, ?)",
@@ -699,7 +703,11 @@ def test_a_cells_sounding_sits_at_the_same_tie_whichever_file_came_first(env, fi
         put(env, n, [(0, *spot[vessel], 10.0)], vessel)
     build(env)
     placed = env.query("SELECT depth_lon, depth_lat FROM lake.cells WHERE level = 1")
-    assert placed == env.query("SELECT lon, lat FROM lake.points ORDER BY point_id LIMIT 1")
+    # The sounding with the least content key, whichever file holds it.
+    assert placed == env.query(
+        f"""SELECT lon, lat FROM lake.points p JOIN lake.files f USING (file_id)
+        ORDER BY {catalog.CONTENT_KEY} LIMIT 1"""
+    )
 
 
 def two_tiles(env):  # noqa: F811
