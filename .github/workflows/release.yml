@@ -19,7 +19,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
@@ -75,7 +75,7 @@ jobs:
 
   publish:
     needs: build
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     permissions:
       # npm trusted publishing (OIDC)
       id-token: write
@@ -101,7 +101,7 @@ jobs:
 
   version:
     needs: publish
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:

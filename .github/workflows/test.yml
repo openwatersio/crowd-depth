@@ -8,7 +8,7 @@ on:
 jobs:
   lint:
     name: Lint
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -27,7 +27,7 @@ jobs:
 
   test:
     name: Tests
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     env:
       CI: true
     steps:
@@ -56,7 +56,7 @@ jobs:
 
   e2e:
     name: End-to-end
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Checkout repository
@@ -88,7 +88,7 @@ jobs:
   # here instead of in Cloudflare's build.
   worker:
     name: Worker startup
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Checkout repository

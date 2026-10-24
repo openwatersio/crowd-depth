@@ -22,7 +22,7 @@ permissions:
 jobs:
   test:
     name: Grid tests (Python ${{ matrix.python }})
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       matrix:
