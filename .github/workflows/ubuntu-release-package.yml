@@ -1,0 +1,54 @@
+name: Ubuntu release package validation
+
+on:
+  pull_request:
+    paths: [".github/workflows/ubuntu-release-package.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    env:
+      VALIDATION_VERSION: 0.0.0-ubuntu-ci.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: mise.toml
+          package-manager-cache: false
+      - run: npm ci
+      - name: Exercise the release version and package build
+        run: |
+          npm pkg set version="$VALIDATION_VERSION" -w crowd-depth
+          npm run lint -w crowd-depth
+          mkdir -p "$RUNNER_TEMP/pack"
+          npm pack -w crowd-depth --pack-destination "$RUNNER_TEMP/pack"
+      - name: Check every declared package path and the packed version
+        run: |
+          tar -tzf "$RUNNER_TEMP"/pack/*.tgz > "$RUNNER_TEMP/contents.txt"
+          for f in $(jq -r '.files[]' packages/signalk-plugin/package.json); do
+            awk -v p="package/$f" '$0 == p || index($0, p "/") == 1 { found = 1 } END { exit !found }' "$RUNNER_TEMP/contents.txt" \
+              || { echo "::error::$f is missing from the tarball"; exit 1; }
+          done
+          grep -qx package/dist/index.js "$RUNNER_TEMP/contents.txt"
+          jq -e --arg v "$VALIDATION_VERSION" '.version == $v' <(tar -xzOf "$RUNNER_TEMP"/pack/*.tgz package/package.json)
+          sha256sum "$RUNNER_TEMP"/pack/*.tgz
+      - name: Install the tarball into an isolated consumer
+        run: |
+          mkdir -p "$RUNNER_TEMP/consumer"
+          npm install --prefix "$RUNNER_TEMP/consumer" --ignore-scripts --install-strategy=nested --no-audit --no-fund "$RUNNER_TEMP"/pack/*.tgz
+          cd "$RUNNER_TEMP/consumer"
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          import createPlugin from 'crowd-depth';
+          const manifest = JSON.parse(readFileSync('node_modules/crowd-depth/package.json', 'utf8'));
+          assert.equal(manifest.version, process.env.VALIDATION_VERSION);
+          assert.equal(typeof createPlugin, 'function');
+          console.log(`Installed and imported crowd-depth ${manifest.version} outside the workspace`);
+          JS
