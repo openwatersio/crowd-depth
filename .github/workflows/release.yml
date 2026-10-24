@@ -36,7 +36,7 @@ jobs:
           [ "$main" = "$GITHUB_SHA" ] || { echo "::error::$TAG is $GITHUB_SHA but main is $main. Release from the tip of main."; exit 1; }
 
       # No dependency cache: a poisoned cache would reach the release.
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: actions/setup-node@v7
         with:
           node-version-file: mise.toml
           package-manager-cache: false
@@ -86,7 +86,7 @@ jobs:
 
       # Only npm's version matters here, and this job has no checkout to read
       # mise.toml from.
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org/
@@ -109,7 +109,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
 
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: actions/setup-node@v7
         with:
           node-version-file: mise.toml
           package-manager-cache: false
