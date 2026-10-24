@@ -21,7 +21,7 @@ jobs:
   plugin:
     name: Publish plugin preview
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       # pkg.pr.new serves the preview under the PR's head SHA, so build that
