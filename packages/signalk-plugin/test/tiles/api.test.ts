@@ -82,6 +82,27 @@ test("serves the style, with the tiles under the extension's route", async () =>
   }
 });
 
+// The stacks openwatersio/tile-fonts publishes; a symbol layer without a text-font asks
+// for MapLibre's default "Open Sans Regular", which the server doesn't have.
+test("sets every label in a font the glyph server publishes", async () => {
+  const { get } = serve();
+  const style = (await get(STYLE_PATH)).body as {
+    glyphs: string;
+    layers: { type: string; layout?: { "text-font"?: string[] } }[];
+  };
+  expect(style.glyphs).toBe(
+    "https://tiles.openwaters.io/fonts/{fontstack}/{range}.pbf",
+  );
+  const symbols = style.layers.filter((l) => l.type === "symbol");
+  expect(symbols.length).toBeGreaterThan(0);
+  for (const layer of symbols) {
+    expect(layer.layout?.["text-font"]).toBeDefined();
+    for (const font of layer.layout!["text-font"]!) {
+      expect(["Noto Sans Medium", "Noto Sans Medium Italic"]).toContain(font);
+    }
+  }
+});
+
 test("draws the boat's own data in the colour, tint and contours set", async () => {
   const { get } = serve({
     accent: "#00a0a0",

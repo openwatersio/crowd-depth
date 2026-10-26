@@ -10,6 +10,12 @@ import { MAX_ZOOM, MIN_ZOOM } from "./surface.js";
 
 const P = DEFINITIONS.portrayal;
 
+// Self-hosted (openwatersio/tile-fonts), the glyph server Seascape and Seamap use. Text
+// is set in Seascape's faces: Medium for contour labels, Medium Italic for depths.
+const GLYPHS = "https://tiles.openwaters.io/fonts/{fontstack}/{range}.pbf";
+const LABEL_FONT = ["Noto Sans Medium"];
+const DEPTH_FONT = ["Noto Sans Medium Italic"];
+
 /** Seascape's day flavor. */
 const DAY = {
   // Deepest band first.
@@ -98,9 +104,9 @@ export function buildStyle({
   ];
   return {
     version: 8,
-    // Plotters draw text in their own fonts and ignore this, but the style spec wants a
+    // Plotters that draw text in their own fonts ignore this, but the style spec wants a
     // glyphs URL wherever a layer has text, and validating hosts refuse a style without.
-    glyphs: "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
+    glyphs: GLYPHS,
     state: {
       safetyDepth: { default: safetyDepth },
       // The SOUNDG label in the user's unit: `depth_m` or `depth_ft`.
@@ -198,6 +204,7 @@ export function buildStyle({
               { "max-fraction-digits": 0 },
             ],
           ],
+          "text-font": LABEL_FONT,
           "text-size": 10,
         },
         paint: {
@@ -213,6 +220,7 @@ export function buildStyle({
         "source-layer": "SOUNDG",
         layout: {
           "text-field": ["to-string", ["get", ["global-state", "depthLabel"]]],
+          "text-font": DEPTH_FONT,
           "text-size": 12,
           "text-allow-overlap": false,
         },
@@ -246,6 +254,7 @@ export function buildStyle({
         minzoom: 14,
         layout: {
           "text-field": ["to-string", ["get", ["global-state", "depthLabel"]]],
+          "text-font": DEPTH_FONT,
           "text-size": 10,
           "text-offset": [0, 0.9],
         },
