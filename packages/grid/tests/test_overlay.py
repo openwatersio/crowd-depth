@@ -237,6 +237,53 @@ def write_surface(path, lon0, lat0, depth, distance, count, sigma=None):
     rasterio.shutil.copy(sparse, path, driver="COG", compress="deflate", sparse_ok=True)
 
 
+@pytest.mark.parametrize(
+    "rows, cols, neighbors",
+    [
+        # Depths in one corner, crossing two levels, a lone sounding off their edge and a
+        # neighbor's sounding a pixel past it, capping the depths carried there.
+        ((300, 380), (40, 120), [(121.5, 340.5, 0.5)]),
+        # Depths a row short of the tile's south edge, which bounds the window: a sounding
+        # just past the tile caps that row, and one far from any depth is outside the window.
+        ((340, 399), (200, 280), [(240.5, 400.5, 0.5), (40.5, 40.5, 0.5)]),
+    ],
+)
+def test_surface_bands_worked_on_their_window_match_the_whole_tile(
+    tmp_path, monkeypatch, rows, cols, neighbors
+):
+    depth = np.full((400, 400), surface.NODATA, dtype=np.float32)
+    depth[rows[0] : rows[1], cols[0] : cols[1]] = np.linspace(1.0, 14.0, cols[1] - cols[0])
+    count = np.zeros_like(depth)
+    count[rows[0] + 10 : rows[1] - 10 : 7, cols[0] + 10 : cols[1] - 10 : 9] = 1
+    count[rows[0] - 10, cols[1] + 10] = 1
+    write_surface(tmp_path / "t.tif", -78, 33, depth, np.zeros_like(depth), count)
+    neighbor = tuple(
+        list(v) for v in zip(*((-78 + c / 400, 34 - r / 400, d) for c, r, d in neighbors))
+    )
+    windows = []
+
+    real = rasterio.io.DatasetReader.window_transform
+    monkeypatch.setattr(
+        rasterio.io.DatasetReader,
+        "window_transform",
+        lambda self, w: windows.append((w.width, w.height)) or real(self, w),
+    )
+
+    def worked(window_px):
+        monkeypatch.setattr(overlay, "WINDOW_PX", window_px)
+        return overlay.surface_bands(tmp_path / "t.tif", neighbor)
+
+    window_px = overlay.WINDOW_PX
+    whole, cropped = worked(10**6), worked(window_px)
+    # The whole tile, then a window of it.
+    assert windows[0] == (400, 400) and windows[1][0] * windows[1][1] < 400 * 400 / 4
+    assert whole[0].keys() == cropped[0].keys() and whole[4] == cropped[4]
+    pixel = 1 / 400
+    # The same shapes, but for where tracing starts: within a tenth of a pixel here.
+    for a, b in [*zip(whole[0].values(), cropped[0].values()), *zip(whole[1:4], cropped[1:4])]:
+        assert shapely.hausdorff_distance(a, b) < 0.1 * pixel
+
+
 def test_surface_bands_follow_the_surface(tmp_path):
     # A 1° tile, 100 pixels a side: 3 m in the west, 12 m in the east, nothing in the
     # north-east corner but one sounding the surface didn't reach.

@@ -33,24 +33,27 @@ The per-tile cells stage costs about the same (36 min serially for Chesapeake). 
 
 ## A planet day
 
-This assumes 8 cores and 32 GB, and the measured archive from [planet-size.md](planet-size.md): 1.96B active soundings in 7,295 tiles, 42 of which hold half of them, and about 900 tiles touched a day. Costs use the per-tile model in [per-tile-pipeline.md](per-tile-pipeline.md#planet-extrapolation-8-cores-32-gb): a fixed 8.7 s per tile (cells 0.9, surface 6.5, web 1.3) plus 47 s per million soundings (cells 20, surface 19.4, web 7.8) on M-series cores, with cheap cores 1.5× slower and 8 workers giving 6×. A daily run rebuilds cells in the touched tiles, and surfaces and web tiles in those and their neighbors.
+This assumes 8 cores and 32 GB, and the measured archive from [planet-size.md](planet-size.md): 1.96B active soundings in 7,295 tiles, 42 of which hold half of them, and about 900 tiles touched a day. Costs use the per-tile model in [per-tile-pipeline.md](per-tile-pipeline.md#planet-extrapolation-8-cores-32-gb), with cheap cores 1.5× slower than this laptop's M-series cores and 8 workers giving 6×, and these inputs:
 
-|                                                        |         Worker-hours | Wall time on cheap cores |
-| ------------------------------------------------------ | -------------------: | -----------------------: |
-| Full rebuild, per-tile as built                        |                   43 |                     11 h |
-| …of which fixed per-tile cost, mostly empty rasters    |                   18 |                          |
-| Daily at 1° granularity                                | 22–25 (30-day range) |                5.5–6.5 h |
-| Full rebuild with empty blocks skipped                 |                   29 |                    7.5 h |
-| Daily at 1° with empty blocks skipped                  |                19–22 |                  5–5.5 h |
-| Daily with empty blocks skipped and sub-tile dirtiness |            about 1–3 |                under 1 h |
+- **Cells:** 0.9 s per tile plus 22.7 s per million soundings, from a full Chesapeake build on main 42a9f95 (2,427 s for 98.5M soundings).
+- **Surface:** 2.8 s per tile with empty space skipped, the median of the Chesapeake's tiles under 10k soundings, against 6.5 s for the whole raster. Of that 2.8 s, about 1.2 s builds the COG's overviews, which nothing in the pipeline reads yet; without them a tile takes about 1.6 s. Plus 19.4 s per million soundings, which skipping empty space doesn't change: dense tiles spend it in their soundings and depth areas.
+- **Web tiles:** 1.3 s per tile plus 7.8 s per million.
+
+A daily run rebuilds cells in the touched tiles, and surfaces and web tiles in those and their neighbors.
+
+|                                                       | Worker-hours | Wall time on cheap cores |
+| ----------------------------------------------------- | -----------: | -----------------------: |
+| Full rebuild, whole rasters                           |           45 |                     11 h |
+| Full rebuild, empty space skipped                     |           37 |                    9.5 h |
+| …and the COG's overviews left out                     |           35 |                    8.5 h |
+| Daily at 1°, empty space skipped (30-day range)       |        23–27 |                    6–7 h |
+| Daily with empty space skipped and sub-tile dirtiness |    about 1–3 |                under 1 h |
 
 The last row is an estimate. It assumes dirty work follows each day's new tracks, a few percent of the dense tiles rather than all of them.
 
-The per-sounding cost decides the planet, not the fixed cost. With 7,295 tiles, the fixed cost is 18 of 43 worker-hours, and the dense tiles hold most of the work. A day's touched tiles and their neighbors hold 84% of all soundings, so a 1° daily run costs about 55% of a full rebuild as built and about 70% with block skipping, which saves the daily run only 3–4 worker-hours. Sub-tile dirtiness is the change that makes a daily run cheap, and the per-sounding cost of cells and surfaces is what decides a full rebuild.
+The per-sounding cost decides the planet, not the fixed cost. Skipping empty space takes the fixed cost from 18 to 10 worker-hours of a full rebuild, and to about 8 without overviews, while the soundings cost 27. A day's touched tiles and their neighbors hold 79 to 88% of all soundings, so a 1° daily run costs about two thirds of a full rebuild whatever the fixed cost. Sub-tile dirtiness is the change that makes a daily run cheap, and the per-sounding cost of cells and surfaces is what decides a full rebuild.
 
 The densest tile is a critical path of its own. The Galveston and Houston tile (29°N 95°W) holds 67M soundings, more than twice Chesapeake's densest, and needs about 45 min of cells and surface on one M-series core at the linear rate.
-
-Skipping empty raster blocks has the headroom to remove most of the fixed cost. On a 5,400-pixel tile with 512-pixel blocks, blocks with a sounding within about 200 m are a median 15% of a tile's blocks, and 17% on average across the 171 Chesapeake tiles under 100k soundings. Pixels within 200 m of a sounding are 1% of a median tile. If the fixed stages scale with pixels, as profiling suggests, block skipping cuts the fixed cost by roughly 5 times, which the table assumes.
 
 ## Not measured
 
