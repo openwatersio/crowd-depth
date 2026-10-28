@@ -58,6 +58,11 @@ CREATE TABLE IF NOT EXISTS lake.withdrawal_holds (
   source VARCHAR, key VARCHAR, seen INTEGER, confirmed BOOLEAN
 );
 CREATE TABLE IF NOT EXISTS lake.qc_batches (batch_id BIGINT, qc_version INTEGER);
+-- Each file's soundings per tile, and the batch they came in, so a tile's files are found
+-- without reading points sorted by tile for a file_id.
+CREATE TABLE IF NOT EXISTS lake.file_tiles (
+  file_id BIGINT, tile_id INTEGER, cell_id SMALLINT, batch_id BIGINT, n BIGINT
+);
 CREATE TABLE IF NOT EXISTS lake.store_meta (key VARCHAR, value VARCHAR);
 -- Tiles whose cells are built, the inputs fingerprint they were built from and a digest
 -- of the cells, so a build that stopped partway resumes where it was.
@@ -650,6 +655,7 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
                         con.execute(f"CALL ducklake_merge_adjacent_files('lake', '{table}')")
                     for table in (
                         "points",
+                        "file_tiles",
                         "cells",
                         "qc_flags",
                         "shoals",

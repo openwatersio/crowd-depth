@@ -77,8 +77,9 @@ FROM file_points
 
 def take_over(con, old: int, new: int):
     """Move file `old`'s points to file `new`, with their flags, which are keyed by file and
-    row (catalog.POINT_ID)."""
+    row (catalog.POINT_ID), and their tiles."""
     con.execute("UPDATE lake.points SET file_id = ? WHERE file_id = ?", [new, old])
+    con.execute("UPDATE lake.file_tiles SET file_id = ? WHERE file_id = ?", [new, old])
     con.execute(
         """UPDATE lake.qc_flags SET point_id = ($1::BIGINT << 32) | (point_id & 4294967295)
         WHERE point_id BETWEEN $2::BIGINT << 32 AND ($2::BIGINT << 32) | 4294967295
@@ -573,6 +574,11 @@ class Ingest:
             # Each flush is its own batch, the unit QC runs on now and when it's rerun.
             batch_id = self.last_batch = max(time.time_ns() // 1000, self.last_batch + 1)
             with self.timed("write"):
+                self.sql(
+                    f"""INSERT INTO lake.file_tiles
+                    SELECT file_id, tile_id, cell_id, {batch_id}, count(*) FROM pending
+                    GROUP BY ALL"""
+                )
                 self.sql(
                     f"""INSERT INTO lake.points BY NAME
                     SELECT *, {batch_id} AS batch_id FROM pending"""
