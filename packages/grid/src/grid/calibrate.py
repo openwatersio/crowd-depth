@@ -94,6 +94,12 @@ LOST_BOTTOM = 0.5
 LOST_MARGIN_M = 2.0
 STUCK_RUN = 60
 STUCK_REACH_M = 200
+# A searched vessel's lost readings over a flat, well-surveyed pixel (relief under
+# FLAT_RELIEF_M, uncertainty under ANCHOR_UNCERTAINTY_M) are set aside however they wander,
+# a stretch of them at a time: water that flat is no slip or bank a sounder reads true. On
+# the Chesapeake store one vessel's Gulf transit read 0.4 to 1.4 m in 20 m of water, in
+# stretches of a median 6 to 11 readings, never steady enough to be a stuck run.
+FLAT_RELIEF_M = 0.5
 # The seabed a run is judged over: the survey's, or the median of the corrected depths of
 # at least CROWD_VESSELS vessels, whichever is shallower, so water that has shoaled since
 # the survey isn't mistaken for a lost bottom. Against the survey on the Chesapeake, three
@@ -147,7 +153,8 @@ WHERE abs(o.m - r.depth) < {ANCHOR_DIFF_M}
 # (ties broken by row, so a run comes out the same every time), its stuck windows
 # (`unit_offsets`, `seabed_px`) joined where they overlap; a run counts from STUCK_RUN
 # stuck windows across STUCK_REACH_M, and starts and ends on a lost reading, so a bank
-# crossed just before the sounder sticks at its depth isn't in it.
+# crossed just before the sounder sticks at its depth isn't in it. With them, each stretch
+# of lost readings over flat pixels.
 STUCK = f"""
 WITH p AS (
   SELECT p.file_id, p.row, p.unique_id AS vessel, p.time, p.lon, p.lat, p.depth_raw AS raw,
@@ -168,6 +175,7 @@ WITH p AS (
 w AS (
   SELECT p.*,
     coalesce(tr < {LOST_BOTTOM} * (u.o + s.z) AND tr < u.o + s.z - {LOST_MARGIN_M}, false) AS lost,
+    coalesce(s.flat, false) AS flat,
     row_number() OVER (PARTITION BY p.file_id ORDER BY time, raw, row) AS i
   FROM p JOIN unit_offsets u USING (vessel, file_id)
   LEFT JOIN seabed_px s ON s.tile_id = $tile AND s.py = p.py AND s.px = p.px
@@ -191,6 +199,11 @@ m AS (
 l AS (
   SELECT *, i - row_number() OVER (PARTITION BY file_id ORDER BY time, raw, row) AS run
   FROM m WHERE member
+),
+k AS (
+  SELECT *, i - row_number() OVER (PARTITION BY file_id, lost AND flat ORDER BY time, raw, row)
+    AS run
+  FROM w
 )
 -- From its first lost reading to its last, so a true one before or after stays out.
 SELECT f.content_hash, l.vessel, $tile AS tile_id, min(l.time) FILTER (WHERE l.lost) AS t_start,
@@ -201,6 +214,10 @@ HAVING count(*) FILTER (WHERE l.stuck) >= {STUCK_RUN} AND 6371000 * sqrt(
   pow(radians(max(l.lat) FILTER (WHERE l.lost) - min(l.lat) FILTER (WHERE l.lost)), 2)
   + pow(radians(max(l.lon) FILTER (WHERE l.lost) - min(l.lon) FILTER (WHERE l.lost))
     * cos(radians(avg(l.lat))), 2)) >= {STUCK_REACH_M}
+UNION
+SELECT f.content_hash, k.vessel, $tile, min(k.time), max(k.time)
+FROM k JOIN lake.files f USING (file_id) WHERE k.lost AND k.flat
+GROUP BY f.content_hash, k.vessel, k.file_id, k.run
 """
 
 
@@ -225,15 +242,18 @@ def reduce(con):
 
 def reference_px(con):
     """The temp tables `anchor_px`, the reference that would anchor at each pixel, and
-    `survey_px`, the depth of each pixel a reference has one for: at each pixel, the
-    reference with the least uncertainty there. Picked once per run and a tile at a time,
+    `survey_px`, the depth of each pixel a reference has one for and whether it's flat
+    (FLAT_RELIEF_M): at each pixel, the reference with the least uncertainty there. Picked once per run and a tile at a time,
     so memory follows a tile's reference pixels rather than every one."""
     best = "QUALIFY row_number() OVER (PARTITION BY py, px ORDER BY uncertainty, source) = 1"
     con.execute(
         """CREATE OR REPLACE TEMP TABLE anchor_px (tile_id INTEGER, py INTEGER, px INTEGER,
         depth FLOAT)"""
     )
-    con.execute("CREATE OR REPLACE TEMP TABLE survey_px AS FROM anchor_px LIMIT 0")
+    con.execute(
+        """CREATE OR REPLACE TEMP TABLE survey_px (tile_id INTEGER, py INTEGER, px INTEGER,
+        depth FLOAT, flat BOOLEAN)"""
+    )
     # Only tiles calibration has medians in: no other pixel is joined.
     tiles = con.execute("SELECT DISTINCT tile_id FROM cal_obs ORDER BY 1").fetchall()
     for (tile,) in tiles:
@@ -248,7 +268,9 @@ def reference_px(con):
             {"tile": tile},
         )
         con.execute(
-            f"""INSERT INTO survey_px SELECT tile_id, py, px, depth FROM lake.reference_pixels
+            f"""INSERT INTO survey_px SELECT tile_id, py, px, depth,
+              coalesce(relief < {FLAT_RELIEF_M} AND uncertainty < {ANCHOR_UNCERTAINTY_M}, false)
+            FROM lake.reference_pixels
             WHERE tile_id = $tile AND depth IS NOT NULL {best}""",
             {"tile": tile},
         )
@@ -257,8 +279,9 @@ def reference_px(con):
 def stuck_runs(con, offset, status):
     """Runs of soundings whose sounder lost the bottom, as rows (content hash, vessel, tile,
     start, end): every file of a month set aside in a tile, there and that month, and the
-    stuck runs of the vessels with a month at STUCK_SHARE. From segments whose offset is applied: only those
-    say what a vessel should read."""
+    stuck runs and lost readings over flat pixels of the vessels with a month at
+    STUCK_SHARE. From segments whose offset is applied: only those say what a vessel should
+    read."""
     applied = np.isin(status, APPLIED)
     con.register("offsets_np", {"unit": np.flatnonzero(applied), "o": np.asarray(offset)[applied]})
     con.execute(
@@ -275,7 +298,7 @@ def stuck_runs(con, offset, status):
           GROUP BY ALL HAVING count(*) >= {CROWD_VESSELS}
         )
         -- least() passes over a NULL: either alone, or the shallower of both.
-        SELECT tile_id, py, px, least(s.depth, c.z) AS z
+        SELECT tile_id, py, px, least(s.depth, c.z) AS z, s.flat
         FROM survey_px s FULL JOIN crowd c USING (tile_id, py, px)"""
     )
     # Each vessel's calendar months in each tile: how many of its file-pixel medians were

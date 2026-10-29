@@ -849,6 +849,8 @@ def stuck(n, vessel, depth, slot, cols=(0, 240), step=2):
     ],
 )
 def test_a_stuck_run_must_last_and_go_somewhere(env, tmp_path, monkeypatch, case, runs):  # noqa: F811
+    # Over a seabed with relief, where lost readings that aren't a stuck run are kept.
+    monkeypatch.setattr(calibrate, "FLAT_RELIEF_M", 0)
     lost = {
         "moving": stuck(20, "AQM-T", 0.8, 20),
         "moored": stuck(20, "AQM-T", 0.8, 20, step=0),
@@ -957,6 +959,35 @@ def test_a_month_is_set_aside_only_in_its_month(env, tmp_path, monkeypatch):  # 
     assert got == [(False, True, True), (True, False, False)]
 
 
+@pytest.mark.parametrize("relief, set_aside", [(calibrate.FLAT_RELIEF_M, True), (0, False)])
+def test_lost_readings_that_wander_over_flat_water_are_set_aside(
+    env,  # noqa: F811
+    tmp_path,
+    monkeypatch,
+    relief,
+    set_aside,
+):
+    # T's month reads true but for one transit's stretches of 8 readings at 0.4 to 1.4 m,
+    # never a stuck run and a few percent of its pixels: over the flat survey, they're set
+    # aside and the readings between them kept; over relief, all of them are kept.
+    monkeypatch.setattr(calibrate, "STUCK_SHARE", 0.01)
+    monkeypatch.setattr(calibrate, "FLAT_RELIEF_M", relief)
+    n, rows, vessel = transit(20, "AQM-T", 5.4, (0, 240), 20)
+    rows = [
+        (ts, x, y, 0.4 + 0.2 * (i % 6) if i % 40 < 8 else d) for i, (ts, x, y, d) in enumerate(rows)
+    ]
+    fleet = [
+        *(transit(1 + i, "AQM-T", 5.4, (0, 240), i) for i in range(10)),
+        (n, rows, vessel),
+        *(transit(30 + i, "AQM-A", 9.5, (0, 240), 30 + i) for i in range(3)),
+    ]
+    calibrated(env, fleet, reference(tmp_path / "ref.tif", (0, 240)), monkeypatch)
+    got = {
+        (raw < 2, c) for u, _, raw, c in corrected(env, "depth_raw, lost_bottom") if u == "AQM-T"
+    }
+    assert got == ({(True, True), (False, False)} if set_aside else {(True, False), (False, False)})
+
+
 def test_a_stuck_run_holds_through_a_stray_reading(env, tmp_path, monkeypatch):  # noqa: F811
     # One reading in 15 jumps to 1.6 m: still lost, and two to a window, under its top tenth.
     n, rows, vessel = stuck(20, "AQM-T", 0.8, 20)
@@ -996,7 +1027,7 @@ def test_stuck_run_windows_order_soundings_the_same_every_time():
     # Soundings of one file can share a time and depth: ordered by those alone, which of
     # them a window holds, and so the runs found, could change from run to run.
     orders = re.findall(r"ORDER BY ([^)\n]*?)(?:\s+ROWS|\)|\n)", calibrate.STUCK)
-    assert len(orders) == 4 and all(o.strip() == "time, raw, row" for o in orders), orders
+    assert len(orders) == 5 and all(o.strip() == "time, raw, row" for o in orders), orders
 
 
 def test_a_sounder_holding_one_depth_is_a_stuck_run(env, tmp_path, monkeypatch):  # noqa: F811
