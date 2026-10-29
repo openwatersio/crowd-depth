@@ -813,14 +813,17 @@ def publish(con, rows, stray=(), accept_losses=False, runs=()):
             was_settled,
         )
         con.execute("DROP TABLE old_runs")
-        # The calibration these runs were found under: one that differs, from an older build
-        # or a run that stopped short, leaves them stale.
+        # Until the calibration these runs were found under is recorded, they're stale.
         con.execute("DELETE FROM lake.store_meta WHERE key = 'stuck_runs'")
-        con.execute("INSERT INTO lake.store_meta VALUES ('stuck_runs', ?)", [calibrated_by(kept)])
         con.execute("COMMIT")
     except BaseException:
         con.execute("ROLLBACK")
         raise
+    # The calibration as the store holds it once committed, which can round an offset to
+    # another single-precision value than numpy does. A run that stops before this leaves
+    # them stale, and `grid cells` waits for `grid calibrate`.
+    stored = con.execute("SELECT * FROM lake.calibration").fetchall()
+    con.execute("INSERT INTO lake.store_meta VALUES ('stuck_runs', ?)", [calibrated_by(stored)])
     return dirty + assign(con, was_settled)
 
 

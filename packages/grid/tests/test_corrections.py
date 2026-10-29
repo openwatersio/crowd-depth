@@ -1076,6 +1076,16 @@ def test_stuck_runs_from_another_calibration_arent_current(env, tmp_path, monkey
         cli.main(["--store", str(env.store.root), "cells"])
 
 
+def test_stuck_runs_are_current_for_an_offset_the_store_rounds_its_own_way(env):  # noqa: F811
+    # The store keeps this offset as -1.79755878 where numpy's single precision is
+    # -1.79755867: the runs are found under the offset as the store holds it.
+    env.run("noaa")
+    row = ("AQM-T", 0, None, None, -1.7975586593173563, 0.1, "anchored", 100, 5, 0)
+    with open_store(env.store) as con:
+        calibrate.publish(con, [row])
+        assert calibrate.runs_current(con)
+
+
 def test_a_recalibration_leaves_changed_tiles_to_rebuild(env, tmp_path, monkeypatch):  # noqa: F811
     calibrated(env, FLEET, reference(tmp_path / "ref.tif", (0, 110)), monkeypatch)
     with open_store(env.store) as con:
