@@ -99,6 +99,11 @@ STUCK_REACH_M = 200
 # the survey isn't mistaken for a lost bottom. Against the survey on the Chesapeake, three
 # vessels found 96% of the soundings it did, at 98% precision.
 CROWD_VESSELS = 3
+# Calibration's medians that read lost against a solve's offsets, by the same test and over
+# the same seabed, are left out of the next solve, which is judged again, for at most
+# LOST_PASSES passes: a vessel that often loses the bottom would otherwise be calibrated too
+# shallow, and every sounding it reads true corrected too deep.
+LOST_PASSES = 3
 # A vessel's calendar month with MONTH_SHARE or more of its pixels reading lost (from
 # MONTH_PIXELS judged) is set aside whole: on the Chesapeake 14 months of 7 vessels, a
 # fifth of the stuck readings, at 61,000 good pixels. A vessel with any month at
@@ -235,9 +240,9 @@ CODE = hashlib.sha256(
 ).hexdigest()[:16]
 
 # Rows at anchor-quality reference pixels (`anchor_px`), with the difference from the
-# reference.
+# reference and whether the row reads lost.
 ANCHOR_ROWS = f"""
-SELECT o.vessel, o.file_id, o.t, o.tile_id, o.py, o.px, o.m - r.depth AS e, r.depth AS z
+SELECT o.vessel, o.file_id, o.t, o.tile_id, o.py, o.px, o.m - r.depth AS e, r.depth AS z, o.lost
 FROM cal_obs o JOIN anchor_px r USING (tile_id, py, px)
 WHERE abs(o.m - r.depth) < {ANCHOR_DIFF_M}
 """
@@ -388,7 +393,10 @@ def reduce(con, full=False):
         "SELECT (SELECT count(*) FROM cal_dirty), (SELECT count(*) FROM cal_inputs)"
     ).fetchall()
     log.info("calibrate: reduced %d of %d files, in %d tiles", files, of, len(tiles))
-    con.execute("CREATE OR REPLACE TEMP TABLE cal_obs AS FROM lake.file_medians")
+    # Whether a median reads lost depends on the offsets, so it's judged each run, not kept.
+    con.execute(
+        "CREATE OR REPLACE TEMP TABLE cal_obs AS SELECT *, false AS lost FROM lake.file_medians"
+    )
     con.execute("DROP TABLE cal_inputs")
     con.execute("DROP TABLE cal_dirty")
     return len(tiles), files
@@ -529,7 +537,8 @@ def units_for(con, segments):
 
 def crossings(con):
     """The temp table `xrows`: each unit's median at pixels two or more units share,
-    weighted so each transit counts once across its crossing pixels."""
+    weighted so each transit counts once across its crossing pixels, from rows not read
+    lost. `xobs` keeps the lost ones, for a transit's offset to show it lost the bottom."""
     con.execute(
         """CREATE OR REPLACE TEMP TABLE xobs AS
         WITH o AS (SELECT o.*, u.unit FROM cal_obs o JOIN file_units u USING (vessel, file_id)),
@@ -538,9 +547,10 @@ def crossings(con):
     )
     con.execute(
         """CREATE OR REPLACE TEMP TABLE xrows AS
-        WITH n AS (SELECT vessel, file_id, count(*) AS n FROM xobs GROUP BY ALL)
+        WITH x AS (FROM xobs WHERE NOT lost),
+        n AS (SELECT vessel, file_id, count(*) AS n FROM x GROUP BY ALL)
         SELECT tile_id, py, px, unit, median(m) AS m, sum(1.0 / n.n) AS b
-        FROM xobs JOIN n USING (vessel, file_id) GROUP BY ALL ORDER BY tile_id"""
+        FROM x JOIN n USING (vessel, file_id) GROUP BY ALL ORDER BY tile_id"""
     )
 
 
@@ -550,6 +560,7 @@ def anchors(con, n_units):
     rows = con.execute(
         f"""WITH a AS (
           SELECT a.*, u.unit FROM ({ANCHOR_ROWS}) a JOIN file_units u USING (vessel, file_id)
+          WHERE NOT a.lost
         ),
         f AS (SELECT unit, file_id, median(e) AS e FROM a GROUP BY ALL),
         g AS (SELECT unit, count(DISTINCT (tile_id, py, px)) AS pixels FROM a GROUP BY unit)
@@ -663,10 +674,11 @@ def inverse_diagonal(lu, n, batch=256):
     return out
 
 
-def transit_offsets(con, offset):
+def transit_offsets(con, offset, lost=False):
     """Each transit's offset, as rows (vessel, file_id, start, offset, seabed depth) in time
     order: against the reference where it has one, elsewhere against the pixel depths of
-    the units other than its own, which are also the seabed it's judged over."""
+    the units other than its own, which are also the seabed it's judged over. From its rows
+    read lost too where `lost`, so a transit that lost the bottom shows it."""
     con.register("offsets_np", {"unit": np.arange(len(offset)), "o": offset})
     rows = con.execute(
         f"""WITH x AS (SELECT x.*, o.o FROM xrows x JOIN offsets_np o USING (unit)),
@@ -679,12 +691,12 @@ def transit_offsets(con, offset):
           FROM x JOIN px USING (tile_id, py, px) WHERE px.w > x.b
         ),
         e AS (
-          SELECT o.vessel, o.file_id, o.t, o.m - z.z AS e, z.z AS z
+          SELECT o.vessel, o.file_id, o.t, o.m - z.z AS e, z.z AS z, o.lost
           FROM xobs o JOIN others z USING (tile_id, py, px, unit)
           UNION ALL BY NAME {ANCHOR_ROWS}
         )
         SELECT e.vessel, e.file_id, f.time_min AS t, median(e) AS e, median(z) AS z
-        FROM e JOIN lake.files f USING (file_id) GROUP BY ALL
+        FROM e JOIN lake.files f USING (file_id) WHERE {bool(lost)} OR NOT e.lost GROUP BY ALL
         HAVING count(*) >= {STEP_PIXELS} ORDER BY e.vessel, t, e.file_id"""
     ).fetchall()
     con.unregister("offsets_np")
@@ -760,8 +772,68 @@ def segments_from(series):
     return out
 
 
+def solve_without_lost(con, n_units):
+    """Solve, judge each of calibration's medians lost against the offsets, and solve
+    again without the lost ones while that changes which they are, for at most LOST_PASSES
+    passes. Returns (offset, se, anchored component mask, anchor offset, anchor pixels,
+    anchor transits)."""
+    for i in range(LOST_PASSES + 1):
+        crossings(con)
+        anchor, anchor_se, pixels, transits = anchors(con, n_units)
+        offset, se, anchored = solve(con, n_units, anchor, anchor_se)
+        if i == LOST_PASSES or not judge_lost(con, offset, anchored):
+            return offset, se, anchored, anchor, pixels, transits
+
+
+def judge_lost(con, offset, anchored):
+    """Mark each row of `cal_obs` lost or not by `offset`, over the seabed `stuck_runs`
+    judges by: the survey's, or the crowd's where shallower. A unit no anchor reaches has
+    no offset to judge by, and its rows aren't lost. Returns how many rows changed."""
+    con.register(
+        "offsets_np", {"unit": np.flatnonzero(anchored), "o": np.asarray(offset)[anchored]}
+    )
+    con.execute(
+        f"""CREATE OR REPLACE TEMP TABLE lost_change AS
+        WITH o AS (
+          SELECT c.tile_id, c.py, c.px, c.vessel, c.file_id, c.m, c.lost, u.o
+          FROM cal_obs c JOIN file_units USING (vessel, file_id) JOIN offsets_np u USING (unit)
+        ),
+        crowd AS (
+          SELECT tile_id, py, px, median(z) AS z FROM (
+            SELECT tile_id, py, px, vessel, median(m - o) AS z FROM o GROUP BY ALL)
+          GROUP BY ALL HAVING count(*) >= {CROWD_VESSELS}
+        ),
+        seabed AS (
+          SELECT tile_id, py, px, least(s.depth, c.z) AS z
+          FROM survey_px s FULL JOIN crowd c USING (tile_id, py, px)
+        ),
+        judged AS (
+          SELECT o.tile_id, o.py, o.px, o.file_id, o.lost,
+            coalesce(o.m < {LOST_BOTTOM} * (s.z + o.o) AND o.m < s.z + o.o - {LOST_MARGIN_M},
+              false) AS now
+          FROM o LEFT JOIN seabed s USING (tile_id, py, px)
+        )
+        SELECT tile_id, py, px, file_id, now FROM judged WHERE now <> lost
+        UNION ALL
+        SELECT c.tile_id, c.py, c.px, c.file_id, false FROM cal_obs c
+        JOIN file_units USING (vessel, file_id)
+        WHERE c.lost AND unit NOT IN (SELECT unit FROM offsets_np)"""
+    )
+    con.unregister("offsets_np")
+    con.execute(
+        """UPDATE cal_obs c SET lost = l.now FROM lost_change l
+        WHERE c.tile_id = l.tile_id AND c.py = l.py AND c.px = l.px AND c.file_id = l.file_id"""
+    )
+    changed = con.execute("SELECT count(*) FROM lost_change").fetchone()[0]
+    con.execute("DROP TABLE lost_change")
+    log.info("calibrate: %d medians judged lost or no longer lost", changed)
+    return changed
+
+
 def crossing_transits(con, n_units):
-    rows = con.execute("SELECT unit, count(DISTINCT file_id) FROM xobs GROUP BY unit").fetchall()
+    rows = con.execute(
+        "SELECT unit, count(DISTINCT file_id) FROM xobs WHERE NOT lost GROUP BY unit"
+    ).fetchall()
     n = np.zeros(n_units, int)
     for unit, k in rows:
         n[unit] = k
@@ -782,17 +854,13 @@ def run(con, references=(), accept_losses=False) -> dict:
         log.info("calibrate: no tide-reduced soundings to calibrate")
         return {"tiles": tiles, "reduced_files": reduced, "segments": 0}
     reference_px(con)
-    crossings(con)
-    anchor, anchor_se, *_ = anchors(con, len(names))
-    first, _, _ = solve(con, len(names), anchor, anchor_se)
+    first, *_ = solve_without_lost(con, len(names))
     segments = segments_from(series(transit_offsets(con, first)))
     # Pass 2: a unit per segment.
     names = units_for(con, segments)
-    crossings(con)
-    anchor, anchor_se, pixels, transits = anchors(con, len(names))
-    offset, se, anchored = solve(con, len(names), anchor, anchor_se)
+    offset, se, anchored, anchor, pixels, transits = solve_without_lost(con, len(names))
     crossed = crossing_transits(con, len(names))
-    stray = outliers(con, transit_offsets(con, offset), offset, se, anchored)
+    stray = outliers(con, transit_offsets(con, offset, lost=True), offset, se, anchored)
     status = np.where(
         ~np.isnan(anchor),
         "anchored",
