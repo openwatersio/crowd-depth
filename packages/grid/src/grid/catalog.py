@@ -116,8 +116,8 @@ CREATE TABLE IF NOT EXISTS lake.file_offsets (
   file_id BIGINT, vessel VARCHAR, offset_m FLOAT, se_m FLOAT, excluded BOOLEAN,
   lost_bottom BOOLEAN
 );
--- Runs of a file's soundings whose sounder lost the bottom, in one tile or, with no tile,
--- in all of them; by content, as ingest may move the soundings to another file.
+-- Runs of a file's soundings in one tile whose sounder lost the bottom; by content, as
+-- ingest may move the soundings to another file.
 CREATE TABLE IF NOT EXISTS lake.lost_runs (
   content_hash VARCHAR, vessel VARCHAR, tile_id INTEGER, t_start TIMESTAMP, t_end TIMESTAMP
 );
@@ -258,7 +258,7 @@ p AS (
     coalesce(o.lost_bottom, false) OR EXISTS (
       SELECT 1 FROM lake.lost_runs r JOIN lake.files f USING (content_hash)
       WHERE f.file_id = p.file_id AND r.vessel = p.unique_id
-        AND (r.tile_id IS NULL OR r.tile_id = p.tile_id)
+        AND r.tile_id = p.tile_id
         AND p.time BETWEEN r.t_start AND r.t_end
     ) AS lost_bottom,
     l.level + l.slope * epoch(p.time - l.slot) AS tide,

@@ -99,10 +99,12 @@ STUCK_REACH_M = 200
 # the survey isn't mistaken for a lost bottom. Against the survey on the Chesapeake, three
 # vessels found 96% of the soundings it did, at 98% precision.
 CROWD_VESSELS = 3
-# A vessel's calendar month with MONTH_SHARE or more of its pixels reading lost (from
-# MONTH_PIXELS judged) is set aside whole: on the Chesapeake 14 months of 7 vessels, a
-# fifth of the stuck readings, at 61,000 good pixels. A vessel with any month at
-# STUCK_SHARE or more has its stuck runs found too; the others aren't searched.
+# A vessel's calendar month in a 1° tile with MONTH_SHARE or more of its pixels there
+# reading lost (from MONTH_PIXELS judged) is set aside in that tile, so a sounder that lost
+# the bottom in one bay keeps its soundings in the next: with stuck runs, 2.47M soundings
+# on the Chesapeake store, where judging the month across its tiles set aside 3.05M. A
+# vessel with any month at STUCK_SHARE or more, across its tiles, has its stuck runs found
+# too; the others aren't searched.
 MONTH_SHARE = 0.2
 STUCK_SHARE = 0.05
 MONTH_PIXELS = 100
@@ -254,8 +256,8 @@ def reference_px(con):
 
 def stuck_runs(con, offset, status):
     """Runs of soundings whose sounder lost the bottom, as rows (content hash, vessel, tile,
-    start, end): every file of a month set aside, with no tile, and the stuck runs of the
-    vessels with a month at STUCK_SHARE. From segments whose offset is applied: only those
+    start, end): every file of a month set aside in a tile, there and that month, and the
+    stuck runs of the vessels with a month at STUCK_SHARE. From segments whose offset is applied: only those
     say what a vessel should read."""
     applied = np.isin(status, APPLIED)
     con.register("offsets_np", {"unit": np.flatnonzero(applied), "o": np.asarray(offset)[applied]})
@@ -276,27 +278,32 @@ def stuck_runs(con, offset, status):
         SELECT tile_id, py, px, least(s.depth, c.z) AS z
         FROM survey_px s FULL JOIN crowd c USING (tile_id, py, px)"""
     )
-    # Each vessel's calendar months: the share of its file-pixel medians reading lost.
+    # Each vessel's calendar months in each tile: how many of its file-pixel medians were
+    # judged, and how many read lost.
     con.execute(
         f"""CREATE OR REPLACE TEMP TABLE vessel_months AS
-        SELECT o.vessel, date_trunc('month', o.t) AS month, count(*) AS judged,
-          avg((o.m < {LOST_BOTTOM} * (s.z + u.o) AND o.m < s.z + u.o - {LOST_MARGIN_M})::INTEGER)
-            AS lost_share
+        SELECT o.vessel, date_trunc('month', o.t) AS month, o.tile_id, count(*) AS judged,
+          count(*) FILTER (WHERE o.m < {LOST_BOTTOM} * (s.z + u.o)
+            AND o.m < s.z + u.o - {LOST_MARGIN_M}) AS lost
         FROM cal_obs o JOIN unit_offsets u USING (vessel, file_id)
         JOIN seabed_px s USING (tile_id, py, px)
-        GROUP BY ALL HAVING count(*) >= {MONTH_PIXELS}"""
+        GROUP BY ALL"""
     )
+    # Searched by the month across its tiles, as the search finds runs in any of them.
     con.execute(
         f"""CREATE OR REPLACE TEMP TABLE stuck_vessels AS
-        SELECT DISTINCT vessel FROM vessel_months WHERE lost_share >= {STUCK_SHARE}"""
+        SELECT DISTINCT vessel FROM vessel_months GROUP BY vessel, month
+        HAVING sum(judged) >= {MONTH_PIXELS} AND sum(lost) >= {STUCK_SHARE} * sum(judged)"""
     )
-    # A month set aside whole: each of its judged files, in every tile.
+    # A month set aside in a tile: each of its judged files' soundings there that month.
     runs = con.execute(
-        f"""SELECT DISTINCT f.content_hash, f.vessel, NULL::INTEGER, f.time_min, f.time_max
+        f"""SELECT DISTINCT f.content_hash, f.vessel, o.tile_id, greatest(f.time_min, m.month),
+          least(f.time_max, m.month + INTERVAL 1 MONTH - INTERVAL 1 MICROSECOND)
         FROM cal_obs o JOIN unit_offsets USING (vessel, file_id) JOIN vessel_months m
-          ON m.vessel = o.vessel AND m.month = date_trunc('month', o.t)
+          ON m.vessel = o.vessel AND m.month = date_trunc('month', o.t) AND m.tile_id = o.tile_id
         JOIN lake.files f ON f.file_id = o.file_id
-        WHERE f.status = 'active' AND m.lost_share >= {MONTH_SHARE}"""
+        WHERE f.status = 'active' AND m.judged >= {MONTH_PIXELS}
+          AND m.lost >= {MONTH_SHARE} * m.judged"""
     ).fetchall()
     # ponytail: a file's run is found and applied per tile, so one that crosses a tile edge
     # is two; judge across tiles if the seams show
@@ -735,7 +742,8 @@ def publish(con, rows, stray=(), accept_losses=False, runs=()):
         con.execute("DELETE FROM lake.lost_runs")
         if runs:
             con.executemany("INSERT INTO lake.lost_runs VALUES (?, ?, ?, ?, ?)", runs)
-        # The tiles of soundings a run now takes, or no longer takes.
+        # The tiles of soundings a run now takes, or no longer takes. A store calibrated
+        # before months were judged by tile holds months with no tile, in every tile.
         dirty = cells.stale(
             con,
             """SELECT p.tile_id FROM lake.points p JOIN lake.files f USING (file_id)

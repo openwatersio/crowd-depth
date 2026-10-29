@@ -886,10 +886,75 @@ def test_a_month_mostly_lost_is_set_aside(env, tmp_path, monkeypatch, good, shar
         *(transit(30 + i, "AQM-A", 9.5, (0, 240), 30 + i) for i in range(3)),
     ]
     calibrated(env, fleet, reference(tmp_path / "ref.tif", (0, 240)), monkeypatch)
-    assert env.query(
-        "SELECT count(*) FILTER (WHERE tile_id IS NULL), count(*) FILTER (WHERE tile_id IS NOT NULL)"
-        " FROM lake.lost_runs"
-    ) == [(months, runs)]
+    # A month's files are a row each in its tile, beside the stuck run's own.
+    assert env.query("SELECT count(*) FROM lake.lost_runs") == [(months + runs,)]
+
+
+def test_a_month_is_set_aside_only_in_the_tiles_it_read_lost(env, tmp_path, monkeypatch):  # noqa: F811
+    # T's month: lost on half its pixels here, true over the survey in the next tile, a
+    # third lost across both. The file that crosses into the next tile keeps its soundings
+    # there; here, the month's files are set aside.
+    monkeypatch.setattr(calibrate, "MONTH_PIXELS", 1)
+    monkeypatch.setattr(calibrate, "STUCK_SHARE", 1.0)
+    here, beyond = (0, 240), (cells.BASE, cells.BASE + 480)
+    refs = tmp_path / "refs"
+    refs.mkdir()
+    reference(refs / "here.tif", here)
+    reference(refs / "beyond.tif", beyond)
+    _, lost, _ = stuck(0, "AQM-T", 0.8, 20)
+    _, true, _ = transit(0, "AQM-T", 5.4, beyond, 21)
+    fleet = [
+        *(transit(1 + i, "AQM-T", 5.4, here, i) for i in range(2)),
+        stuck(10, "AQM-T", 0.8, 10),
+        (20, lost + true, "AQM-T"),
+        *(transit(30 + i, "AQM-A", 9.5, here, 30 + i) for i in range(3)),
+    ]
+    calibrated(env, fleet, str(refs), monkeypatch)
+    assert {t for (t,) in env.query("SELECT DISTINCT tile_id FROM lake.lost_runs")} == {TILE}
+    crossing = env.query(
+        """SELECT p.tile_id, bool_and(p.lost_bottom), bool_or(p.lost_bottom)
+        FROM corrected_points_in((SELECT any_value(cell_id) FROM lake.points), [], 0, 10800) p
+        JOIN lake.files f USING (file_id) WHERE ends_with(f.key, '_20_pointData.csv')
+        GROUP BY 1 ORDER BY 1"""
+    )
+    assert crossing == [(TILE, True, True), (TILE + 1, False, False)]
+    # From a store whose month had no tile, the next tile's soundings come back stale.
+    with open_store(env.store) as con:
+        con.execute(
+            "DELETE FROM lake.lost_runs; DELETE FROM lake.tile_changes;"
+            " INSERT INTO lake.lost_runs SELECT content_hash, vessel, NULL, time_min, time_max"
+            " FROM lake.files WHERE ends_with(key, '_20_pointData.csv')"
+        )
+        calibrate.run(con, [str(refs)])
+    assert (TILE + 1,) in env.query("SELECT DISTINCT tile_id FROM lake.tile_changes")
+
+
+def test_a_month_is_set_aside_only_in_its_month(env, tmp_path, monkeypatch):  # noqa: F811
+    # A file running from last month into this one, in one tile: lost last month, true in
+    # this. Its soundings this month are kept.
+    monkeypatch.setattr(calibrate, "MONTH_PIXELS", 1)
+    monkeypatch.setattr(calibrate, "STUCK_SHARE", 1.0)
+    ref = reference(tmp_path / "ref.tif", (0, 480))
+    month = datetime(T0.year, T0.month, 1)
+    start = (month - T0).total_seconds()
+    _, lost, _ = stuck(0, "AQM-T", 0.8, 0)
+    _, true, _ = transit(0, "AQM-T", 5.4, (240, 480), 0)
+    lost = [(start - 3600 + ts, x, y, d) for ts, x, y, d in lost]
+    true = [(start + 60 + ts, x, y, d) for ts, x, y, d in true]
+    fleet = [
+        *(transit(1 + i, "AQM-T", 5.4, (0, 480), i) for i in range(2)),
+        (20, lost + true, "AQM-T"),
+        *(transit(30 + i, "AQM-A", 9.5, (0, 480), 30 + i) for i in range(3)),
+    ]
+    calibrated(env, fleet, ref, monkeypatch)
+    got = env.query(
+        """SELECT p.time >= $month, bool_and(p.lost_bottom), bool_or(p.lost_bottom)
+        FROM corrected_points_in((SELECT any_value(cell_id) FROM lake.points), [], 0, 10800) p
+        JOIN lake.files f USING (file_id) WHERE ends_with(f.key, '_20_pointData.csv')
+        GROUP BY 1 ORDER BY 1""",
+        {"month": month},
+    )
+    assert got == [(False, True, True), (True, False, False)]
 
 
 def test_a_stuck_run_holds_through_a_stray_reading(env, tmp_path, monkeypatch):  # noqa: F811
