@@ -3,6 +3,8 @@
 # coverage, tippecanoe from Open Waters' image, Node and the Slackwater engine for tide
 # levels, and uv, which installs Python and the locked dependencies. The package is
 # mounted at /app, not copied in; the Slackwater helper is copied with its locked modules.
+# A C compiler builds the dependencies with no wheel for a Python uv installs: immutables,
+# which Snakemake needs, has none for 3.14. libc6-dev follows the image's libc6.
 FROM ghcr.io/openwatersio/tippecanoe:2.79 AS tippecanoe
 FROM node:24.11.1-bookworm-slim AS slackwater
 WORKDIR /opt/slackwater
@@ -10,6 +12,7 @@ COPY slackwater/package.json slackwater/package-lock.json slackwater/predict.mjs
 RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund
 FROM ghcr.io/osgeo/gdal:ubuntu-small-3.11.4
 RUN apt-get update && apt-get install -y --no-install-recommends potrace=1.16-2build1 \
+    gcc=4:13.2.0-7ubuntu1 libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=tippecanoe /usr/local/bin/tippecanoe /usr/local/bin/tippecanoe-decode /usr/local/bin/tile-join /usr/local/bin/
 COPY --from=slackwater /usr/local/bin/node /usr/local/bin/
