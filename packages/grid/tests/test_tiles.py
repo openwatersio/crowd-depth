@@ -220,7 +220,7 @@ def test_the_worker_stops_its_jobs_when_its_parent_is_killed(tmp_path):
         stdout=subprocess.PIPE,
         text=True,
     )
-    sock, pid = parent.stdout.readline().split()
+    sock, _ = parent.stdout.readline().split()
     client, pipe = blocking_job(sock, tmp_path / "run")
     parent.kill()
     parent.wait()
@@ -228,12 +228,15 @@ def test_the_worker_stops_its_jobs_when_its_parent_is_killed(tmp_path):
     with pytest.raises(BrokenPipeError):
         os.write(pipe, b"x")
     os.close(pipe)
+    # Gone once it no longer listens: its pid can outlast it as a zombie, where the
+    # container's init (uv, in CI) doesn't reap orphans.
     for _ in range(100):
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(int(pid), 0)
-            time.sleep(0.1)
-            continue
-        break
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.connect(sock)
+        except (ConnectionRefusedError, FileNotFoundError):
+            break
+        time.sleep(0.1)
     else:
         raise AssertionError("the worker outlived its parent")
 
