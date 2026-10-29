@@ -405,10 +405,34 @@ class Lock:
 def connect(
     catalog_path: str, data_url: str, temp_dir: str, write=True
 ) -> duckdb.DuckDBPyConnection:
+    con = session(data_url, temp_dir)
+    attach(con, catalog_path, data_url)
+    existing = {
+        name
+        for (name,) in con.execute(
+            "SELECT table_name FROM duckdb_tables() WHERE database_name = 'lake'"
+        ).fetchall()
+    }
+    con.execute(SCHEMA)
+    con.execute(MIGRATIONS)
+    # Partitioning is set once, when a table is created.
+    for table in PARTITIONED.keys() - existing:
+        con.execute(f"ALTER TABLE lake.{table} SET PARTITIONED BY ({PARTITIONED[table]})")
+    check_hash_scheme(con)
+    migrate_layout(con, write)
+    con.execute(ACTIVE_POINTS)
+    return con
+
+
+def session(data_url: str, temp_dir: str, memory_limit=None) -> duckdb.DuckDBPyConnection:
+    """A connection set up to read a store's data at `data_url`, with nothing attached."""
     con = duckdb.connect()
     # A fixed budget per process, so several can run side by side; work past it
     # spills to disk instead of growing.
-    con.execute("SET memory_limit = ?", [os.environ.get("GRID_MEMORY_LIMIT") or MEMORY_LIMIT])
+    con.execute(
+        "SET memory_limit = ?",
+        [memory_limit or os.environ.get("GRID_MEMORY_LIMIT") or MEMORY_LIMIT],
+    )
     con.execute("SET temp_directory = ?", [temp_dir])
     # A partitioned write buffers rows for every partition it has open: cap both, so a
     # track crossing many 10° cells costs a fixed amount.
@@ -430,33 +454,19 @@ def connect(
                 os.environ.get("S3_REGION", "auto"),
             ],
         )
-    attach(con, catalog_path, data_url)
-    existing = {
-        name
-        for (name,) in con.execute(
-            "SELECT table_name FROM duckdb_tables() WHERE database_name = 'lake'"
-        ).fetchall()
-    }
-    con.execute(SCHEMA)
-    con.execute(MIGRATIONS)
-    # Partitioning is set once, when a table is created.
-    for table in PARTITIONED.keys() - existing:
-        con.execute(f"ALTER TABLE lake.{table} SET PARTITIONED BY ({PARTITIONED[table]})")
-    check_hash_scheme(con)
-    migrate_layout(con, write)
-    con.execute(ACTIVE_POINTS)
     return con
 
 
-def attach(con, catalog_path: str, data_url: str):
+def attach(con, catalog_path: str, data_url: str, alias="lake", read_only=False):
     # Inlining keeps the small per-file writes to files and submission_meta in the
     # catalog instead of a Parquet file each. A local store's data is its own folder
     # wherever that is, so a copied or cloned store reads its own files rather than
     # refusing the path the catalog was built at; data files are stored relative to it.
     local = "" if data_url.startswith("s3://") else ", OVERRIDE_DATA_PATH true"
+    mode = ", READ_ONLY" if read_only else ""
     con.execute(
-        f"ATTACH {literal('ducklake:' + catalog_path)} AS lake"
-        f" (DATA_PATH {literal(data_url)}, DATA_INLINING_ROW_LIMIT 1000{local})"
+        f"ATTACH {literal('ducklake:' + catalog_path)} AS {alias}"
+        f" (DATA_PATH {literal(data_url)}, DATA_INLINING_ROW_LIMIT 1000{local}{mode})"
     )
 
 
