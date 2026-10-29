@@ -829,6 +829,45 @@ def test_a_transit_that_lost_the_bottom_publishes_shoals(env, tmp_path, monkeypa
     )
 
 
+def losing(n, vessel, depth, slot, share, r):
+    """A transit along row `r` whose first `share` of soundings lost the bottom, wandering
+    0.6 to 1.4 m, and whose others read `depth`."""
+    n, rows, vessel = transit(n, vessel, depth, (0, 240), slot, r=r)
+    k = round(len(rows) * share)
+    return (
+        n,
+        [(ts, x, y, 0.6 + 0.1 * (i % 9) if i < k else d) for i, (ts, x, y, d) in enumerate(rows)],
+        vessel,
+    )
+
+
+def test_lost_readings_dont_calibrate_a_vessel_shallow(env, tmp_path, monkeypatch):  # noqa: F811
+    # ROSEP-607cc5a5 in the Gulf: it reads 2.3 m shallow where it holds the bottom, but loses
+    # it for up to most of a transit, over 8 and 12 m of surveyed seabed. Lost readings in its
+    # medians would calibrate it too shallow, and its true soundings would correct too deep.
+    refs = [
+        reference(tmp_path / "8.tif", (0, 240), elevation=-8.0, rows=(4990, 5010)),
+        reference(tmp_path / "12.tif", (0, 240), elevation=-12.0, rows=(5090, 5110)),
+    ]
+    shares = [0.6, 0, 0.45, 0.8, 0.1, 0.55, 0.3, 0.7, 0.2, 0.4]
+    fleet = [
+        *(losing(1 + i, "AQM-T", 5.7, i, s, 5000) for i, s in enumerate(shares)),
+        *(losing(20 + i, "AQM-T", 9.7, 20 + i, s, 5100) for i, s in enumerate(shares)),
+        *(transit(40 + i, "AQM-A", 7.5, (0, 240), 40 + i) for i in range(3)),
+        *(transit(50 + i, "AQM-A", 11.5, (0, 240), 50 + i, r=5100) for i in range(3)),
+    ]
+    for n, rows, vessel in fleet:
+        put(env, n, rows, vessel)
+    env.run("noaa")
+    monkeypatch.setattr("grid.reference.coops_separation", lambda: lambda lon, lat: 0.0)
+    with open_store(env.store) as con:
+        untided(con)
+        calibrate.run(con, refs)
+    got = segments(env)
+    assert got[("AQM-A", 0)] == (pytest.approx(-0.5, abs=0.06), "anchored")
+    assert got[("AQM-T", 0)] == (pytest.approx(-2.3, abs=0.06), "anchored")
+
+
 def stuck(n, vessel, depth, slot, cols=(0, 240), step=2):
     """A transit reading `depth` wandering a tenth either way, one sounding per `step`
     columns (step 0: sitting still)."""
