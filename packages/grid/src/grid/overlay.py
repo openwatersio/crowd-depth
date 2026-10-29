@@ -31,7 +31,6 @@ from scipy.ndimage import (
     binary_erosion,
     distance_transform_edt,
     label,
-    minimum_filter,
 )
 
 from . import cells, surface
@@ -353,9 +352,7 @@ def surface_bands(path, soundings=None):
     if valid.any():
         # Each empty pixel near the surface takes its nearest pixel's depth, so the bands
         # reach past the outline, which cuts them.
-        far, (rows, cols) = distance_transform_edt(~valid, return_indices=True)
-        grown = depth[rows, cols]
-        grown[far > FILL_PX] = surface.NODATA
+        grown, near = carry(depth, valid)
         if soundings is not None and len(soundings[2]):
             lon, lat, d = (np.asarray(a, dtype=float) for a in soundings)
             row, col = (np.asarray(a) for a in rasterio.transform.rowcol(transform, lon, lat))
@@ -364,22 +361,23 @@ def surface_bands(path, soundings=None):
             row = np.clip(row + r0, 0, tile_shape[0] - 1) - r0
             col = np.clip(col + c0, 0, tile_shape[1] - 1) - c0
             inside = (row >= 0) & (row < depth.shape[0]) & (col >= 0) & (col < depth.shape[1])
-            row, col, d = row[inside], col[inside], d[inside]
-            cap = np.full(depth.shape, np.inf, dtype=np.float32)
-            np.minimum.at(cap, (row, col), d)
-            cap = minimum_filter(cap, footprint=around)
-            grown[~valid] = np.minimum(grown[~valid], cap[~valid])
-            del cap
+            row, col, d = row[inside], col[inside], d[inside].astype(np.float32)
+            # Each sounding's pixel and the eight around it, so only pixels beside one are
+            # touched: a sparse tile's window is most of the tile.
+            for dr, dc in np.argwhere(around) - 1:
+                r, c = row + dr, col + dc
+                ok = (r >= 0) & (r < depth.shape[0]) & (c >= 0) & (c < depth.shape[1])
+                r, c, v = r[ok], c[ok], d[ok]
+                empty = ~valid[r, c]
+                np.minimum.at(grown, (r[empty], c[empty]), v[empty])
         reach = shapely.MultiPolygon(
             [
                 shapely.geometry.shape(g)
-                for g, v in rasterio.features.shapes(
-                    (far <= FILL_PX).astype("uint8"), transform=transform
-                )
+                for g, v in rasterio.features.shapes(near.view("uint8"), transform=transform)
                 if v
             ]
         )
-        del far, rows, cols
+        del near
         with tempfile.TemporaryDirectory(dir=os.environ.get("GRID_TEMP_DIR") or None) as tmp:
             src_path, out = Path(tmp) / "depth.tif", Path(tmp) / "bands.geojson"
             profile.update(driver="GTiff", count=1, dtype="float32", nodata=surface.NODATA)
@@ -408,6 +406,7 @@ def surface_bands(path, soundings=None):
             taken[near] = True
             bands[b] = shapely.union(band, shapely.MultiPolygon(list(rest[near])))
         bands = {b: a for b, a in bands.items() if not a.is_empty}
+        del features, reach, rest, tree
     # Where interpolation starts is drawn more loosely than the edge of the water, on the
     # surface as it's grown, so the growth is measured only beside a sounding. It's grown a
     # pixel into the measured part too: rounding would lose a strip a pixel wide, and
@@ -445,9 +444,35 @@ def surface_bands(path, soundings=None):
     return bands, footprint, surfaced, between, tvu
 
 
+def carry(depth, valid):
+    """`depth` carried to the empty pixels within FILL_PX of a `valid` one, each taking its
+    nearest's depth, and where it reaches. A strip of CARRY_ROWS rows at a time, so the
+    distance transform's indices are held for a strip, not the whole window: a pixel's
+    nearest within FILL_PX is within FILL_PX rows of it, so a strip reads only a row more
+    than that each side."""
+    grown = np.full(depth.shape, surface.NODATA, dtype=depth.dtype)
+    near = np.zeros(depth.shape, dtype=bool)
+    halo, cols = FILL_PX + 1, np.arange(depth.shape[1], dtype=np.int32)
+    for a in range(0, depth.shape[0], CARRY_ROWS):
+        b = min(a + CARRY_ROWS, depth.shape[0])
+        a0, b0 = max(a - halo, 0), min(b + halo, depth.shape[0])
+        if not valid[a0:b0].any():
+            continue
+        r, c = distance_transform_edt(~valid[a0:b0], return_distances=False, return_indices=True)
+        r, c = r[a - a0 : b - a0], c[a - a0 : b - a0]
+        here = np.arange(a - a0, b - a0, dtype=np.int32)[:, None]
+        # Squared, in integers: the same test as the distance against FILL_PX.
+        ok = (r - here) ** 2 + (c - cols) ** 2 <= FILL_PX**2
+        near[a:b] = ok
+        grown[a:b][ok] = depth[a0:b0][r[ok], c[ok]]
+    return grown, near
+
+
 # Pixels past the surface's edge its depths are carried, for the bands to reach its
 # outline, which is grown a pixel and fills small gaps.
 FILL_PX = 2
+# Rows of the window carried at once.
+CARRY_ROWS = 512
 # Pixels past a tile's depths and soundings its bands are worked to: wider than the
 # furthest anything looks, coverage grown a pixel and then eroded three for its rim.
 WINDOW_PX = 16
