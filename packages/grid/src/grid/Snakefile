@@ -1,0 +1,165 @@
+# The per-tile rebuild (tiles.py): cells → surface → overlay per 1° tile, web per z8 tile, then
+# the low zooms and one archive. Run it with `grid tiles`, which prepares the run directory
+# first: the frozen catalog, tiles.txt, and fp/{tile}.txt, rewritten only when a tile's
+# fingerprint moves, so a moved fingerprint is what reruns a tile.
+#
+# Config: memory_mb (the run's budget, which no job's estimate exceeds), code (tiles.code(),
+# so a code change reruns everything), and socket (the warm worker's; without it each job
+# starts its own Python).
+#
+# Each job's declared output is a sentinel under done/, and it writes its files itself, each
+# replaced whole: Snakemake removes a job's declared outputs before running it, which would
+# leave no overlay.pmtiles while assemble runs, or after it fails.
+
+import shlex
+import sys
+from pathlib import Path
+
+from grid import tiles
+
+COUNTS = tiles.counts(Path.cwd())
+TILES = sorted(COUNTS)
+WEB = tiles.web_keys(TILES)
+BUDGET = int(config.get("memory_mb", 8192))
+CODE = config.get("code") or tiles.code()
+PYTHON = shlex.quote(sys.executable)
+CLIENT = shlex.quote(str(Path(tiles.__file__).with_name("worker_client.py")))
+
+
+def run_job(stage, keys):
+    """The shell command for a job; Snakemake fills in {log} and {threads}."""
+    if config.get("socket"):
+        sock = shlex.quote(config["socket"])
+        return f"{PYTHON} -S {CLIENT} {sock} {{log:q}} {stage} . {{threads}} {keys}"
+    return f"{PYTHON} -m grid.tiles {stage} . {{threads}} {keys} 2> {{log:q}}"
+
+
+def around(tile, stage):
+    """The `stage` sentinels of the tile and its neighbors in this run."""
+    return [f"done/{stage}/{n}" for n in tiles.neighbors(int(tile)) if n in COUNTS]
+
+
+def mem(stage):
+    return lambda wc: min(tiles.resources(stage, COUNTS[int(wc.tile)])[0], BUDGET)
+
+
+def threads(stage):
+    return lambda wc: tiles.resources(stage, COUNTS[int(wc.tile)])[1]
+
+
+def weight(wc):
+    """Densest first: they set the critical path."""
+    return min(COUNTS[int(wc.tile)] // 100_000, 10_000)
+
+
+wildcard_constraints:
+    tile=r"[0-9]+",
+    key=r"[0-9]+_[0-9]+",
+
+
+# Every tile's overlay, those past Web Mercator too, which no web tile reads.
+rule all:
+    input:
+        "done/assemble",
+        expand("done/overlay/{tile}", tile=TILES),
+
+
+rule cells:
+    input:
+        "fp/{tile}.txt",
+    output:
+        "done/cells/{tile}",
+    params:
+        code=CODE,
+    threads: threads("cells")
+    priority: weight
+    resources:
+        mem_mb=mem("cells"),
+    log:
+        "logs/cells/{tile}.log",
+    shell:
+        run_job("cells", "{wildcards.tile}") + " && touch {output}"
+
+
+# A surface reads its neighbors' points and cell-level flags, within the search radius.
+rule surface:
+    input:
+        lambda wc: around(wc.tile, "cells"),
+    output:
+        "done/surface/{tile}",
+    params:
+        code=CODE,
+    threads: threads("surface")
+    priority: weight
+    resources:
+        mem_mb=mem("surface"),
+    log:
+        "logs/surface/{tile}.log",
+    shell:
+        run_job("surface", "{wildcards.tile}") + " && touch {output}"
+
+
+# Depth areas, contours and prime soundings; reads the neighbors' published soundings.
+rule overlay:
+    input:
+        "done/surface/{tile}",
+        lambda wc: around(wc.tile, "cells"),
+    output:
+        "done/overlay/{tile}",
+    params:
+        code=CODE,
+    threads: threads("overlay")
+    priority: weight
+    resources:
+        mem_mb=mem("overlay"),
+    log:
+        "logs/overlay/{tile}.log",
+    shell:
+        run_job("overlay", "{wildcards.tile}") + " && touch {output}"
+
+
+rule web:
+    input:
+        lambda wc: [f"done/overlay/{t}" for t in WEB[wc.key]],
+    output:
+        "done/web/{key}",
+    params:
+        code=CODE,
+    resources:
+        mem_mb=min(tiles.WEB_MEMORY_MB, BUDGET),
+    log:
+        "logs/web/{key}.log",
+    shell:
+        run_job("web", "{wildcards.key}") + " && touch {output}"
+
+
+rule low:
+    input:
+        expand("done/web/{key}", key=sorted(WEB)),
+    output:
+        "done/low",
+    params:
+        code=CODE,
+    resources:
+        mem_mb=min(tiles.WEB_MEMORY_MB, BUDGET),
+    log:
+        "logs/low.log",
+    shell:
+        run_job("low", "") + " && touch {output}"
+
+
+rule assemble:
+    input:
+        "done/low",
+        "credits.txt",
+        expand("done/web/{key}", key=sorted(WEB)),
+    output:
+        "done/assemble",
+    params:
+        code=CODE,
+    resources:
+        mem_mb=min(tiles.WEB_MEMORY_MB, BUDGET),
+    log:
+        "logs/assemble.log",
+    shell:
+        run_job("assemble", "") + " && touch {output}"

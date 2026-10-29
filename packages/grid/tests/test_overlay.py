@@ -180,6 +180,34 @@ def test_areas_and_contours_stop_at_200_m():
     assert [f["properties"]["VALDCO"] for f in got["DEPCNT"]] == [200]
 
 
+def test_a_tie_for_prime_goes_to_the_westmost_whatever_order_the_store_holds():
+    con = duckdb.connect()
+    con.execute("ATTACH ':memory:' AS lake")
+    con.execute(
+        """CREATE TABLE lake.cells (cell_id INTEGER, tile_id INTEGER, depth_lon DOUBLE,
+        depth_lat DOUBLE, depth FLOAT)"""
+    )
+    shoal = [(1.0 + i / 100, 1.0 + (i * 37 % 99) / 100) for i in range(1, 99)]
+    deep = shapely.difference(box(0, 0, 3, 3), box(1, 1, 2, 2))
+    bands = {band_index(2): box(1, 1, 2, 2), band_index(10): deep}
+    picked = set()
+    for order in (shoal, shoal[::-1], shoal[1::2] + shoal[::2]):
+        con.execute("DELETE FROM lake.cells")
+        con.executemany(
+            "INSERT INTO lake.cells VALUES (1, 2, ?, ?, 3.4)", [(x, y) for x, y in order]
+        )
+        got = con.execute(
+            overlay.PRIME_CANDIDATES, {"partition": 1, "tile": 2, "max": 200}
+        ).fetchnumpy()
+        [prime] = by_layer(
+            overlay.tile_areas(
+                (got["lon"], got["lat"], got["depth"]), PROPERTIES, bands, box(0, 0, 3, 3)
+            )
+        )["SOUNDG"]
+        picked.add(tuple(prime["geometry"]["coordinates"]))
+    assert picked == {(1.01, 1.37)}
+
+
 def test_a_real_surface_draws_its_200_m_contour(tmp_path):
     # 250 m water with a 150 m rise, through gdal_contour: the 200 m isobath closes
     # round the rise, and its least depth is prime.
