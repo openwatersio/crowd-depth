@@ -43,7 +43,7 @@ from scipy.sparse import coo_matrix, csc_matrix, csr_matrix, diags
 from scipy.sparse.csgraph import connected_components
 from scipy.sparse.linalg import splu
 
-from . import cells, reference
+from . import catalog, cells, manifest, reference
 from .cells import BASE, K_LIST
 from .qc import QC_VERSION, TRACK_REASONS
 
@@ -111,17 +111,18 @@ MAX_LOST = 0.5
 GUARDED_SEGMENTS = 20
 
 # Each vessel's median tide-reduced depth per file per calibration pixel (two base rows
-# by two base columns), from soundings track QC accepted. Read a unit of tiles or a band
-# of one at a time, whose rows hold whole pixels.
+# by two base columns), from soundings track QC accepted, for the files in `cal_dirty`.
+# Read a unit of tiles or a band of one at a time, whose rows hold whole pixels.
 REDUCE = f"""
-INSERT INTO cal_obs
+INSERT INTO lake.file_medians
 SELECT p.tile_id, floor((p.lat - (p.tile_id // 360 - 90)) * {BASE} / 2)::INTEGER AS py,
   floor((p.lon - (p.tile_id % 360 - 180)) * {BASE}
     / {K_LIST}[p.tile_id // 360 - 90 + 91] / 2)::INTEGER AS px,
   p.unique_id AS vessel, p.file_id, min(p.time) AS t,
   median(p.depth_raw - coalesce(p.tide, 0))::FLOAT AS m
-FROM corrected_points_in($partition, $tiles, $rlo, $rhi) p
-WHERE p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M} AND p.time IS NOT NULL
+FROM corrected_points_in($partition, $tiles, $rlo, $rhi, vessels := $vessels) p
+WHERE p.file_id IN (SELECT file_id FROM cal_dirty)
+  AND p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M} AND p.time IS NOT NULL
   -- Tide-reduced, or where `grid tide` found no station in reach: one whose level is
   -- still to come, or in a cell tide hasn't seen, would leave the tide in the offset and
   -- count it twice once the level arrives.
@@ -132,6 +133,106 @@ WHERE p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M} AND p.time IS NOT NULL
       AND flag IN ('reject', 'unconfirmed', 'noisy'))
 GROUP BY ALL
 """
+
+# Each active file's soundings per tile and their batches, keyed so a file whose
+# soundings moved has its tide cells found again (FILE_TIDE_CELLS).
+FILE_OWN = """
+SELECT file_id, left(sha256(concat_ws('/', $code, sum(hash(tile_id, batch_id, n)::HUGEINT))), 16)
+  AS own
+FROM lake.file_tiles WHERE file_id IN (SELECT file_id FROM lake.files WHERE status = 'active')
+GROUP BY 1
+"""
+# The tide cells a file's soundings fall in, so a cell `grid tide` adds for a new file
+# moves no other file of its tile.
+FILE_TIDE_CELLS = f"""
+INSERT INTO lake.file_tide_cells
+SELECT DISTINCT p.file_id, s.own, {catalog.TIDE_CELL} FROM lake.points p JOIN cal_stale s USING (file_id)
+WHERE p.cell_id = ?
+"""
+TIDE_CELLS_CODE = hashlib.sha256(repr((FILE_OWN, FILE_TIDE_CELLS)).encode()).hexdigest()[:16]
+
+# What each active file's own medians are made of, as parts summed from hashes of rows,
+# so the order rows come in doesn't matter: its soundings per tile and their batches; its
+# track flags; and its tide cells and their stations, with those stations' levels on the
+# days it covers. The files dedupe compares it with are DEPENDENTS'.
+MEDIAN_INPUTS = f"""
+WITH f AS (
+  SELECT file_id, source, vessel, content_hash, time_min, time_max FROM lake.files
+  WHERE status = 'active'
+),
+own AS (
+  SELECT file_id, sum(hash(tile_id, batch_id, n)::HUGEINT) AS h FROM lake.file_tiles GROUP BY 1
+),
+flags AS (
+  SELECT point_id >> 32 AS file_id, sum(hash(point_id, flag, reason)::HUGEINT) AS h
+  FROM lake.qc_flags WHERE qc_version = {QC_VERSION} AND list_contains({TRACK_REASONS}, reason)
+    AND flag IN ('reject', 'unconfirmed', 'noisy')
+  GROUP BY 1
+),
+cells AS (
+  SELECT DISTINCT x.file_id, x.tide_cell, c.tide_cell IS NOT NULL AS assigned, c.station_id
+  FROM lake.file_tide_cells x LEFT JOIN lake.tide_cells c USING (tide_cell)
+),
+stations AS (
+  SELECT file_id, sum(hash(tide_cell, assigned, station_id)::HUGEINT) AS h FROM cells GROUP BY 1
+),
+days AS (
+  SELECT DISTINCT d.file_id, s.station_id, d.day FROM (
+    SELECT file_id, unnest(generate_series(time_min::DATE, time_max::DATE, INTERVAL 1 DAY))::DATE
+      AS day
+    FROM f WHERE time_min IS NOT NULL AND time_max IS NOT NULL
+  ) d JOIN (
+    SELECT DISTINCT file_id, station_id FROM cells WHERE station_id IS NOT NULL
+  ) s USING (file_id)
+),
+levels AS (
+  SELECT station_id, slot::DATE AS day,
+    sum(hash(station_id, slot, level, slope, sigma)::HUGEINT) AS h
+  FROM lake.tide_levels WHERE (station_id, slot::DATE) IN (SELECT (station_id, day) FROM days)
+  GROUP BY ALL
+),
+tide AS (
+  SELECT d.file_id, sum(l.h) AS h FROM days d JOIN levels l USING (station_id, day) GROUP BY 1
+)
+SELECT f.file_id, f.vessel, left(sha256(concat_ws(
+    '/', $code, f.source, f.vessel, f.content_hash, f.time_min, f.time_max, coalesce(own.h, 0),
+    coalesce(flags.h, 0), coalesce(stations.h, 0), coalesce(tide.h, 0)
+  )), 16) AS inputs
+FROM f LEFT JOIN own USING (file_id) LEFT JOIN flags USING (file_id)
+LEFT JOIN stations USING (file_id) LEFT JOIN tide USING (file_id)
+"""
+
+# The files to reduce: those whose own inputs moved, and the active files whose soundings
+# dedupe weighs against a file that moved, came or went (catalog.ACTIVE). Under rule 4 that
+# is the higher file_ids of its source and vessel over its time, since the lowest keeps a
+# shared sounding; under rule 5 the NOAA files of an Open Waters file's vessel over its
+# time, widened to whole seconds. Only files that haven't moved are joined, so a first run
+# doesn't pair every file of a vessel with every other.
+DEPENDENTS = """
+CREATE OR REPLACE TEMP TABLE cal_dirty AS
+WITH moved AS (
+  SELECT file_id FROM cal_inputs ANTI JOIN lake.file_median_inputs USING (file_id, inputs)
+  UNION SELECT file_id FROM lake.file_median_inputs ANTI JOIN cal_inputs USING (file_id)
+),
+m AS (SELECT file_id, source, vessel, time_min, time_max FROM lake.files SEMI JOIN moved USING (file_id)),
+rest AS (
+  SELECT c.file_id, f.source, f.vessel, f.time_min, f.time_max
+  FROM (FROM cal_inputs ANTI JOIN moved USING (file_id)) c JOIN lake.files f USING (file_id)
+)
+SELECT file_id, vessel FROM cal_inputs SEMI JOIN moved USING (file_id)
+UNION
+SELECT DISTINCT r.file_id, r.vessel FROM rest r JOIN m ON m.vessel = r.vessel AND (
+  (m.source = r.source AND m.file_id < r.file_id
+    AND m.time_min <= r.time_max AND m.time_max >= r.time_min)
+  OR (m.source = 'openwaters' AND r.source = 'noaa'
+    AND date_trunc('second', m.time_min) <= r.time_max
+    AND date_trunc('second', m.time_max) + INTERVAL 1 SECOND > r.time_min))
+"""
+
+# The code a file's medians come from: once it changes, every file is reduced again.
+CODE = hashlib.sha256(
+    repr((REDUCE, TIDE_CELLS_CODE, MEDIAN_INPUTS, DEPENDENTS, catalog.ACTIVE_POINTS)).encode()
+).hexdigest()[:16]
 
 # Rows at anchor-quality reference pixels (`anchor_px`), with the difference from the
 # reference.
@@ -202,23 +303,95 @@ HAVING count(*) FILTER (WHERE l.stuck) >= {STUCK_RUN} AND 6371000 * sqrt(
 """
 
 
-def reduce(con):
-    """Fill the temp table `cal_obs` in cells' units of work, so memory follows a unit
-    rather than the densest tile. Returns how many tiles it read."""
+def fill_tide_cells(con):
+    """Find the tide cells of each active file whose soundings are new or moved, a
+    partition at a time, in one transaction, so no file is left with only some."""
+    con.execute(f"CREATE OR REPLACE TEMP TABLE cal_own AS {FILE_OWN}", {"code": TIDE_CELLS_CODE})
     con.execute(
-        """CREATE OR REPLACE TEMP TABLE cal_obs (tile_id INTEGER, py INTEGER, px INTEGER,
-        vessel VARCHAR, file_id BIGINT, t TIMESTAMP, m FLOAT)"""
+        """CREATE OR REPLACE TEMP TABLE cal_stale AS FROM cal_own
+        ANTI JOIN (SELECT DISTINCT file_id, own FROM lake.file_tide_cells) USING (file_id, own)"""
     )
-    partitions = [
-        p for (p,) in con.execute("SELECT DISTINCT cell_id FROM lake.points ORDER BY 1").fetchall()
-    ]
+    try:
+        con.execute("BEGIN")
+        try:
+            con.execute(
+                """DELETE FROM lake.file_tide_cells WHERE file_id NOT IN (SELECT file_id FROM cal_own)
+                OR file_id IN (SELECT file_id FROM cal_stale)"""
+            )
+            for (partition,) in con.execute(
+                """SELECT DISTINCT cell_id FROM lake.file_tiles SEMI JOIN cal_stale USING (file_id)
+                ORDER BY 1"""
+            ).fetchall():
+                con.execute(FILE_TIDE_CELLS, [partition])
+            con.execute("COMMIT")
+        except BaseException:
+            con.execute("ROLLBACK")
+            raise
+    finally:
+        con.execute("DROP TABLE cal_stale")
+        con.execute("DROP TABLE cal_own")
+
+
+def reduce(con, full=False):
+    """Fill the temp table `cal_obs` from each active file's kept medians, after reducing
+    again the files whose inputs moved (MEDIAN_INPUTS, DEPENDENTS), or every file if
+    `full`, in cells' units of work, so memory follows a unit rather than the densest tile.
+    Returns how many tiles and files it read."""
+    manifest.ensure_file_tiles(con)
+    fill_tide_cells(con)
+    con.execute(f"CREATE OR REPLACE TEMP TABLE cal_inputs AS {MEDIAN_INPUTS}", {"code": CODE})
+    con.execute(
+        "CREATE OR REPLACE TEMP TABLE cal_dirty AS SELECT file_id, vessel FROM cal_inputs"
+        if full
+        else DEPENDENTS
+    )
+    # Inputs first: a run stopped from here on finds these files to reduce again.
+    con.execute(
+        """DELETE FROM lake.file_median_inputs WHERE file_id IN (SELECT file_id FROM cal_dirty)
+        OR file_id NOT IN (SELECT file_id FROM cal_inputs)"""
+    )
+    con.execute(
+        """DELETE FROM lake.file_medians
+        WHERE file_id NOT IN (SELECT file_id FROM lake.file_median_inputs)"""
+    )
+    # Every vessel's, rather than a list of them all, where a partition's every vessel has a
+    # file to reduce: the list is searched for each sounding.
+    parts = con.execute(
+        """SELECT t.cell_id,
+          list(DISTINCT t.tile_id ORDER BY t.tile_id) FILTER (d.file_id NOT NULL),
+          CASE WHEN count(DISTINCT c.vessel) = count(DISTINCT d.vessel) THEN []
+            ELSE list(DISTINCT d.vessel ORDER BY d.vessel) FILTER (d.file_id NOT NULL) END
+        FROM lake.file_tiles t JOIN cal_inputs c USING (file_id)
+        LEFT JOIN cal_dirty d USING (file_id)
+        GROUP BY 1 HAVING count(d.file_id) > 0 ORDER BY 1"""
+    ).fetchall()
     tiles = set()
-    for partition in partitions:
+    for partition, dirty_tiles, vessels in parts:
         # Bands of 18 base rows: an even number, so no pixel is split between two.
-        for unit, rlo, rhi in cells.units(con, partition, [], rows=18):
-            con.execute(REDUCE, {"partition": partition, "tiles": unit, "rlo": rlo, "rhi": rhi})
+        for unit, rlo, rhi in cells.units(con, partition, dirty_tiles, rows=18):
+            con.execute(
+                REDUCE,
+                {
+                    "partition": partition,
+                    "tiles": unit,
+                    "rlo": rlo,
+                    "rhi": rhi,
+                    "vessels": vessels,
+                },
+            )
             tiles.update(unit)
-    return len(tiles)
+    con.execute(
+        """INSERT INTO lake.file_median_inputs
+        SELECT file_id, inputs FROM cal_inputs WHERE file_id IN (SELECT file_id FROM cal_dirty)"""
+    )
+    [(files, of)] = con.execute(
+        "SELECT (SELECT count(*) FROM cal_dirty), (SELECT count(*) FROM cal_inputs)"
+    ).fetchall()
+    log.info("calibrate: reduced %d of %d files, in %d tiles", files, of, len(tiles))
+    con.execute("CREATE OR REPLACE TEMP TABLE cal_obs AS FROM lake.file_medians")
+    con.execute("DROP TABLE cal_inputs")
+    con.execute("DROP TABLE cal_dirty")
+    return len(tiles), files
 
 
 def reference_px(con):
@@ -600,14 +773,14 @@ def run(con, references=(), accept_losses=False) -> dict:
     `references` (see reference.py) at pixels they haven't been sampled at."""
     if not con.execute("SELECT count(*) FROM lake.tide_stations").fetchone()[0]:
         raise RuntimeError("calibration reads tide-reduced depths; run `grid tide` first")
-    tiles = reduce(con)
+    tiles, reduced = reduce(con)
     if references:
         reference.sample(con, references)
     # Pass 1: a unit per vessel, for pixel depths to find steps against.
     names = units_for(con, {})
     if not names:
         log.info("calibrate: no tide-reduced soundings to calibrate")
-        return {"tiles": tiles, "segments": 0}
+        return {"tiles": tiles, "reduced_files": reduced, "segments": 0}
     reference_px(con)
     crossings(con)
     anchor, anchor_se, *_ = anchors(con, len(names))
@@ -657,6 +830,7 @@ def run(con, references=(), accept_losses=False) -> dict:
     con.execute("INSERT INTO lake.store_meta VALUES ('calibration_tide', ?)", [cells.tides(con)])
     totals = {
         "tiles": tiles,
+        "reduced_files": reduced,
         "segments": len(rows),
         "steps": sum(len(s) for s in segments.values()),
         **{
