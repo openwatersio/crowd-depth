@@ -23,12 +23,12 @@ def two_tiles(env):  # noqa: F811
     env.run("noaa")
 
 
-def prints(env, change=None):  # noqa: F811
+def prints(env, change=None, counts=False):  # noqa: F811
     # Read only: a change is made in this open's copy alone, and never published.
     with open_store(env.store, write=False) as con:
         if change:
             change(con)
-        return {t: fp for t, (fp, _) in manifest.fingerprints(con).items()}
+        return {t: (fp, n) if counts else fp for t, (fp, n) in manifest.fingerprints(con).items()}
 
 
 def test_ingest_records_each_files_soundings_per_tile(env):  # noqa: F811
@@ -147,6 +147,10 @@ def test_an_open_waters_copy_moves_the_noaa_files_tile(env):  # noqa: F811
 
     got = prints(env, copy)
     assert got[SOUTH_TILE] != base[SOUTH_TILE] and got[NORTH_TILE] == base[NORTH_TILE]
+    # The copy takes every sounding in the south tile, which still counts them, so it is
+    # rebuilt rather than removed.
+    before, after = prints(env, counts=True), prints(env, copy, counts=True)
+    assert after[SOUTH_TILE][1] == before[SOUTH_TILE][1] > 0
 
 
 def test_a_tide_cells_distance_alone_moves_its_tile(env):  # noqa: F811

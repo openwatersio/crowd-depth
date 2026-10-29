@@ -162,7 +162,11 @@ ORDER BY tile_id
 
 def fingerprints(con) -> dict[int, tuple[str, int]]:
     """{tile: (fingerprint, active soundings)} for every tile any file has held soundings in,
-    those with none active left included, so their outputs can be removed."""
+    those with none active left included, so their outputs can be removed.
+
+    The count is of active files' rows before dedupe, read from file_tiles rather than the
+    points: a tile whose soundings rules 4 and 5 all set aside still counts them. Its
+    fingerprint moves with the files that set them aside, so it is rebuilt, with no cells."""
     incomplete = [f for (f,) in con.execute(f"{INCOMPLETE} ORDER BY 1 LIMIT 5").fetchall()]
     if incomplete:
         raise RuntimeError(
