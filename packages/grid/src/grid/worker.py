@@ -25,6 +25,8 @@ from . import tiles
 
 # The running jobs' children, each the leader of its own process group.
 children = set()
+# The signals held while a child is forked and registered.
+HELD = {signal.SIGCHLD, signal.SIGTERM, signal.SIGINT}
 
 
 def reap():
@@ -104,11 +106,12 @@ def serve(path: str):
     server.settimeout(1)
     print("ready", os.getpid(), flush=True)
     while True:
+        # Checked before each job too: a steady stream of jobs never lets accept time out.
+        if os.getppid() != parent:
+            stop()
         try:
             conn, _ = server.accept()
         except TimeoutError:
-            if os.getppid() != parent:
-                stop()
             continue
         try:
             with conn.makefile() as f:
@@ -119,19 +122,20 @@ def serve(path: str):
             # A client gone before it sent its job, or not one of ours: it gets no reply.
             conn.close()
             continue
-        # Held until the child is in `children`, so a child that ends at once is reaped
-        # from it, not left there for stop() to signal after its pid is reused.
-        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGCHLD})
+        # Held until the child is in `children`: a child that ends at once is reaped from
+        # it, not left there for stop() to signal after its pid is reused, and a stop
+        # signal waits until stop() will find the child.
+        signal.pthread_sigmask(signal.SIG_BLOCK, HELD)
         pid = os.fork()
         if pid:
             children.add(pid)
-            signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGCHLD})
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, HELD)
             conn.close()
             continue
-        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGCHLD})
         server.close()
-        for sig in (signal.SIGCHLD, signal.SIGTERM, signal.SIGINT):
+        for sig in HELD:
             signal.signal(sig, signal.SIG_DFL)
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, HELD)
         code = child(request)
         try:
             conn.sendall(f"{code}\n".encode())

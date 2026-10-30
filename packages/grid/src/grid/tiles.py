@@ -436,9 +436,9 @@ def do_overlay(run: Path, tile: int, threads):
         tmp.replace(out)
 
 
-def tippecanoe(out: Path, inputs, zooms, clip=None) -> bool:
-    """Tile `inputs` into `out` (MBTiles) at `zooms`, as `overlay.build` does; False when
-    nothing fell in the clip box, so there are no tiles."""
+def tippecanoe(out: Path, inputs, zooms, threads, clip=None) -> bool:
+    """Tile `inputs` into `out` (MBTiles) at `zooms` on `threads` threads, the job's, as
+    `overlay.build` does; False when nothing fell in the clip box, so there are no tiles."""
     cmd = [
         *("tippecanoe", "-o", str(out), "--force", "--quiet", f"-Z{zooms[0]}", f"-z{zooms[1]}"),
         *("-r1", "--no-feature-limit", "--no-tile-size-limit"),
@@ -446,7 +446,9 @@ def tippecanoe(out: Path, inputs, zooms, clip=None) -> bool:
     ]
     if clip:
         cmd.append("--clip-bounding-box=" + ",".join(f"{v:.9f}" for v in clip))
-    done = subprocess.run(cmd + [str(i) for i in inputs], check=False)
+    # Every core otherwise, whatever the job was scheduled with. The tiles are the same.
+    env = {**os.environ, "TIPPECANOE_MAX_THREADS": str(threads)}
+    done = subprocess.run(cmd + [str(i) for i in inputs], env=env, check=False)
     # 110: "Did not read any valid geometries", all of it clipped away.
     if done.returncode == 110:
         return False
@@ -510,7 +512,11 @@ def do_web(run: Path, key: str, threads):
     bx, by = (e - w) * 5 / 256, (nn - s) * 5 / 256
     mbtiles = out.with_suffix(".mbtiles")
     if (count or areas) and tippecanoe(
-        mbtiles, [sounds, *areas], (Z, overlay.MAX_ZOOM), clip=(w - bx, s - by, e + bx, nn + by)
+        mbtiles,
+        [sounds, *areas],
+        (Z, overlay.MAX_ZOOM),
+        threads,
+        clip=(w - bx, s - by, e + bx, nn + by),
     ):
         to_pmtiles(mbtiles, out)
     mbtiles.unlink(missing_ok=True)
@@ -591,7 +597,7 @@ def do_low(run: Path, threads):
             json.dumps(feat, separators=(",", ":")) + "\n" for feat in reduce_level4(candidates())
         )
     mbtiles = run / "low.mbtiles"
-    if tippecanoe(mbtiles, [sounds, feats], (0, Z - 1)):
+    if tippecanoe(mbtiles, [sounds, feats], (0, Z - 1), threads):
         to_pmtiles(mbtiles, run / "low.pmtiles")
     else:
         (run / "low.pmtiles").unlink(missing_ok=True)

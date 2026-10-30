@@ -125,6 +125,7 @@ rule web:
         "done/web/{key}",
     params:
         code=CODE,
+    threads: 1
     resources:
         mem_mb=min(tiles.WEB_MEMORY_MB, BUDGET),
     log:
@@ -133,6 +134,7 @@ rule web:
         run_job("web", "{wildcards.key}") + " && touch {output}"
 
 
+# Runs alone, after every web job.
 rule low:
     input:
         expand("done/web/{key}", key=sorted(WEB)),
@@ -140,6 +142,7 @@ rule low:
         "done/low",
     params:
         code=CODE,
+    threads: workflow.cores
     resources:
         mem_mb=min(tiles.WEB_MEMORY_MB, BUDGET),
     log:
