@@ -8,6 +8,7 @@
     grid --store DIR_OR_S3_URL calibrate [--reference s102|bluetopo|PATH]...
     grid --store DIR_OR_S3_URL cells [--bbox=W,S,E,N | --changed]
     grid --store DIR_OR_S3_URL overlay --out DIR
+    grid --store DIR_OR_S3_URL tiles --out DIR [--cores N] [--memory-gb N] [--dry-run]
     grid --store DIR_OR_S3_URL benchmark --surface DIR --out DIR [--bbox=W,S,E,N | --tiles=ID,...]
                                           [--source NAME]... [--cells] [--qc-version N]
     grid --store DIR_OR_S3_URL compact
@@ -26,7 +27,7 @@ import math
 import sys
 from pathlib import Path
 
-from . import benchmark, cache, calibrate, catalog, cells, overlay, qc, reference, tide
+from . import benchmark, cache, calibrate, catalog, cells, overlay, qc, reference, tide, tiles
 from .catalog import open_store
 from .ingest import Ingest, confirm_withdrawals
 from .objects import open_objects
@@ -41,6 +42,16 @@ def positive(value: str) -> int:
     n = int(value)
     if n < 1:
         raise argparse.ArgumentTypeError("must be 1 or more")
+    return n
+
+
+def memory_gb(value: str) -> float:
+    n = float(value)
+    # Under 1 MB is 0 MB, which would mean the machine's memory.
+    if not n * 1024 >= 1:
+        raise argparse.ArgumentTypeError("must be 1 MB (0.001) or more")
+    if not math.isfinite(n):
+        raise argparse.ArgumentTypeError("must be a number of GB")
     return n
 
 
@@ -126,6 +137,21 @@ def main(argv=None):
     )
     o = sub.add_parser("overlay", help="Build the overlay layers and their PMTiles from the cells")
     o.add_argument("--out", required=True, type=Path, help="Directory for the layers and PMTiles")
+    t = sub.add_parser(
+        "tiles",
+        help="Rebuild the cells, surfaces and overlay of the tiles whose inputs moved since the"
+        " last run into DIR, and its PMTiles, through Snakemake",
+    )
+    t.add_argument(
+        "--out", required=True, type=Path, help="The run directory, kept from run to run"
+    )
+    t.add_argument("--cores", type=positive, help="Default: every core")
+    t.add_argument(
+        "--memory-gb",
+        type=memory_gb,
+        help="The jobs' memory budget; default: three quarters of the machine's",
+    )
+    t.add_argument("--dry-run", action="store_true", help="Prepare, then list the jobs to run")
     b = sub.add_parser(
         "benchmark", help="Score a render's depth surface against the surveyed references"
     )
@@ -171,6 +197,10 @@ def main(argv=None):
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
+    if args.command == "tiles":
+        # Prepare opens the store itself; the jobs read a frozen copy of its catalog.
+        memory = int(args.memory_gb * 1024) if args.memory_gb else None
+        return tiles.build(open_objects(args.store), args.out, args.cores, memory, args.dry_run)
     alert = False
     with open_store(
         open_objects(args.store), write=args.command not in ("stats", "overlay", "benchmark")
