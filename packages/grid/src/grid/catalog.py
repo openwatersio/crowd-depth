@@ -112,6 +112,14 @@ CREATE TABLE IF NOT EXISTS lake.calibration (
   se_m FLOAT, status VARCHAR, anchor_pixels INTEGER, anchor_transits INTEGER,
   crossing_transits INTEGER
 );
+-- Each vessel's median tide-reduced depth per file per calibration pixel, kept so a run
+-- reduces only the files whose inputs moved, and the inputs each file's were made from.
+CREATE TABLE IF NOT EXISTS lake.file_medians (
+  tile_id INTEGER, py INTEGER, px INTEGER, vessel VARCHAR, file_id BIGINT, t TIMESTAMP, m FLOAT
+);
+CREATE TABLE IF NOT EXISTS lake.file_median_inputs (file_id BIGINT, inputs VARCHAR);
+-- The tide cells each active file's soundings fall in, under a key of its soundings.
+CREATE TABLE IF NOT EXISTS lake.file_tide_cells (file_id BIGINT, own VARCHAR, tide_cell BIGINT);
 -- Transits that disagree with their segment by more than a step, left uncalibrated.
 CREATE TABLE IF NOT EXISTS lake.calibration_outliers (
   file_id BIGINT, vessel VARCHAR, transit_m FLOAT, segment_m FLOAT, content_hash VARCHAR,
@@ -663,8 +671,9 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
                     # Rebuilds delete and reinsert cells, their flags and shoals, the
                     # calibration and the cells' marker, and DuckLake deletes by writing
                     # delete files, so the replaced files stay live until rewritten.
-                    # Small files, a run's inserts, merge into sorted ones.
-                    for table in SORTED:
+                    # Small files, a run's inserts, merge into sorted ones, and calibration's
+                    # medians, added a few files at a time each day, into larger ones.
+                    for table in (*SORTED, "file_medians", "file_median_inputs", "file_tide_cells"):
                         con.execute(f"CALL ducklake_merge_adjacent_files('lake', '{table}')")
                     for table in (
                         "points",
@@ -676,6 +685,9 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
                         "cells_built",
                         "calibration",
                         "calibration_outliers",
+                        "file_medians",
+                        "file_median_inputs",
+                        "file_tide_cells",
                         "lost_runs",
                         "file_offsets",
                         "tile_changes",

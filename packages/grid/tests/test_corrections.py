@@ -328,9 +328,116 @@ def test_calibration_reads_a_dense_tile_in_bands_as_it_would_whole(env, monkeypa
         monkeypatch.setattr(cells, "BATCH_POINTS", 1)
         [(partition,)] = con.execute("SELECT DISTINCT cell_id FROM lake.points").fetchall()
         assert len(cells.units(con, partition, [], rows=18)) > 1
-        calibrate.reduce(con)
+        calibrate.reduce(con, full=True)
         banded = sorted(con.execute("FROM cal_obs").fetchall())
     assert len(whole) > 100 and banded == whole
+
+
+def test_calibration_reduces_only_the_files_whose_inputs_moved(env, tmp_path, monkeypatch):  # noqa: F811
+    # E's second file repeats most of its first, which dedupe gives the lower file_id.
+    n, first, v = transit(56, "AQM-E", 9.0, (0, 60), 60)
+    _, later, _ = transit(57, "AQM-E", 9.0, (60, 120), 61)
+    second = (57, first[10:] + later, v)
+    totals = calibrated(
+        env, [*FLEET, (n, first, v), second], reference(tmp_path / "r.tif", (0, 110)), monkeypatch
+    )
+    assert totals["reduced_files"] == len(FLEET) + 2
+
+    def reduced(con):
+        """The files a reduce read, after checking it kept what a full one would."""
+        _, files = calibrate.reduce(con)
+        kept = sorted(con.execute("FROM lake.file_medians").fetchall())
+        assert (
+            calibrate.reduce(con, full=True)[1]
+            == con.execute("SELECT count(*) FROM lake.files WHERE status = 'active'").fetchone()[0]
+        )
+        assert sorted(con.execute("FROM lake.file_medians").fetchall()) == kept
+        assert sorted(con.execute("FROM cal_obs").fetchall()) == kept
+        return files
+
+    def file_of(key):
+        return f"(SELECT file_id FROM lake.files WHERE key LIKE '%\\_{key}\\_pointData.csv' ESCAPE '\\')"
+
+    with open_store(env.store) as con:
+        # Nothing changed, nothing read.
+        assert calibrate.reduce(con) == (0, 0)
+        # A new transit is read alone: a higher file_id changes no other file's soundings.
+        n, rows, v = transit(50, "AQM-B", 8.79, (130, 190), 50)
+        put(env, n, rows, v)
+    env.run("noaa")
+    with open_store(env.store) as con:
+        assert reduced(con) == 1
+    # One in cells no earlier file reached moves no other file once tide takes them in.
+    n, rows, v = transit(51, "AQM-B", 8.79, (130, 190), 51, r=5000 + 270)
+    put(env, n, rows, v)
+    env.run("noaa")
+    with open_store(env.store) as con:
+        untided(con)
+        assert con.execute("SELECT count(DISTINCT tile_id) FROM lake.tide_cells").fetchall() == [
+            (1,)
+        ]
+        assert reduced(con) == 1
+        # A track flag on one sounding moves its file alone.
+        con.execute(
+            f"""INSERT INTO lake.qc_flags SELECT {catalog.POINT_ID}, 'reject', 'jump',
+              {calibrate.QC_VERSION}, p.cell_id, p.tile_id
+            FROM lake.points p WHERE file_id = {file_of(1)} AND "row" = 3"""
+        )
+        assert reduced(con) == 1
+        # Without E's first file, its second keeps the soundings they share.
+        con.execute(f"UPDATE lake.files SET status = 'superseded' WHERE file_id = {file_of(56)}")
+        [(before,)] = con.execute(
+            f"SELECT count(*) FROM lake.file_medians WHERE file_id = {file_of(57)}"
+        ).fetchall()
+        assert reduced(con) == 1
+        [(after,)] = con.execute(
+            f"SELECT count(*) FROM lake.file_medians WHERE file_id = {file_of(57)}"
+        ).fetchall()
+        assert after > before
+        assert not con.execute(
+            f"SELECT 1 FROM lake.file_tide_cells WHERE file_id = {file_of(56)}"
+        ).fetchall()
+        # A tide cell that takes a station moves every file of its tile.
+        con.execute("UPDATE lake.tide_cells SET station_id = 1")
+        con.execute(
+            """INSERT INTO lake.tide_levels
+            SELECT 1, unnest(generate_series(time_bucket(INTERVAL 30 MINUTE, min(time_min)),
+              max(time_max), INTERVAL 30 MINUTE)), 0.2, 0, 0.05, 'test'
+            FROM lake.files"""
+        )
+        assert reduced(con) == len(FLEET) + 3
+        [(medians,)] = con.execute("SELECT count(*) FROM lake.file_medians").fetchall()
+        assert medians > 0
+        # A station's levels move the files that cover their day, and only those.
+        con.execute(
+            "INSERT INTO lake.tide_levels VALUES (1, '2000-01-01 12:00', 0.3, 0, 0.05, 'x')"
+        )
+        assert reduced(con) == 0
+        [(day, covering)] = con.execute(
+            """SELECT d, count(*) FILTER (WHERE time_min::DATE <= d AND time_max::DATE >= d)
+            FROM lake.files, (SELECT max(time_max)::DATE AS d FROM lake.files)
+            WHERE status = 'active' GROUP BY 1"""
+        ).fetchall()
+        con.execute("UPDATE lake.tide_levels SET level = 0.3 WHERE slot::DATE = $day", {"day": day})
+        assert 0 < reduced(con) == covering
+        # An Open Waters file over E's NOAA file takes its soundings (rule 5), points or not.
+        assert con.execute(
+            f"SELECT 1 FROM lake.file_medians WHERE file_id = {file_of(57)}"
+        ).fetchall()
+        con.execute(
+            f"""INSERT INTO lake.files (file_id, source, vessel, content_hash, time_min,
+              time_max, point_count, has_points, status)
+            SELECT (SELECT max(file_id) + 1 FROM lake.files), 'openwaters', 'AQM-E', 'ow',
+              time_min, time_max, 0, false, 'active'
+            FROM lake.files WHERE file_id = {file_of(57)}"""
+        )
+        assert reduced(con) == 2
+        assert not con.execute(
+            f"SELECT 1 FROM lake.file_medians WHERE file_id = {file_of(57)}"
+        ).fetchall()
+        # And new code moves every file.
+        monkeypatch.setattr(calibrate, "CODE", "new")
+        assert calibrate.reduce(con)[1] == len(FLEET) + 4
 
 
 def test_a_noisy_tracks_soundings_dont_calibrate_its_vessel(env, tmp_path, monkeypatch):  # noqa: F811
