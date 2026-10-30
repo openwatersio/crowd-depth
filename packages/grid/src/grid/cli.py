@@ -50,6 +50,8 @@ def memory_gb(value: str) -> float:
     # Under 1 MB is 0 MB, which would mean the machine's memory.
     if not n * 1024 >= 1:
         raise argparse.ArgumentTypeError("must be 1 MB (0.001) or more")
+    if not math.isfinite(n):
+        raise argparse.ArgumentTypeError("must be a number of GB")
     return n
 
 

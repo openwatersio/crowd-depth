@@ -224,12 +224,9 @@ def test_the_worker_stops_its_jobs_when_its_parent_is_killed(tmp_path):
     client, pipe = blocking_job(sock, tmp_path / "run")
     parent.kill()
     parent.wait()
-    assert client.wait(timeout=30) != 0
-    with pytest.raises(BrokenPipeError):
-        os.write(pipe, b"x")
-    os.close(pipe)
     # Gone once it no longer listens: its pid can outlast it as a zombie, where the
-    # container's init (uv, in CI) doesn't reap orphans.
+    # container's init (uv, in CI) doesn't reap orphans. Asked every 0.1 s, as a busy
+    # run's clients would, so it never waits a second for a job.
     for _ in range(100):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
@@ -239,6 +236,22 @@ def test_the_worker_stops_its_jobs_when_its_parent_is_killed(tmp_path):
         time.sleep(0.1)
     else:
         raise AssertionError("the worker outlived its parent")
+    assert client.wait(timeout=30) != 0
+    with pytest.raises(BrokenPipeError):
+        os.write(pipe, b"x")
+    os.close(pipe)
+
+
+def test_tippecanoe_runs_on_the_jobs_threads(tmp_path, monkeypatch):
+    seen = []
+
+    def run(cmd, **kwargs):
+        seen.append(kwargs["env"]["TIPPECANOE_MAX_THREADS"])
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(tiles.subprocess, "run", run)
+    assert tiles.tippecanoe(tmp_path / "x.mbtiles", [], (0, 7), 3)
+    assert seen == ["3"]
 
 
 def test_sigterm_ends_a_run_through_its_cleanup():
@@ -264,7 +277,7 @@ def test_a_code_change_reruns_everything(monkeypatch):
     assert len(got) == 2
 
 
-@pytest.mark.parametrize("gb", ["0", "0.0005"])
+@pytest.mark.parametrize("gb", ["0", "0.0005", "inf", "nan"])
 def test_memory_must_be_a_megabyte_or_more(gb):
     with pytest.raises(SystemExit):
         cli.main(["--store", "store", "tiles", "--out", "run", "--memory-gb", gb])
