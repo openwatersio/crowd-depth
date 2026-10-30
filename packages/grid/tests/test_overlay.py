@@ -11,7 +11,7 @@ import rasterio.shutil
 import shapely
 import test_grid
 from pmtiles.reader import MmapSource, Reader
-from scipy.ndimage import binary_dilation
+from scipy.ndimage import binary_dilation, distance_transform_edt
 from test_grid import CSIG
 from test_ingest import env  # noqa: F401  (env is a fixture)
 
@@ -282,6 +282,28 @@ def test_surface_bands_worked_on_their_window_match_the_whole_tile(
     # The same shapes, but for where tracing starts: within a tenth of a pixel here.
     for a, b in [*zip(whole[0].values(), cropped[0].values()), *zip(whole[1:4], cropped[1:4])]:
         assert shapely.hausdorff_distance(a, b) < 0.1 * pixel
+
+
+@pytest.mark.parametrize("carry_rows", [1, 2, 7])
+def test_depths_carried_a_strip_at_a_time_match_the_whole_window(monkeypatch, carry_rows):
+    # Tracks a pixel or a few wide, crossing strips of a few rows and leaving some empty,
+    # with depths that vary pixel to pixel so a wrong source pixel shows.
+    rng = np.random.default_rng(0)
+    depth = np.full((90, 70), surface.NODATA, dtype=np.float32)
+    for _ in range(12):
+        r, c = rng.integers(0, 90), rng.integers(0, 70)
+        dr, dc = rng.integers(-1, 2, size=2)
+        for _ in range(rng.integers(5, 40)):
+            depth[r : r + rng.integers(1, 3), c : c + rng.integers(1, 3)] = rng.uniform(1, 30)
+            r, c = np.clip(r + dr, 0, 89), np.clip(c + dc, 0, 69)
+    depth[40:60] = surface.NODATA
+    valid = depth != surface.NODATA
+    far, (rows, cols) = distance_transform_edt(~valid, return_indices=True)
+    grown = np.where(far <= overlay.FILL_PX, depth[rows, cols], surface.NODATA)
+    monkeypatch.setattr(overlay, "CARRY_ROWS", carry_rows)
+    carried, near = overlay.carry(depth, valid)
+    assert np.array_equal(near, far <= overlay.FILL_PX)
+    assert np.array_equal(carried, grown)
 
 
 def test_surface_bands_follow_the_surface(tmp_path):
