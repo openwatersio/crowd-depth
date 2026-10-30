@@ -12,8 +12,9 @@ dependencies = [
   "rasterio>=1.4",
   "scipy>=1.14",
   "shapely>=2.1",
-  # Runs the per-tile rebuild (tiles.py); pinned as Seascape pins it.
-  "snakemake==9.26.1",
+  # Runs the per-tile rebuild (tiles.py). A new major version can change the flags
+  # `grid tiles` passes and how Snakemake decides what reruns.
+  "snakemake>=9.26.1,<10",
 ]
 
 [project.scripts]
