@@ -176,6 +176,38 @@ def test_levels_come_from_the_slackwater_engine():
     assert series[0][1] == pytest.approx(0.2504, abs=1e-3)
 
 
+@pytest.mark.skipif(
+    not shutil.which("node") or not (tide.PREDICT.parent / "node_modules").exists(),
+    reason="needs node and `npm ci` in slackwater/",
+)
+def test_a_station_the_database_lacks_leaves_its_days_empty_every_time():
+    known = {"station": "noaa/8638863", "start": 1717200000, "end": 1717203600, "step": 1800}
+    unknown = known | {"station": "nowhere/1"}
+    missing, again, series = tide.slackwater_levels([unknown, unknown, known])
+    assert missing == again == []
+    assert len(series) == 3
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="needs node")
+def test_a_database_that_wont_load_fails_the_run_rather_than_every_station(tmp_path, monkeypatch):
+    # Empty series would mark the stations unpredictable, so their cells would move.
+    modules = {
+        "@slackwater/database": 'export const loadStations = () => Promise.reject(new Error("bad"));',
+        "slackwater": 'export const findStation = () => Promise.reject(new Error("bad"));',
+    }
+    for name, source in modules.items():
+        package = tmp_path / "node_modules" / name
+        package.mkdir(parents=True)
+        (package / "package.json").write_text('{"type": "module", "main": "index.js"}')
+        (package / "index.js").write_text(source)
+    helper = tmp_path / "predict.mjs"
+    shutil.copy(tide.PREDICT, helper)
+    monkeypatch.setattr(tide, "PREDICT", helper)
+    request = {"station": "noaa/8638863", "start": 1717200000, "end": 1717203600, "step": 1800}
+    with pytest.raises(RuntimeError, match="Slackwater helper failed"):
+        tide.slackwater_levels([request])
+
+
 # Calibration
 
 
