@@ -13,6 +13,14 @@ import duckdb
 import pytest
 import test_grid
 from pmtiles.reader import MmapSource, Reader, all_tiles
+from pmtiles.tile import (
+    Compression,
+    TileType,
+    deserialize_directory,
+    deserialize_header,
+    zxy_to_tileid,
+)
+from pmtiles.writer import Writer
 from test_ingest import env  # noqa: F401  (env is a fixture)
 
 from grid import cells, cli, overlay, tiles
@@ -449,6 +457,49 @@ def test_a_run_whose_tiles_are_all_withdrawn_publishes_nothing(env, tmp_path):  
         tiles.build(env.store, tmp_path, dry_run=True)
     assert not (tmp_path / "overlay.pmtiles").exists()
     assert not (tmp_path / "low.pmtiles").exists()
+
+
+def test_assembly_keeps_every_tile_of_a_run_length_entry(tmp_path, monkeypatch):
+    key = tiles.tile_z8s(SOUTH)[0]
+    x, y = map(int, key.split("_"))
+    (tmp_path / "tiles.txt").write_text(f"{SOUTH}\t5\n")
+    (tmp_path / "web").mkdir()
+    children = {
+        zxy_to_tileid(9, 2 * x + i, 2 * y + j): (9, 2 * x + i, 2 * y + j)
+        for i in (0, 1)
+        for j in (0, 1)
+    }
+    # A run holds one tile's bytes once, so a tile with other bytes follows it.
+    data = dict(zip(sorted(children), [b"same", b"same", b"same", b"something else"], strict=True))
+    header = {
+        "tile_type": TileType.MVT,
+        "tile_compression": Compression.GZIP,
+        "min_zoom": 9,
+        "max_zoom": 9,
+        "min_lon_e7": 0,
+        "min_lat_e7": 0,
+        "max_lon_e7": 0,
+        "max_lat_e7": 0,
+        "center_zoom": 9,
+        "center_lon_e7": 0,
+        "center_lat_e7": 0,
+    }
+    with open(tmp_path / "web" / f"{key}.pmtiles", "wb") as f:
+        writer = Writer(f)
+        for tile_id, tile in data.items():
+            writer.write_tile(tile_id, tile)
+        writer.finalize(header, {})
+    monkeypatch.setattr(tiles, "snapshot", lambda *_: contextlib.nullcontext())
+    monkeypatch.setattr(overlay, "describe", lambda _: {})
+
+    tiles.do_assemble(tmp_path, 1)
+
+    with open(tmp_path / "overlay.pmtiles", "rb") as f:
+        get = MmapSource(f)
+        got = deserialize_header(get(0, 127))
+        directory = deserialize_directory(get(got["root_offset"], got["root_length"]))
+        assert [e.run_length for e in directory] == [3, 1]
+        assert dict(all_tiles(get)) == {children[t]: tile for t, tile in data.items()}
 
 
 def test_a_tile_past_web_mercator_leaves_the_low_zooms_alone(tmp_path):
