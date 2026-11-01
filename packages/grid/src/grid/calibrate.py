@@ -1125,7 +1125,10 @@ def calibrated_by(rows) -> str:
     # The runs' queries, their constants, and the QC whose flags they read.
     rule = (
         STUCK,
+        inspect.getsource(reference_px),
         inspect.getsource(stuck_runs),
+        FLAT_RELIEF_M,
+        ANCHOR_UNCERTAINTY_M,
         CROWD_VESSELS,
         MONTH_SHARE,
         STUCK_SHARE,

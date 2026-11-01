@@ -1578,6 +1578,19 @@ def test_stuck_runs_are_current_for_an_offset_the_store_rounds_its_own_way(env):
         assert calibrate.runs_current(con)
 
 
+@pytest.mark.parametrize("constant", ["FLAT_RELIEF_M", "ANCHOR_UNCERTAINTY_M"])
+def test_stuck_runs_from_another_flat_water_rule_arent_current(
+    env,  # noqa: F811
+    tmp_path,
+    monkeypatch,
+    constant,
+):
+    calibrated(env, FLEET, reference(tmp_path / "ref.tif", (0, 110)), monkeypatch)
+    monkeypatch.setattr(calibrate, constant, getattr(calibrate, constant) + 0.1)
+    with open_store(env.store) as con:
+        assert not calibrate.runs_current(con)
+
+
 def test_a_recalibration_leaves_changed_tiles_to_rebuild(env, tmp_path, monkeypatch):  # noqa: F811
     calibrated(env, FLEET, reference(tmp_path / "ref.tif", (0, 110)), monkeypatch)
     with open_store(env.store) as con:
