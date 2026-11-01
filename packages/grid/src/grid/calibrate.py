@@ -686,9 +686,13 @@ def transit_offsets(con, offset, lost=False):
           SELECT tile_id, py, px, sum(b * (m - o)) AS t, sum(b) AS w FROM x GROUP BY ALL
         ),
         others AS (
-          -- Each unit's pixel depth from the other units there.
-          SELECT x.tile_id, x.py, x.px, x.unit, (px.t - x.b * (x.m - x.o)) / (px.w - x.b) AS z
-          FROM x JOIN px USING (tile_id, py, px) WHERE px.w > x.b
+          -- Each unit's pixel depth from the other units there: all of them for a unit
+          -- whose rows there all read lost, which has none in `xrows`.
+          SELECT tile_id, py, px, unit,
+            (px.t - coalesce(x.b * (x.m - x.o), 0)) / (px.w - coalesce(x.b, 0)) AS z
+          FROM (SELECT DISTINCT tile_id, py, px, unit FROM xobs)
+          JOIN px USING (tile_id, py, px) LEFT JOIN x USING (tile_id, py, px, unit)
+          WHERE px.w > coalesce(x.b, 0)
         ),
         e AS (
           SELECT o.vessel, o.file_id, o.t, o.m - z.z AS e, z.z AS z, o.lost

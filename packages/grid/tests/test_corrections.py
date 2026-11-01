@@ -1007,6 +1007,28 @@ def test_lost_readings_dont_calibrate_a_vessel_shallow(env, tmp_path, monkeypatc
     assert got[("AQM-T", 0)] == (pytest.approx(-2.3, abs=0.06), "anchored")
 
 
+def test_a_transit_lost_where_only_the_crowd_sounded_still_shows_it(env, tmp_path, monkeypatch):  # noqa: F811
+    # T's two transits past the survey read 0.8 m where three other vessels read 10 m. T has
+    # no other reading at those pixels, so nothing of its own is left there once they're
+    # judged lost, and they're still measured against the other vessels.
+    ref = reference(tmp_path / "ref.tif", (0, 110))
+    fleet = [
+        *(transit(1 + i, "AQM-T", 5.4, (0, 110), i) for i in range(10)),
+        *(transit(20 + i, "AQM-T", 0.8, (130, 190), 20 + i) for i in range(2)),
+        *(
+            transit(30 + 3 * v + i, f"AQM-{v}", 9.5, (0, 240), 30 + 3 * v + i)
+            for v in range(3)
+            for i in range(3)
+        ),
+    ]
+    calibrated(env, fleet, ref, monkeypatch)
+    assert (
+        env.query("SELECT round(transit_m), round(segment_m) FROM lake.calibration_outliers")
+        == [(-9.0, -5.0)] * 2
+    )
+    assert {round(raw) for _, _, raw, c in corrected(env, "depth_raw, lost_bottom") if c} == {1}
+
+
 def stuck(n, vessel, depth, slot, cols=(0, 240), step=2):
     """A transit reading `depth` wandering a tenth either way, one sounding per `step`
     columns (step 0: sitting still)."""
