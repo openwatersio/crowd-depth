@@ -5,6 +5,7 @@ import shutil
 import sqlite3
 from datetime import date, datetime, timedelta
 
+import duckdb
 import numpy as np
 import pytest
 import rasterio
@@ -1029,6 +1030,206 @@ def test_a_transit_lost_where_only_the_crowd_sounded_still_shows_it(env, tmp_pat
     assert {round(raw) for _, _, raw, c in corrected(env, "depth_raw, lost_bottom") if c} == {1}
 
 
+@pytest.mark.parametrize(
+    "first, second, want",
+    [
+        ((14, 9.5), (8, 4.0), [-0.5, -6.0]),  # the sounder's new reading in the minority
+        ((5, 3.0), (20, 8.0), [-7.0, -2.0]),  # its old one
+    ],
+)
+def test_a_sounders_real_move_stays_a_step(env, tmp_path, monkeypatch, first, second, want):  # noqa: F811
+    # Against one offset per vessel the far side of the move reads lost, by every test of a
+    # lost bottom. Its transits still show as a step, and each side reads the survey's 10 m.
+    fleet = [
+        *(transit(1 + i, "AQM-T", first[1], (0, 240), i) for i in range(first[0])),
+        *(transit(30 + i, "AQM-T", second[1], (0, 240), 30 + i) for i in range(second[0])),
+        *(transit(60 + i, "AQM-A", 9.5, (0, 240), 60 + i) for i in range(3)),
+    ]
+    totals = calibrated(env, fleet, reference(tmp_path / "ref.tif", (0, 240)), monkeypatch)
+    got = segments(env)
+    assert totals["steps"] == 1 and totals["stray_transits"] == 0
+    assert [got[("AQM-T", s)][0] for s in (0, 1)] == pytest.approx(want, abs=0.06)
+    assert env.query("SELECT count(*) FROM lake.lost_runs") == [(0,)]
+
+
+def two_depths(tmp_path):
+    return [
+        reference(tmp_path / "7.tif", (0, 240), elevation=-7.0, rows=(4990, 5010)),
+        reference(tmp_path / "13.tif", (0, 240), elevation=-13.0, rows=(5090, 5110)),
+    ]
+
+
+def run_over(env, refs, fleet, monkeypatch):  # noqa: F811
+    for n, rows, vessel in fleet:
+        put(env, n, rows, vessel)
+    env.run("noaa")
+    monkeypatch.setattr("grid.reference.coops_separation", lambda: lambda lon, lat: 0.0)
+    with open_store(env.store) as con:
+        untided(con)
+        return calibrate.run(con, refs)
+
+
+def test_a_stretch_that_doesnt_follow_the_seabed_isnt_a_step(env, tmp_path, monkeypatch):  # noqa: F811
+    # T reads 3 m shallow, then for a run of transits holds 0.8 m over both 7 and 13 m of
+    # survey. Its offset against each is as steady as a moved sounder's would be there.
+    fleet = [
+        *(
+            transit(1 + i, "AQM-T", 4.0 + 6 * (i % 2), (0, 240), i, r=5000 + 100 * (i % 2))
+            for i in range(12)
+        ),
+        *(
+            transit(20 + i, "AQM-T", 0.8, (0, 240), 20 + i, r=5000 + 100 * (i % 2))
+            for i in range(8)
+        ),
+        *(
+            transit(40 + i, "AQM-A", 6.5 + 6 * (i % 2), (0, 240), 40 + i, r=5000 + 100 * (i % 2))
+            for i in range(6)
+        ),
+    ]
+    totals = run_over(env, two_depths(tmp_path), fleet, monkeypatch)
+    assert totals["steps"] == 0
+    assert segments(env)[("AQM-T", 0)] == (pytest.approx(-3.0, abs=0.06), "anchored")
+    assert env.query("SELECT count(*) FROM lake.calibration_outliers") == [(8,)]
+
+
+def test_a_move_that_follows_the_seabed_is_a_step_where_a_lost_one_isnt(env, tmp_path, monkeypatch):  # noqa: F811
+    # The same run of transits, now reading 5 m shallower than before over either depth.
+    fleet = [
+        *(
+            transit(1 + i, "AQM-T", 6.0 + 6 * (i % 2), (0, 240), i, r=5000 + 100 * (i % 2))
+            for i in range(12)
+        ),
+        *(
+            transit(20 + i, "AQM-T", 1.0 + 6 * (i % 2), (0, 240), 20 + i, r=5000 + 100 * (i % 2))
+            for i in range(8)
+        ),
+        *(
+            transit(40 + i, "AQM-A", 6.5 + 6 * (i % 2), (0, 240), 40 + i, r=5000 + 100 * (i % 2))
+            for i in range(6)
+        ),
+    ]
+    totals = run_over(env, two_depths(tmp_path), fleet, monkeypatch)
+    got = segments(env)
+    assert totals["steps"] == 1 and totals["stray_transits"] == 0
+    assert [got[("AQM-T", s)][0] for s in (0, 1)] == pytest.approx([-1.0, -6.0], abs=0.06)
+
+
+def test_a_first_stretch_that_doesnt_follow_the_seabed_joins_the_next(env, tmp_path, monkeypatch):  # noqa: F811
+    fleet = [
+        *(transit(1 + i, "AQM-T", 0.8, (0, 240), i, r=5000 + 100 * (i % 2)) for i in range(8)),
+        *(
+            transit(20 + i, "AQM-T", 4.0 + 6 * (i % 2), (0, 240), 20 + i, r=5000 + 100 * (i % 2))
+            for i in range(12)
+        ),
+        *(
+            transit(40 + i, "AQM-A", 6.5 + 6 * (i % 2), (0, 240), 40 + i, r=5000 + 100 * (i % 2))
+            for i in range(6)
+        ),
+    ]
+    assert run_over(env, two_depths(tmp_path), fleet, monkeypatch)["steps"] == 0
+    assert segments(env)[("AQM-T", 0)] == (pytest.approx(-3.0, abs=0.06), "anchored")
+
+
+def test_a_passage_over_deep_water_doesnt_cost_a_real_move_its_step(env, tmp_path, monkeypatch):  # noqa: F811
+    # After a move T crosses 60 m of survey, too deep to anchor, once, where it reads 1 m: over
+    # all the survey its segment wouldn't follow the seabed, though it plainly moved.
+    refs = [
+        *two_depths(tmp_path)[:1],
+        reference(tmp_path / "60.tif", (0, 240), elevation=-60.0, rows=(5090, 5110)),
+    ]
+    fleet = [
+        *(transit(1 + i, "AQM-T", 6.0, (0, 240), i) for i in range(12)),
+        *(transit(20 + i, "AQM-T", 1.0, (0, 240), 20 + i) for i in range(8)),
+        transit(30, "AQM-T", 1.0, (0, 240), 30, r=5100),
+        *(transit(40 + i, "AQM-A", 6.5, (0, 240), 40 + i) for i in range(3)),
+    ]
+    assert run_over(env, refs, fleet, monkeypatch)["steps"] == 1
+
+
+@pytest.mark.parametrize("passes", [2, 3, 4])
+def test_leaving_out_lost_rows_doesnt_take_a_vessels_anchor(
+    env,  # noqa: F811
+    tmp_path,
+    monkeypatch,
+    passes,
+):
+    # 15 of its 60 anchor pixels read lost in every transit, which leaves it under
+    # ANCHOR_PIXELS. It stays anchored, or nothing would say those rows are lost, and however
+    # many passes it gets.
+    monkeypatch.setattr(calibrate, "LOST_PASSES", passes)
+    fleet = []
+    for i in range(3):
+        n, rows, vessel = transit(1 + i, "AQM-T", 5.4, (0, 120), i)
+        rows = [
+            (ts, x, y, 0.6 + 0.1 * (j % 9) if j < 15 else d) for j, (ts, x, y, d) in enumerate(rows)
+        ]
+        fleet.append((n, rows, vessel))
+    calibrated(env, fleet, reference(tmp_path / "ref.tif", (0, 240)), monkeypatch)
+    assert segments(env)[("AQM-T", 0)] == (pytest.approx(-4.6, abs=0.06), "anchored")
+    assert env.query("SELECT anchor_pixels FROM lake.calibration") == [(60,)]
+
+
+def test_a_transit_lost_over_one_other_vessel_still_shows_it(env, tmp_path, monkeypatch):  # noqa: F811
+    # T's two transits read 1 m over 25 m of survey, too deep to anchor, where only A sounded
+    # with it: that pixel leaves the solve once they read lost, and still measures them.
+    refs = [
+        reference(tmp_path / "10.tif", (0, 240), rows=(4990, 5010)),
+        reference(tmp_path / "25.tif", (0, 240), elevation=-25.0, rows=(5090, 5110)),
+    ]
+    fleet = [
+        *(transit(1 + i, "AQM-T", 5.0, (0, 240), i) for i in range(10)),
+        *(transit(20 + i, "AQM-T", 1.0, (0, 240), 20 + i, r=5100) for i in range(2)),
+        *(transit(30 + i, "AQM-A", 9.5, (0, 240), 30 + i) for i in range(3)),
+        *(transit(40 + i, "AQM-A", 24.5, (0, 240), 40 + i, r=5100) for i in range(3)),
+    ]
+    for n, rows, vessel in fleet:
+        put(env, n, rows, vessel)
+    env.run("noaa")
+    monkeypatch.setattr("grid.reference.coops_separation", lambda: lambda lon, lat: 0.0)
+    with open_store(env.store) as con:
+        untided(con)
+        calibrate.run(con, refs)
+    assert env.query("SELECT count(*) FROM lake.calibration_outliers") == [(2,)]
+    assert {round(raw) for _, _, raw, c in corrected(env, "depth_raw, lost_bottom") if c} == {1}
+
+
+def test_a_transit_counts_once_across_the_pixels_the_solve_keeps():
+    # B's file crosses A at one pixel, and at three others only a lost row of C's.
+    con = duckdb.connect()
+    con.execute(
+        """CREATE TEMP TABLE cal_obs AS SELECT * FROM (VALUES
+          (1, 1, 1, 'A', 10, 5.0, false), (1, 1, 1, 'B', 20, 5.0, false),
+          (1, 2, 2, 'B', 20, 5.0, false), (1, 2, 2, 'C', 30, 1.0, true),
+          (1, 3, 3, 'B', 20, 5.0, false), (1, 3, 3, 'C', 30, 1.0, true),
+          (1, 4, 4, 'B', 20, 5.0, false), (1, 4, 4, 'C', 30, 1.0, true))
+          t(tile_id, py, px, vessel, file_id, m, lost)"""
+    )
+    con.execute(
+        """CREATE TEMP TABLE file_units AS SELECT * FROM (VALUES
+          ('A', 10, 0), ('B', 20, 1), ('C', 30, 2)) t(vessel, file_id, unit)"""
+    )
+    calibrate.crossings(con)
+    assert con.execute("SELECT sum(b) FROM xrows WHERE solved AND unit = 1").fetchone() == (1.0,)
+
+
+def test_a_pixel_shared_only_with_lost_rows_isnt_a_crossing():
+    # Two units at each pixel, but B's rows at the first read lost: only the second crosses.
+    con = duckdb.connect()
+    con.execute(
+        """CREATE TEMP TABLE cal_obs AS SELECT * FROM (VALUES
+          (1, 1, 1, 'A', 10, 5.0, false), (1, 1, 1, 'B', 20, 1.0, true),
+          (1, 2, 2, 'A', 11, 5.0, false), (1, 2, 2, 'B', 21, 5.0, false))
+          t(tile_id, py, px, vessel, file_id, m, lost)"""
+    )
+    con.execute(
+        """CREATE TEMP TABLE file_units AS SELECT * FROM (VALUES
+          ('A', 10, 0), ('B', 20, 1), ('A', 11, 0), ('B', 21, 1)) t(vessel, file_id, unit)"""
+    )
+    calibrate.crossings(con)
+    assert con.execute("SELECT DISTINCT py FROM xrows WHERE solved").fetchall() == [(2,)]
+    assert list(calibrate.crossing_transits(con, 2)) == [1, 1]
+
+
 def stuck(n, vessel, depth, slot, cols=(0, 240), step=2):
     """A transit reading `depth` wandering a tenth either way, one sounding per `step`
     columns (step 0: sitting still)."""
@@ -1244,6 +1445,13 @@ def test_stuck_runs_are_current_for_an_offset_the_store_rounds_its_own_way(env):
     row = ("AQM-T", 0, None, None, -1.7975586593173563, 0.1, "anchored", 100, 5, 0)
     with open_store(env.store) as con:
         calibrate.publish(con, [row])
+        assert calibrate.runs_current(con)
+    # And so it stays once the store is reopened, and its inlined rows are flushed to Parquet.
+    with open_store(env.store) as con:
+        assert calibrate.runs_current(con)
+        catalog.flush_inlined(con)
+        assert calibrate.runs_current(con)
+    with open_store(env.store) as con:
         assert calibrate.runs_current(con)
 
 
