@@ -358,9 +358,9 @@ def reduce(con, full=False):
     # file to reduce: the list is searched for each sounding.
     parts = con.execute(
         """SELECT t.cell_id,
-          list(DISTINCT t.tile_id ORDER BY t.tile_id) FILTER (d.file_id NOT NULL),
+          list(DISTINCT t.tile_id ORDER BY t.tile_id) FILTER (WHERE d.file_id IS NOT NULL),
           CASE WHEN count(DISTINCT c.vessel) = count(DISTINCT d.vessel) THEN []
-            ELSE list(DISTINCT d.vessel ORDER BY d.vessel) FILTER (d.file_id NOT NULL) END
+            ELSE list(DISTINCT d.vessel ORDER BY d.vessel) FILTER (WHERE d.file_id IS NOT NULL) END
         FROM lake.file_tiles t JOIN cal_inputs c USING (file_id)
         LEFT JOIN cal_dirty d USING (file_id)
         GROUP BY 1 HAVING count(d.file_id) > 0 ORDER BY 1"""
