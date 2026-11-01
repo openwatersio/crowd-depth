@@ -44,4 +44,4 @@ jobs:
       - name: Run tests
         env:
           UV_PYTHON: ${{ matrix.python }}
-        run: ./docker.sh uv run --locked pytest
+        run: ./docker.sh uv run --locked pytest -n auto

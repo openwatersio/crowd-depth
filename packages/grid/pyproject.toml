@@ -18,7 +18,12 @@ dependencies = [
 grid = "grid.cli:main"
 
 [dependency-groups]
-dev = ["pyarrow>=20", "pytest>=8", "ruff>=0.12"]
+dev = [
+    "pyarrow>=20",
+    "pytest>=8",
+    "pytest-xdist>=3.8.0",
+    "ruff>=0.12",
+]
 
 [build-system]
 requires = ["hatchling"]
