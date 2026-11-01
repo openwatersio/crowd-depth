@@ -397,6 +397,7 @@ def surface_bands(path, soundings=None):
             b = int(np.searchsorted(LEVELS, f["properties"]["lo"], side="right")) - 1
             part = shapely.make_valid(shapely.from_geojson(json.dumps(f["geometry"])))
             bands[b] = shapely.union(bands[b], part) if b in bands else part
+            del f, part
         # Where the outline bulges past the depths' reach, as at a corner it rounds on the
         # tile's edge, the shoalest band beside it takes the rest.
         rest = shapely.get_parts(polygonal(shapely.difference(surfaced, reach)))
@@ -408,6 +409,7 @@ def surface_bands(path, soundings=None):
             near = near[~taken[near]]
             taken[near] = True
             bands[b] = shapely.union(band, shapely.MultiPolygon(list(rest[near])))
+            del band
         bands = {b: a for b, a in bands.items() if not a.is_empty}
         del features, reach, rest, tree
     # Where interpolation starts is drawn more loosely than the edge of the water, on the
