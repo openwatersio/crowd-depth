@@ -39,7 +39,10 @@ export function createReporter({
   url = BATHY_URL,
 }: ReporterOptions) {
   const reportLog = createReportLogger(db);
-  const job = new CronJob(schedule, report);
+  let running = false;
+  let retry: ReturnType<typeof setTimeout> | undefined;
+  let retryAt: Temporal.Instant | undefined;
+  const job = new CronJob(schedule, sync);
   signal.addEventListener("abort", stop, { once: true });
 
   // From the last report to a whole second BATHY_REPORT_DELAY ago. History
@@ -138,20 +141,45 @@ export function createReporter({
   }
 
   function updateStatus() {
+    const scheduled = Temporal.Instant.fromEpochMilliseconds(
+      job.nextDate().toMillis(),
+    );
     status.set({
       lastReport: reportLog.lastReport,
-      nextReport: Temporal.Instant.fromEpochMilliseconds(
-        job.nextDate().toMillis(),
-      ),
+      nextReport:
+        retryAt && Temporal.Instant.compare(retryAt, scheduled) < 0
+          ? retryAt
+          : scheduled,
     });
+  }
+
+  async function sync() {
+    if (signal.aborted || running) return;
+    running = true;
+    clearTimeout(retry);
+    retryAt = undefined;
+    try {
+      await reportInBatches();
+    } catch (err) {
+      if (!signal.aborted) {
+        status.error(err as Error);
+        retryAt = Temporal.Now.instant().add({ minutes: 5 });
+        retry = setTimeout(() => void sync(), 5 * 60_000);
+      }
+    } finally {
+      running = false;
+      if (!signal.aborted) updateStatus();
+    }
   }
 
   function stop() {
     app.debug(`Stopping reporter`);
     job.stop();
+    clearTimeout(retry);
   }
 
   function start() {
+    if (signal.aborted) return;
     job.start();
     updateStatus();
   }
@@ -164,7 +192,7 @@ export function createReporter({
   ) {
     start();
   } else {
-    reportInBatches().then(start);
+    void sync().then(start);
   }
 
   return { report, reportInBatches };
