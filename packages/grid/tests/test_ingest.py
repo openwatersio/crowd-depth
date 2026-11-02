@@ -775,8 +775,7 @@ def test_lock_renewal_survives_a_retried_renewal(tmp_path):
     assert not lock.lost.is_set()
     assert json.loads(store.get(LOCK)[0])["owner"] == lock.owner
     store.put(LOCK, json.dumps({"owner": "other", "expires": "2999-01-01T00:00:00+00:00"}).encode())
-    time.sleep(0.2)
-    assert lock.lost.is_set()
+    assert lock.lost.wait(2)
     lock.release()
 
 
@@ -882,15 +881,15 @@ def test_unknown_keys_alert_but_hidden_files_do_not(env):
 
 def test_lock_survives_a_brief_outage(tmp_path, monkeypatch):
     store = LocalObjects(tmp_path)
-    lock = Lock(store, ttl=timedelta(seconds=0.4))
+    lock = Lock(store, ttl=timedelta(seconds=1.6))
     lock.acquire()
     put, get = store.put, store.get
     monkeypatch.setattr(store, "put", lambda *a, **k: (_ for _ in ()).throw(OSError()))
     monkeypatch.setattr(store, "get", lambda *a, **k: (_ for _ in ()).throw(OSError()))
-    time.sleep(0.15)  # one failed renewal, well inside the TTL
+    time.sleep(0.6)  # one failed renewal, well inside the TTL
     monkeypatch.setattr(store, "put", put)
     monkeypatch.setattr(store, "get", get)
-    time.sleep(0.25)
+    time.sleep(1)
     assert not lock.lost.is_set()
     lock.release()
     assert lock_free(store)

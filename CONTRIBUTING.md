@@ -144,7 +144,8 @@ changed.
 
 ```sh
 cd packages/grid
-./docker.sh                            # tests, in the same image CI uses
+./docker.sh                            # tests, one at a time, in the same image CI uses
+./docker.sh uv run pytest -n auto      # the same, one worker per core, as CI runs them
 ./docker.sh uv run ruff check          # any command, in that image
 uv run pytest                          # tests on the host; those that need tippecanoe, gdal_grid, gdal_contour or potrace fail without them
 uv run pytest -n auto                  # the same, one worker per core
