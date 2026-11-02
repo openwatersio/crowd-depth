@@ -59,6 +59,7 @@ export async function settleSource({
   // The provider records the same stream itself.
   signal.removeEventListener("abort", stopRecording);
   recording.abort("History provider found");
+  status.clearError("collector");
   status.set({ collecting: false, usingHistory: true });
   return late;
 }

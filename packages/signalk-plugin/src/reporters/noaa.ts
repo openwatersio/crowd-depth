@@ -1,6 +1,6 @@
 import { text } from "stream/consumers";
 import type { VesselInfo } from "../metadata.js";
-import { Readable } from "stream";
+import { Readable, addAbortSignal } from "stream";
 import { Config, depthReference } from "../config.js";
 import pkg from "../../package.json" with { type: "json" };
 import {
@@ -29,6 +29,22 @@ export class SubmissionError extends Error {
   ) {
     super(message);
     this.name = "SubmissionError";
+  }
+
+  get permanent() {
+    if (this.status === 413) return true;
+    if (![400, 401, 403, 413, 426].includes(this.status)) return false;
+    try {
+      const body = JSON.parse(this.body);
+      return (
+        body?.success === false &&
+        typeof body.message === "string" &&
+        (this.status !== 400 ||
+          body.message === "Missing or invalid User-Agent")
+      );
+    } catch {
+      return false;
+    }
   }
 }
 
@@ -59,7 +75,40 @@ export async function submitFormData(
   metadata: object,
   file: Readable,
   headers: Record<string, string> = {},
+  signal?: AbortSignal,
+  generationTimeout?: number,
 ): Promise<SubmissionResponse> {
+  signal?.throwIfAborted();
+  let contents: string;
+  if (!signal && generationTimeout === undefined) {
+    contents = await text(file);
+  } else {
+    const controller = new AbortController();
+    const preparing = signal
+      ? AbortSignal.any([signal, controller.signal])
+      : controller.signal;
+    addAbortSignal(preparing, file);
+    const timeout =
+      generationTimeout === undefined
+        ? undefined
+        : setTimeout(
+            () =>
+              controller.abort(
+                new Error(
+                  "GeoJSON generation timed out; raise BATHY_REPORT_TIMEOUT for slow storage",
+                ),
+              ),
+            generationTimeout,
+          );
+    try {
+      contents = await text(file);
+    } catch (err) {
+      if (preparing.aborted) throw preparing.reason;
+      throw err;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
   const form = new FormData();
 
   form.append(
@@ -72,7 +121,7 @@ export async function submitFormData(
   // used chunked encoding, but Vercel chokes on chunked multipart forms.
   form.append(
     "file",
-    new Blob([await text(file)], { type: "application/geo+json" }),
+    new Blob([contents], { type: "application/geo+json" }),
     `${prefix}.geojson`,
   );
 
@@ -82,6 +131,7 @@ export async function submitFormData(
     method: "POST",
     headers,
     body: form,
+    signal,
   });
 
   debug("Received response: %d %s", response.status, response.statusText);
@@ -116,13 +166,29 @@ export async function submitGeoJSON(
   config: Config,
   vessel: VesselInfo,
   data: Readable,
+  signal?: AbortSignal,
+  generationTimeout?: number,
 ) {
+  signal?.throwIfAborted();
   const url = new URL("geojson", endpoint);
   const headers = { Authorization: `Bearer ${vessel.token}` };
   const body = createGeoJSON(config, vessel, data);
   const uniqueID = toUniqueID(vessel);
 
-  return submitFormData(url, vessel.uuid, { uniqueID }, body, headers);
+  try {
+    return await submitFormData(
+      url,
+      vessel.uuid,
+      { uniqueID },
+      body,
+      headers,
+      signal,
+      generationTimeout,
+    );
+  } finally {
+    body.destroy();
+    data.destroy();
+  }
 }
 
 export type Metadata = ReturnType<typeof getMetadata>;

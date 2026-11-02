@@ -46,7 +46,7 @@ export default function createPlugin(app: ServerAPI): Plugin {
             writer: sqlite.createWriter!(),
             signal,
           }).catch((err: unknown) => {
-            if (!signal.aborted) status.error(err as Error);
+            if (!signal.aborted) status.error(err as Error, "collector");
           }),
         status,
         wait: BATHY_HISTORY_WAIT,

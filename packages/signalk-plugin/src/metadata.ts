@@ -3,6 +3,7 @@ import { readFile, writeFile } from "fs/promises";
 import { join } from "path";
 import { BATHY_URL } from "./constants.js";
 import fetch from "./fetch.js";
+import { SubmissionError } from "./reporters/noaa.js";
 
 export type Identity = {
   uuid: string;
@@ -17,9 +18,12 @@ export type VesselInfo = Identity & {
   type?: string;
 };
 
-export async function getVesselInfo(app: ServerAPI): Promise<VesselInfo> {
+export async function getVesselInfo(
+  app: ServerAPI,
+  signal?: AbortSignal,
+): Promise<VesselInfo> {
   return {
-    ...(await identify(app)),
+    ...(await identify(app, BATHY_URL, signal)),
     // @ts-expect-error remove after next signalk release
     mmsi: app.config.vesselMMSI,
     imo: app.getSelfPath("registrations.imo") as string | undefined,
@@ -34,6 +38,7 @@ export async function getVesselInfo(app: ServerAPI): Promise<VesselInfo> {
 export async function identify(
   app: ServerAPI,
   url = BATHY_URL,
+  signal?: AbortSignal,
 ): Promise<Identity> {
   const path = join(app.getDataDirPath(), "identity.json");
 
@@ -46,11 +51,17 @@ export async function identify(
     app.debug(`Identifying with ${url}`);
     const res = await fetch(new URL("identify", url).toString(), {
       method: "POST",
+      signal,
     });
     if (!res.ok) {
-      throw new Error(`Failed to identify: ${res.status} ${res.statusText}`);
+      throw new SubmissionError(
+        `Failed to identify: ${res.status} ${res.statusText}`,
+        res.status,
+        await res.text(),
+      );
     }
     identity = await res.json();
+    signal?.throwIfAborted();
     app.debug(`UUID: ${identity.uuid}`);
     await writeFile(path, JSON.stringify(identity, null, 2), "utf-8");
   }

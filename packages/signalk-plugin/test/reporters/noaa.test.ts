@@ -1,4 +1,4 @@
-import { describe, test, expect } from "vitest";
+import { describe, test, expect, vi } from "vitest";
 import Ajv from "ajv/dist/2020.js";
 import {
   getMetadata,
@@ -47,6 +47,66 @@ const data: BathymetryData[] = [
 ];
 
 describe("submitGeoJSON", () => {
+  test("a stalled GeoJSON stream times out with an actionable error", async () => {
+    vi.useFakeTimers();
+    const stream = new Readable({ objectMode: true, read() {} });
+    try {
+      const upload = submitGeoJSON(
+        BATHY_URL,
+        config,
+        vessel,
+        stream,
+        undefined,
+        1000,
+      );
+      const result = upload.catch((err: unknown) => err);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(await result).toMatchObject({
+        message:
+          "GeoJSON generation timed out; raise BATHY_REPORT_TIMEOUT for slow storage",
+      });
+      expect(stream.destroyed).toBe(true);
+    } finally {
+      stream.destroy();
+      vi.useRealTimers();
+    }
+  });
+
+  test("cancels an in-flight HTTP upload when the reporter stops", async () => {
+    const controller = new AbortController();
+    let started!: () => void;
+    const sending = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      (_url: unknown, init: RequestInit) =>
+        new Promise((_resolve, reject) => {
+          init.signal!.addEventListener(
+            "abort",
+            () => reject(init.signal!.reason),
+            { once: true },
+          );
+          started();
+        }),
+    );
+    try {
+      const upload = submitGeoJSON(
+        BATHY_URL,
+        config,
+        vessel,
+        Readable.from(data),
+        controller.signal,
+      );
+      const rejected = expect(upload).rejects.toThrow("Stopping upload");
+      await sending;
+      controller.abort(new Error("Stopping upload"));
+      await rejected;
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   test("success", async () => {
     const scope = nock(BATHY_URL)
       .post("/geojson")

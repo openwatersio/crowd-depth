@@ -11,6 +11,7 @@ export function createStatus(app: ServerAPI) {
     lastReport: undefined as Temporal.Instant | undefined,
     nextReport: undefined as Temporal.Instant | undefined,
   };
+  const errors = new Map<string, Error>();
 
   function getStatusMessage() {
     return (
@@ -27,7 +28,12 @@ export function createStatus(app: ServerAPI) {
   }
 
   function updateStatus() {
-    app.setPluginStatus(getStatusMessage());
+    const message = getStatusMessage();
+    if (errors.size)
+      app.setPluginError(
+        `${[...errors.values()].map((err) => err.message).join("; ")}; ${message}`,
+      );
+    else app.setPluginStatus(message);
   }
 
   return {
@@ -41,10 +47,17 @@ export function createStatus(app: ServerAPI) {
       return state;
     },
 
-    error(err: Error) {
+    clearError(source: string) {
+      errors.delete(source);
+      updateStatus();
+    },
+
+    error(value: unknown, source = "plugin") {
+      const err = value instanceof Error ? value : new Error(String(value));
       // @ts-expect-error: it does accept an Error
       app.error(err);
-      app.setPluginError(err.message);
+      errors.set(source, err);
+      updateStatus();
       return err;
     },
   };

@@ -47,7 +47,53 @@ test("logReport", async () => {
   expect(logger.lastReport).toEqual(to);
 });
 
+test.each(["0", "0.0004", "-1", "soon", "Infinity", "2147484"])(
+  "rejects invalid report deadline %s",
+  async (value) => {
+    vi.stubEnv("BATHY_REPORT_TIMEOUT", value);
+    vi.resetModules();
+    try {
+      await expect(import("../src/constants")).rejects.toThrow(
+        "BATHY_REPORT_TIMEOUT",
+      );
+    } finally {
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    }
+  },
+);
+
+test.each(["0", "-1", "1.5", "soon", "Infinity"])(
+  "rejects invalid reporting window %s",
+  async (value) => {
+    vi.stubEnv("BATHY_WINDOW_SIZE", value);
+    vi.resetModules();
+    try {
+      await expect(import("../src/constants")).rejects.toThrow(
+        "BATHY_WINDOW_SIZE",
+      );
+    } finally {
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    }
+  },
+);
+
 describe("report checkpoints", () => {
+  test.each(["", " "])(
+    "a blank report deadline %j uses the default without failing module load",
+    async (value) => {
+      vi.stubEnv("BATHY_REPORT_TIMEOUT", value);
+      vi.resetModules();
+      try {
+        await expect(import("../src/constants")).resolves.toBeDefined();
+      } finally {
+        vi.unstubAllEnvs();
+        vi.resetModules();
+      }
+    },
+  );
+
   test("advances after a scan finds no data", async () => {
     const db = createDB(":memory:");
     const logger = createReportLogger(db);

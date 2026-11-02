@@ -123,6 +123,12 @@ By default the plugin reports to `http://localhost:3001` unless
 Each report leaves out the last `BATHY_REPORT_DELAY` seconds (default 300);
 set it to `0` to report soundings as soon as they're recorded.
 
+`BATHY_REPORT_TIMEOUT` sets the deadline in seconds for each availability scan, history read, identity lookup, or GeoJSON generation (default 1800). Source deadlines bound asynchronous waiting; they do not interrupt synchronous SQLite reads or cancel provider queries, so set the deadline above expected query time. Network uploads retain native fetch/TCP timeouts without a total-duration limit; a peer that keeps a stalled send alive can block reporting until restart. Failed reports retry every five minutes; recognized service authentication, size, version, or User-Agent rejections wait for the normal schedule and require correction, while truncated uploads, proxy errors, and other failures retry. Rejected windows retain their checkpoints and keep later data queued.
+
+`BATHY_WINDOW_SIZE` limits each batch to a positive whole number of hours (default 6) and sets the default cron hour step unless `BATHY_DEFAULT_SCHEDULE` overrides it; steps of 24 or more run daily. For HTTP 413 rejections, lower it, for example to `1`, and restart Signal K to retry the queued data in smaller batches.
+
+For persistent `Invalid token` or `Invalid uniqueID` rejections, stop Signal K, rename `identity.json` in the Crowd Depth data directory to an unused backup filename, and restart. This creates a new vessel UUID and token; preserve the backup as a record of the old identity.
+
 ### Working on the API
 
 ```sh
