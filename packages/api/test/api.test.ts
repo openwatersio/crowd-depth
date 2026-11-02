@@ -10,7 +10,7 @@ import {
   type APIOptions,
 } from "../src/api.js";
 import { createApp } from "../src/app.js";
-import { toUniqueID } from "crowd-depth";
+import { toUniqueID, SubmissionError } from "crowd-depth";
 import { vessel } from "../../signalk-plugin/test/helper.js";
 
 // This is a real response from NOAA for a valid submission
@@ -36,11 +36,18 @@ function useApp(options: APIOptions = {}) {
 describe("POST /geojson", () => {
   describe("client version validation", () => {
     test("rejects requests without User-Agent", async () => {
-      await useApp()
+      const response = await useApp()
         .post("/geojson")
         .set("Authorization", `Bearer ${createIdentity(vessel.uuid).token}`)
         .expect(400)
         .expect({ success: false, message: "Missing or invalid User-Agent" });
+      expect(
+        new SubmissionError(
+          "Rejected",
+          response.status,
+          JSON.stringify(response.body),
+        ).permanent,
+      ).toBe(true);
     });
 
     test("rejects requests with invalid User-Agent format", async () => {
@@ -78,7 +85,7 @@ describe("POST /geojson", () => {
     });
 
     test("accepts requests with minimum version", async () => {
-      await useApp()
+      const response = await useApp()
         .post("/geojson")
         .set("Authorization", `Bearer ${createIdentity(vessel.uuid).token}`)
         .set(
@@ -87,6 +94,13 @@ describe("POST /geojson", () => {
         )
         .expect(400) // Will fail at the next validation step (missing data)
         .expect({ success: false, message: "Missing Content-Type" });
+      expect(
+        new SubmissionError(
+          "Rejected",
+          response.status,
+          JSON.stringify(response.body),
+        ).permanent,
+      ).toBe(false);
     });
 
     test("accepts requests with version above minimum", async () => {

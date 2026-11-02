@@ -12,7 +12,10 @@ const sqlite = { createReader: () => undefined } as unknown as BathymetrySource;
 
 // Drives settleSource with a provider that answers from the given call on
 // (never, when undefined), recording what the plugin would have started.
-function setup({ registersOnCall }: { registersOnCall?: number } = {}) {
+function setup({
+  registersOnCall,
+  recordError,
+}: { registersOnCall?: number; recordError?: boolean } = {}) {
   let calls = 0;
   const recordings: AbortSignal[] = [];
   const messages: string[] = [];
@@ -20,6 +23,7 @@ function setup({ registersOnCall }: { registersOnCall?: number } = {}) {
   const status = createStatus({
     ...app,
     setPluginStatus: (m: string) => messages.push(m),
+    setPluginError: (m: string) => messages.push(`Error: ${m}`),
   } as typeof app);
   const settled = (wait = Temporal.Duration.from({ seconds: 5 })) =>
     settleSource({
@@ -30,7 +34,11 @@ function setup({ registersOnCall }: { registersOnCall?: number } = {}) {
           : undefined;
       },
       sqlite,
-      record: (signal) => recordings.push(signal),
+      record: (signal) => {
+        recordings.push(signal);
+        if (recordError)
+          status.error(new Error("Collector stopped"), "collector");
+      },
       status,
       wait,
       interval: Temporal.Duration.from({ milliseconds: 1 }),
@@ -74,6 +82,21 @@ test("keeps recording to SQLite when no provider appears in time", async () => {
     collecting: true,
     waitingForHistory: false,
   });
+});
+
+test("history handover clears an obsolete collector error while retaining reporter errors", async () => {
+  const { settled, messages, status } = setup({
+    registersOnCall: 4,
+    recordError: true,
+  });
+  status.error(new Error("Reporter offline"), "reporter");
+  expect(await settled()).toBe(history);
+  expect(
+    messages.some((message) => message.includes("Collector stopped")),
+  ).toBe(true);
+  expect(messages.at(-1)).toContain("Using history");
+  expect(messages.at(-1)).toContain("Reporter offline");
+  expect(messages.at(-1)).not.toContain("Collector stopped");
 });
 
 test("starts nothing when stopped during the first lookup", async () => {

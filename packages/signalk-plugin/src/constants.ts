@@ -30,8 +30,14 @@ export const BATHY_URL = (
   .replace(/\/?$/, "/");
 
 /** Number of hours of data to report in each submission */
+const windowHours = Number(process.env.BATHY_WINDOW_SIZE?.trim() || 6);
+if (!Number.isSafeInteger(windowHours) || windowHours <= 0) {
+  throw new RangeError(
+    `BATHY_WINDOW_SIZE must be a positive whole number of hours, not "${process.env.BATHY_WINDOW_SIZE}"`,
+  );
+}
 export const BATHY_WINDOW_SIZE = Temporal.Duration.from({
-  hours: Number(process.env.BATHY_WINDOW_SIZE ?? 6),
+  hours: windowHours,
 });
 
 /**
@@ -55,6 +61,15 @@ if (!(reportDelay >= 0)) {
 export const BATHY_REPORT_DELAY = Temporal.Duration.from({
   milliseconds: Math.round(reportDelay * 1000),
 });
+
+const reportTimeout = Number(process.env.BATHY_REPORT_TIMEOUT?.trim() || 1800);
+const reportTimeoutMs = Math.round(reportTimeout * 1000);
+if (!(reportTimeoutMs >= 1 && reportTimeoutMs <= 2_147_483_647)) {
+  throw new RangeError(
+    `BATHY_REPORT_TIMEOUT must round to at least 1 ms within the Node timer limit, not "${process.env.BATHY_REPORT_TIMEOUT}"`,
+  );
+}
+export const BATHY_REPORT_TIMEOUT = reportTimeoutMs;
 
 /** Cron schedule to report bathy */
 export const BATHY_DEFAULT_SCHEDULE =
