@@ -149,6 +149,7 @@ The plotter extension's provider and page serving are adapted from [signalk-live
 - Data is reported every 6 hours, at midnight, 06:00, noon and 18:00 local
   time; set a cron-style schedule in the `BATHY_DEFAULT_SCHEDULE` environment
   variable to change it.
+- Failed reports retry every five minutes until they succeed, resuming from the last successful report. This also applies to the history upload at startup. Stopping the plugin cancels pending retries.
 - `BATHY_HISTORY_WAIT` sets how many seconds to wait at startup for a History
   API provider (default 600).
 - `BATHY_REPORT_DELAY` sets how many seconds behind now each report ends, so
