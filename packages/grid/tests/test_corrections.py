@@ -171,7 +171,7 @@ def test_levels_come_from_the_slackwater_engine():
     [series] = tide.slackwater_levels(
         [{"station": "noaa/8638863", "start": 1717200000, "end": 1717203600, "step": 1800}]
     )
-    # 2024-06-01 00:00Z at Chesapeake Bay Bridge Tunnel, as slackwater 1.0.0-beta.3 predicts it.
+    # 2024-06-01 00:00Z at Chesapeake Bay Bridge Tunnel, as slackwater 1.0.0-beta.4 predicts it.
     assert [t for t, _ in series] == [1717200000, 1717201800, 1717203600]
     assert series[0][1] == pytest.approx(0.2504, abs=1e-3)
 

@@ -5,6 +5,6 @@
   "type": "module",
   "dependencies": {
     "@slackwater/database": "1.0.0-beta.20261102",
-    "slackwater": "https://pkg.pr.new/openwatersio/slackwater/slackwater@5062f83"
+    "slackwater": "1.0.0-beta.4"
   }
 }
