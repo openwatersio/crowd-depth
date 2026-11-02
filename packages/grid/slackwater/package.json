@@ -4,7 +4,7 @@
   "description": "Tide levels from the Slackwater engine for the grid's tide reduction",
   "type": "module",
   "dependencies": {
-    "@slackwater/database": "https://pkg.pr.new/@slackwater/database@372",
-    "slackwater": "https://pkg.pr.new/openwatersio/slackwater/slackwater@0912bce"
+    "@slackwater/database": "1.0.0-beta.20261102",
+    "slackwater": "https://pkg.pr.new/openwatersio/slackwater/slackwater@5062f83"
   }
 }
