@@ -23,7 +23,7 @@ from pmtiles.tile import (
 from pmtiles.writer import Writer
 from test_ingest import env  # noqa: F401  (env is a fixture)
 
-from grid import cells, cli, overlay, tiles
+from grid import cells, cli, manifest, overlay, tiles
 from grid.catalog import open_store
 from grid.objects import LocalObjects
 
@@ -88,6 +88,27 @@ def test_prepare_writes_fingerprints_only_when_they_move(env, tmp_path):  # noqa
     env.run("noaa")
     assert tiles.prepare(env.store, run)["moved"] == [NORTH]
     assert tiles.fp_path(run, SOUTH).stat().st_mtime_ns == written[SOUTH]
+
+
+@pytest.mark.parametrize(
+    ("file", "tile", "moved"),
+    [
+        (3, NORTH, {NORTH}),  # a run in the tile it was found in
+        (3, SOUTH, set()),  # one in a tile the file has no soundings in
+        (1, None, {SOUTH}),  # one a store not yet recalibrated holds, in every tile
+    ],
+)
+def test_a_lost_run_moves_the_fingerprints_of_the_tiles_it_sets_aside(env, file, tile, moved):  # noqa: F811
+    two_tiles(env)
+    with open_store(env.store) as con:
+        before = manifest.fingerprints(con)
+        con.execute(
+            """INSERT INTO lake.lost_runs SELECT content_hash, vessel, $tile, time_min, time_max
+            FROM lake.files WHERE key = $key""",
+            {"tile": tile, "key": key_of(file)},
+        )
+        after = manifest.fingerprints(con)
+    assert {t for t in before if before[t] != after[t]} == moved
 
 
 def test_prepare_freezes_the_catalog_it_checked(env, tmp_path, monkeypatch):  # noqa: F811
