@@ -385,7 +385,7 @@ def test_calibration_reduces_only_the_files_whose_inputs_moved(env, tmp_path, mo
             == con.execute("SELECT count(*) FROM lake.files WHERE status = 'active'").fetchone()[0]
         )
         assert sorted(con.execute("FROM lake.file_medians").fetchall()) == kept
-        assert sorted(con.execute("FROM cal_obs").fetchall()) == kept
+        assert sorted(con.execute("SELECT * EXCLUDE (lost) FROM cal_obs").fetchall()) == kept
         return files
 
     def file_of(key):
@@ -981,10 +981,10 @@ def losing(n, vessel, depth, slot, share, r):
     )
 
 
-def test_lost_readings_dont_calibrate_a_vessel_shallow(env, tmp_path, monkeypatch):  # noqa: F811
-    # ROSEP-607cc5a5 in the Gulf: it reads 2.3 m shallow where it holds the bottom, but loses
-    # it for up to most of a transit, over 8 and 12 m of surveyed seabed. Lost readings in its
-    # medians would calibrate it too shallow, and its true soundings would correct too deep.
+def gulf(env, tmp_path, monkeypatch):  # noqa: F811
+    """ROSEP-607cc5a5 in the Gulf: it reads 2.3 m shallow where it holds the bottom, but loses
+    it for up to most of a transit, over 8 and 12 m of surveyed seabed. Ingests the fleet and
+    returns the references."""
     refs = [
         reference(tmp_path / "8.tif", (0, 240), elevation=-8.0, rows=(4990, 5010)),
         reference(tmp_path / "12.tif", (0, 240), elevation=-12.0, rows=(5090, 5110)),
@@ -1002,10 +1002,37 @@ def test_lost_readings_dont_calibrate_a_vessel_shallow(env, tmp_path, monkeypatc
     monkeypatch.setattr("grid.reference.coops_separation", lambda: lambda lon, lat: 0.0)
     with open_store(env.store) as con:
         untided(con)
+    return refs
+
+
+def test_lost_readings_dont_calibrate_a_vessel_shallow(env, tmp_path, monkeypatch):  # noqa: F811
+    # Lost readings in its medians would calibrate it too shallow, and its true soundings
+    # would correct too deep.
+    refs = gulf(env, tmp_path, monkeypatch)
+    with open_store(env.store) as con:
         calibrate.run(con, refs)
     got = segments(env)
     assert got[("AQM-A", 0)] == (pytest.approx(-0.5, abs=0.06), "anchored")
     assert got[("AQM-T", 0)] == (pytest.approx(-2.3, abs=0.06), "anchored")
+
+
+def test_a_store_calibrated_with_lost_readings_corrects_without_reducing_again(
+    env,  # noqa: F811
+    tmp_path,
+    monkeypatch,
+):
+    # A median's lost flag is judged each run from the kept medians, so a store calibrated
+    # before lost readings were left out needs no file reduced again to correct its offsets.
+    refs = gulf(env, tmp_path, monkeypatch)
+    with monkeypatch.context() as m:
+        m.setattr(calibrate, "LOST_PASSES", 0)
+        with open_store(env.store) as con:
+            calibrate.run(con, refs)
+    assert segments(env)[("AQM-T", 0)][0] < -3
+    with open_store(env.store) as con:
+        totals = calibrate.run(con, refs)
+    assert totals["reduced_files"] == 0
+    assert segments(env)[("AQM-T", 0)] == (pytest.approx(-2.3, abs=0.06), "anchored")
 
 
 def test_a_transit_lost_where_only_the_crowd_sounded_still_shows_it(env, tmp_path, monkeypatch):  # noqa: F811
