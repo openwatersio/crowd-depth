@@ -144,7 +144,7 @@ GUARDED_SEGMENTS = 20
 # by two base columns), from soundings track QC accepted, for the files in `cal_dirty`.
 # Read a unit of tiles or a band of one at a time, whose rows hold whole pixels.
 REDUCE = f"""
-INSERT INTO lake.file_medians
+INSERT INTO lake.file_medians BY NAME
 SELECT p.tile_id, floor((p.lat - (p.tile_id // 360 - 90)) * {BASE} / 2)::INTEGER AS py,
   floor((p.lon - (p.tile_id % 360 - 180)) * {BASE}
     / {K_LIST}[p.tile_id // 360 - 90 + 91] / 2)::INTEGER AS px,
