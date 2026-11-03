@@ -103,6 +103,18 @@ LOST_BOTTOM = 0.5
 LOST_MARGIN_M = 2.0
 STUCK_RUN = 60
 STUCK_REACH_M = 200
+# A searched vessel's lost readings over a flat, well-surveyed pixel (relief under
+# FLAT_RELIEF_M, uncertainty under ANCHOR_UNCERTAINTY_M) are set aside however they wander,
+# a stretch of them at a time: water that flat is no slip or bank a sounder reads true. On
+# the Chesapeake store one vessel's Gulf transit read 0.4 to 1.4 m in 20 m of water, in
+# stretches of a median 6 to 11 readings, never steady enough to be a stuck run. A stretch
+# counts from FLAT_REACH_M, far less than a run's, at FLAT_SPEED_MS or faster: those hold
+# 95% of these soundings, and a spike goes nowhere, and a boat at its mooring no faster
+# than its GPS wanders. Over water that has shoaled since the survey, with too few vessels
+# to say so, true readings are set aside too: they publish as unconfirmed shoals from 0.5 m.
+FLAT_RELIEF_M = 0.5
+FLAT_REACH_M = 20
+FLAT_SPEED_MS = 0.5
 # The seabed a run is judged over: the survey's, or the median of the corrected depths of
 # at least CROWD_VESSELS vessels, whichever is shallower, so water that has shoaled since
 # the survey isn't mistaken for a lost bottom. Against the survey on the Chesapeake, three
@@ -114,10 +126,13 @@ CROWD_VESSELS = 3
 # reads true corrected too deep. Only readings the solve can already tell from the rest: where
 # lost ones are most of a vessel's, its offset settles among them and none reads lost.
 LOST_PASSES = 3
-# A vessel's calendar month with MONTH_SHARE or more of its pixels reading lost (from
-# MONTH_PIXELS judged) is set aside whole: on the Chesapeake 14 months of 7 vessels, a
-# fifth of the stuck readings, at 61,000 good pixels. A vessel with any month at
-# STUCK_SHARE or more has its stuck runs found too; the others aren't searched.
+# A vessel's calendar month in a 1° tile with MONTH_SHARE or more of its pixels there
+# reading lost (from MONTH_PIXELS judged) is set aside in that tile, so a sounder that lost
+# the bottom in one bay keeps its soundings in the next: with stuck runs and stretches, 2.54M
+# soundings on the Chesapeake store, where judging the month across its tiles set aside 3.05M. A tile
+# with too few judged pixels to say takes the verdict of the month across its tiles. A
+# vessel with any month at STUCK_SHARE or more, across its tiles, has its stuck runs found
+# too; the others aren't searched.
 MONTH_SHARE = 0.2
 STUCK_SHARE = 0.05
 MONTH_PIXELS = 100
@@ -129,12 +144,12 @@ GUARDED_SEGMENTS = 20
 # by two base columns), from soundings track QC accepted, for the files in `cal_dirty`.
 # Read a unit of tiles or a band of one at a time, whose rows hold whole pixels.
 REDUCE = f"""
-INSERT INTO lake.file_medians
+INSERT INTO lake.file_medians BY NAME
 SELECT p.tile_id, floor((p.lat - (p.tile_id // 360 - 90)) * {BASE} / 2)::INTEGER AS py,
   floor((p.lon - (p.tile_id % 360 - 180)) * {BASE}
     / {K_LIST}[p.tile_id // 360 - 90 + 91] / 2)::INTEGER AS px,
   p.unique_id AS vessel, p.file_id, min(p.time) AS t,
-  median(p.depth_raw - coalesce(p.tide, 0))::FLOAT AS m
+  median(p.depth_raw - coalesce(p.tide, 0))::FLOAT AS m, max(p.time) AS t_last
 FROM corrected_points_in($partition, $tiles, $rlo, $rhi, vessels := $vessels) p
 WHERE p.file_id IN (SELECT file_id FROM cal_dirty)
   AND p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M} AND p.time IS NOT NULL
@@ -257,12 +272,10 @@ FROM cal_obs o JOIN anchor_px r USING (tile_id, py, px)
 WHERE abs(o.m - r.depth) < {ANCHOR_DIFF_M}
 """
 
-# Stuck runs in one tile, for the vessels in `$vessels`: each file's soundings in order
-# (ties broken by row, so a run comes out the same every time), its stuck windows
-# (`unit_offsets`, `seabed_px`) joined where they overlap; a run counts from STUCK_RUN
-# stuck windows across STUCK_REACH_M, and starts and ends on a lost reading, so a bank
-# crossed just before the sounder sticks at its depth isn't in it.
-STUCK = f"""
+# One tile's soundings of the vessels in `$vessels`: each file's in order (ties broken by
+# row, so a run comes out the same every time), and whether each reads lost over a seabed
+# (`unit_offsets`, `seabed_px`).
+SEARCHED = f"""
 WITH p AS (
   SELECT p.file_id, p.row, p.unique_id AS vessel, p.time, p.lon, p.lat, p.depth_raw AS raw,
     p.depth_raw - coalesce(p.tide, 0) AS tr,
@@ -282,10 +295,16 @@ WITH p AS (
 w AS (
   SELECT p.*,
     coalesce(tr < {LOST_BOTTOM} * (u.o + s.z) AND tr < u.o + s.z - {LOST_MARGIN_M}, false) AS lost,
+    coalesce(s.flat, false) AS flat,
     row_number() OVER (PARTITION BY p.file_id ORDER BY time, raw, row) AS i
   FROM p JOIN unit_offsets u USING (vessel, file_id)
   LEFT JOIN seabed_px s ON s.tile_id = $tile AND s.py = p.py AND s.px = p.px
-),
+)"""
+
+# Stuck runs: stuck windows joined where they overlap. A run counts from STUCK_RUN stuck
+# windows across STUCK_REACH_M, and starts and ends on a lost reading, so a bank crossed
+# just before the sounder sticks at its depth isn't in it.
+STUCK = f"""{SEARCHED},
 x AS (
   -- Stuck: STUCK_LOST of the STUCK_WINDOW soundings up to it read lost, and their middle
   -- 80% span no more than STUCK_SPAN_M.
@@ -315,6 +334,25 @@ HAVING count(*) FILTER (WHERE l.stuck) >= {STUCK_RUN} AND 6371000 * sqrt(
   pow(radians(max(l.lat) FILTER (WHERE l.lost) - min(l.lat) FILTER (WHERE l.lost)), 2)
   + pow(radians(max(l.lon) FILTER (WHERE l.lost) - min(l.lon) FILTER (WHERE l.lost))
     * cos(radians(avg(l.lat))), 2)) >= {STUCK_REACH_M}
+"""
+
+# Each stretch of lost readings over flat pixels in one tile, a query of its own so the
+# soundings aren't held for both.
+FLAT = f"""{SEARCHED},
+k AS (
+  SELECT *, i - row_number() OVER (PARTITION BY file_id, lost AND flat ORDER BY time, raw, row)
+    AS run
+  FROM w
+),
+s AS (
+  SELECT f.content_hash, k.vessel, min(k.time) AS t_start, max(k.time) AS t_end,
+    6371000 * sqrt(pow(radians(max(k.lat) - min(k.lat)), 2)
+      + pow(radians(max(k.lon) - min(k.lon)) * cos(radians(avg(k.lat))), 2)) AS reach
+  FROM k JOIN lake.files f USING (file_id) WHERE k.lost AND k.flat
+  GROUP BY f.content_hash, k.vessel, k.file_id, k.run
+)
+SELECT content_hash, vessel, $tile AS tile_id, t_start, t_end FROM s
+WHERE reach >= {FLAT_REACH_M} AND reach >= {FLAT_SPEED_MS} * epoch(t_end - t_start)
 """
 
 
@@ -414,15 +452,18 @@ def reduce(con, full=False):
 
 def reference_px(con):
     """The temp tables `anchor_px`, the reference that would anchor at each pixel, and
-    `survey_px`, the depth of each pixel a reference has one for: at each pixel, the
-    reference with the least uncertainty there. Picked once per run and a tile at a time,
-    so memory follows a tile's reference pixels rather than every one."""
+    `survey_px`, the depth of each pixel a reference has one for and whether it's flat
+    (FLAT_RELIEF_M): at each pixel, the reference with the least uncertainty there. Picked
+    once per run and a tile at a time, so memory follows a tile's reference pixels rather than every one."""
     best = "QUALIFY row_number() OVER (PARTITION BY py, px ORDER BY uncertainty, source) = 1"
     con.execute(
         """CREATE OR REPLACE TEMP TABLE anchor_px (tile_id INTEGER, py INTEGER, px INTEGER,
         depth FLOAT)"""
     )
-    con.execute("CREATE OR REPLACE TEMP TABLE survey_px AS FROM anchor_px LIMIT 0")
+    con.execute(
+        """CREATE OR REPLACE TEMP TABLE survey_px (tile_id INTEGER, py INTEGER, px INTEGER,
+        depth FLOAT, flat BOOLEAN)"""
+    )
     # Only tiles calibration has medians in: no other pixel is joined.
     tiles = con.execute("SELECT DISTINCT tile_id FROM cal_obs ORDER BY 1").fetchall()
     for (tile,) in tiles:
@@ -437,7 +478,9 @@ def reference_px(con):
             {"tile": tile},
         )
         con.execute(
-            f"""INSERT INTO survey_px SELECT tile_id, py, px, depth FROM lake.reference_pixels
+            f"""INSERT INTO survey_px SELECT tile_id, py, px, depth,
+              coalesce(relief < {FLAT_RELIEF_M} AND uncertainty < {ANCHOR_UNCERTAINTY_M}, false)
+            FROM lake.reference_pixels
             WHERE tile_id = $tile AND depth IS NOT NULL {best}""",
             {"tile": tile},
         )
@@ -445,9 +488,10 @@ def reference_px(con):
 
 def stuck_runs(con, offset, status):
     """Runs of soundings whose sounder lost the bottom, as rows (content hash, vessel, tile,
-    start, end): every file of a month set aside, with no tile, and the stuck runs of the
-    vessels with a month at STUCK_SHARE. From segments whose offset is applied: only those
-    say what a vessel should read."""
+    start, end): every file of a month set aside in a tile, there and that month, and the
+    stuck runs and lost readings over flat pixels of the vessels with a month at
+    STUCK_SHARE. From segments whose offset is applied: only those say what a vessel should
+    read."""
     applied = np.isin(status, APPLIED)
     con.register("offsets_np", {"unit": np.flatnonzero(applied), "o": np.asarray(offset)[applied]})
     con.execute(
@@ -464,30 +508,46 @@ def stuck_runs(con, offset, status):
           GROUP BY ALL HAVING count(*) >= {CROWD_VESSELS}
         )
         -- least() passes over a NULL: either alone, or the shallower of both.
-        SELECT tile_id, py, px, least(s.depth, c.z) AS z
+        SELECT tile_id, py, px, least(s.depth, c.z) AS z, s.flat
         FROM survey_px s FULL JOIN crowd c USING (tile_id, py, px)"""
     )
-    # Each vessel's calendar months: the share of its file-pixel medians reading lost.
+    # Each vessel's calendar months in each tile: how many of its file-pixel medians were
+    # judged, and how many read lost.
+    lost = f"o.m < {LOST_BOTTOM} * (s.z + u.o) AND o.m < s.z + u.o - {LOST_MARGIN_M}"
     con.execute(
         f"""CREATE OR REPLACE TEMP TABLE vessel_months AS
-        SELECT o.vessel, date_trunc('month', o.t) AS month, count(*) AS judged,
-          avg((o.m < {LOST_BOTTOM} * (s.z + u.o) AND o.m < s.z + u.o - {LOST_MARGIN_M})::INTEGER)
-            AS lost_share
+        SELECT o.vessel, date_trunc('month', o.t) AS month, o.tile_id, count(*) AS judged,
+          count(*) FILTER (WHERE {lost}) AS lost
         FROM cal_obs o JOIN unit_offsets u USING (vessel, file_id)
         JOIN seabed_px s USING (tile_id, py, px)
-        GROUP BY ALL HAVING count(*) >= {MONTH_PIXELS}"""
+        GROUP BY ALL"""
     )
+    # Searched by the month across its tiles, as the search finds runs in any of them.
     con.execute(
         f"""CREATE OR REPLACE TEMP TABLE stuck_vessels AS
-        SELECT DISTINCT vessel FROM vessel_months WHERE lost_share >= {STUCK_SHARE}"""
+        SELECT DISTINCT vessel FROM vessel_months GROUP BY vessel, month
+        HAVING sum(judged) >= {MONTH_PIXELS} AND sum(lost) >= {STUCK_SHARE} * sum(judged)"""
     )
-    # A month set aside whole: each of its judged files, in every tile.
+    # A month set aside in a tile: each of its files' soundings there, to the end of the
+    # last month its lost medians reach, as a median holds every visit to its pixel.
     runs = con.execute(
-        f"""SELECT DISTINCT f.content_hash, f.vessel, NULL::INTEGER, f.time_min, f.time_max
-        FROM cal_obs o JOIN unit_offsets USING (vessel, file_id) JOIN vessel_months m
-          ON m.vessel = o.vessel AND m.month = date_trunc('month', o.t)
+        f"""WITH months AS (
+          SELECT vessel, month, sum(judged) AS judged, sum(lost) AS lost
+          FROM vessel_months GROUP BY ALL
+        )
+        SELECT f.content_hash, f.vessel, o.tile_id, greatest(f.time_min, a.month),
+          least(f.time_max, coalesce(max(date_trunc('month', o.t_last)) FILTER (WHERE {lost}),
+            a.month) + INTERVAL 1 MONTH - INTERVAL 1 MICROSECOND)
+        FROM cal_obs o JOIN unit_offsets u USING (vessel, file_id) JOIN months a
+          ON a.vessel = o.vessel AND a.month = date_trunc('month', o.t)
+        LEFT JOIN seabed_px s USING (tile_id, py, px)
+        LEFT JOIN vessel_months m
+          ON m.vessel = a.vessel AND m.month = a.month AND m.tile_id = o.tile_id
         JOIN lake.files f ON f.file_id = o.file_id
-        WHERE f.status = 'active' AND m.lost_share >= {MONTH_SHARE}"""
+        WHERE f.status = 'active' AND CASE WHEN m.judged >= {MONTH_PIXELS}
+          THEN m.lost >= {MONTH_SHARE} * m.judged
+          ELSE a.judged >= {MONTH_PIXELS} AND a.lost >= {MONTH_SHARE} * a.judged END
+        GROUP BY f.content_hash, f.vessel, o.tile_id, f.time_min, f.time_max, a.month"""
     ).fetchall()
     # ponytail: a file's run is found and applied per tile, so one that crosses a tile edge
     # is two; judge across tiles if the seams show
@@ -495,10 +555,10 @@ def stuck_runs(con, offset, status):
     # tile rather than every searched vessel's. ponytail: one vessel's years at its mooring
     # still go in at once; band by file time if a liveaboard outgrows the limit
     for partition, tile, vessel in stuck_pairs(con):
-        runs += con.execute(
-            STUCK, {"partition": partition, "tile": tile, "vessels": [vessel]}
-        ).fetchall()
-    return runs
+        params = {"partition": partition, "tile": tile, "vessels": [vessel]}
+        runs += con.execute(STUCK, params).fetchall() + con.execute(FLAT, params).fetchall()
+    # A stretch can be a run to the reading.
+    return list(dict.fromkeys(runs))
 
 
 def stuck_pairs(con):
@@ -1057,7 +1117,8 @@ def publish(con, rows, stray=(), accept_losses=False, runs=()):
         con.execute("DELETE FROM lake.lost_runs")
         if runs:
             con.executemany("INSERT INTO lake.lost_runs VALUES (?, ?, ?, ?, ?)", runs)
-        # The tiles of soundings a run now takes, or no longer takes.
+        # The tiles of soundings a run now takes, or no longer takes. A store calibrated
+        # before months were judged by tile holds months with no tile, in every tile.
         dirty = cells.stale(
             con,
             """SELECT p.tile_id FROM lake.points p JOIN lake.files f USING (file_id)
@@ -1094,7 +1155,11 @@ def calibrated_by(rows) -> str:
     # The runs' queries, their constants, and the QC whose flags they read.
     rule = (
         STUCK,
+        FLAT,
+        inspect.getsource(reference_px),
         inspect.getsource(stuck_runs),
+        FLAT_RELIEF_M,
+        ANCHOR_UNCERTAINTY_M,
         CROWD_VESSELS,
         MONTH_SHARE,
         STUCK_SHARE,

@@ -1277,6 +1277,8 @@ def stuck(n, vessel, depth, slot, cols=(0, 240), step=2):
     ],
 )
 def test_a_stuck_run_must_last_and_go_somewhere(env, tmp_path, monkeypatch, case, runs):  # noqa: F811
+    # Over a seabed with relief, where lost readings that aren't a stuck run are kept.
+    monkeypatch.setattr(calibrate, "FLAT_RELIEF_M", 0)
     lost = {
         "moving": stuck(20, "AQM-T", 0.8, 20),
         "moored": stuck(20, "AQM-T", 0.8, 20, step=0),
@@ -1302,7 +1304,7 @@ def test_a_stuck_run_must_last_and_go_somewhere(env, tmp_path, monkeypatch, case
     [
         (10, 0.05, 0, 1),  # one transit lost in 11: its stuck run alone
         (10, 0.5, 0, 0),  # no month at STUCK_SHARE: not looked for
-        (3, 0.05, 4, 1),  # one in 4: the month's files set aside whole
+        (3, 0.05, 4, 0),  # one in 4: the month's files, and the run is its file's row
     ],
 )
 def test_a_month_mostly_lost_is_set_aside(env, tmp_path, monkeypatch, good, share, months, runs):  # noqa: F811
@@ -1314,10 +1316,200 @@ def test_a_month_mostly_lost_is_set_aside(env, tmp_path, monkeypatch, good, shar
         *(transit(30 + i, "AQM-A", 9.5, (0, 240), 30 + i) for i in range(3)),
     ]
     calibrated(env, fleet, reference(tmp_path / "ref.tif", (0, 240)), monkeypatch)
-    assert env.query(
-        "SELECT count(*) FILTER (WHERE tile_id IS NULL), count(*) FILTER (WHERE tile_id IS NOT NULL)"
-        " FROM lake.lost_runs"
-    ) == [(months, runs)]
+    # A month's files are a row each in its tile, beside a stuck run's own.
+    assert env.query("SELECT count(*) FROM lake.lost_runs") == [(months + runs,)]
+
+
+def test_a_month_is_set_aside_only_in_the_tiles_it_read_lost(env, tmp_path, monkeypatch):  # noqa: F811
+    # T's month: lost on half its pixels here, true over the survey in the next tile, a
+    # third lost across both. The file that crosses into the next tile keeps its soundings
+    # there; here, the month's files are set aside.
+    monkeypatch.setattr(calibrate, "MONTH_PIXELS", 1)
+    monkeypatch.setattr(calibrate, "STUCK_SHARE", 1.0)
+    here, beyond = (0, 240), (cells.BASE, cells.BASE + 480)
+    refs = tmp_path / "refs"
+    refs.mkdir()
+    reference(refs / "here.tif", here)
+    reference(refs / "beyond.tif", beyond)
+    _, lost, _ = stuck(0, "AQM-T", 0.8, 20)
+    _, true, _ = transit(0, "AQM-T", 5.4, beyond, 21)
+    fleet = [
+        *(transit(1 + i, "AQM-T", 5.4, here, i) for i in range(2)),
+        stuck(10, "AQM-T", 0.8, 10),
+        (20, lost + true, "AQM-T"),
+        *(transit(30 + i, "AQM-A", 9.5, here, 30 + i) for i in range(3)),
+    ]
+    calibrated(env, fleet, str(refs), monkeypatch)
+    assert {t for (t,) in env.query("SELECT DISTINCT tile_id FROM lake.lost_runs")} == {TILE}
+    crossing = env.query(
+        """SELECT p.tile_id, bool_and(p.lost_bottom), bool_or(p.lost_bottom)
+        FROM corrected_points_in((SELECT any_value(cell_id) FROM lake.points), [], 0, 10800) p
+        JOIN lake.files f USING (file_id) WHERE ends_with(f.key, '_20_pointData.csv')
+        GROUP BY 1 ORDER BY 1"""
+    )
+    assert crossing == [(TILE, True, True), (TILE + 1, False, False)]
+    # From a store whose month had no tile, the next tile's soundings come back stale.
+    with open_store(env.store) as con:
+        con.execute(
+            "DELETE FROM lake.lost_runs; DELETE FROM lake.tile_changes;"
+            " INSERT INTO lake.lost_runs SELECT content_hash, vessel, NULL, time_min, time_max"
+            " FROM lake.files WHERE ends_with(key, '_20_pointData.csv')"
+        )
+        calibrate.run(con, [str(refs)])
+    assert (TILE + 1,) in env.query("SELECT DISTINCT tile_id FROM lake.tile_changes")
+
+
+def test_a_run_with_no_tile_holds_in_every_tile_until_recalibration(env, tmp_path, monkeypatch):  # noqa: F811
+    # An upgrade reaches the overlay without a calibrate, and the overlay reads these too.
+    calibrated(env, FLEET, reference(tmp_path / "ref.tif", (0, 110)), monkeypatch)
+    with open_store(env.store) as con:
+        con.execute(
+            "DELETE FROM lake.lost_runs; INSERT INTO lake.lost_runs"
+            " SELECT content_hash, vessel, NULL, time_min, time_max FROM lake.files"
+        )
+    assert all(lost for _, _, lost in corrected(env, "lost_bottom"))
+
+
+def test_a_tile_too_thin_to_judge_takes_the_months_verdict(env, tmp_path, monkeypatch):  # noqa: F811
+    # T's month reads half lost here, and the file carries on into a tile with no survey,
+    # where its readings can't be judged at all: its month is set aside there too.
+    monkeypatch.setattr(calibrate, "MONTH_PIXELS", 20)
+    monkeypatch.setattr(calibrate, "STUCK_SHARE", 1.0)
+    _, lost, _ = stuck(0, "AQM-T", 0.8, 20)
+    _, beyond, _ = transit(0, "AQM-T", 0.8, (cells.BASE, cells.BASE + 240), 21)
+    fleet = [
+        *(transit(1 + i, "AQM-T", 5.4, (0, 240), i) for i in range(2)),
+        stuck(10, "AQM-T", 0.8, 10),
+        (20, lost + beyond, "AQM-T"),
+        *(transit(30 + i, "AQM-A", 9.5, (0, 240), 30 + i) for i in range(3)),
+    ]
+    calibrated(env, fleet, reference(tmp_path / "ref.tif", (0, 240)), monkeypatch)
+    assert {t for (t,) in env.query("SELECT DISTINCT tile_id FROM lake.lost_runs")} == {
+        TILE,
+        TILE + 1,
+    }
+
+
+def test_a_month_is_set_aside_only_in_its_month(env, tmp_path, monkeypatch):  # noqa: F811
+    # A file running from last month into this one, in one tile: lost last month, true in
+    # this. Its soundings this month are kept.
+    monkeypatch.setattr(calibrate, "MONTH_PIXELS", 1)
+    monkeypatch.setattr(calibrate, "STUCK_SHARE", 1.0)
+    ref = reference(tmp_path / "ref.tif", (0, 480))
+    month = datetime(T0.year, T0.month, 1)
+    start = (month - T0).total_seconds()
+    _, lost, _ = stuck(0, "AQM-T", 0.8, 0)
+    _, true, _ = transit(0, "AQM-T", 5.4, (240, 480), 0)
+    lost = [(start - 3600 + ts, x, y, d) for ts, x, y, d in lost]
+    true = [(start + 60 + ts, x, y, d) for ts, x, y, d in true]
+    # Pixels it read true on both sides of the month's end: those medians carry nothing on.
+    _, berth, _ = transit(0, "AQM-T", 5.4, (300, 360), 0)
+    lost = [(start - 7200 + ts, x, y, d) for ts, x, y, d in berth] + lost
+    fleet = [
+        *(transit(1 + i, "AQM-T", 5.4, (0, 480), i) for i in range(2)),
+        (20, lost + true, "AQM-T"),
+        *(transit(30 + i, "AQM-A", 9.5, (0, 480), 30 + i) for i in range(3)),
+    ]
+    calibrated(env, fleet, ref, monkeypatch)
+    got = env.query(
+        """SELECT p.time >= $month, bool_and(p.lost_bottom), bool_or(p.lost_bottom)
+        FROM corrected_points_in((SELECT any_value(cell_id) FROM lake.points), [], 0, 10800) p
+        JOIN lake.files f USING (file_id) WHERE ends_with(f.key, '_20_pointData.csv')
+        GROUP BY 1 ORDER BY 1""",
+        {"month": month},
+    )
+    assert got == [(False, True, True), (True, False, False)]
+
+
+def test_a_month_covers_the_visits_its_medians_hold(env, tmp_path, monkeypatch):  # noqa: F811
+    # A file true over half its pixels last month, and true once then lost three times over
+    # the other half on either side of the month's end. Those medians read lost and are
+    # dated by the true visit, last month, so the set-aside runs on to the lost readings
+    # this month. No vessel is searched: the month's rule alone sets them aside.
+    monkeypatch.setattr(calibrate, "MONTH_PIXELS", 1)
+    monkeypatch.setattr(calibrate, "STUCK_SHARE", 2.0)
+    ref = reference(tmp_path / "ref.tif", (0, 480))
+    month = datetime(T0.year, T0.month, 1)
+    start = (month - T0).total_seconds()
+    _, true, _ = transit(0, "AQM-T", 5.4, (0, 480), 0)
+    rows = [(start - 3600 + ts, x, y, d) for ts, x, y, d in true]
+    for visit in range(3):
+        _, lost, _ = stuck(0, "AQM-T", 0.8 + visit * 0.3, 0)
+        rows += [(start + 3600 * (1 + visit) + ts, x, y, d) for ts, x, y, d in lost]
+    fleet = [
+        *(transit(1 + i, "AQM-T", 5.4, (0, 480), i) for i in range(2)),
+        (20, rows, "AQM-T"),
+        *(transit(30 + i, "AQM-A", 9.5, (0, 480), 30 + i) for i in range(3)),
+    ]
+    calibrated(env, fleet, ref, monkeypatch)
+    got = env.query(
+        """SELECT bool_and(p.lost_bottom)
+        FROM corrected_points_in((SELECT any_value(cell_id) FROM lake.points), [], 0, 10800) p
+        JOIN lake.files f USING (file_id)
+        WHERE ends_with(f.key, '_20_pointData.csv') AND p.time >= $month""",
+        {"month": month},
+    )
+    assert got == [(True,)]
+
+
+def test_a_short_stretch_over_flat_water_is_kept(env, tmp_path, monkeypatch):  # noqa: F811
+    # Three lost readings in each 12 of T's, under 20 m end to end: a shoal of fish, not a
+    # stretch.
+    monkeypatch.setattr(calibrate, "STUCK_SHARE", 0)
+    n, rows, vessel = stuck(20, "AQM-T", 5.4, 20, step=1)
+    rows = [(ts, x, y, 0.8 if i % 12 < 3 else d) for i, (ts, x, y, d) in enumerate(rows)]
+    fleet = [
+        *(transit(1 + i, "AQM-T", 5.4, (0, 240), i) for i in range(10)),
+        (n, rows, vessel),
+        *(transit(30 + i, "AQM-A", 9.5, (0, 240), 30 + i) for i in range(3)),
+    ]
+    calibrated(env, fleet, reference(tmp_path / "ref.tif", (0, 240)), monkeypatch)
+    assert env.query("SELECT count(*) FROM lake.lost_runs") == [(0,)]
+
+
+@pytest.mark.parametrize("wander", [0, 4])
+def test_lost_readings_at_a_mooring_over_flat_water_are_kept(env, tmp_path, monkeypatch, wander):  # noqa: F811
+    # Searched, lost and over the flat survey, and going nowhere, or no faster than its GPS
+    # wanders: a slip the survey missed.
+    monkeypatch.setattr(calibrate, "STUCK_SHARE", 0)
+    n, rows, vessel = stuck(20, "AQM-T", 0.8, 20, step=0)
+    rows = [(ts, *at(5000, 120 + wander * (i % 2)), d) for i, (ts, _, _, d) in enumerate(rows)]
+    fleet = [
+        *(transit(1 + i, "AQM-T", 5.4, (0, 240), i) for i in range(10)),
+        (n, rows, vessel),
+        *(transit(30 + i, "AQM-A", 9.5, (0, 240), 30 + i) for i in range(3)),
+    ]
+    calibrated(env, fleet, reference(tmp_path / "ref.tif", (0, 240)), monkeypatch)
+    assert env.query("SELECT count(*) FROM lake.lost_runs") == [(0,)]
+
+
+@pytest.mark.parametrize("relief, set_aside", [(calibrate.FLAT_RELIEF_M, True), (0, False)])
+def test_lost_readings_that_wander_over_flat_water_are_set_aside(
+    env,  # noqa: F811
+    tmp_path,
+    monkeypatch,
+    relief,
+    set_aside,
+):
+    # T's month reads true but for one transit's stretches of 8 readings at 0.4 to 1.4 m,
+    # never a stuck run and a few percent of its pixels: over the flat survey, they're set
+    # aside and the readings between them kept; over relief, all of them are kept.
+    monkeypatch.setattr(calibrate, "STUCK_SHARE", 0.01)
+    monkeypatch.setattr(calibrate, "FLAT_RELIEF_M", relief)
+    n, rows, vessel = transit(20, "AQM-T", 5.4, (0, 240), 20)
+    rows = [
+        (ts, x, y, 0.4 + 0.2 * (i % 6) if i % 40 < 8 else d) for i, (ts, x, y, d) in enumerate(rows)
+    ]
+    fleet = [
+        *(transit(1 + i, "AQM-T", 5.4, (0, 240), i) for i in range(10)),
+        (n, rows, vessel),
+        *(transit(30 + i, "AQM-A", 9.5, (0, 240), 30 + i) for i in range(3)),
+    ]
+    calibrated(env, fleet, reference(tmp_path / "ref.tif", (0, 240)), monkeypatch)
+    got = {
+        (raw < 2, c) for u, _, raw, c in corrected(env, "depth_raw, lost_bottom") if u == "AQM-T"
+    }
+    assert got == ({(True, True), (False, False)} if set_aside else {(True, False), (False, False)})
 
 
 def test_a_stuck_run_holds_through_a_stray_reading(env, tmp_path, monkeypatch):  # noqa: F811
@@ -1358,8 +1550,8 @@ def test_stuck_runs_are_searched_where_a_vessel_holds_only_held_depths(env):  # 
 def test_stuck_run_windows_order_soundings_the_same_every_time():
     # Soundings of one file can share a time and depth: ordered by those alone, which of
     # them a window holds, and so the runs found, could change from run to run.
-    orders = re.findall(r"ORDER BY ([^)\n]*?)(?:\s+ROWS|\)|\n)", calibrate.STUCK)
-    assert len(orders) == 4 and all(o.strip() == "time, raw, row" for o in orders), orders
+    orders = re.findall(r"ORDER BY ([^)\n]*?)(?:\s+ROWS|\)|\n)", calibrate.STUCK + calibrate.FLAT)
+    assert len(orders) == 6 and all(o.strip() == "time, raw, row" for o in orders), orders
 
 
 def test_a_sounder_holding_one_depth_is_a_stuck_run(env, tmp_path, monkeypatch):  # noqa: F811
@@ -1422,9 +1614,7 @@ def test_a_bank_crossed_before_the_sounder_sticks_isnt_in_the_run(env, tmp_path,
     fleet.append((n, rows, vessel))
     calibrated(env, fleet, ref, monkeypatch)
     # Its 120 soundings 10 s apart, the first 30 over the bank: the run is the last 90.
-    assert env.query(
-        "SELECT epoch(t_end - t_start) FROM lake.lost_runs WHERE tile_id IS NOT NULL"
-    ) == [(890.0,)]
+    assert env.query("SELECT epoch(t_end - t_start) FROM lake.lost_runs") == [(890.0,)]
 
 
 def test_a_stuck_run_follows_its_soundings_to_a_copy(env, tmp_path, monkeypatch):  # noqa: F811
@@ -1480,6 +1670,19 @@ def test_stuck_runs_are_current_for_an_offset_the_store_rounds_its_own_way(env):
         assert calibrate.runs_current(con)
     with open_store(env.store) as con:
         assert calibrate.runs_current(con)
+
+
+@pytest.mark.parametrize("constant", ["FLAT_RELIEF_M", "ANCHOR_UNCERTAINTY_M"])
+def test_stuck_runs_from_another_flat_water_rule_arent_current(
+    env,  # noqa: F811
+    tmp_path,
+    monkeypatch,
+    constant,
+):
+    calibrated(env, FLEET, reference(tmp_path / "ref.tif", (0, 110)), monkeypatch)
+    monkeypatch.setattr(calibrate, constant, getattr(calibrate, constant) + 0.1)
+    with open_store(env.store) as con:
+        assert not calibrate.runs_current(con)
 
 
 def test_a_recalibration_leaves_changed_tiles_to_rebuild(env, tmp_path, monkeypatch):  # noqa: F811

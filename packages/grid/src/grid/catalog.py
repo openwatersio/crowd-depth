@@ -115,7 +115,8 @@ CREATE TABLE IF NOT EXISTS lake.calibration (
 -- Each vessel's median tide-reduced depth per file per calibration pixel, kept so a run
 -- reduces only the files whose inputs moved, and the inputs each file's were made from.
 CREATE TABLE IF NOT EXISTS lake.file_medians (
-  tile_id INTEGER, py INTEGER, px INTEGER, vessel VARCHAR, file_id BIGINT, t TIMESTAMP, m FLOAT
+  tile_id INTEGER, py INTEGER, px INTEGER, vessel VARCHAR, file_id BIGINT, t TIMESTAMP, m FLOAT,
+  t_last TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS lake.file_median_inputs (file_id BIGINT, inputs VARCHAR);
 -- The tide cells each active file's soundings fall in, under a key of its soundings.
@@ -129,8 +130,9 @@ CREATE TABLE IF NOT EXISTS lake.file_offsets (
   file_id BIGINT, vessel VARCHAR, offset_m FLOAT, se_m FLOAT, excluded BOOLEAN,
   lost_bottom BOOLEAN
 );
--- Runs of a file's soundings whose sounder lost the bottom, in one tile or, with no tile,
--- in all of them; by content, as ingest may move the soundings to another file.
+-- Runs of a file's soundings in one tile whose sounder lost the bottom, or in every tile
+-- for a run a store not yet recalibrated holds; by content, as ingest may move the
+-- soundings to another file.
 CREATE TABLE IF NOT EXISTS lake.lost_runs (
   content_hash VARCHAR, vessel VARCHAR, tile_id INTEGER, t_start TIMESTAMP, t_end TIMESTAMP
 );
@@ -147,6 +149,7 @@ ALTER TABLE lake.calibration_outliers ADD COLUMN IF NOT EXISTS content_hash VARC
 ALTER TABLE lake.tide_stations ADD COLUMN IF NOT EXISTS unpredictable BOOLEAN;
 ALTER TABLE lake.file_offsets ADD COLUMN IF NOT EXISTS lost_bottom BOOLEAN;
 ALTER TABLE lake.calibration_outliers ADD COLUMN IF NOT EXISTS seabed_m FLOAT;
+ALTER TABLE lake.file_medians ADD COLUMN IF NOT EXISTS t_last TIMESTAMP;
 """
 
 # A corrected depth past this is no drying height but a correction gone wrong; cells, the
@@ -257,7 +260,9 @@ CREATE OR REPLACE TEMP MACRO active_points_in(cell, tiles, rlo, rhi, vessels := 
 -- apply is NULL and leaves the depth as it is, and its uncertainty as UNTIDED_SIGMA or
 -- UNCALIBRATED_SIGMA. `excluded` marks a vessel segment known to read too deep to use, and
 -- `lost_bottom` a sounding calibration found its sounder had lost the bottom for: a stray
--- transit that read far too shallow, a stuck run, or a month a vessel mostly read so.
+-- transit that read far too shallow, a stuck run, a stretch over flat water, or a month a
+-- vessel read so in that tile. A run with no tile, from a store not yet recalibrated, holds
+-- in every tile, so its soundings stay out of the overlay until calibration replaces it.
 CREATE OR REPLACE TEMP MACRO corrected_points_in(cell, tiles, rlo, rhi, vessels := []::VARCHAR[]) AS TABLE
 WITH c AS (
   SELECT tide_cell, station_id, km FROM lake.tide_cells
