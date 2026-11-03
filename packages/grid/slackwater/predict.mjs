@@ -8,19 +8,22 @@
 //                               above the station's chart datum, start and end included
 import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
-import { stations } from "@slackwater/database";
+import { loadStations } from "@slackwater/database";
 import { findStation } from "slackwater";
 
 if (process.argv[2] === "stations") {
-  for (const s of stations) {
+  const { accepted } = await loadStations();
+  for (const s of accepted) {
     if (s.kind !== "tide") continue;
+    // A getter that decodes from the database on each read.
+    const { datums } = s;
     const row = {
       id: s.id,
       lon: s.longitude,
       lat: s.latitude,
       chart_datum: s.chart_datum,
-      has_datums: s.datums?.[s.chart_datum] != null,
-      diurnal_range: (s.datums?.MHHW ?? NaN) - (s.datums?.MLLW ?? NaN),
+      has_datums: datums?.[s.chart_datum] != null,
+      diurnal_range: (datums?.MHHW ?? NaN) - (datums?.MLLW ?? NaN),
       commercial_use: s.license?.commercial_use === true,
       license: s.license?.type ?? null,
       attribution: s.attribution ?? null,
@@ -35,12 +38,20 @@ if (process.argv[2] === "stations") {
   const names = ["slackwater", "@slackwater/engine", "@slackwater/database"];
   console.log(JSON.stringify(names.map((n) => `${n}@${version(n)}`).join(" ")));
 } else if (process.argv[2] === "levels") {
+  // Outside the try below: a database that won't load must fail the run, not empty every station.
+  await loadStations();
+  // One lookup per station: each one searches every station and decodes its harmonics.
+  const predictors = new Map();
+  const predictor = (id) => {
+    if (!predictors.has(id)) predictors.set(id, findStation(id));
+    return predictors.get(id);
+  };
   for await (const line of createInterface({ input: process.stdin })) {
     const { station, start, end, step } = JSON.parse(line);
     // A station the engine can't predict gives an empty series: that day goes without.
     let series = [];
     try {
-      const { timeline } = findStation(station).getTimelinePrediction({
+      const { timeline } = (await predictor(station)).getTimelinePrediction({
         start: new Date(start * 1000),
         end: new Date(end * 1000),
         timeFidelity: step,
