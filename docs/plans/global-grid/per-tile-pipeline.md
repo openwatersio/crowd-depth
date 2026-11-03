@@ -1,10 +1,63 @@
 # Per-tile pipeline
 
-Verdict: the per-tile pipeline works end to end and matches the package's own results. Points go to cells, then the surface, then depth areas, contours and soundings, then z8 web tile archives and one low-zoom archive. These are byte-copied into one PMTiles with no global tippecanoe run. A 1° tile is the right unit for the surface. It is the wrong unit for daily incremental work. On every day of the last month, the 3 to 15 tiles that new files touched held 47–86% of all soundings, because new data lands in the dense harbor tiles every day. A daily run at 1° granularity costs about 75% of a full rebuild (Chesapeake: 60 min against 81 min with 4 workers). Two fixed costs dominate at planet scale. First, a full-size raster per tile, even for a tile with 800 soundings. Second, the densest tiles, which set the critical path and break the 2 GB memory budget. Both are fixable, and the fixes are listed under Recommendation.
+`grid tiles` rebuilds the grid one 1° tile at a time, and only the tiles whose inputs moved. Points go to cells, then the surface, then depth areas, contours and prime soundings, per tile. Then z8 web tile archives and one low-zoom archive are byte-copied into one PMTiles, with no global tippecanoe run. [Snakemake](https://snakemake.github.io) runs the jobs, from [the Snakefile](../../../packages/grid/src/grid/Snakefile) in the package, and [tiles.py](../../../packages/grid/src/grid/tiles.py) holds the jobs and the step before them.
+
+On the Chesapeake its surfaces, cells and depth areas are the same as `grid cells` and `grid overlay` build, and replaying a day reruns exactly the tiles that day touched. Two limits are still open: dense tiles and most overlays need more than 2 GB, and a dirty dense tile is rebuilt whole. Both are in [the backlog](backlog.md#3-make-the-daily-rebuild-fit).
+
+## How `grid tiles` runs
+
+```sh
+grid --store DIR_OR_S3_URL tiles --out RUN [--cores N] [--memory-gb N] [--dry-run]
+```
+
+`RUN` is kept from run to run: it holds each tile's outputs and the fingerprints they were built from. One run at a time uses it, and it takes tiles from one store only, named by its path, or its bucket and endpoint: pointed at another, `grid tiles` refuses rather than count every tile gone. It doesn't rebuild the store's own cells or clear its cells marker, so `grid overlay` still asks for `grid cells`. `--dry-run` prepares as a run does, store writes included, then lists the jobs it would run.
+
+1. **Prepare**, on the store, before Snakemake. It does what `grid cells` does first: QC any batch not yet checked at this version, check the stuck runs are this calibration's, and give new files their offsets. Then it fills `lake.file_tiles` where it's behind (`manifest.ensure_file_tiles`), and refuses a store whose tide or calibration is behind its soundings, as `grid overlay` does. It copies the catalog the pointer names to `RUN/snapshot.ducklake`, and fingerprints every tile from it (`manifest.fingerprints`). Each tile's fingerprint goes to `RUN/fp/{tile}.txt`, rewritten only when it moved.
+2. **Gone tiles.** A tile with no active soundings left, because its files were withdrawn, loses its fingerprint file and its outputs. Every archive that held its soundings is removed at once, before any job runs: the web tiles it reached, the low zooms and `overlay.pmtiles`. A run that fails or is stopped after that, or a dry run, leaves no archive rather than one with withdrawn soundings in it; the next run rebuilds them.
+3. **Snakemake** runs the jobs below on the frozen catalog, never on the store, so the store can take new writes during a run. A store keeps the files an old catalog names for 7 days (`catalog.RETAIN`), which bounds how long a run can take.
+
+| Job      | Unit        | Reruns when                                                 | Writes                                                                |
+| -------- | ----------- | ----------------------------------------------------------- | --------------------------------------------------------------------- |
+| cells    | 1° tile     | its fingerprint file is rewritten                           | `cells/`, `shoals/` and `flags/{tile}.parquet` (the cell-level flags) |
+| surface  | 1° tile     | its or a neighbor's cells reran, or a neighbor came or went | `surface/{tile}.tif`, none for a tile with no cells                   |
+| overlay  | 1° tile     | its surface or a neighbor's cells reran                     | `areas/{tile}.geojsons`: DEPARE, DEPCNT, M_QUAL and prime SOUNDG      |
+| web      | z8 web tile | an overlay of a tile in it reran                            | `web/{x}_{y}.pmtiles` (z8–z15), and the soundings it shows below z8   |
+| low      | once        | any web job reran                                           | `low.pmtiles` (z0–z7)                                                 |
+| assemble | once        | low reran                                                   | `overlay.pmtiles`                                                     |
+
+Each job reads the frozen catalog read-only, with the tables it writes held in memory. The cells job runs `cells.build` on its tile; the surface job runs `surface.build_tile` over the tile and its 8 neighbors' points and cell-level flags; the overlay job runs `overlay.tile_areas` with its neighbors' published soundings, as `overlay.areas` does. A change to `tiles.py`, `surface.py`, `overlay.py` or the Snakefile, or to the tools and libraries they draw with (tippecanoe, GDAL, potrace, DuckDB, numpy, SciPy, Shapely, rasterio, pmtiles), reruns every job (`tiles.code()`); a change to the cells code, `catalog.py` among it, moves every fingerprint (`cells.CODE`).
+
+The web jobs cut at z8. Every shoalest-wins pyramid level shown at z8 or past it nests inside one z8 tile, so those soundings are exact per job. The low job takes the levels shown below z8 from every web job. Level 4 (shown at z6, past 1,000 m) has cells wider than a z8 tile, so each web job hands on its level-4 cells' shoalest soundings, whatever their depth, and the low job keeps each cell's shoalest across them: a shallow sounding that shows at no zoom still keeps a deeper one beside it from showing, as in the whole pyramid. Assembly copies the low archive's z0–z7 and each web archive's own subtree, tile bytes as they are, in tile-id order, streaming the tile bytes, so its memory grows only with the archive's directory, about 200 bytes a tile, and writes the same metadata `grid overlay` does. A tile that doesn't rerun keeps the survey end date it was built with, which `grid overlay` caps at the day it runs, and a change to the credit line alone reassembles the archive (`RUN/credits.txt`). A clip box with nothing in it makes tippecanoe exit 110; the web job then writes no archive.
+
+**Scheduling.** Snakemake's greedy scheduler, since its ILP scheduler stalls with thousands of ready jobs and its bundled solver is x86 only. Jobs run densest first. Each declares memory and threads from its tile's active soundings (`tiles.MEMORY_MB`, `tiles.THREADS`), from the Chesapeake's measured peaks, and the run's budget (`--memory-gb`, by default three quarters of the machine's or its container's memory) caps what runs at once. DuckDB gets 1.2 GB in every tile and web job, whatever `GRID_MEMORY_LIMIT` says, since the estimates were measured with it; the rest of a job's memory is numpy, shapely and GDAL, which its limit doesn't cover. A run stopped outright resumes where it stopped: its unfinished jobs rerun.
+
+**The warm worker.** A Python start and the grid's imports cost about 1 s per job, 8–21% of a planet day at 7.5k–17k jobs. `grid tiles` starts [worker.py](../../../packages/grid/src/grid/worker.py) for the run, which imports the package once and forks a child per job. Snakemake's command for each job is a small client that sends the job to the worker and exits with its status, so Snakemake still sees one job, one log and one exit code. The worker runs in its own session; stopping the run (Ctrl-C or SIGTERM) stops the worker, which stops its jobs and their tools before the run directory is free again. It also checks every second that `grid tiles` is still running, and stops its jobs and itself if not, so a run killed outright leaves nothing running. A job costs about 30 ms of fork and 17 ms of Snakemake's dispatch.
+
+`RUN/jobs.jsonl` gets a line per finished job: its stage, key, time and peak memory, its own and the tools'. A failed job's traceback is in its log under `RUN/logs/`.
+
+## Measured with Snakemake
+
+On the Chesapeake (212 tiles, 98.5M soundings), on 18 cores of an M-series Mac Studio. `grid tiles` itself ran the full build; the replay, overhead and planning figures are from the spike it was built from, which ran the same jobs the same way.
+
+- **Same output.** All 193 surfaces byte-identical to `grid overlay`'s, and the 19 tiles with no surface the same 19 (every sounding in them is lost-bottom, rejected or an unconfirmed shoal, so they have shoals but no cells). Cells identical in every column. DEPARE, DEPCNT and M_QUAL identical in all 212 tiles, but for the survey end date, which both cap at the day they run. The archive holds 179,683 tiles.
+- **Prime soundings.** Every closed isobath has a prime of the same depth as `grid overlay`'s. Where several points tie for its least depth, `grid overlay` took the first in the store's row order, and `grid tiles` the first in another order, so primes sat at different points in 16 tiles. `PRIME_CANDIDATES` is now ordered, so a tie goes to the westmost point in both. When nested isobaths' ties land on one point, they share one prime, so a tile's count of primes can change with the order too.
+- **Only what moved.** Replaying the last arrival day moved 8 fingerprints. Cells reran on those 8, surfaces and overlays on 18 (with their neighbors), web on 23. The outputs were byte-identical to a full run's. A run with nothing moved did nothing, in 1.9 s.
+- **Overhead.** With the warm worker, imports and setup were 0.8% of the full run's job time and 0.35% of the replay's.
+- **Wall time.** 23 min for the full build, against 62 min for `grid cells` and `grid overlay` on the same cores, and 41 min for the spike, which gave every job one thread. The densest tile still sets it: 45463 (28M soundings) runs cells, surface and overlay in turn.
+- **Memory.** 75 of 863 jobs went past 2 GB: every stage of the tiles over 1M soundings, and overlays even on sparse tiles. The largest was 4.0 GB, an overlay of tile 46183. Tools stayed under 1.1 GB. Assembly streams the archive at 0.3 GB.
+- **Planning a planet.** On 25,000 synthetic tiles, Snakemake plans a day with 900 dirty tiles (17,002 jobs) in 46 s at 1.9 GB, and a day with none in 54 s.
+
+Not measured yet: reading the frozen catalog from R2, a planet's densest tiles, cheap x86 cores, and what the dense tiles' extra threads cost in memory.
+
+## The first spike
+
+The rest of this document is the first spike, before Snakemake: how the per-tile split was found to work, and what it cost.
+
+**Its verdict:** the per-tile pipeline works end to end and matches the package's own results. Points go to cells, then the surface, then depth areas, contours and soundings, then z8 web tile archives and one low-zoom archive. These are byte-copied into one PMTiles with no global tippecanoe run. A 1° tile is the right unit for the surface. It is the wrong unit for daily incremental work. On every day of the last month, the 3 to 15 tiles that new files touched held 47–86% of all soundings, because new data lands in the dense harbor tiles every day. A daily run at 1° granularity costs about 75% of a full rebuild (Chesapeake: 60 min against 81 min with 4 workers). Two fixed costs dominate at planet scale. First, a full-size raster per tile, even for a tile with 800 soundings. Second, the densest tiles, which set the critical path and break the 2 GB memory budget. Both are fixable, and the fixes are listed under Recommendation.
 
 Measured in October 2026 on the Chesapeake set, with the `packages/grid` code as of the overlay branch ([#150](https://github.com/openwatersio/crowd-depth/pull/150)). The spike's code isn't checked in, and nothing was written to R2.
 
-## Data
+### Data
 
 |                                                |                                                                                                          |
 | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
@@ -15,7 +68,7 @@ Measured in October 2026 on the Chesapeake set, with the `packages/grid` code as
 
 The "Chesapeake" set is every file that touches the bay. Transits take it to 212 tiles between 31°N and 42°N, so it includes a long sparse tail like the planet's.
 
-## The pipeline as built
+### The pipeline as built
 
 | Stage    | Unit                     | Reads                                                                                            | Writes                                                               | Package code reused                                                                                             |
 | -------- | ------------------------ | ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
@@ -33,7 +86,7 @@ Below z8: z0–z7 come from one more tippecanoe run over every tile's features w
 
 Assembly: a Python script reads each archive's directory, keeps the tiles it owns, and copies tile bytes in tile-id order into one clustered archive. Alternative: `pmtiles extract --bbox` per z8 archive, inset so neighbors' tiles don't intersect, then `pmtiles merge`. Both give identical tiles.
 
-### What had to change
+#### What had to change
 
 - **`cells.CLASSIFY` corroboration join**. On tile 45463 (28M soundings) the `corroborated` CTE, which joins each consensus shoal to every sounding in its 3″ block, ran out of memory at 2 GB after 243 s. I rewrote it against one row per distinct depth in the block, with the min and max vessel that read that depth. It is exact while one reading of the same depth corroborates a shoal. On the dev sample it gave identical flags and cells, apart from the tie noted next. With the patch, that statement takes 24 s.
 - **Edge strips.** `surface.margin` reads the E/W neighbors whole, so each surface would read 9 tiles. The cells stage writes the points within 0.004° (about 450 m) of each edge (1.6% of points, 63 MB). The surface stage's `lake.points` is the tile plus its neighbors' strips. `surface.POINTS` filters them.
@@ -41,7 +94,7 @@ Assembly: a Python script reads each archive's directory, keeps the tiles it own
 - **Low-zoom pre-simplification** (`shapely.coverage_simplify` at half a z7 unit). A collapsed DEPARE polygon must keep its original geometry, or shoals vanish below z8. The first dev run lost them.
 - No changes to `surface.py` or `overlay.py`.
 
-## Cost per tile, by density (serial: 1 worker, 4 DuckDB threads)
+### Cost per tile, by density (serial: 1 worker, 4 DuckDB threads)
 
 | soundings in tile | tiles | cells s, median / max | surface s, median / max | cells peak RSS | surface peak RSS | cells, median |
 | ----------------- | ----: | --------------------: | ----------------------: | -------------: | ---------------: | ------------: |
@@ -61,7 +114,7 @@ Linear fits: cells = 1.0 s + 20 s per million soundings; surface = 9.0 s + 19.4 
 
 Web jobs (z8): 239 jobs, 166 with output; median 1.2 s, max 110 s (74/99: 1,662 area features, 234k soundings, tippecanoe 91 s, 1.65 GB). Low-zoom run: 22 s, 0.94 GB. Assembly: 1.3 s, 0.16 GB for 181,108 tiles (217 MB); the CLI path takes 18 s.
 
-## Totals for Chesapeake
+### Totals for Chesapeake
 
 | run                                                                          |   cells | surface |                        web |  low | assemble |                  total |
 | ---------------------------------------------------------------------------- | ------: | ------: | -------------------------: | ---: | -------: | ---------------------: |
@@ -75,13 +128,13 @@ Four workers gave only 1.4×. Three things held it back. First, the densest tile
 
 Output sizes: cells 314 MB (9.14M cells, 3.43M of them filled), flags 131 MB, SOUNDG sources 140 MB, edge strips 63 MB, surfaces 465 MB, area features 550 MB of GeoJSON, low-zoom features 98 MB, web GeoJSON 1.3 GB (scratch), web archives 228 MB, final archive 217 MB.
 
-## Correctness
+### Correctness
 
 - Soundings: on the dev sample (10 tiles, 1.05M soundings), the union of the per-z8 pyramids plus the low-zoom ones equals `overlay.soundings` over the whole store exactly (34,320 features, 0 missing, 0 extra).
 - Tiles against a global tippecanoe run over the same features: the same 181,108 tile addresses. At z8–z15, 0.6% of tiles differ, by points outside the tile's extent. A per-z8 job doesn't see the neighbor job's soundings in its buffer. MapLibre places a symbol only from the tile holding its anchor, so this doesn't show. At z0–z7 the separate run's tiles encode differently. Band areas agree within a few percent per band, and the 0–2 m band covers slightly more in the per-tile build, so no shoal is lost. Feeding the low run unsimplified features gives the same kind of difference (61 s instead of 22 s), so the difference comes from tippecanoe seeing a subset, not from my simplification.
 - Incremental against full: base (to 10-08) → +6 days → +1 day, compared with the serial full build. Flags are identical in all 212 tiles. DEPARE, DEPCNT and M_QUAL are identical in all 212. Prime soundings have the same counts and depths. 31 tiles' cells differ only in `depth_lon` and `depth_lat` (23,777 cells), and 0.1% of final tiles differ by one sounding. Cause: `placed` in `cells.CLASSIFY` takes `arg_min(position, time)`, and soundings at the same depth and time tie, so the position depends on thread order. This affects the package as it is, not just this spike.
 
-## Daily incremental
+### Daily incremental
 
 Dirty sets: cells rebuild the tiles that new files' points touch. Surfaces rebuild those tiles and their 8 neighbors (the edge strips). Web jobs rebuild every z8 tile whose inputs include a rebuilt tile. Low and assemble always rerun.
 
@@ -94,7 +147,7 @@ The last day is large (376 files), but a typical day is no better. On each of th
 
 Swapping changed tiles in the archive: rerun only the dirty z8 jobs, then re-assemble. Assembly copies unchanged tiles byte for byte (1.3–2 s here), so a full rewrite costs about the same as a patch. PMTiles can't be patched in place. Appending new tile data and rewriting the directory would work, but every changed byte range still has to be re-uploaded. A rewrite uploads the whole archive.
 
-## Seams between tiles
+### Seams between tiles
 
 Measured on the full build's depth areas and contours, along all 204 shared edges (84 have areas near the edge), sampled every surface pixel:
 
@@ -106,7 +159,7 @@ Measured on the full build's depth areas and contours, along all 204 shared edge
 
 These seams come from the package's per-tile surface, not from the split. A global tippecanoe run draws the same ones. Interpolation sees 200 m of the neighbors, but the blur, the confirmed-shoal cap (`minimum_filter`) and consensus QC (whose votes stop at tile edges, the existing `ponytail` in `cells.py`) don't. Gridding each tile with a margin of a few pixels and cropping after the guard would remove most of the mismatch. Consensus would also need to read across edges, which makes the cells stage depend on its neighbors too.
 
-## Planet extrapolation (8 cores, 32 GB)
+### Planet extrapolation (8 cores, 32 GB)
 
 Assumptions, none measured:
 
@@ -126,7 +179,7 @@ Assumptions, none measured:
 
 A full daily rebuild doesn't fit in a day on 8 cores as the code stands. A 1°-dirty daily run fits, but costs about half to three quarters of a rebuild every day. Two changes would cut that by an order of magnitude: cropping each surface to its data, which removes most of the fixed cost, and sub-tile dirtiness in dense tiles.
 
-## Downsides I hit
+### Downsides I hit
 
 1. **Dense tiles.** They ran out of memory in the corroboration join. Their surfaces peaked at 3.2–4.5 GB with 4 threads (3.0–3.8 GB with 1), against a 2 GB per-process target; DuckDB's limit doesn't cover numpy, shapely or GDAL. They set the critical path (about 20 min for the densest alone). They needed a memory-weighted scheduler, which then stalled sparse work behind them. **The 2 GB cap was exceeded:** 201 of 212 serial surface processes peaked over it (the full-tile rasters alone take about 1.7 GB), as did one cells process (2.3 GB, tile 46544). Web, low and assembly stayed under 1.7 GB. I couldn't keep the surface under 2 GB without changing `surface.py`, so I kept the machine safe with a total budget instead: 8 GB across workers, dense surfaces counted as 4.6 GB.
 2. **Margins.** Surfaces need neighbors' points, so cells must finish for all 9 tiles first: a barrier between stages, and dirtiness spreads to a 3×3 block and then to about 2 z8 jobs per tile. Cells need no margin only because consensus and σ's windows stop at tile edges, which is itself a cause of the seams. Fixing the seams means cells depend on neighbors too.
@@ -134,7 +187,7 @@ A full daily rebuild doesn't fit in a day on 8 cores as the code stands. A 1°-d
 4. **Versioning and change detection.** Each tile's outputs depend on its own inputs, its neighbors' edge points and flags, and the code version, and the tie nondeterminism changes bytes with no input change. A real run needs a per-tile manifest (input fingerprint, `GRID_VERSION`, `QC_VERSION`, and the neighbors' fingerprints), and the archive should be published only when every dirty unit has finished. A version bump rebuilds everything (16–25 h on the assumptions above). Withdrawn files that empty a tile need its outputs deleted; this spike doesn't handle that.
 5. **Process-per-unit.** It made memory measurable, but costs 0.6–1 s per unit. At planet scale, use long-lived workers.
 
-## Recommendation
+### Recommendation
 
 Keep the 1° tile as the unit for the surface, and tile at z8 web tiles with byte-copy assembly. That part works and is exact. Before building the daily run on it:
 
@@ -145,7 +198,7 @@ Keep the 1° tile as the unit for the surface, and tile at z8 web tiles with byt
 5. **Read the tile's active points once per cells run,** not once per band unit, and fold `SOURCES` into it.
 6. **Build the low zooms hierarchically** before the planet's feature volume makes one run slow, and test that shoals survive at z4–z7.
 
-## Not measured
+### Not measured
 
 - The real store: reading a tile out of DuckLake on R2 (rows pruned by `tile_id` after compaction), the catalog lock, and uploads.
 - Cheap x86 cores and a dedicated machine: every timing here is on a shared M-series laptop, with swap nearly full all night.

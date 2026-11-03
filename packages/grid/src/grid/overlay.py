@@ -239,11 +239,14 @@ SELECT min(first),
 FROM lake.cells WHERE cell_id = $partition AND tile_id = $tile AND depth IS NOT NULL"""
 
 # A tile's published cell soundings shallow enough to be primes: a prime is the least
-# depth published inside its isobath, at that cell's sounding.
+# depth published inside its isobath, at that cell's sounding. In order, so of equal
+# depths the first, which tile_areas takes, is the westmost, then southmost, as the
+# pyramid breaks ties, however the store's files hold the rows.
 PRIME_CANDIDATES = f"""
 SELECT depth_lon AS lon, depth_lat AS lat, depth FROM lake.cells
 WHERE cell_id = $partition AND tile_id = $tile AND depth <= $max
-  AND abs(depth_lat) <= {MERCATOR_MAX_LAT}"""
+  AND abs(depth_lat) <= {MERCATOR_MAX_LAT}
+ORDER BY depth, lon, lat"""
 
 
 # Every published sounding, cell or shoal, in a tile or within a margin of it, from the
@@ -584,7 +587,8 @@ def polygonal(geometry):
 def tile_areas(candidates, properties, bands, footprint, surfaced=None, interpolated=None):
     """Features for one tile: its depth areas from the surface's `bands`, its coverage
     `footprint` with `properties`, the contours between bands, and prime soundings from
-    `candidates`, the (lon, lat, depth) arrays of the tile's published cell soundings. An
+    `candidates`, the (lon, lat, depth) arrays of the tile's published cell soundings, of
+    which a tie goes to the first. An
     isobath is closed when the surface, `surfaced` (the footprint if not given), has
     deeper water all round it. `interpolated`, (geometry, properties), is the part of
     the footprint drawn between tracks: its coverage is a separate M_QUAL marked
@@ -638,7 +642,9 @@ def tile_areas(candidates, properties, bands, footprint, surfaced=None, interpol
         closed = shapely.covers(surfaced, shapely.buffer(rings, 1e-7, quad_segs=1))
         ring_of, point = tree.query(rings[closed], predicate="contains")
         for r in np.unique(ring_of):
-            inside = point[ring_of == r]
+            # In the candidates' order, so a tie goes to the first, whatever order the
+            # tree returns them in.
+            inside = np.sort(point[ring_of == r])
             j = int(inside[np.argmin(depth[inside])])
             key = (float(lon[j]), float(lat[j]))
             primes[key] = min(primes.get(key, (99, 0))[0], level_minzoom(v)), depth[j]
@@ -720,18 +726,23 @@ def attribution(con):
     return "; ".join(credits)
 
 
-def build(con, out):
-    """Write the layers as line-delimited GeoJSON in `out`, then tile them into
-    `out/overlay.pmtiles`. Returns the feature counts.
+def describe(con):
+    """The archive's metadata: its name and credits, and the type, version and date a
+    client reads. Freeboard applies S-52 styling to a vector chart whose type is S-57, and
+    the version and date let a client tell when an extract is out of date."""
+    built = datetime.now(UTC).strftime("%Y-%m-%d")
+    return {
+        "name": "Crowd Depth",
+        "description": f"Crowd Depth grid {GRID_VERSION}, built {built}",
+        "attribution": attribution(con),
+        "type": "S-57",
+        "version": str(GRID_VERSION),
+        "built": built,
+    }
 
-    The cells and their QC must be this build's: overlay reads them as they are, so
-    run `grid cells` first after an upgrade.
-    """
-    # Cells, flags and points must all be from the last full `grid cells` run, by this
-    # build's code: an ingest, withdrawal, QC run or upgrade since changes the inputs.
-    built = con.execute("SELECT value FROM lake.store_meta WHERE key = 'cells'").fetchone()
-    if built is None or built[0] != cells.inputs(con):
-        raise RuntimeError("cells aren't current with the store; run `grid cells` first")
+
+def check_corrections(con):
+    """Refuse a store whose tide or calibration is behind its soundings."""
     # Once a store reduces tide, every area must have been seen by `grid tide`: a sounding
     # in one it hasn't would publish raw, deeper than chart datum.
     if (
@@ -749,6 +760,21 @@ def build(con, out):
     applied = con.execute("SELECT count(*) FROM lake.file_offsets").fetchone()[0]
     if applied and (solved is None or solved[0] != cells.tides(con)):
         raise RuntimeError("tide levels changed since calibration; run `grid calibrate` first")
+
+
+def build(con, out):
+    """Write the layers as line-delimited GeoJSON in `out`, then tile them into
+    `out/overlay.pmtiles`. Returns the feature counts.
+
+    The cells and their QC must be this build's: overlay reads them as they are, so
+    run `grid cells` first after an upgrade.
+    """
+    # Cells, flags and points must all be from the last full `grid cells` run, by this
+    # build's code: an ingest, withdrawal, QC run or upgrade since changes the inputs.
+    built = con.execute("SELECT value FROM lake.store_meta WHERE key = 'cells'").fetchone()
+    if built is None or built[0] != cells.inputs(con):
+        raise RuntimeError("cells aren't current with the store; run `grid cells` first")
+    check_corrections(con)
     out.mkdir(parents=True, exist_ok=True)
     surfaces = out / "surface"
     # Only last build's tiles: a tile with no soundings now must not linger.
@@ -769,7 +795,7 @@ def build(con, out):
     counts["soundings"] = write(soundings(con, primes), out / "soundings.geojsons")
     if not any(counts.values()):
         raise RuntimeError("nothing to tile: the store has no cells")
-    built = datetime.now(UTC).strftime("%Y-%m-%d")
+    meta = describe(con)
     mbtiles = out / "overlay.mbtiles"
     subprocess.run(
         [
@@ -783,20 +809,18 @@ def build(con, out):
             # a small shoal area is never merged away at low zoom.
             "--detect-shared-borders",
             "--no-tiny-polygon-reduction",
-            *("-n", "Crowd Depth", "-N", f"Crowd Depth grid {GRID_VERSION}, built {built}"),
-            *("-A", attribution(con)),
+            *("-n", meta["name"], "-N", meta["description"], "-A", meta["attribution"]),
             str(out / "soundings.geojsons"),
             str(out / "areas.geojsons"),
         ],
         check=True,
     )
-    # Freeboard applies S-52 styling to a vector chart whose metadata says type=S-57, and
-    # the version and date let a client tell when an extract is out of date. Tippecanoe
-    # can't write custom metadata, so it goes in through MBTiles on the way to PMTiles.
+    # Tippecanoe can't write custom metadata, so it goes in through MBTiles on the way to
+    # PMTiles.
     with contextlib.closing(sqlite3.connect(mbtiles)) as db, db:
         db.executemany(
             "INSERT OR REPLACE INTO metadata (name, value) VALUES (?, ?)",
-            [("type", "S-57"), ("version", str(GRID_VERSION)), ("built", built)],
+            [(k, meta[k]) for k in ("type", "version", "built")],
         )
     mbtiles_to_pmtiles(str(mbtiles), str(out / "overlay.pmtiles"), None)
     mbtiles.unlink()
