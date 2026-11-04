@@ -6,7 +6,10 @@ equirectangular projection centred on it, a linear rescaling of latitude and
 longitude, so `gdal_grid`'s search radius is in metres (within about 3% across a tile up to 70°, 5% at 80°)
 and its pixels are exactly the latitude and longitude grid's. Interpolation needs a
 sounding in every quadrant around a pixel, so it fills between tracks and never runs
-past their ends. Depth areas and contours are cut from it; soundings never are.
+past their ends. Within NEAR_M of a sounded pixel, a pixel interpolation leaves empty
+takes the shoalest median within that reach instead, so a lone track draws a narrow
+band and a track's end stops a short way past it. Depth areas and contours are cut from
+it; soundings never are.
 
 What is interpolated is each pixel's median of vessels' medians; the depth is that
 surface less K times σ (statistic.py). A pixel with a depth and no sounding is
@@ -51,6 +54,14 @@ ALGORITHM = (
     f"invdistnn:power=2:smoothing={SMOOTHING_M}:radius={RADIUS_M}:max_points=12:min_points=3"
     f":min_points_per_quadrant=1:nodata={NODATA}"
 )
+# The reach, in metres between pixel centres, of the band beside a track. Measured on the
+# Chesapeake by drawing each vessel's band alone and scoring it against other vessels'
+# medians in pixels it never sounded: after the margin's distance and correction terms,
+# 0.7-0.8% of its own pixels read more than 1 m too deep, about 1% within 20 m, 2.3% at
+# 30-40 m, 3% at 40-50 m and 3.3-3.8% at 50-60 m. Past 40 m it passes three times its
+# own pixels' rate.
+NEAR_M = SURFACE["near_radius_m"]
+assert NEAR_M <= RADIUS_M, "the band reaches past the blocks the search radius picks"
 # The blur, in pixels: never toward deeper water, wide enough that busy and quiet water both
 # read clearly.
 SIGMA_PX = SURFACE["blur_px"]
@@ -259,11 +270,11 @@ def grid_tile(tile_id: int, got, out: Path):
     )
     out.mkdir(parents=True, exist_ok=True)
     path = out / f"{tile_id}.tif"
-    # A pixel has a depth only within the search radius of a point, and then has one of
-    # the tile's own soundings within it too: the quadrant facing into the tile needs one.
-    # So only blocks within that reach of a point have data, and a block's depths and
-    # distances depend only on pixels within that reach of it, or within the blur's (4σ),
-    # whichever is wider.
+    # A pixel has a depth only within the search radius of a vote, this tile's or a
+    # neighbor's, the band beside a track included (NEAR_M <= RADIUS_M). So only blocks
+    # within that reach of a vote have data, and a block's depths and distances depend
+    # only on pixels within that reach of it, or within the blur's (4σ), whichever is
+    # wider.
     reach = (math.ceil(RADIUS_M / dy) + 1, math.ceil(RADIUS_M / dx) + 1)
     blur_px = math.ceil(4 * SIGMA_PX)
     halo = (max(reach[0], blur_px), max(reach[1], blur_px))
@@ -297,29 +308,39 @@ def grid_tile(tile_id: int, got, out: Path):
             if len(upx)
             else None
         )
-        # The blurred surface first, block by block, for σ's spread around it where a
-        # window is too thin for a plane, as the statistic was measured.
+        # The blurred surface first, block by block, with the band beside the tracks.
         central = {
             key: np.full((r1 - r0, c1 - c0), NODATA, dtype=np.float32)
             for key, (r0, c0, r1, c1, *_) in windows.items()
         }
+        rows_at, cols_at = ROWS - 1 - upy, upx
+        near = Near(rows_at, cols_at, medians, dy, dx)
+        inside = (rows_at >= 0) & (rows_at < ROWS) & (cols_at >= 0) & (cols_at < cols)
+        at_central = np.full(len(upx), np.nan)
+        blocks_at = (rows_at // BLOCK) * (cols // BLOCK + 1) + cols_at // BLOCK
         with contextlib.ExitStack() as stack:
             src = stack.enter_context(rasterio.open(grid)) if grid else None
             for key, (r0, c0, r1, c1, wr0, wc0, wr1, wc1) in windows.items() if src else ():
                 window = src.read(
                     1, window=Window(wc0 - extent[1], wr0 - extent[0], wc1 - wc0, wr1 - wr0)
                 )
-                central[key] = blur(window)[r0 - wr0 : r1 - wr0, c0 - wc0 : c1 - wc0]
-        rows_at, cols_at = ROWS - 1 - upy, upx
-        inside = (rows_at >= 0) & (rows_at < ROWS) & (cols_at >= 0) & (cols_at < cols)
-        at_central = np.full(len(upx), np.nan)
-        blocks_at = (rows_at // BLOCK) * (cols // BLOCK + 1) + cols_at // BLOCK
-        for key, block in central.items():
-            mine = inside & (blocks_at == key[0] * (cols // BLOCK + 1) + key[1])
-            value = block[rows_at[mine] % BLOCK, cols_at[mine] % BLOCK]
-            at_central[mine] = np.where(value == NODATA, np.nan, value)
+                inner = np.s_[r0 - wr0 : r1 - wr0, c0 - wc0 : c1 - wc0]
+                between = blur(window)[inner]
+                # σ's spread, where a window is too thin for a plane, is around the
+                # interpolation alone, as the statistic was measured.
+                mine = inside & (blocks_at == key[0] * (cols // BLOCK + 1) + key[1])
+                value = between[rows_at[mine] % BLOCK, cols_at[mine] % BLOCK]
+                at_central[mine] = np.where(value == NODATA, np.nan, value)
+                # The band fills only what interpolation left empty, and never makes a
+                # pixel it filled deeper: blurred together, an interpolated pixel takes
+                # the shoaler of the two.
+                banded = blur(np.where(window == NODATA, near.shoalest(wr0, wc0, wr1, wc1), window))
+                central[key] = np.where(
+                    between == NODATA, banded[inner], np.minimum(between, banded[inner])
+                )
         # Interpolation needs a sounding in every quadrant, so the outermost tracks' own
-        # pixels have no surface: there, as past the tile's edge, the pixel's own median.
+        # pixels have no interpolated surface: there, as past the tile's edge, the pixel's
+        # own median.
         at_central = np.where(np.isnan(at_central), medians, at_central)
 
         def sigma_of(qx, qy, distance):
@@ -381,6 +402,32 @@ class Sounded:
         return count, confirmed
 
 
+class Near:
+    """The voted pixels' medians, by row and column, those past the tile's edges too, and
+    each pixel's shoalest of them within NEAR_M of its centre, a window at a time."""
+
+    def __init__(self, rows, cols, values, dy, dx):
+        rows, cols = np.asarray(rows, dtype=np.int32), np.asarray(cols, dtype=np.int32)
+        order = np.argsort(rows, kind="stable")
+        self.rows, self.cols = rows[order], cols[order]
+        self.values = np.asarray(values, dtype=np.float32)[order]
+        self.pad = (math.floor(NEAR_M / dy), math.floor(NEAR_M / dx))
+        i, j = np.mgrid[-self.pad[0] : self.pad[0] + 1, -self.pad[1] : self.pad[1] + 1]
+        self.footprint = (i * dy) ** 2 + (j * dx) ** 2 <= NEAR_M**2
+
+    def shoalest(self, r0, c0, r1, c1):
+        """Rows [r0, r1), columns [c0, c1): each pixel's shoalest median within NEAR_M,
+        or NODATA with none."""
+        pr, pc = self.pad
+        a, b = np.searchsorted(self.rows, [r0 - pr, r1 + pr])
+        i = a + np.flatnonzero((self.cols[a:b] >= c0 - pc) & (self.cols[a:b] < c1 + pc))
+        raster = np.full((r1 - r0 + 2 * pr, c1 - c0 + 2 * pc), np.inf, dtype=np.float32)
+        np.minimum.at(raster, (self.rows[i] - r0 + pr, self.cols[i] - c0 + pc), self.values[i])
+        got = minimum_filter(raster, footprint=self.footprint, mode="constant", cval=np.inf)
+        got = got[pr : pr + r1 - r0, pc : pc + c1 - c0]
+        return np.where(np.isfinite(got), got, NODATA).astype(np.float32)
+
+
 def interpolate(tmp, px, py, values, scale_x, scale_y, cols, extent):
     """`values` at pixels (px, py) interpolated with `gdal_grid` over the tile's rows and
     columns `extent` (first row, first column, end row, end column); the raster's path."""
@@ -432,8 +479,8 @@ def finish(surface, sigma, around):
     Depth areas follow the surface between pixel centres, so a shoal held at its own
     pixel's centre alone would cover only part of that pixel; carried to the pixels
     around it, it covers all of its own. Shoals may be enlarged, never drawn deeper.
-    A pixel the interpolator leaves empty stays empty, shoal or not, as at a lone track
-    or a track's end: the shoal shows there only as a sounding.
+    A pixel the surface leaves empty, farther than NEAR_M from every vote, stays empty,
+    shoal or not: a shoal there shows only as a sounding.
     """
     valid = surface != NODATA
     # The margin alone never makes water drying: below 0 only where the surface or a

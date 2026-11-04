@@ -34,6 +34,7 @@
   },
   "surface": {
     "interpolation_radius_m": 200,
+    "near_radius_m": 40,
     "smoothing_m": 40,
     "blur_px": 2
   },
