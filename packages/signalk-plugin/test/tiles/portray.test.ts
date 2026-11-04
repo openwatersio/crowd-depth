@@ -136,8 +136,9 @@ test("every depth area is covered, as measured or interpolated, never both", () 
   }
   expect(drawn).toBeGreaterThan(0);
   // Slivers at most, where measured and interpolated water meet at the surface's edge,
-  // which in two short passes is much of it.
-  expect(uncovered / drawn).toBeLessThan(0.01);
+  // and where coverage, simplified to half a pixel, parts from the areas, simplified to
+  // an eighth: in two short passes, much of it is edge.
+  expect(uncovered / drawn).toBeLessThan(0.04);
   expect(both / drawn).toBeLessThan(0.002);
 });
 
@@ -228,9 +229,10 @@ test("contours in shallow water don't follow the pixel grid", () => {
     }
   }
   expect(features(t, "DEPCNT").length).toBeGreaterThan(0);
-  // A z15 pixel is 64 units: a straight run of two and a half pixels along the grid
-  // is the grid's, not the bottom's.
-  expect(longest).toBeLessThan(160);
+  // A z15 pixel is 64 units: a straight run of three pixels along the grid is the
+  // grid's, not the bottom's. Simplified to a 32nd of a pixel, a contour that's nearly
+  // straight here lies along the grid for two and a half.
+  expect(longest).toBeLessThan(192);
 });
 
 test("straight contours across an even slope are drawn", () => {

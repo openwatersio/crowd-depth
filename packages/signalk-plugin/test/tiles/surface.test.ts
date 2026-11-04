@@ -10,7 +10,13 @@ import {
   createTileService,
   readTile,
 } from "../../src/tiles/service.js";
-import { buildTile, contourLevels, surface } from "../../src/tiles/surface.js";
+import { cut, prepare } from "../../src/tiles/portray.js";
+import {
+  buildTile,
+  contourLevels,
+  rasterSize,
+  surface,
+} from "../../src/tiles/surface.js";
 
 const Z = 14;
 const LON = -76.2;
@@ -398,10 +404,11 @@ test("zoomed out, cells past one edge of a tile don't draw at its other", () => 
 
 test("water between two tracks close together stays interpolated", () => {
   const cells = [...lane(LON, () => 10), ...lane(LON + 0.0005, () => 10)];
-  const t = decode(buildTile(13, tileAt(13).x, tileAt(13).y, cells, [])!);
-  expect(features(t, "M_QUAL").map((m) => m.properties.kind)).toContain(
-    "interpolated",
-  );
+  // As traced: at z13 the strip is narrower than half a screen pixel, which the tile's
+  // simplification drops.
+  const { x, y } = tileAt(13);
+  const t = cut(prepare(surface(13, x, y, cells, [])), 0, 0, rasterSize(13));
+  expect(t.extent.some((e, i) => Math.min(e, -t.measured[i]) >= 0)).toBe(true);
 });
 
 test("a tile is tided by its own cells, not the rest of its ancestor's", () => {

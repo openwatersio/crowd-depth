@@ -432,8 +432,13 @@ function slope(v: Float64Array, m: number): Float64Array {
   return out;
 }
 
-/** Polygons where `field` is at least 0, in tile coordinates. */
-export function polygons(t: Traced, field: Float64Array): Point[][][] {
+/** Polygons where `field` is at least 0, in tile coordinates, simplified to within
+ * `tolerance` tile units. */
+export function polygons(
+  t: Traced,
+  field: Float64Array,
+  tolerance: number,
+): Point[][][] {
   const { m } = t;
   // Traced over just the samples about where it's at least 0, and a sample past them.
   let [x0, y0, x1, y1] = [m, m, -1, -1];
@@ -463,7 +468,7 @@ export function polygons(t: Traced, field: Float64Array): Point[][][] {
     poly.map((ring) =>
       simplifyRing(
         ring.map(([x, y]) => [t.toTile(x + x0), t.toTile(y + y0)] as Point),
-        1,
+        tolerance,
       ),
     ),
   );
@@ -471,11 +476,15 @@ export function polygons(t: Traced, field: Float64Array): Point[][][] {
 
 /**
  * The contours at each of `levels`, in metres, within the extent, as lines in tile
- * coordinates, simplified to within a tile unit; in one pass over the samples. Each
+ * coordinates, simplified to within `tolerance` tile units; in one pass over the samples. Each
  * crosses where its distance does, as the bands' edges do, so a contour lies on the edge
  * its bands share.
  */
-export function isolines(t: Traced, levels: number[]): Map<number, Point[][]> {
+export function isolines(
+  t: Traced,
+  levels: number[],
+  tolerance: number,
+): Map<number, Point[][]> {
   const { m, extent, depth } = t;
   const sorted = [...levels].sort((a, b) => a - b);
   const segments = new Map<number, [Point, Point][]>(
@@ -571,8 +580,8 @@ export function isolines(t: Traced, levels: number[]): Map<number, Point[][]> {
           const [a, b] = [line[0], line[line.length - 1]];
           // A closed contour's ends meet: simplified as a ring.
           return a[0] === b[0] && a[1] === b[1]
-            ? simplifyRing(line, 1)
-            : simplify(line, 1);
+            ? simplifyRing(line, tolerance)
+            : simplify(line, tolerance);
         })
         // A loop round a single sample rounds to a point, or a line to a dot: not
         // drawn. A straight line simplifies to its two ends, and is.

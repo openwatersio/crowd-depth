@@ -7,6 +7,8 @@
 // refreshes are batched to one per REFRESH_MS. Soundings stay drawn as provisional until
 // the refresh that brings in their tiles has landed, so the track has no gap at zoom 10
 // and in, where tiles refresh as the boat goes. Further out they refresh every 5 minutes.
+//
+// It polls only while the overlay is drawn and the plotter's tab is showing.
 import { connectExtension } from "signalk-plotterext-bus/extension";
 import type { OverlayStateEvent } from "signalk-plotterext-bus/extension";
 import { createBatch, type Live } from "./batch.js";
@@ -15,24 +17,31 @@ import { createBatch, type Live } from "./batch.js";
 const overlayId = "depth";
 const POLL_MS = 2000;
 const REFRESH_MS = 30_000;
+/** How long a poll or a host call may take before it's given up, and the next poll
+ * tries again. */
+const TIMEOUT_MS = 10_000;
 const LIVE_URL = "/plotterext/crowd-depth/live";
 const M_PER_FT = 0.3048;
 
-const client = await connectExtension();
+const client = await connectExtension({ callTimeoutMs: TIMEOUT_MS });
 
-let visible = true;
+let drawn = true;
 let busy = false;
+let timer: ReturnType<typeof setInterval> | undefined;
 const batch = createBatch(REFRESH_MS);
 
 async function poll(): Promise<void> {
-  if (!visible || busy) return;
+  if (busy) return;
   busy = true;
   try {
     const res = await fetch(`${LIVE_URL}?since=${batch.rev}`, {
       credentials: "include",
+      signal: AbortSignal.timeout(TIMEOUT_MS),
     });
     if (!res.ok) return;
-    const { refresh, data } = batch.next((await res.json()) as Live);
+    const { refresh, data, upsert, remove } = batch.next(
+      (await res.json()) as Live,
+    );
     if (refresh) {
       await client.call("overlay.refresh", {
         overlayId,
@@ -46,13 +55,34 @@ async function poll(): Promise<void> {
         source: "provisional",
         data: { type: "FeatureCollection", features: data },
       });
+    } else if (upsert || remove) {
+      await client.call("overlay.setData", {
+        overlayId,
+        source: "provisional",
+        ...(upsert ? { upsert } : {}),
+        ...(remove ? { remove } : {}),
+      });
     }
     batch.taken();
   } catch {
-    // The server is restarting or the overlay isn't drawn; the next poll tries again.
+    // The server is restarting, a call timed out, or the overlay isn't drawn; the next
+    // poll tries again.
     batch.failed();
   } finally {
     busy = false;
+  }
+}
+
+/** Poll while the overlay is drawn and the tab is showing, and at once when both
+ * become so; else not at all. */
+function schedule(): void {
+  const active = drawn && document.visibilityState === "visible";
+  if (active && !timer) {
+    timer = setInterval(() => void poll(), POLL_MS);
+    void poll();
+  } else if (!active && timer) {
+    clearInterval(timer);
+    timer = undefined;
   }
 }
 
@@ -78,10 +108,10 @@ async function loadUnits(): Promise<void> {
 await client.subscribe(["overlay.state"], (_name, payload) => {
   const state = payload as OverlayStateEvent;
   if (state.overlayId !== overlayId) return;
-  visible = state.visible && !state.suspended;
-  if (visible) void poll();
+  drawn = state.visible && !state.suspended;
+  schedule();
 });
+document.addEventListener("visibilitychange", schedule);
 
 await loadUnits();
-await poll();
-setInterval(() => void poll(), POLL_MS);
+schedule();
