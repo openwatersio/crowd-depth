@@ -116,11 +116,14 @@ def publish_locked(run, objects, lock, now):
         }
         for kind in KINDS:
             path = run / tiles.TILE_FILES[kind].format(tile)
-            # A tile with no cells has no surface.
             if path.exists():
                 key = f"tiles/{kind}/{tile}-{sha256(path)[:16]}{path.suffix}"
                 entry[kind] = key
                 uploads.append((key, path))
+            elif kind != "surface":
+                # A tile with no cells has no surface, but every live tile has cells and
+                # areas: without them its published files would be withdrawn.
+                raise RuntimeError(f"{path} is missing: the run didn't finish")
         current[str(tile)] = entry
 
     def keys(entries):
@@ -135,17 +138,22 @@ def publish_locked(run, objects, lock, now):
         if tile in current:
             retired |= {k: now.isoformat() for k in keys({tile: entry}) - after}
     retired = {k: t for k, t in retired.items() if datetime.fromisoformat(t) > now - RETIRED_FOR}
-    # What the bucket holds, not what the last manifest says it does. Unlisted, every file
-    # goes up again.
+    # What the bucket holds, not what the last manifest says it does.
     listed, complete = objects.list("tiles/")
-    there = {o.key for o in listed} if complete else set()
+    if not complete:
+        raise RuntimeError(f"couldn't list {objects.url}tiles/")
+    there = {o.key for o in listed}
     todo = [(k, p) for k, p in uploads if k not in there]
-    with ThreadPoolExecutor(PARALLEL) as pool:
+    pool = ThreadPoolExecutor(PARALLEL)
+    try:
         for _ in pool.map(
             lambda kp: objects.upload(kp[0], kp[1], TYPES[kp[1].suffix], TILE_CACHE, threads=False),
             todo,
         ):
             pass
+    finally:
+        # Stopped or failed, the uploads still queued don't start.
+        pool.shutdown(cancel_futures=True)
 
     # The archive as stored, not as the last manifest says: a publish stopped between the
     # archive and the manifest leaves them apart.
@@ -191,8 +199,6 @@ def publish_locked(run, objects, lock, now):
     # and what a publish that stopped early or a delete that failed left behind. Files
     # this run uploaded are all named.
     keep = after | retired.keys()
-    if not complete:
-        log.warning("couldn't list %stiles/; leaving files to the next publish", objects.url)
     deleted = sorted(k for k in there - keep if OURS.fullmatch(k))
     for key in deleted:
         # Another publisher may have taken a lapsed lock and named these since.

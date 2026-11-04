@@ -1,10 +1,10 @@
 """Object storage: S3-compatible buckets (NOAA, R2) and a local directory for runs and tests."""
 
+import fcntl
 import hashlib
 import logging
 import os
 import shutil
-import threading
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -146,9 +146,6 @@ class S3Objects:
         return objs, True
 
 
-_put_lock = threading.Lock()
-
-
 class LocalObjects:
     """A directory standing in for a bucket. ETags are content MD5s, as S3 gives for single-part uploads."""
 
@@ -191,11 +188,13 @@ class LocalObjects:
         if_none_match=False,
         cache_control: str | None = None,
     ) -> str:
-        # The check and write are atomic within one process (a run and its lock renewal),
-        # and a reader never sees a half-written object.
-        # ponytail: not across processes; R2 enforces conditional puts for real
+        # The check and write are atomic across threads and processes on one host, as two
+        # runs taking the same lock need, and a reader never sees a half-written object.
+        # ponytail: flock may not exclude across hosts on a network filesystem
         path = self.root / key
-        with _put_lock:
+        self.root.mkdir(parents=True, exist_ok=True)
+        with open(self.root / ".put.lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
             current = self.get(key)
             if if_none_match and current is not None:
                 raise Conflict(key)

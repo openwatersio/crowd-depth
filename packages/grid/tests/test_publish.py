@@ -1,6 +1,8 @@
 import contextlib
 import json
 import subprocess
+import sys
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -221,6 +223,46 @@ def test_one_publisher_at_a_time(tmp_path):
     assert out.get(MANIFEST) is None and out.get(ARCHIVE) is None
 
 
+def test_a_local_targets_lock_holds_across_processes(tmp_path):
+    out = LocalObjects(tmp_path / "out")
+    out.put("x", b"")
+    # Another process in the middle of a conditional put holds the store's put lock.
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import fcntl, sys; f = open(sys.argv[1], 'a'); fcntl.flock(f, fcntl.LOCK_EX);"
+                " print(flush=True); sys.stdin.read()"
+            ),
+            str(tmp_path / "out" / ".put.lock"),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    )
+    holder.stdout.readline()
+    taking = threading.Thread(target=Lock(out, key=LOCK).acquire)
+    taking.start()
+    taking.join(0.3)
+    assert taking.is_alive() and out.get(LOCK) is None
+    holder.communicate(b"")
+    taking.join(5)
+    assert out.get(LOCK) is not None
+
+
+@pytest.mark.parametrize("failing", ["tiles/", ARCHIVE])
+def test_an_incomplete_listing_publishes_nothing(tmp_path, monkeypatch, failing):
+    run, out = tmp_path / "run", LocalObjects(tmp_path / "out")
+    make_run(run, {1: full(1)})
+    listing = out.list
+    monkeypatch.setattr(out, "list", lambda prefix="": (listing(prefix)[0], prefix != failing))
+    with pytest.raises(RuntimeError, match="couldn't list"):
+        publish(run, out, now=DAY)
+    # Tile files uploaded before the archive's listing failed are named by nothing, and
+    # the next publish sweeps them.
+    assert out.get(MANIFEST) is None and out.get(ARCHIVE) is None
+
+
 def test_a_manifest_changed_meanwhile_is_not_overwritten(tmp_path, monkeypatch):
     run, out = tmp_path / "run", LocalObjects(tmp_path / "out")
     make_run(run, {1: full(1)})
@@ -238,10 +280,11 @@ def test_a_manifest_changed_meanwhile_is_not_overwritten(tmp_path, monkeypatch):
     assert out.get(MANIFEST)[0] == b"{}"
 
 
-def test_an_unfinished_run_publishes_nothing(tmp_path):
+@pytest.mark.parametrize("missing", [ARCHIVE, "cells", "areas"])
+def test_an_unfinished_run_publishes_nothing(tmp_path, missing):
     run, out = tmp_path / "run", LocalObjects(tmp_path / "out")
     make_run(run, {1: full(1)})
-    (run / ARCHIVE).unlink()
+    (run / tiles.TILE_FILES.get(missing, missing).format(1)).unlink()
     with pytest.raises(RuntimeError, match="didn't finish"):
         publish(run, out)
     assert out.get(MANIFEST) is None and tile_keys(out) == []

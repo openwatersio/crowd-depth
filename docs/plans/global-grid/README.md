@@ -234,7 +234,7 @@ Depth areas and contours come from the [depth surface](surface.md): a raster per
 
 ### 5. Publish
 
-Outputs go to R2 and are served from `tiles.openwaters.io/crowd-depth/`. `grid tiles --publish` uploads them: the archive, and each tile's surface, cells and depth areas behind a manifest, which carries the tile files' license and credit line since the files themselves don't ([per-tile-pipeline.md](per-tile-pipeline.md#publishing)). Like Seascape's tiles, they are licensed CC BY 4.0, and their TileJSON and file metadata carry the attribution their inputs require: the IHO DCDB and NOAA, TICON-4 and the Slackwater stations used, AVISO for FES2022, and each survey used as a calibration reference, such as EMODnet. MapLibre reads them by HTTP range request, which needs CORS headers that GitHub release downloads don't send, and a global archive exceeds the 2 GiB limit on release assets.
+Outputs go to R2 and are served from `tiles.openwaters.io/crowd-depth/`. `grid tiles --publish` uploads them: the archive, and each tile's surface, cells and depth areas behind a manifest, which carries the tile files' license and credit line since the files themselves don't ([per-tile-pipeline.md](per-tile-pipeline.md#publishing)). Like Seascape's tiles, they are licensed CC BY 4.0, and the archive's metadata carries the attribution their inputs require (the manifest carries the same line for the tile files): the IHO DCDB and NOAA, TICON-4 and the Slackwater stations used, AVISO for FES2022, and each survey used as a calibration reference, such as EMODnet. MapLibre reads them by HTTP range request, which needs CORS headers that GitHub release downloads don't send, and a global archive exceeds the 2 GiB limit on release assets.
 
 #### Overlay
 
@@ -247,7 +247,7 @@ One global PMTiles archive, built so a plotter that styles ENCs portrays it the 
 
 The archive is the contract with chart plotters and chart providers:
 
-- One global archive at a URL that doesn't change between builds, with its TileJSON beside it.
+- One global archive at a URL that doesn't change between builds. Its metadata is what a PMTiles client reads in place of a TileJSON.
 - Metadata with `type=S-57`, which Freeboard needs before it applies S-52 styling to a vector chart, and a build version and date, so a client can tell when an extract is out of date.
 - Each build replaces the archive at the same URL. Clients reading by range send the ETag they started with, as the PMTiles libraries do, so a build that lands mid-read is detected and the read restarts instead of mixing tiles from two builds.
 
