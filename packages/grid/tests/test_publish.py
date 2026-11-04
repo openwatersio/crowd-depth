@@ -3,14 +3,16 @@ import json
 import subprocess
 import sys
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from botocore.exceptions import ClientError
 
-from grid import cli, tiles
-from grid.catalog import Lock
-from grid.objects import LocalObjects, S3Objects
+from grid import cli, objects, tiles
+from grid.catalog import Lock, Locked
+from grid.objects import Conflict, LocalObjects, S3Objects
 from grid.publish import ARCHIVE, KINDS, LOCK, MANIFEST, RETIRED_FOR, publish
 
 DAY = datetime(2026, 11, 3, tzinfo=UTC)
@@ -396,9 +398,9 @@ def test_a_publish_serves_the_manifest_as_json_and_names_every_files_type(tmp_pa
     headers = {}
 
     class Recording(LocalObjects):
-        def upload(self, key, path, content_type, cache_control, threads=True):
+        def upload(self, key, path, content_type, cache_control, **kw):
             headers[key] = (content_type, cache_control)
-            super().upload(key, path, content_type, cache_control, threads)
+            super().upload(key, path, content_type, cache_control, **kw)
 
         def put(self, key, data, cache_control=None, content_type=None, **kw):
             headers[key] = (content_type, cache_control)
@@ -415,3 +417,245 @@ def test_a_publish_serves_the_manifest_as_json_and_names_every_files_type(tmp_pa
         "cells": ("application/vnd.apache.parquet", "public, max-age=3600"),
         "areas": ("application/x-ndjson", "public, max-age=3600"),
     }
+
+
+def short_locks(monkeypatch):
+    """Make publish's lock renew every 0.25 s, and return the locks it takes."""
+    taken = []
+
+    class Short(Lock):
+        def __init__(self, objects, key):
+            super().__init__(objects, ttl=timedelta(seconds=1), key=key)
+            taken.append(self)
+
+    monkeypatch.setattr("grid.publish.Lock", Short)
+    return taken
+
+
+def take_over(out):
+    """Another run takes the publish lock over."""
+    expires = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+    out.put(LOCK, json.dumps({"owner": "other", "expires": expires}).encode())
+
+
+@pytest.mark.parametrize("how", ["taken over", "renewal stalled"])
+def test_a_lease_lost_during_the_archives_upload_leaves_whats_published(tmp_path, monkeypatch, how):
+    run, out = tmp_path / "run", LocalObjects(tmp_path / "out")
+    make_run(run, {1: full(1)})
+    publish(run, out, now=DAY)
+    before = out.get(MANIFEST)
+    locks = short_locks(monkeypatch)
+    upload, sent = out.upload, []
+
+    def slow(key, path, *args, **kw):
+        sent.append(key)
+        if key == ARCHIVE:
+            if how == "taken over":
+                take_over(out)
+                assert locks[0].lost.wait(2)
+            else:
+                # Renewal stalls without noticing (a hung request), and half the TTL passes:
+                # another run may take over soon.
+                locks[0]._stop.set()
+                locks[0]._thread.join()
+                time.sleep(0.6)
+        upload(key, path, *args, **kw)
+
+    monkeypatch.setattr(out, "upload", slow)
+    make_run(run, {1: full(1) | {"cells": b"parquet1 again"}}, archive=b"archive 2")
+    with pytest.raises(Locked):
+        publish(run, out, now=DAY + timedelta(hours=1))
+    assert sent[-1] == ARCHIVE
+    assert out.get(ARCHIVE)[0] == b"archive 1"
+    assert out.get(MANIFEST) == before
+    # The new tile file is named by nothing, and the next publish sweeps it.
+    assert len(tile_keys(out)) == 4
+    assert not any(
+        p.name.startswith(".")
+        for p in (tmp_path / "out").iterdir()
+        if p.is_file() and p.name != ".put.lock"
+    )
+    if how == "taken over":
+        assert json.loads(out.get(LOCK)[0])["owner"] == "other"
+
+
+@pytest.mark.parametrize("first", [True, False])
+def test_an_archive_another_run_published_meanwhile_is_not_overwritten(
+    tmp_path, monkeypatch, first
+):
+    """A run that stalled past its last lock check, while another took over and published."""
+    run, out = tmp_path / "run", LocalObjects(tmp_path / "out")
+    if not first:
+        make_run(run, {1: full(1)})
+        publish(run, out, now=DAY)
+    before = out.get(MANIFEST)
+    upload = out.upload
+
+    def meanwhile(key, path, *args, **kw):
+        if key == ARCHIVE:
+            out.put(ARCHIVE, b"another run's archive")
+        upload(key, path, *args, **kw)
+
+    monkeypatch.setattr(out, "upload", meanwhile)
+    make_run(run, {1: full(1)}, archive=b"archive 2")
+    with pytest.raises(RuntimeError, match="overlay.pmtiles changed while publishing"):
+        publish(run, out, now=DAY + timedelta(hours=1))
+    assert out.get(ARCHIVE)[0] == b"another run's archive"
+    assert out.get(MANIFEST) == before
+
+
+def test_a_lease_lost_during_the_tile_uploads_stops_before_the_archive(tmp_path, monkeypatch):
+    run, out = tmp_path / "run", LocalObjects(tmp_path / "out")
+    make_run(run, {t: full(t) for t in range(1, 41)})
+    locks = short_locks(monkeypatch)
+    monkeypatch.setattr("grid.publish.PARALLEL", 1)
+    upload, sent = out.upload, []
+
+    def losing(key, path, *args, **kw):
+        if not sent:
+            take_over(out)
+            assert locks[0].lost.wait(2)
+        sent.append(key)
+        upload(key, path, *args, **kw)
+
+    monkeypatch.setattr(out, "upload", losing)
+    with pytest.raises(Locked):
+        publish(run, out, now=DAY)
+    # The upload under way when the lock went finishes; none after it starts.
+    assert len(sent) == 1
+    assert out.get(ARCHIVE) is None and out.get(MANIFEST) is None
+
+
+class Multipart:
+    """An S3 client that records a multipart upload."""
+
+    def __init__(self, conflict=False):
+        self.calls = []
+        self.conflict = conflict
+
+    def _conditions(self, args):
+        got = {k: v for k, v in args.items() if k in ("IfMatch", "IfNoneMatch")}
+        if got and self.conflict:
+            raise ClientError({"Error": {"Code": "PreconditionFailed"}}, "op")
+        return got
+
+    def put_object(self, **args):
+        conditions = self._conditions(args)
+        body = args["Body"].read()
+        self.calls.append(("put", args["Key"], body, args["ContentType"], conditions))
+
+    def create_multipart_upload(self, **args):
+        assert args["ChecksumAlgorithm"] == "CRC32"
+        self.calls.append(("create", args["Key"], args["ContentType"], args["CacheControl"]))
+        return {"UploadId": "u"}
+
+    def upload_part(self, PartNumber, Body, **args):
+        assert args["ChecksumAlgorithm"] == "CRC32"
+        self.calls.append(("part", PartNumber, Body.read()))
+        return {"ETag": f'"{PartNumber}"', "ChecksumCRC32": f"c{PartNumber}"}
+
+    def complete_multipart_upload(self, MultipartUpload, **args):
+        conditions = self._conditions(args)
+        self.calls.append(("complete", MultipartUpload["Parts"], conditions))
+
+    def abort_multipart_upload(self, UploadId, **args):
+        self.calls.append(("abort", UploadId))
+
+
+def checks(fail_at=None):
+    count = []
+
+    def check():
+        count.append(1)
+        # As a lost lock does, every check from then on fails.
+        if fail_at and len(count) >= fail_at:
+            raise Locked("lost")
+
+    return check, count
+
+
+def test_a_checked_upload_to_r2_checks_before_each_part_and_before_it_completes(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(objects, "PART", 4)
+    (tmp_path / "a").write_bytes(b"0123456789")
+    client = Multipart()
+    check, count = checks()
+    S3Objects("b", "p", client).upload(
+        "k", tmp_path / "a", "x/y", "no-cache", check=check, if_match='"live"'
+    )
+    assert client.calls[0] == ("create", "p/k", "x/y", "no-cache")
+    assert sorted(c for c in client.calls if c[0] == "part") == [
+        ("part", 1, b"0123"),
+        ("part", 2, b"4567"),
+        ("part", 3, b"89"),
+    ]
+    assert client.calls[-1] == (
+        "complete",
+        [{"PartNumber": n, "ETag": f'"{n}"', "ChecksumCRC32": f"c{n}"} for n in (1, 2, 3)],
+        {"IfMatch": '"live"'},
+    )
+    assert len(count) == 4
+
+
+@pytest.mark.parametrize("parts", [1, 8])
+@pytest.mark.parametrize("fail_at", [1, 2, 4])
+def test_a_checked_upload_to_r2_that_fails_its_check_never_completes(
+    tmp_path, monkeypatch, fail_at, parts
+):
+    monkeypatch.setattr(objects, "PART", 4)
+    monkeypatch.setattr(objects, "PARTS", parts)
+    (tmp_path / "a").write_bytes(b"0123456789")
+    client = Multipart()
+    check, _ = checks(fail_at)
+    with pytest.raises(Locked):
+        S3Objects("b", "p", client).upload("k", tmp_path / "a", "x/y", "no-cache", check=check)
+    kinds = [c[0] for c in client.calls]
+    # Parts in flight finish before the abort.
+    assert "complete" not in kinds and kinds[-1] == "abort"
+    if parts == 1:
+        # Parts after the failed check never start.
+        assert kinds.count("part") == min(fail_at - 1, 3)
+
+
+@pytest.mark.parametrize("size", [5, 10])
+def test_an_upload_to_r2_whose_condition_fails_raises_conflict(tmp_path, monkeypatch, size):
+    monkeypatch.setattr(objects, "PART", 8)
+    (tmp_path / "a").write_bytes(b"x" * size)
+    client = Multipart(conflict=True)
+    with pytest.raises(Conflict):
+        S3Objects("b", "p", client).upload(
+            "k", tmp_path / "a", "x/y", "no-cache", check=lambda: None, if_none_match=True
+        )
+    if size > 8:
+        assert client.calls[-1] == ("abort", "u")
+
+
+def test_a_small_checked_upload_to_r2_checks_before_its_one_put(tmp_path):
+    (tmp_path / "a").write_bytes(b"small")
+    client = Multipart()
+    check, count = checks()
+    S3Objects("b", "p", client).upload(
+        "k", tmp_path / "a", "x/y", "no-cache", check=check, if_none_match=True
+    )
+    assert client.calls == [("put", "p/k", b"small", "x/y", {"IfNoneMatch": "*"})]
+    assert len(count) == 1
+    with pytest.raises(Locked):
+        S3Objects("b", "p", client).upload(
+            "k", tmp_path / "a", "x/y", "no-cache", check=checks(1)[0]
+        )
+    assert len(client.calls) == 1
+
+
+def test_a_local_upload_is_conditional_like_a_put(tmp_path):
+    out = LocalObjects(tmp_path / "out")
+    (tmp_path / "a").write_bytes(b"new")
+    etag = out.put("k", b"old")
+    with pytest.raises(Conflict):
+        out.upload("k", tmp_path / "a", "x/y", "no-cache", if_none_match=True)
+    with pytest.raises(Conflict):
+        out.upload("k", tmp_path / "a", "x/y", "no-cache", if_match='"other"')
+    assert out.get("k")[0] == b"old"
+    out.upload("k", tmp_path / "a", "x/y", "no-cache", if_match=etag)
+    assert out.get("k")[0] == b"new"
+    assert [p.name for p in (tmp_path / "out").iterdir() if p.name != ".put.lock"] == ["k"]

@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,11 +16,17 @@ from boto3.s3.transfer import TransferConfig
 from botocore import UNSIGNED
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from s3transfer.utils import ReadFileChunk
 
 log = logging.getLogger(__name__)
 
 # At least the number of parallel fetches in ingest.
 POOL = 32
+# A large upload goes up in parts this size, a checked one PARTS at a time.
+PART = 64 * 2**20
+PARTS = 8
+# What a conditional write that lost answers.
+CONFLICTS = ("PreconditionFailed", "412", "ConditionalRequestConflict")
 
 
 class Conflict(Exception):
@@ -88,18 +95,95 @@ class S3Objects:
             raise
         return True
 
-    def upload(self, key: str, path, content_type: str, cache_control: str, threads=True):
+    def upload(
+        self,
+        key: str,
+        path,
+        content_type: str,
+        cache_control: str,
+        threads=True,
+        check=None,
+        if_match: str | None = None,
+        if_none_match=False,
+    ):
         """Stream a file to an object. A large file goes up in parts, and the object appears
-        only once every part has, so a reader sees the old object or the whole new one."""
+        only once every part has, so a reader sees the old object or the whole new one.
+
+        With `check`, the upload calls it before each part and again just before the object
+        appears, and stops at the first exception it raises, leaving the object as it was.
+        With `if_match` or `if_none_match`, the object appears only if what's stored is still
+        that version, or still nothing, and Conflict is raised otherwise."""
+        if check or if_match or if_none_match:
+            conditions = {"IfMatch": if_match} if if_match else {}
+            if if_none_match:
+                conditions["IfNoneMatch"] = "*"
+            try:
+                return self._upload_checked(
+                    key, path, content_type, cache_control, check or (lambda: None), conditions
+                )
+            except ClientError as e:
+                if e.response["Error"]["Code"] in CONFLICTS:
+                    raise Conflict(key) from e
+                raise
         self.client.upload_file(
             str(path),
             self.bucket,
             self.prefix + key,
             ExtraArgs={"ContentType": content_type, "CacheControl": cache_control},
             Config=TransferConfig(
-                multipart_threshold=64 * 2**20, multipart_chunksize=64 * 2**20, use_threads=threads
+                multipart_threshold=PART, multipart_chunksize=PART, use_threads=threads
             ),
         )
+
+    def _upload_checked(self, key, path, content_type, cache_control, check, conditions):
+        # boto3's upload_file has no hook before it completes an upload, so this one sends
+        # the parts itself, with the CRC32 checksums upload_file sends.
+        args = {"Bucket": self.bucket, "Key": self.prefix + key}
+        headers = {"ContentType": content_type, "CacheControl": cache_control}
+        size = os.path.getsize(path)
+        if size <= PART:
+            check()
+            with open(path, "rb") as f:
+                self.client.put_object(**args, **headers, **conditions, Body=f)
+            return
+        upload = self.client.create_multipart_upload(**args, **headers, ChecksumAlgorithm="CRC32")[
+            "UploadId"
+        ]
+
+        def part(n):
+            check()
+            # Read from the file as it's sent, as upload_file does, not held in memory.
+            with ReadFileChunk.from_filename(
+                str(path), (n - 1) * PART, PART, enable_callbacks=False
+            ) as body:
+                sent = self.client.upload_part(
+                    **args, UploadId=upload, PartNumber=n, Body=body, ChecksumAlgorithm="CRC32"
+                )
+            got = {"PartNumber": n, "ETag": sent["ETag"]}
+            if "ChecksumCRC32" in sent:
+                got["ChecksumCRC32"] = sent["ChecksumCRC32"]
+            return got
+
+        pool = ThreadPoolExecutor(PARTS)
+        try:
+            parts = list(pool.map(part, range(1, -(-size // PART) + 1)))
+            check()
+            # R2 treats an upload whose conditions fail as aborted (release notes, August
+            # 2023). A retry after a lost response fails too, and the run stops.
+            self.client.complete_multipart_upload(
+                **args, **conditions, UploadId=upload, MultipartUpload={"Parts": parts}
+            )
+        except BaseException:
+            # This upload's parts still sending finish first, so none lands after the abort.
+            pool.shutdown(cancel_futures=True)
+            try:
+                self.client.abort_multipart_upload(**args, UploadId=upload)
+            except Exception:
+                # The bucket's lifecycle rule aborts it later; never mask why it stopped.
+                log.warning("aborting the upload of %s%s failed", self.url, key, exc_info=True)
+            raise
+        finally:
+            pool.shutdown()
 
     def put(
         self,
@@ -122,11 +206,7 @@ class S3Objects:
         try:
             return self.client.put_object(**args)["ETag"]
         except ClientError as e:
-            if e.response["Error"]["Code"] in (
-                "PreconditionFailed",
-                "412",
-                "ConditionalRequestConflict",
-            ):
+            if e.response["Error"]["Code"] in CONFLICTS:
                 raise Conflict(key) from e
             raise
 
@@ -176,12 +256,38 @@ class LocalObjects:
         shutil.copyfile(source, path)
         return True
 
-    def upload(self, key: str, path, content_type: str, cache_control: str, threads=True):
+    def upload(
+        self,
+        key: str,
+        path,
+        content_type: str,
+        cache_control: str,
+        threads=True,
+        check=None,
+        if_match: str | None = None,
+        if_none_match=False,
+    ):
         target = self.root / key
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}")
         shutil.copyfile(path, tmp)
-        os.replace(tmp, target)
+        try:
+            if check:
+                check()
+            with open(self.root / ".put.lock", "a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                if if_none_match and target.exists():
+                    raise Conflict(key)
+                if if_match and (not target.exists() or self._file_etag(target) != if_match):
+                    raise Conflict(key)
+                os.replace(tmp, target)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def _file_etag(self, path) -> str:
+        with open(path, "rb") as f:
+            # Streamed: a published archive can be larger than memory.
+            return '"' + hashlib.file_digest(f, "md5").hexdigest() + '"'
 
     def put(
         self,
@@ -223,10 +329,7 @@ class LocalObjects:
             if path.is_file() and key.startswith(prefix) and not path.name.startswith("."):
                 stat = path.stat()
                 mtime = datetime.fromtimestamp(stat.st_mtime, UTC)
-                with open(path, "rb") as f:
-                    # Streamed: a published archive can be larger than memory.
-                    etag = '"' + hashlib.file_digest(f, "md5").hexdigest() + '"'
-                objs.append(Obj(key, etag, mtime, stat.st_size))
+                objs.append(Obj(key, self._file_etag(path), mtime, stat.st_size))
         return objs, True
 
 

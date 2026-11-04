@@ -779,6 +779,46 @@ def test_lock_renewal_survives_a_retried_renewal(tmp_path):
     lock.release()
 
 
+def test_a_renewal_whose_response_was_lost_still_renews_the_lease(tmp_path, monkeypatch):
+    # Each renewal lands but its response is lost: the lock stays this run's, and its
+    # lease stays fresh, so a check during a long upload doesn't fail.
+    store = LocalObjects(tmp_path)
+    lock = Lock(store, ttl=timedelta(seconds=2))
+    lock.acquire()
+    put = store.put
+
+    def lost_response(*args, **kwargs):
+        put(*args, **kwargs)
+        raise OSError("response lost")
+
+    monkeypatch.setattr(store, "put", lost_response)
+    time.sleep(1.6)
+    lock.check()
+    assert not lock.lost.is_set()
+    monkeypatch.setattr(store, "put", put)
+    lock.release()
+    assert lock_free(store)
+
+
+def test_a_failed_renewal_is_retried_sooner(tmp_path, monkeypatch):
+    # A failed renewal waits a sixteenth of the TTL, not a quarter, to try again, so one
+    # failure doesn't leave the lease too low for a check to pass.
+    store = LocalObjects(tmp_path)
+    lock = Lock(store, ttl=timedelta(seconds=6.4))
+    lock.acquire()
+    acquired = lock.renewed
+    put, get = store.put, store.get
+    monkeypatch.setattr(store, "put", lambda *a, **k: (_ for _ in ()).throw(OSError()))
+    monkeypatch.setattr(store, "get", lambda *a, **k: (_ for _ in ()).throw(OSError()))
+    time.sleep(1.8)  # the renewal at 1.6 s fails
+    monkeypatch.setattr(store, "put", put)
+    monkeypatch.setattr(store, "get", get)
+    time.sleep(0.8)  # retried at 2.0 s, where a quarter would wait until 3.2 s
+    assert lock.renewed - acquired > timedelta(seconds=1.8)
+    lock.release()
+    assert lock_free(store)
+
+
 def test_a_run_that_lost_its_lock_publishes_nothing(tmp_path):
     store = LocalObjects(tmp_path)
     with open_store(store):

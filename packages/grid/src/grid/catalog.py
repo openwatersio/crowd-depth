@@ -355,14 +355,19 @@ class Lock:
         self._thread.start()
 
     def _renew(self):
-        while not self._stop.wait(self.ttl.total_seconds() / 4):
+        every = self.ttl.total_seconds() / 4
+        wait = every
+        while not self._stop.wait(wait):
             sent = datetime.now(UTC)
             try:
                 self.etag = self.objects.put(self.key, self._body(), if_match=self.etag)
                 self.renewed = sent
+                wait = every
                 continue
             except Exception:
                 log.warning("renewing %s failed", self.key, exc_info=True)
+            # Retried sooner, so one failure doesn't leave the lease too low to check.
+            wait = every / 4
             # A renewal that succeeded but whose response was lost fails its retry
             # with a 412; the lock is still ours if it still names this run and hasn't
             # expired, since another run may take over an expired lock at any moment.
@@ -374,6 +379,8 @@ class Lock:
                 and datetime.fromisoformat(held["expires"]) > datetime.now(UTC)
             ):
                 self.etag = current[1]
+                # That write was this run's, its expiry a TTL after it was sent.
+                self.renewed = datetime.fromisoformat(held["expires"]) - self.ttl
             elif current or datetime.now(UTC) - self.renewed >= self.ttl:
                 # Another run holds it, or it may have expired while unreachable.
                 log.error("lost %s", self.key)

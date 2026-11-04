@@ -10,6 +10,8 @@ dependencies = [
   "numpy>=2",
   "pmtiles>=3.4",
   "rasterio>=1.4",
+  # ReadFileChunk streams a checked upload's parts from the file, as boto3's own uploads do.
+  "s3transfer>=0.10",
   "scipy>=1.14",
   "shapely>=2.1",
   # Runs the per-tile rebuild (tiles.py). A new major version can change the flags
