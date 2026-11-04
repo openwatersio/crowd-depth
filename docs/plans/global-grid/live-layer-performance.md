@@ -256,3 +256,32 @@ node scripts/bench-view.mjs ~/.signalk/plugin-config-data/crowd-depth/bathymetry
 ```
 
 Along with the Pi's model and memory, these give the factor this note assumes, and a view's cost on the boat's own soundings.
+
+### First Pi run
+
+The boat's own Pi, model and memory not yet recorded, on the stage 1 build. Its tile sizes match the laptop's stage 1 build to the tenth of a KB, so the two are compared directly. The laptop ran at a load average of 6 to 9 with other work.
+
+`bench-live-layer.mjs 400000`, a store of 431,666 cells:
+
+| What                           |                Pi |             Laptop |              Pi factor |
+| ------------------------------ | ----------------: | -----------------: | ---------------------: |
+| Live writer                    | 1,376 soundings/s |  5,633 soundings/s |                   4.1× |
+| Backfill writer                | 5,955 soundings/s | 43,517 soundings/s |                   7.3× |
+| Filling the store              | 2,776 soundings/s | 23,864 soundings/s |                   8.6× |
+| Cold tiles, z15 to z6          |      442–1,255 ms |          86–267 ms | 4.5× to 5.7×, about 5× |
+| 20 z13 tiles on 3 tile threads |             8.8 s |              1.3 s |                   6.6× |
+
+The event loop was held at most 91 ms while the store filled, and 29 ms while the 20 tiles were built.
+
+So a Pi core builds tiles about 5 times slower than the laptop's, not 10 to 15 times as the estimates above assumed; that's a Pi 5's figure more than a Pi 4's. Writing to its storage costs more, 7 to 9 times. A zoom 13 view's worth of tiles takes about 9 s on the three tile threads.
+
+`bench-view.mjs` on the boat's own store, 373,011 cells, centred where it has the most: most of the view is unsounded, so it's light on geometry, though not on time.
+
+| View of 20 tiles | Tiles with soundings | Build, one thread | Bytes | Vertices |
+| ---------------- | -------------------: | ----------------: | ----: | -------: |
+| z13              |                    6 |             4.3 s | 30 KB |    8,176 |
+| z14              |                   10 |             3.2 s | 31 KB |    7,995 |
+| z15              |                   12 |             2.1 s | 55 KB |   17,566 |
+| 13 → 15          |                      |             9.6 s |       |          |
+
+The same view on `main` isn't measured yet, so stage 1's gain on the Pi is inferred from the laptop's.
