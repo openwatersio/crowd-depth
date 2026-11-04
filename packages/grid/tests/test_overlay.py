@@ -481,6 +481,17 @@ def test_holes_and_islands_in_holes_are_traced():
     assert traced.contains(shapely.Point(20, 20))
 
 
+def test_water_held_at_0_m_is_never_drawn_drying(tmp_path):
+    # 0 to 2 m water with pixels at exactly 0 m, where the margin's floor holds them, and
+    # none below: all of it is in the 0-2 m band, as `band` reads 0 m.
+    depth = np.full((100, 100), surface.NODATA, dtype=np.float32)
+    depth[30:70, 30:70] = 0.8
+    depth[45:55, 45:55] = 0.0
+    write_surface(tmp_path / "t.tif", -78, 33, depth, np.zeros_like(depth), np.ones_like(depth))
+    bands, *_ = overlay.surface_bands(tmp_path / "t.tif")
+    assert set(bands) == {overlay.LEVELS.index(0)}
+
+
 def test_a_shoal_is_closed_only_away_from_the_surface_edge(tmp_path):
     # A 3 m shoal in 12 m water: closed and prime in a whole tile, and beside a one-pixel
     # gap that touches only its corner; open against the surface's edge.

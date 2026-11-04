@@ -428,6 +428,13 @@ def surface_bands(path, soundings=None):
         with tempfile.TemporaryDirectory(dir=os.environ.get("GRID_TEMP_DIR") or None) as tmp:
             src_path, out = Path(tmp) / "depth.tif", Path(tmp) / "bands.geojson"
             profile.update(driver="GTiff", count=1, dtype="float32", nodata=surface.NODATA)
+            # A depth exactly on a level is in the band it starts, as `band` reads it.
+            # gdal_contour reads it as below the level, and where nothing is truly below,
+            # labels the polygon with the band under it: water held at 0 m by the margin's
+            # floor drew as drying.
+            on_level = np.isin(grown, levels)
+            grown[on_level] = np.nextafter(grown[on_level], np.float32(np.inf))
+            del on_level
             with rasterio.open(src_path, "w", **profile) as dst:
                 dst.write(grown, 1)
             del grown
