@@ -32,7 +32,7 @@ export function overviewLevel(z: number, lat: number): number {
  * loads, which the API's Worker bundle does too. */
 const tileThreads = () => Math.max(1, Math.min(3, availableParallelism() - 1));
 
-/** Encoded tiles kept in memory. A z13 tile of busy water is a few KB. */
+/** Encoded tiles kept in memory. A z13 tile of busy water at High detail is about 100 KB. */
 const CACHE_TILES = 2000;
 /** Below this zoom a tile covers a bay or more, so it's rebuilt from many cells, and
  * the boat's latest pass hardly shows: those tiles refresh on a slow timer. */
