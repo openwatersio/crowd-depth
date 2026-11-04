@@ -190,7 +190,12 @@ def publish_locked(run, objects, lock, now):
     try:
         # The lock already keeps a second publisher out; this catches one that ignored it.
         objects.put(
-            MANIFEST, body, if_match=etag, if_none_match=etag is None, cache_control=REVALIDATE
+            MANIFEST,
+            body,
+            if_match=etag,
+            if_none_match=etag is None,
+            cache_control=REVALIDATE,
+            content_type="application/json",
         )
     except Conflict:
         raise RuntimeError(f"{objects.url}{MANIFEST} changed while publishing") from None

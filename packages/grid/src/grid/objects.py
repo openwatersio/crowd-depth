@@ -108,10 +108,13 @@ class S3Objects:
         if_match: str | None = None,
         if_none_match=False,
         cache_control: str | None = None,
+        content_type: str | None = None,
     ) -> str:
         args = {"Bucket": self.bucket, "Key": self.prefix + key, "Body": data}
         if cache_control:
             args["CacheControl"] = cache_control
+        if content_type:
+            args["ContentType"] = content_type
         if if_match:
             args["IfMatch"] = if_match
         if if_none_match:
@@ -187,6 +190,7 @@ class LocalObjects:
         if_match: str | None = None,
         if_none_match=False,
         cache_control: str | None = None,
+        content_type: str | None = None,
     ) -> str:
         # The check and write are atomic across threads and processes on one host, as two
         # runs taking the same lock need, and a reader never sees a half-written object.

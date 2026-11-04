@@ -370,3 +370,48 @@ def test_an_upload_to_r2_names_its_type_and_caching_and_goes_up_in_parts(tmp_pat
     assert seen["key"] == "crowd-depth/overlay.pmtiles"
     assert seen["args"] == {"ContentType": "x/y", "CacheControl": "no-cache"}
     assert seen["config"].multipart_threshold == 64 * 2**20
+
+
+def test_a_put_to_r2_names_its_type_and_caching():
+    seen = {}
+
+    class Client:
+        def put_object(self, **args):
+            seen.update(args)
+            return {"ETag": '"e"'}
+
+    S3Objects("b", "crowd-depth", Client()).put(
+        "manifest.json", b"{}", cache_control="no-cache", content_type="application/json"
+    )
+    assert seen["Key"] == "crowd-depth/manifest.json"
+    assert seen["ContentType"] == "application/json"
+    assert seen["CacheControl"] == "no-cache"
+    # The lock and catalog name no type, and boto3 refuses a None.
+    seen.clear()
+    S3Objects("b", "crowd-depth", Client()).put("lock", b"{}")
+    assert "ContentType" not in seen and "CacheControl" not in seen
+
+
+def test_a_publish_serves_the_manifest_as_json_and_names_every_files_type(tmp_path):
+    headers = {}
+
+    class Recording(LocalObjects):
+        def upload(self, key, path, content_type, cache_control, threads=True):
+            headers[key] = (content_type, cache_control)
+            super().upload(key, path, content_type, cache_control, threads)
+
+        def put(self, key, data, cache_control=None, content_type=None, **kw):
+            headers[key] = (content_type, cache_control)
+            return super().put(key, data, **kw)
+
+    run = tmp_path / "run"
+    make_run(run, {1: full(1)})
+    publish(run, Recording(tmp_path / "out"), now=DAY)
+    assert headers[MANIFEST] == ("application/json", "no-cache")
+    assert headers[ARCHIVE] == ("application/vnd.pmtiles", "no-cache")
+    tile = {k.split("/")[1]: v for k, v in headers.items() if k.startswith("tiles/")}
+    assert tile == {
+        "surface": ("image/tiff", "public, max-age=3600"),
+        "cells": ("application/vnd.apache.parquet", "public, max-age=3600"),
+        "areas": ("application/x-ndjson", "public, max-age=3600"),
+    }
