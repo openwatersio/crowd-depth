@@ -54,8 +54,10 @@ def two_tiles(env):  # noqa: F811
 
 def test_resources_grow_with_soundings():
     assert tiles.resources("cells", 50_000) == (512, 1)
-    assert tiles.resources("surface", 5_000_000) == (3584, 2)
-    assert tiles.resources("overlay", 30_000_000) == (7168, 4)
+    assert tiles.resources("cells", 5_000_000) == (2304, 2)
+    # A surface takes one thread, however dense its tile.
+    assert tiles.resources("surface", 30_000_000) == (2304, 1)
+    assert tiles.resources("overlay", 30_000_000) == (2560, 4)
     assert tiles.resources("web", 10) == (tiles.WEB_MEMORY_MB, 1)
 
 
@@ -547,3 +549,42 @@ def test_outputs_go_to_paths_sql_would_misread(tmp_path):
     assert duckdb.connect().execute("SELECT one FROM read_parquet(?)", [str(out)]).fetchall() == [
         (1,)
     ]
+
+
+def test_neighbors_read_as_views_match_their_copies(tmp_path):
+    run = tmp_path / "boat's run"
+    for t, rows in ((100, 3), (101, 0), (102, 2)):
+        tiles.export(
+            duckdb.connect(),
+            f"SELECT {t} AS tile_id, range AS depth FROM range({rows})",
+            run / tiles.TILE_FILES["cells"].format(t),
+        )
+    copied, viewed = duckdb.connect(), duckdb.connect()
+    for con in (copied, viewed):
+        con.execute("ATTACH ':memory:' AS lake")
+        con.execute("CREATE TABLE lake.cells (tile_id INTEGER, depth BIGINT)")
+    # A tile with no file, as one past the run's tiles, is left out.
+    tiles.load(copied, run, [100, 101, 102, 103], kinds=("cells",))
+    tiles.attach(viewed, run, [100, 101, 102, 103], kinds=("cells",))
+    query = "SELECT * FROM lake.cells ORDER BY ALL"
+    assert viewed.execute(query).fetchall() == copied.execute(query).fetchall()
+    assert len(copied.execute(query).fetchall()) == 5
+    kind = "SELECT table_type FROM information_schema.tables WHERE table_name = 'cells'"
+    assert viewed.execute(kind).fetchone() == ("VIEW",)
+
+
+def test_a_job_caps_gdals_block_cache(tmp_path, monkeypatch):
+    # Set first, so the variable's absence is what's restored, whatever the job sets.
+    monkeypatch.setenv("GDAL_CACHEMAX", "")
+    monkeypatch.delenv("GDAL_CACHEMAX")
+    seen = {}
+    monkeypatch.setitem(
+        tiles.PER_KEY, "cells", lambda *a: seen.setdefault("cache", os.environ["GDAL_CACHEMAX"])
+    )
+    tiles.job(["cells", str(tmp_path), "1", "1"])
+    assert seen["cache"] == tiles.GDAL_CACHE_MB
+    # One set for the run wins.
+    monkeypatch.setenv("GDAL_CACHEMAX", "256")
+    seen.clear()
+    tiles.job(["cells", str(tmp_path), "1", "1"])
+    assert seen["cache"] == "256"

@@ -351,67 +351,6 @@ def surface_bands(path, soundings=None):
     around = np.ones((3, 3), dtype=bool)
     # Grown a pixel all round, as coverage is, so the two trace alike.
     surfaced = outline(binary_dilation(valid, structure=around), transform)
-    bands = {}
-    if valid.any():
-        # Each empty pixel near the surface takes its nearest pixel's depth, so the bands
-        # reach past the outline, which cuts them.
-        grown, near = carry(depth, valid)
-        if soundings is not None and len(soundings[2]):
-            lon, lat, d = (np.asarray(a, dtype=float) for a in soundings)
-            row, col = (np.asarray(a) for a in rasterio.transform.rowcol(transform, lon, lat))
-            # One in the pixel beside the tile caps the edge pixels next to it; the window
-            # is the only part of the tile with pixels to cap.
-            row = np.clip(row + r0, 0, tile_shape[0] - 1) - r0
-            col = np.clip(col + c0, 0, tile_shape[1] - 1) - c0
-            inside = (row >= 0) & (row < depth.shape[0]) & (col >= 0) & (col < depth.shape[1])
-            row, col, d = row[inside], col[inside], d[inside].astype(np.float32)
-            # Each sounding's pixel and the eight around it, so only pixels beside one are
-            # touched: a sparse tile's window is most of the tile.
-            for dr, dc in np.argwhere(around) - 1:
-                r, c = row + dr, col + dc
-                ok = (r >= 0) & (r < depth.shape[0]) & (c >= 0) & (c < depth.shape[1])
-                r, c, v = r[ok], c[ok], d[ok]
-                empty = ~valid[r, c]
-                np.minimum.at(grown, (r[empty], c[empty]), v[empty])
-        reach = shapely.MultiPolygon(
-            [
-                shapely.geometry.shape(g)
-                for g, v in rasterio.features.shapes(near.view("uint8"), transform=transform)
-                if v
-            ]
-        )
-        del near
-        with tempfile.TemporaryDirectory(dir=os.environ.get("GRID_TEMP_DIR") or None) as tmp:
-            src_path, out = Path(tmp) / "depth.tif", Path(tmp) / "bands.geojson"
-            profile.update(driver="GTiff", count=1, dtype="float32", nodata=surface.NODATA)
-            with rasterio.open(src_path, "w", **profile) as dst:
-                dst.write(grown, 1)
-            del grown
-            subprocess.run(
-                ["gdal_contour", "-q", "-p", "-b", "1", "-amin", "lo", "-amax", "hi",
-                 "-fl", *map(str, levels), str(src_path), str(out)],
-                check=True,
-            )  # fmt: skip
-            features = json.loads(out.read_text())["features"]
-        for f in features:
-            b = int(np.searchsorted(LEVELS, f["properties"]["lo"], side="right")) - 1
-            part = shapely.make_valid(shapely.from_geojson(json.dumps(f["geometry"])))
-            bands[b] = shapely.union(bands[b], part) if b in bands else part
-            del f, part
-        # Where the outline bulges past the depths' reach, as at a corner it rounds on the
-        # tile's edge, the shoalest band beside it takes the rest.
-        rest = shapely.get_parts(polygonal(shapely.difference(surfaced, reach)))
-        rest = rest[shapely.area(rest) > 1e-4 * abs(transform.a * transform.e)]
-        tree, taken = shapely.STRtree(rest), np.zeros(len(rest), dtype=bool)
-        for b in sorted(bands):
-            band = polygonal(shapely.intersection(surfaced, bands[b]))
-            near = tree.query(band, predicate="dwithin", distance=1e-6 * abs(transform.a))
-            near = near[~taken[near]]
-            taken[near] = True
-            bands[b] = shapely.union(band, shapely.MultiPolygon(list(rest[near])))
-            del band
-        bands = {b: a for b, a in bands.items() if not a.is_empty}
-        del features, reach, rest, tree
     # Where interpolation starts is drawn more loosely than the edge of the water, on the
     # surface as it's grown, so the growth is measured only beside a sounding. It's grown a
     # pixel into the measured part too: rounding would lose a strip a pixel wide, and
@@ -446,7 +385,88 @@ def surface_bands(path, soundings=None):
     shaved = pixels[~shapely.covers(footprint, pixels)]
     if len(shaved):
         footprint = polygonal(shapely.union(footprint, shapely.union_all(shaved)))
+    del far_from_soundings, grown_interpolated, interpolated, lone, covered, rim, d, s
+    del sigma
+    bands = {}
+    if valid.any():
+        # Each empty pixel near the surface takes its nearest pixel's depth, so the bands
+        # reach past the outline, which cuts them.
+        grown, near = carry(depth, valid)
+        if soundings is not None and len(soundings[2]):
+            lon, lat, d = (np.asarray(a, dtype=float) for a in soundings)
+            row, col = (np.asarray(a) for a in rasterio.transform.rowcol(transform, lon, lat))
+            # One in the pixel beside the tile caps the edge pixels next to it; the window
+            # is the only part of the tile with pixels to cap.
+            row = np.clip(row + r0, 0, tile_shape[0] - 1) - r0
+            col = np.clip(col + c0, 0, tile_shape[1] - 1) - c0
+            inside = (row >= 0) & (row < depth.shape[0]) & (col >= 0) & (col < depth.shape[1])
+            row, col, d = row[inside], col[inside], d[inside].astype(np.float32)
+            # Each sounding's pixel and the eight around it, so only pixels beside one are
+            # touched: a sparse tile's window is most of the tile.
+            for dr, dc in np.argwhere(around) - 1:
+                r, c = row + dr, col + dc
+                ok = (r >= 0) & (r < depth.shape[0]) & (c >= 0) & (c < depth.shape[1])
+                r, c, v = r[ok], c[ok], d[ok]
+                empty = ~valid[r, c]
+                np.minimum.at(grown, (r[empty], c[empty]), v[empty])
+        # The window's rasters go before its bands are built: validating a dense tile's
+        # contour polygons is the job's peak.
+        del depth, count, valid
+        reach = shapely.MultiPolygon(
+            [
+                shapely.geometry.shape(g)
+                for g, v in rasterio.features.shapes(near.view("uint8"), transform=transform)
+                if v
+            ]
+        )
+        del near
+        # Where the outline bulges past the depths' reach, as at a corner it rounds on the
+        # tile's edge, the shoalest band beside it takes the rest.
+        rest = shapely.get_parts(polygonal(shapely.difference(surfaced, reach)))
+        rest = rest[shapely.area(rest) > 1e-4 * abs(transform.a * transform.e)]
+        del reach
+        with tempfile.TemporaryDirectory(dir=os.environ.get("GRID_TEMP_DIR") or None) as tmp:
+            src_path, out = Path(tmp) / "depth.tif", Path(tmp) / "bands.geojson"
+            profile.update(driver="GTiff", count=1, dtype="float32", nodata=surface.NODATA)
+            with rasterio.open(src_path, "w", **profile) as dst:
+                dst.write(grown, 1)
+            del grown
+            subprocess.run(
+                ["gdal_contour", "-q", "-p", "-b", "1", "-amin", "lo", "-amax", "hi",
+                 "-fl", *map(str, levels), str(src_path), str(out)],
+                check=True,
+            )  # fmt: skip
+            text = out.read_text()
+        for f in collection_features(text):
+            b = int(np.searchsorted(LEVELS, f["properties"]["lo"], side="right")) - 1
+            part = shapely.make_valid(shapely.from_geojson(json.dumps(f["geometry"])))
+            bands[b] = shapely.union(bands[b], part) if b in bands else part
+            del f, part
+        del text
+        tree, taken = shapely.STRtree(rest), np.zeros(len(rest), dtype=bool)
+        for b in sorted(bands):
+            band = polygonal(shapely.intersection(surfaced, bands[b]))
+            near = tree.query(band, predicate="dwithin", distance=1e-6 * abs(transform.a))
+            near = near[~taken[near]]
+            taken[near] = True
+            bands[b] = shapely.union(band, shapely.MultiPolygon(list(rest[near])))
+            del band
+        bands = {b: a for b, a in bands.items() if not a.is_empty}
+        del rest, tree
     return bands, footprint, surfaced, between, tvu
+
+
+def collection_features(text):
+    """Yield the features of a GeoJSON FeatureCollection's `text` one at a time, so only
+    one is ever parsed: a dense tile's bands are hundreds of MB as Python objects."""
+    decoder = json.JSONDecoder()
+    at = re.search(r'"features"\s*:\s*\[', text).end()
+    while True:
+        at = re.compile(r"[\s,]*").match(text, at).end()
+        if text[at] == "]":
+            return
+        f, at = decoder.raw_decode(text, at)
+        yield f
 
 
 def carry(depth, valid):
@@ -641,28 +661,31 @@ def tile_areas(candidates, properties, bands, footprint, surfaced=None, interpol
     points = shapely.points(lon, lat)
     tree = shapely.STRtree(points)
     # The areas shoaler than each level and at or deeper than it, built up one band at
-    # a time from each end rather than from every band at every level.
-    shoaler, deeper = {}, {}
-    area = shapely.Polygon()
-    for i in range(1, deepest + 1):
-        area = shapely.union(area, bands[i - 1]) if i - 1 in bands else area
-        shoaler[i] = area
+    # a time from each end rather than from every band at every level. The shoaler
+    # ones are built as the levels are worked, and each contour level's deeper one is
+    # dropped once it's used, so a dense tile holds one ladder of them, not two.
+    deeper = {}
     area = shapely.Polygon()
     for i in reversed(range(1, len(LEVELS))):
         area = shapely.union(area, bands[i]) if i in bands else area
         deeper[i] = area
+    del area
     primes = {}
+    shoaler = shapely.Polygon()
     for i in range(1, deepest + 1):
         v = LEVELS[i]
-        if shoaler[i].is_empty or deeper[i].is_empty:
+        shoaler = shapely.union(shoaler, bands[i - 1]) if i - 1 in bands else shoaler
+        below = deeper.pop(i)
+        if shoaler.is_empty or below.is_empty:
             continue
-        line = lines(shapely.intersection(shoaler[i].boundary, deeper[i].boundary))
+        line = lines(shapely.intersection(shoaler.boundary, below.boundary))
+        del below
         if line.is_empty:
             continue
         yield shape("DEPCNT", line, {"VALDCO": v, "QUAPOS": 4}, level_minzoom(v))
         if v > PRIME_MAX_DEPTH_M or not len(points):
             continue
-        rings = shapely.get_parts(shoaler[i])
+        rings = shapely.get_parts(shoaler)
         # A closed isobath: deeper water all the way round, so the shoal grown by about
         # a centimetre is still all surface; touching the surface's edge, even at a
         # corner, leaves it open.

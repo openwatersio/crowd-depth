@@ -123,18 +123,19 @@ FROM surface_points WHERE keep GROUP BY py, px, vessel ORDER BY py, px, v, m
 """
 
 # Each sounded pixel's soundings, those of them that vote, and its shoalest confirmed
-# shoal, which no pixel may be deeper than.
+# shoal, which no pixel may be deeper than; north to south, as the raster's rows run.
 COUNTS = """
 SELECT py, px, count(*) AS n, count(*) FILTER (WHERE NOT unconfirmed) AS votes,
   min(d) FILTER (WHERE confirmed) AS confirmed
-FROM surface_points GROUP BY ALL
+FROM surface_points GROUP BY ALL ORDER BY py DESC, px
 """
 
 
-def entries(con, params):
-    """The entries and per-pixel counts for one tile's or neighbor strip's soundings."""
+def entries(con, params, counts=True):
+    """The entries and, unless `counts` is false, per-pixel counts for one tile's or
+    neighbor strip's soundings."""
     con.execute(POINTS, params)
-    got = con.execute(ENTRIES).fetchnumpy(), con.execute(COUNTS).fetchnumpy()
+    got = con.execute(ENTRIES).fetchnumpy(), counts and con.execute(COUNTS).fetchnumpy()
     con.execute("DROP TABLE surface_points")
     return got
 
@@ -175,6 +176,7 @@ def margin(con, lat0, lon0, k, cols, scale_x, scale_y):
                  "lat0": lat0, "lon0": lon0 + turn, "k": k, "rlo": rlo, "rhi": rhi,
                  "pylo": -rows_m, "pyhi": ROWS + rows_m - 1,
                  "pxlo": -cols_m, "pxhi": cols + cols_m - 1},
+                counts=False,
             )  # fmt: skip
             parts.append(
                 (
@@ -193,24 +195,45 @@ def margin(con, lat0, lon0, k, cols, scale_x, scale_y):
 def build_tile(con, tile_id: int, partition: int, out: Path):
     """Grid one tile into `out/{tile_id}.tif`. Returns its path, or None when the tile has
     no soundings."""
+    got = tile_entries(con, tile_id, partition)
+    return grid_tile(tile_id, got, out) if got else None
+
+
+def geometry(tile_id):
+    """A tile's (lat0, lon0, k, columns, metres east and north across it, scaled at its
+    centre, from its south-west corner)."""
     lat0, lon0 = tile_id // 360 - 90, tile_id % 360 - 180
     k = k_for(lat0)
     # ponytail: past about 86° a tile has an odd number of base columns, so its last
     # surface column holds one; pad the grid if polar tiles ever matter
     cols = math.ceil(BASE / k / PIXEL_BASE)
+    scale_x = EARTH_M * math.cos(math.radians(lat0 + 0.5)) * math.pi / 180
+    scale_y = EARTH_M * math.pi / 180
+    return lat0, lon0, k, cols, scale_x, scale_y
+
+
+def tile_entries(con, tile_id: int, partition: int):
+    """What gridding a tile reads from the store: its entries and per-pixel counts, and
+    its neighbors' entries within the search radius; None when it has no soundings. The
+    rest needs no connection, so a job can close its own first: what DuckDB holds then
+    goes back before the rasters are made."""
+    lat0, lon0, k, cols, scale_x, scale_y = geometry(tile_id)
     params = {"partition": partition, "tile": tile_id, "lat0": lat0, "lon0": lon0, "k": k,
               "rlo": 0, "rhi": BASE, "pylo": -ROWS, "pyhi": 2 * ROWS, "pxlo": -cols,
               "pxhi": 2 * cols}  # fmt: skip
     own, counted = entries(con, params)
     if not len(counted["py"]):
         return None
-    # The tile in metres east and north of its south-west corner, scaled at its centre.
-    scale_x = EARTH_M * math.cos(math.radians(lat0 + 0.5)) * math.pi / 180
-    scale_y = EARTH_M * math.pi / 180
+    return own, counted, margin(con, lat0, lon0, k, cols, scale_x, scale_y)
+
+
+def grid_tile(tile_id: int, got, out: Path):
+    """Grid one tile from its `tile_entries` into `out/{tile_id}.tif`; returns its path."""
+    lat0, lon0, _, cols, scale_x, scale_y = geometry(tile_id)
+    own, counted, (my, mx, mv, mm, ms) = got
     dx, dy = scale_x / cols, scale_y / ROWS
     shape = (ROWS, cols)
     # A tile's own soundings always land on its pixels, even on its north or east edge.
-    my, mx, mv, mm, ms = margin(con, lat0, lon0, k, cols, scale_x, scale_y)
     # Each vessel smoothed along its own coverage, this tile's and the margin's together.
     epx, epy, em, es = statistic.smoothed(
         np.concatenate([np.clip(own["px"].astype(np.int64), 0, cols - 1), mx]),
@@ -220,17 +243,11 @@ def build_tile(con, tile_id: int, partition: int, out: Path):
         np.concatenate([np.asarray(own["s"], dtype=np.float64), ms]),
     )
     upx, upy, _, medians = statistic.pixels(epx, epy, em)
-    # Accumulated, not assigned: a sounding on the tile's north or east edge is its own
-    # group in SQL but shares the last pixel, and must not overwrite its values.
     cpy = np.clip(counted["py"].astype(np.int64), 0, ROWS - 1)
     cpx = np.clip(counted["px"].astype(np.int64), 0, cols - 1)
-    count = np.zeros(shape, dtype=np.float32)
-    np.add.at(count, (ROWS - 1 - cpy, cpx), np.asarray(counted["n"], dtype=np.float32))
-    confirmed = np.full(shape, np.inf, dtype=np.float32)
     # NULL, a pixel without one, comes back masked: as NaN, never as its 0 fill.
     shoal = np.ma.filled(np.ma.asarray(counted["confirmed"], dtype=np.float32), np.nan)
-    has = ~np.isnan(shoal)
-    np.minimum.at(confirmed, (ROWS - 1 - cpy[has], cpx[has]), shoal[has])
+    sounded_at = Sounded(ROWS - 1 - cpy, cpx, np.asarray(counted["n"], dtype=np.float32), shoal)
     # Every pixel with a vote, this tile's and its neighbors', in metres: distance is to
     # the nearest, wherever it is, and a pixel holding only shoals the surface ignores
     # isn't sounded for it.
@@ -315,8 +332,6 @@ def build_tile(con, tile_id: int, partition: int, out: Path):
         with open_sparse(sparse, lon0, lat0, shape) as dst:
             for key, (r0, c0, r1, c1, wr0, wc0, wr1, wc1) in windows.items():
                 inner = np.s_[r0 - wr0 : r1 - wr0, c0 - wc0 : c1 - wc0]
-                block = np.s_[r0:r1, c0:c1]
-                win = np.s_[wr0:wr1, wc0:wc1]
                 surface = central[key]
                 distance = np.full(surface.shape, NODATA, dtype=np.float32)
                 sigma = np.full(surface.shape, NODATA, dtype=np.float32)
@@ -324,15 +339,46 @@ def build_tile(con, tile_id: int, partition: int, out: Path):
                 qx, qy = cc + c0, ROWS - 1 - (rr + r0)
                 distance[rr, cc] = sounded.query(np.column_stack([qx * dx, qy * dy]))[0]
                 sigma[rr, cc] = sigma_of(qx, qy, distance[rr, cc])
-                depth = finish(surface, sigma, around(confirmed[win])[inner])
+                count, confirmed = sounded_at.rasters(wr0, wc0, wr1, wc1)
+                depth = finish(surface, sigma, around(confirmed)[inner])
                 distance[depth == NODATA] = NODATA
                 sigma[depth == NODATA] = NODATA
                 dst.write(
-                    np.stack([depth, distance, count[block], sigma]),
+                    np.stack([depth, distance, count[inner], sigma]),
                     window=Window(c0, r0, c1 - c0, r1 - r0),
                 )
         rasterio.shutil.copy(sparse, path, driver="COG", compress="deflate", sparse_ok=True)
     return path
+
+
+class Sounded:
+    """The tile's sounded pixels, by row and column: each one's soundings and its shoalest
+    confirmed shoal (NaN for none), rasterized a window at a time, so a tile holds its
+    windows' rasters, not the whole tile's: 16 bytes a sounded pixel, against 8 a pixel."""
+
+    def __init__(self, rows, cols, n, shoal):
+        rows, cols = np.asarray(rows, dtype=np.int32), np.asarray(cols, dtype=np.int32)
+        # COUNTS returns them in row order; sorted only if not.
+        if len(rows) and (np.diff(rows) < 0).any():
+            order = np.argsort(rows, kind="stable")
+            rows, cols, n, shoal = rows[order], cols[order], n[order], shoal[order]
+        self.rows, self.cols = rows, cols
+        self.n = np.asarray(n, dtype=np.float32)
+        self.shoal = np.asarray(shoal, dtype=np.float32)
+
+    def rasters(self, r0, c0, r1, c1):
+        """(soundings, shoalest confirmed shoal or inf) for rows [r0, r1), columns [c0,
+        c1). Accumulated, not assigned: a sounding on the tile's north or east edge is its
+        own group in SQL but shares the last pixel, and must not overwrite its values."""
+        a, b = np.searchsorted(self.rows, [r0, r1])
+        i = a + np.flatnonzero((self.cols[a:b] >= c0) & (self.cols[a:b] < c1))
+        at = self.rows[i] - r0, self.cols[i] - c0
+        count = np.zeros((r1 - r0, c1 - c0), dtype=np.float32)
+        np.add.at(count, at, self.n[i])
+        confirmed = np.full((r1 - r0, c1 - c0), np.inf, dtype=np.float32)
+        has = ~np.isnan(self.shoal[i])
+        np.minimum.at(confirmed, (at[0][has], at[1][has]), self.shoal[i][has])
+        return count, confirmed
 
 
 def interpolate(tmp, px, py, values, scale_x, scale_y, cols, extent):

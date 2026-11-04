@@ -46,16 +46,26 @@ JOB_MEMORY_LIMIT = "1200MB"
 # Tables a job writes; everything else is a view over the frozen catalog.
 WRITTEN = ("cells", "qc_flags", "shoals", "cells_built", "store_meta", "tile_changes")
 # Peak memory of a job, Python and the tools it runs, by its tile's active soundings:
-# (fewer than, MB). The Chesapeake's peaks with 1 thread, rounded up; a stage's last
-# entry covers the rest. Overlay peaks follow the tile's surface more than its soundings.
+# (fewer than, MB). The Chesapeake's peaks, anon memory sampled in a Linux cgroup of the
+# job's own with the threads `resources` gives, rounded up; about 30% more under 1M
+# soundings, where a tile with few soundings can have a large surface. A stage's last
+# entry covers the rest. A dense surface runs in a 2 GB cgroup, where the kernel takes
+# back what it can, but 45463's reached 2.05 GB run alone. Overlay peaks follow the
+# tile's surface more than its soundings: one overlay, of a tile whose contour bands
+# GEOS validates at 1.4 GB, needs 2.2 GB, and the rest of its row 1.3 GB.
 # ponytail: measured on one region; refit once the planet's densest tiles have run
 MEMORY_MB = {
-    "cells": [(100_000, 512), (1_000_000, 1024), (10_000_000, 3072), (None, 4096)],
-    "surface": [(100_000, 2048), (1_000_000, 2560), (10_000_000, 3584), (None, 4608)],
-    "overlay": [(100_000, 3584), (1_000_000, 4096), (None, 7168)],
+    "cells": [(100_000, 512), (1_000_000, 1536), (10_000_000, 2304), (None, 2560)],
+    "surface": [(1_000_000, 1792), (None, 2304)],
+    "overlay": [(1_000_000, 1536), (None, 2560)],
 }
 WEB_MEMORY_MB = 2048
-# DuckDB threads by soundings: dense tiles set the run's critical path.
+# GDAL's block cache in each job, in MB.
+GDAL_CACHE_MB = "64"
+# DuckDB threads by soundings: dense tiles set the run's critical path. A surface's
+# DuckDB takes one whatever its tile: its per-pixel medians can't spill, and each thread
+# adds memory past its limit. The densest tile's surface took 430-540 s on one thread,
+# 326 s on two and 411 s on four, and only one kept it near 2 GB.
 THREADS = [(1_000_000, 1), (10_000_000, 2), (None, 4)]
 # The tools and libraries a run's outputs are built with, besides this package.
 TOOLS = (
@@ -93,7 +103,7 @@ def resources(stage, soundings):
         return next(v for below, v in table if below is None or soundings < below)
 
     mem = pick(MEMORY_MB[stage]) if stage in MEMORY_MB else WEB_MEMORY_MB
-    return mem, pick(THREADS)
+    return mem, 1 if stage == "surface" else pick(THREADS)
 
 
 # Tile geometry --------------------------------------------------------------------------------
@@ -352,6 +362,21 @@ def load(con, run: Path, tiles, kinds):
                 )
 
 
+def attach(con, run: Path, tiles, kinds):
+    """The tiles' outputs of `kinds` (cells, shoals) as views in `lake` over their files,
+    read where queried, not copied in: a dense neighbor's cells are hundreds of MB, and a
+    tile reads only a margin of them."""
+    for kind in kinds:
+        files = [str(f) for t in tiles if (f := run / TILE_FILES[kind].format(t)).exists()]
+        if not files:
+            continue
+        con.execute(f"DROP TABLE lake.{kind}")
+        listed = ", ".join(map(literal, files))
+        con.execute(
+            f"CREATE VIEW lake.{kind} AS SELECT * FROM read_parquet([{listed}], union_by_name = true)"
+        )
+
+
 def export(con, query, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -398,8 +423,10 @@ def do_surface(run: Path, tile: int, threads):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open_job(run, around, threads) as con:
         load(con, run, around, kinds=("flags",))
-        if has_cells(con, run, tile):
-            surface.build_tile(con, tile, partition(tile), path.parent)
+        got = has_cells(con, run, tile) and surface.tile_entries(con, tile, partition(tile))
+    # Gridded with the job's DuckDB closed, so what it held is free for the rasters.
+    if got:
+        surface.grid_tile(tile, got, path.parent)
 
 
 def do_overlay(run: Path, tile: int, threads):
@@ -415,7 +442,7 @@ def do_overlay(run: Path, tile: int, threads):
         return
     around = neighbors(tile)
     with scratch(run, threads) as con:
-        load(con, run, around, kinds=("cells", "shoals"))
+        attach(con, run, around, kinds=("cells", "shoals"))
         params = {"partition": partition(tile), "tile": tile}
         first, last, count, tvu = con.execute(overlay.TILE_QUALITY, params).fetchone()
         got = con.execute(
@@ -722,6 +749,10 @@ def job(argv):
     """Run one job, STAGE RUN THREADS [KEY...], and log its time and peak memory to
     RUN/jobs.jsonl."""
     stage, run, threads, keys = argv[0], Path(argv[1]), int(argv[2]), argv[3:]
+    # GDAL's block cache is 5% of the machine's memory by default, whatever the job's
+    # share: 1.6 GB on a 32 GB worker, which a tile's rasters fill. Set before the job
+    # first reads a raster, and inherited by the GDAL tools it runs.
+    os.environ["GDAL_CACHEMAX"] = os.environ.get("GDAL_CACHEMAX") or GDAL_CACHE_MB
     started = time.time()
     if stage in PER_KEY:
         for k in keys:

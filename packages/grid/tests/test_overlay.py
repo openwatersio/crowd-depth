@@ -642,6 +642,43 @@ def test_surface_is_the_median_less_k_sigma_and_never_deeper_than_a_confirmed_sh
     assert (surface.finish(surface_, wide, shoal) == -0.5).all()
 
 
+@pytest.mark.parametrize("indent", [None, 1])
+def test_a_collections_features_are_read_one_at_a_time_as_parsed_whole(indent):
+    # As gdal_contour writes them, a feature a line with spaces, and compact.
+    whole = {
+        "type": "FeatureCollection",
+        "features": [
+            {"type": "Feature", "properties": {"lo": i}, "geometry": {"type": "Point",
+             "coordinates": [i + 0.1234567890123456, -1e-17]}}
+            for i in range(3)
+        ],
+    }  # fmt: skip
+    text = json.dumps(whole, indent=indent)
+    assert list(overlay.collection_features(text)) == json.loads(text)["features"]
+    empty = json.dumps({"type": "FeatureCollection", "features": []}, indent=indent)
+    assert list(overlay.collection_features(empty)) == []
+
+
+def test_a_windows_sounded_rasters_match_the_whole_tiles():
+    # Pixels repeated, as an edge sounding's group shares the last pixel, some with a
+    # confirmed shoal and some without; every window cut from the whole tile's rasters.
+    rng = np.random.default_rng(7)
+    shape, n = (40, 30), 300
+    rows, cols = rng.integers(0, shape[0], n), rng.integers(0, shape[1], n)
+    counts = rng.integers(1, 5, n).astype(np.float32)
+    shoal = np.where(rng.random(n) < 0.3, rng.uniform(0, 10, n), np.nan).astype(np.float32)
+    count = np.zeros(shape, dtype=np.float32)
+    np.add.at(count, (rows, cols), counts)
+    confirmed = np.full(shape, np.inf, dtype=np.float32)
+    has = ~np.isnan(shoal)
+    np.minimum.at(confirmed, (rows[has], cols[has]), shoal[has])
+    sounded = surface.Sounded(rows, cols, counts, shoal)
+    for r0, c0, r1, c1 in [(0, 0, 40, 30), (5, 7, 13, 30), (39, 0, 40, 1), (10, 10, 11, 29)]:
+        got_count, got_confirmed = sounded.rasters(r0, c0, r1, c1)
+        assert np.array_equal(got_count, count[r0:r1, c0:c1])
+        assert np.array_equal(got_confirmed, confirmed[r0:r1, c0:c1])
+
+
 @pytest.mark.parametrize("reason, drawn", [("cell_shoal", False), ("cell_unjudged", True)])
 def test_contradicted_shoals_dont_vote_and_unjudged_ones_do(env, tmp_path, reason, drawn):  # noqa: F811
     put_tracks(env, parallel())
