@@ -358,8 +358,14 @@ def test_a_run_rebuilds_only_what_moved_and_matches_the_whole_region_build(
 ):
     two_tiles(env)
     run = tmp_path / "run"
-    assert tiles.build(env.store, run, cores=2, memory_mb=8192) == 0
+    out = LocalObjects(tmp_path / "published")
+    assert tiles.build(env.store, run, cores=2, memory_mb=8192, publish_to=out) == 0
     first = ran(run, 0)
+    # Published: the archive, and every tile's surface, cells and areas.
+    assert out.get("overlay.pmtiles")[0] == (run / "overlay.pmtiles").read_bytes()
+    published = json.loads(out.get("manifest.json")[0])["tiles"]
+    assert set(published) == {str(SOUTH), str(NORTH)}
+    assert all({"surface", "cells", "areas"} <= set(e) for e in published.values())
     assert first["cells"] == first["surface"] == first["overlay"] == [str(SOUTH), str(NORTH)]
     assert first["low"] == first["assemble"] == []
     # The same surfaces and areas as `grid cells` and `grid overlay` build.
@@ -385,10 +391,13 @@ def test_a_run_rebuilds_only_what_moved_and_matches_the_whole_region_build(
     with open(run / "overlay.pmtiles", "rb") as f:
         assert Reader(MmapSource(f)).header()["clustered"]  # written in tile-id order
 
-    # Nothing moved: nothing runs.
+    # Nothing moved: nothing runs, and nothing new is published.
     seen = len(jobs(run))
-    assert tiles.build(env.store, run, cores=2, memory_mb=8192) == 0
+    capfd.readouterr()
+    assert tiles.build(env.store, run, cores=2, memory_mb=8192, publish_to=out) == 0
     assert ran(run, seen) == {}
+    assert '"uploaded": 0' in capfd.readouterr().out
+    assert json.loads(out.get("manifest.json")[0])["tiles"] == published
     # A change to the code or the tools it runs: every job would run again.
     capfd.readouterr()
     with monkeypatch.context() as m:

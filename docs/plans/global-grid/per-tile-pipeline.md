@@ -7,7 +7,7 @@ On the Chesapeake its surfaces, cells and depth areas are the same as `grid cell
 ## How `grid tiles` runs
 
 ```sh
-grid --store DIR_OR_S3_URL tiles --out RUN [--cores N] [--memory-gb N] [--dry-run]
+grid --store DIR_OR_S3_URL tiles --out RUN [--publish DIR_OR_S3_URL [--take-down]] [--cores N] [--memory-gb N] [--dry-run]
 ```
 
 `RUN` is kept from run to run: it holds each tile's outputs and the fingerprints they were built from. One run at a time uses it, and it takes tiles from one store only, named by its path, or its bucket and endpoint: pointed at another, `grid tiles` refuses rather than count every tile gone. It doesn't rebuild the store's own cells or clear its cells marker, so `grid overlay` still asks for `grid cells`. `--dry-run` prepares as a run does, store writes included, then lists the jobs it would run.
@@ -35,6 +35,27 @@ The web jobs cut at z8. Every shoalest-wins pyramid level shown at z8 or past it
 
 `RUN/jobs.jsonl` gets a line per finished job: its stage, key, time and peak memory, its own and the tools'. A failed job's traceback is in its log under `RUN/logs/`.
 
+## Publishing
+
+With `--publish`, a run that finished every job makes what's published at an R2 prefix (`s3://bucket/prefix`, with the store's `S3_*` credentials) or a local directory match the run directory, still holding the run directory's lock ([publish.py](../../../packages/grid/src/grid/publish.py)). A run with a failed job, or a dry run, publishes nothing, and what was published stays. The target must stand apart from the store and the run directory.
+
+| Key                                         | What                                                                                                                                                                                                  |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `overlay.pmtiles`                           | The archive, at a key that never changes                                                                                                                                                              |
+| `tiles/surface/{tile}-{sha256[:16]}.tif`    | A tile's surface, the COG Seascape reads                                                                                                                                                              |
+| `tiles/cells/{tile}-{sha256[:16]}.parquet`  | A tile's cells                                                                                                                                                                                        |
+| `tiles/areas/{tile}-{sha256[:16]}.geojsons` | A tile's depth areas, contours, coverage and prime soundings                                                                                                                                          |
+| `manifest.json`                             | What is published now: each tile's files, fingerprint and soundings, a hash naming the store they came from, the archive's SHA-256, size and ETag, the license and credit line, and the files retired |
+| `lock`                                      | Held while a run publishes, renewed as the store's catalog lock is                                                                                                                                    |
+
+One run publishes to a prefix at a time: a second is refused while the first holds `lock`, and the manifest is written conditionally on the one the publish started from as well. A run whose store isn't the one the manifest names is refused, so a run against an empty or staging store can't take a prefix down or over. A tile's files are named by their content, so one that didn't change keeps its key and isn't uploaded, and a new one never overwrites a file a reader is reading. The manifest is written last, so a reader that goes through it sees one run's tile files throughout. A changed tile's old files are listed under `retired` and stay a day, for readers still on the last manifest; a gone tile's go at once, retired ones included. Which files are there comes from listing `tiles/`, not from the last manifest, so a file the bucket lost goes up again. Then every tile file under `tiles/` the manifest doesn't name is deleted, so what a stopped publish or a failed delete left goes on the next one; a key that isn't a tile file's, as a publish names them, is left alone. The tile files carry no credit of their own: the manifest's `attribution` and `license` are theirs. Tile files may be cached for an hour, so a deleted one doesn't outlive its withdrawal in caches by long, and the archive and manifest are revalidated on every read. `lock` names the publishing host and process, as the store's catalog lock does, and is as public as the rest of the prefix.
+
+The archive is replaced whole at its own key, after the tiles' files and before the manifest, when its SHA-256 moved or the stored object isn't the one the manifest recorded, as after a publish stopped between the two. Past 64 MB it goes up in parts, and R2 shows the object only when every part is in, so a reader sees the old archive or the new one; one reading by range with the old ETag gets a 412 and starts over. A withdrawn file's soundings stay published until a run finishes and publishes, and in a changed tile's retired files for a day after. A store with every tile withdrawn stops `grid tiles` for having nothing to tile, and leaves what was published, since a catalog read empty by mistake looks the same. With `--take-down` it publishes instead: it deletes the archive and every tile file, and writes a manifest with none.
+
+The run directory keeps the state a run needs: shoals, cell-level flags, web archives and the low zooms aren't published, so a run starts from its own directory, not from R2.
+
+On the Chesapeake run's outputs (212 tiles), a first publish is 617 files and 1.35 GB, of which the archive is 206 MB. Publishing them to a local directory takes 2.8 s, and 2.1 s with nothing changed, when only the manifest is written. The replayed arrival day reran cells on 8 tiles and surfaces and overlays on 18, which hold 357 MB of cells, 276 MB of surfaces and 161 MB of areas: with the archive, at most 1.0 GB a day by those files' sizes, since those are the dense harbor tiles; less where a rebuilt file's bytes didn't change. Not measured yet: upload time to R2 from the build machine, and a planet's 15–30 GB archive.
+
 ## Measured with Snakemake
 
 On the Chesapeake (212 tiles, 98.5M soundings), on 18 cores of an M-series Mac Studio. `grid tiles` itself ran the full build; the replay, overhead and planning figures are from the spike it was built from, which ran the same jobs the same way.
@@ -47,7 +68,7 @@ On the Chesapeake (212 tiles, 98.5M soundings), on 18 cores of an M-series Mac S
 - **Memory.** 75 of 863 jobs went past 2 GB: every stage of the tiles over 1M soundings, and overlays even on sparse tiles. The largest was 4.0 GB, an overlay of tile 46183. Tools stayed under 1.1 GB. Assembly streams the archive at 0.3 GB.
 - **Planning a planet.** On 25,000 synthetic tiles, Snakemake plans a day with 900 dirty tiles (17,002 jobs) in 46 s at 1.9 GB, and a day with none in 54 s.
 
-Not measured yet: reading the frozen catalog from R2, a planet's densest tiles, cheap x86 cores, and what the dense tiles' extra threads cost in memory.
+Not measured yet: reading the frozen catalog from R2, uploads to R2, a planet's densest tiles, cheap x86 cores, and what the dense tiles' extra threads cost in memory.
 
 ## The first spike
 

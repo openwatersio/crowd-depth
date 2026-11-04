@@ -88,8 +88,30 @@ class S3Objects:
             raise
         return True
 
-    def put(self, key: str, data: bytes, if_match: str | None = None, if_none_match=False) -> str:
+    def upload(self, key: str, path, content_type: str, cache_control: str, threads=True):
+        """Stream a file to an object. A large file goes up in parts, and the object appears
+        only once every part has, so a reader sees the old object or the whole new one."""
+        self.client.upload_file(
+            str(path),
+            self.bucket,
+            self.prefix + key,
+            ExtraArgs={"ContentType": content_type, "CacheControl": cache_control},
+            Config=TransferConfig(
+                multipart_threshold=64 * 2**20, multipart_chunksize=64 * 2**20, use_threads=threads
+            ),
+        )
+
+    def put(
+        self,
+        key: str,
+        data: bytes,
+        if_match: str | None = None,
+        if_none_match=False,
+        cache_control: str | None = None,
+    ) -> str:
         args = {"Bucket": self.bucket, "Key": self.prefix + key, "Body": data}
+        if cache_control:
+            args["CacheControl"] = cache_control
         if if_match:
             args["IfMatch"] = if_match
         if if_none_match:
@@ -154,7 +176,21 @@ class LocalObjects:
         shutil.copyfile(source, path)
         return True
 
-    def put(self, key: str, data: bytes, if_match: str | None = None, if_none_match=False) -> str:
+    def upload(self, key: str, path, content_type: str, cache_control: str, threads=True):
+        target = self.root / key
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}")
+        shutil.copyfile(path, tmp)
+        os.replace(tmp, target)
+
+    def put(
+        self,
+        key: str,
+        data: bytes,
+        if_match: str | None = None,
+        if_none_match=False,
+        cache_control: str | None = None,
+    ) -> str:
         # The check and write are atomic within one process (a run and its lock renewal),
         # and a reader never sees a half-written object.
         # ponytail: not across processes; R2 enforces conditional puts for real
@@ -184,7 +220,10 @@ class LocalObjects:
             if path.is_file() and key.startswith(prefix) and not path.name.startswith("."):
                 stat = path.stat()
                 mtime = datetime.fromtimestamp(stat.st_mtime, UTC)
-                objs.append(Obj(key, self._etag(path.read_bytes()), mtime, stat.st_size))
+                with open(path, "rb") as f:
+                    # Streamed: a published archive can be larger than memory.
+                    etag = '"' + hashlib.file_digest(f, "md5").hexdigest() + '"'
+                objs.append(Obj(key, etag, mtime, stat.st_size))
         return objs, True
 
 
