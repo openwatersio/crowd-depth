@@ -307,8 +307,9 @@ class Lock:
     A lock whose expiry has passed has stopped being renewed and can be taken over.
     """
 
-    def __init__(self, objects, ttl=timedelta(minutes=10)):
+    def __init__(self, objects, ttl=timedelta(minutes=10), key=LOCK):
         self.objects = objects
+        self.key = key
         self.ttl = ttl
         self.owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         self.etag = None
@@ -325,9 +326,9 @@ class Lock:
     def acquire(self):
         sent = datetime.now(UTC)
         try:
-            self.etag = self.objects.put(LOCK, self._body(), if_none_match=True)
+            self.etag = self.objects.put(self.key, self._body(), if_none_match=True)
         except Conflict:
-            current = self.objects.get(LOCK)
+            current = self.objects.get(self.key)
             if current is None:
                 return self.acquire()
             held = json.loads(current[0])
@@ -336,13 +337,13 @@ class Lock:
                 self.etag = current[1]
                 return self._start(sent)
             if datetime.fromisoformat(held["expires"]) > datetime.now(UTC):
-                raise Locked(f"catalog locked by {held['owner']} until {held['expires']}")
+                raise Locked(f"{self.key} locked by {held['owner']} until {held['expires']}")
             if not held.get("released"):
                 log.warning("taking over stale lock from %s", held["owner"])
             try:
-                self.etag = self.objects.put(LOCK, self._body(), if_match=current[1])
+                self.etag = self.objects.put(self.key, self._body(), if_match=current[1])
             except Conflict:
-                now = self.objects.get(LOCK)
+                now = self.objects.get(self.key)
                 if not now or json.loads(now[0])["owner"] != self.owner:
                     raise Locked("another run took the stale lock first")
                 self.etag = now[1]
@@ -357,11 +358,11 @@ class Lock:
         while not self._stop.wait(self.ttl.total_seconds() / 4):
             sent = datetime.now(UTC)
             try:
-                self.etag = self.objects.put(LOCK, self._body(), if_match=self.etag)
+                self.etag = self.objects.put(self.key, self._body(), if_match=self.etag)
                 self.renewed = sent
                 continue
             except Exception:
-                log.warning("renewing the catalog lock failed", exc_info=True)
+                log.warning("renewing %s failed", self.key, exc_info=True)
             # A renewal that succeeded but whose response was lost fails its retry
             # with a 412; the lock is still ours if it still names this run and hasn't
             # expired, since another run may take over an expired lock at any moment.
@@ -375,7 +376,7 @@ class Lock:
                 self.etag = current[1]
             elif current or datetime.now(UTC) - self.renewed >= self.ttl:
                 # Another run holds it, or it may have expired while unreachable.
-                log.error("lost the catalog lock")
+                log.error("lost %s", self.key)
                 self.lost.set()
                 return
 
@@ -387,11 +388,11 @@ class Lock:
         is still this run's, even if renewal has stalled.
         """
         if self.lost.is_set() or datetime.now(UTC) - self.renewed >= self.ttl / 2:
-            raise Locked("the catalog lock was lost or its lease ran low; result discarded")
+            raise Locked(f"{self.key} was lost or its lease ran low; result discarded")
 
     def _held(self):
         try:
-            return self.objects.get(LOCK)
+            return self.objects.get(self.key)
         except (BotoCoreError, ClientError, OSError):
             return None
 
@@ -407,12 +408,12 @@ class Lock:
             {"owner": self.owner, "expires": datetime.now(UTC).isoformat(), "released": True}
         )
         try:
-            self.objects.put(LOCK, body.encode(), if_match=self.etag)
+            self.objects.put(self.key, body.encode(), if_match=self.etag)
         except Conflict:
-            log.warning("the catalog lock changed hands before release")
+            log.warning("%s changed hands before release", self.key)
         except (BotoCoreError, ClientError, OSError):
             # Never mask the error that ended the run; the lock expires on its own.
-            log.warning("releasing the catalog lock failed", exc_info=True)
+            log.warning("releasing %s failed", self.key, exc_info=True)
 
 
 def connect(

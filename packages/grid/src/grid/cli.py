@@ -8,7 +8,8 @@
     grid --store DIR_OR_S3_URL calibrate [--reference s102|bluetopo|PATH]...
     grid --store DIR_OR_S3_URL cells [--bbox=W,S,E,N | --changed]
     grid --store DIR_OR_S3_URL overlay --out DIR
-    grid --store DIR_OR_S3_URL tiles --out DIR [--cores N] [--memory-gb N] [--dry-run]
+    grid --store DIR_OR_S3_URL tiles --out DIR [--publish DIR_OR_S3_URL [--take-down]] [--cores N]
+                                     [--memory-gb N] [--dry-run]
     grid --store DIR_OR_S3_URL benchmark --surface DIR --out DIR [--bbox=W,S,E,N | --tiles=ID,...]
                                           [--source NAME]... [--cells] [--qc-version N]
     grid --store DIR_OR_S3_URL compact
@@ -145,6 +146,11 @@ def main(argv=None):
     t.add_argument(
         "--out", required=True, type=Path, help="The run directory, kept from run to run"
     )
+    t.add_argument(
+        "--publish",
+        help="Then upload the archive and the tiles' surfaces, cells and areas that changed:"
+        " a local directory or s3://bucket/prefix on R2",
+    )
     t.add_argument("--cores", type=positive, help="Default: every core")
     t.add_argument(
         "--memory-gb",
@@ -152,6 +158,11 @@ def main(argv=None):
         help="The jobs' memory budget; default: three quarters of the machine's",
     )
     t.add_argument("--dry-run", action="store_true", help="Prepare, then list the jobs to run")
+    t.add_argument(
+        "--take-down",
+        action="store_true",
+        help="When the store has no soundings left, delete everything published at --publish",
+    )
     b = sub.add_parser(
         "benchmark", help="Score a render's depth surface against the surveyed references"
     )
@@ -200,7 +211,21 @@ def main(argv=None):
     if args.command == "tiles":
         # Prepare opens the store itself; the jobs read a frozen copy of its catalog.
         memory = int(args.memory_gb * 1024) if args.memory_gb else None
-        return tiles.build(open_objects(args.store), args.out, args.cores, memory, args.dry_run)
+        if args.take_down and not args.publish:
+            p.error("--take-down needs --publish")
+        # A dry run publishes nothing, so needs no credentials for it.
+        target = open_objects(args.publish) if args.publish and not args.dry_run else None
+        if target and clashes(target.url, open_objects(args.store).url, args.out):
+            p.error("--publish must be a place of its own, apart from --store and --out")
+        return tiles.build(
+            open_objects(args.store),
+            args.out,
+            args.cores,
+            memory,
+            args.dry_run,
+            target,
+            args.take_down,
+        )
     alert = False
     with open_store(
         open_objects(args.store), write=args.command not in ("stats", "overlay", "benchmark")
@@ -268,6 +293,15 @@ def main(argv=None):
                 print(*row, sep="\t")
     # Held withdrawals, incomplete listings, unreadable files and unknown keys need an operator.
     return 2 if alert else 0
+
+
+def clashes(publish: str, store: str, run: Path) -> bool:
+    """Whether a publish target holds or sits in the store or the run directory."""
+    if publish.startswith("s3://"):
+        return publish.startswith(store) or store.startswith(publish)
+    at = Path(publish).resolve()
+    others = [run.resolve()] + ([] if store.startswith("s3://") else [Path(store).resolve()])
+    return any(at == o or at in o.parents or o in at.parents for o in others)
 
 
 def show_cache(prune):
