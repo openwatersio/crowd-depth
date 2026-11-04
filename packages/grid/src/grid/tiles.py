@@ -766,8 +766,12 @@ def machine():
     return cores, mb
 
 
-def build(store, run: Path, cores=None, memory_mb=None, dry_run=False) -> int:
-    """Prepare `run` from the store and rebuild what moved. Returns Snakemake's exit code."""
+def build(
+    store, run: Path, cores=None, memory_mb=None, dry_run=False, publish_to=None, take_down=False
+) -> int:
+    """Prepare `run` from the store and rebuild what moved, then publish it to `publish_to`
+    (an object store) if every job succeeded; with `take_down`, a store with no soundings
+    left unpublishes everything. Returns Snakemake's exit code."""
     run = run.resolve()
     run.mkdir(parents=True, exist_ok=True)
     with open(run / ".lock", "w") as lock:
@@ -778,15 +782,29 @@ def build(store, run: Path, cores=None, memory_mb=None, dry_run=False) -> int:
         except BlockingIOError:
             raise RuntimeError(f"another `grid tiles` run is using {run}") from None
         with terminating():
-            return run_locked(store, run, cores, memory_mb, dry_run)
+            return run_locked(store, run, cores, memory_mb, dry_run, publish_to, take_down)
 
 
-def run_locked(store, run, cores, memory_mb, dry_run):
+def run_locked(store, run, cores, memory_mb, dry_run, publish_to=None, take_down=False):
+    # Published under the run directory's lock: no other run may change the files while
+    # they go up.
+    def send():
+        if publish_to is not None and not dry_run:
+            from .publish import publish
+
+            print(json.dumps(publish(run, publish_to)), flush=True)
+
     prepared = prepare(store, run)
     print(json.dumps(prepared), flush=True)
     if not prepared["tiles"]:
         # Every tile's soundings withdrawn: prepare removed what they were published in.
-        raise RuntimeError("nothing to tile: the store has no active soundings")
+        # Taking down what went out waits for an operator to say so: a catalog read empty
+        # by mistake would take it down too.
+        if take_down and publish_to is not None and not dry_run:
+            send()
+            return 0
+        hint = "; --take-down unpublishes what went out" if publish_to is not None else ""
+        raise RuntimeError("nothing to tile: the store has no active soundings" + hint)
     # The machine's cores, and three quarters of its memory, by default: what runs beside
     # the jobs needs the rest.
     cores = cores or machine()[0]
@@ -815,7 +833,10 @@ def run_locked(store, run, cores, memory_mb, dry_run):
         ]
         if dry_run:
             cmd.append("--dry-run")
-        return subprocess.run(cmd, check=False).returncode
+        status = subprocess.run(cmd, check=False).returncode
+    if status == 0:
+        send()
+    return status
 
 
 @contextlib.contextmanager
