@@ -21,7 +21,7 @@ Details are in [store-layout.md](store-layout.md), [qc-functions.md](qc-function
 Chesapeake takes 1 h 53 m serially and 81 min with 4 workers on a shared laptop. Its limits:
 
 - **A daily run costs about 75% of a full rebuild.** Over the last 30 arrival days, the 3–15 tiles touched each day held 47–86% of all soundings (median 76%).
-- **Memory.** Surfaces peak at 3–4.5 GB, past the 2 GB budget per work unit. Full-tile rasters alone take about 1.7 GB.
+- **Memory.** Surfaces peaked at 3–4.5 GB in that measurement, past the 2 GB budget per work unit, full-tile rasters alone about 1.7 GB. A surface now works only the blocks with data and runs in a 2 GB cgroup ([per-tile-pipeline.md](per-tile-pipeline.md#measured-with-snakemake)).
 - **Seams.** Coverage stops at a tile edge on one side in 28% of samples, and depth bands disagree across an edge in 9.4%. A single global run draws the same seams, so they come from the per-tile surface, not from the split.
 
 ## Current design
