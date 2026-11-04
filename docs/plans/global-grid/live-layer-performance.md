@@ -1,8 +1,8 @@
 # Live layer performance
 
-The "My soundings" layer ([live-layer.md](live-layer.md)) is slow to fill a view and heavy for a Raspberry Pi and the plotter that draws it. Most of the cost is two things. The plugin rebuilds each tile's depth surface from the cells every time the tile is asked for, and the zoom-13 to 15 tiles it sends carry far more geometry than a screen can show. This note measures both, reviews what upstream signalk-livedepth-plugin has done since we adapted it, and proposes a staged plan. Stage 1 alone should make tiles about half the size, and somewhat faster to build: 12% measured, perhaps a quarter.
+The "My soundings" layer ([live-layer.md](live-layer.md)) is slow to fill a view and heavy for a Raspberry Pi and the plotter that draws it. Most of the cost is two things. The plugin rebuilds each tile's depth surface from the cells every time the tile is asked for, and the zoom-13 to 15 tiles it sends carry far more geometry than a screen can show. This note measures both, reviews what upstream signalk-livedepth-plugin has done since we adapted it, and proposes a staged plan. The measurements describe the layer before stage 1; [Stage 1 results](#stage-1-results) measures what it changed.
 
-## How the layer works today
+## How the layer worked before stage 1
 
 - **Server:** the plugin folds each pass into its cells in SQLite (`src/tiles/writer.ts`, `cells.ts`). Tiles are built on request on a pool of up to three worker threads (`service.ts`, `tile-worker.ts`). Each build runs these steps:
   - reads the cells under the tile and a 364 m margin;
@@ -100,7 +100,7 @@ The plotter is idle between refreshes. Each refresh, every 30 s while the boat m
 
 Two smaller client costs:
 
-- **Polling doesn't stop in a background tab.** The runtime polls `/live` every 2 s while the overlay is shown, 1,800 requests an hour, because it only listens to `overlay.state`, not to the page's visibility. Browsers throttle timers in hidden tabs, Chromium to about once a minute after five minutes, so a background tab costs less than that, but never nothing. Freeboard's own `suspended` flag marks an overlay over its budget, not a hidden tab. The runtime's `fetch` and host calls also have no timeout, and a call that never settles leaves the `busy` flag set, so polling stops for good.
+- **Polling doesn't stop in a background tab.** The runtime polls `/live` every 2 s while the overlay is shown, 1,800 requests an hour, because it only listens to `overlay.state`, not to the page's visibility. Browsers throttle timers in hidden tabs, Chromium to about once a minute after five minutes, so a background tab costs less than that, but never nothing. Freeboard's own `suspended` flag marks an overlay over its budget, not a hidden tab. The runtime's `fetch` also has no timeout, and one that never settles leaves the `busy` flag set, so polling stops for good. Host calls time out after the bus's default of 10 s.
 - **Provisional soundings are resent in full.** Each poll that changes them sends up to 2,000 provisional soundings with `overlay.setData`, rather than the few that came or went.
 
 ### Memory on the server
@@ -121,19 +121,19 @@ Upstream has kept the client-side design we left behind, `overlays.image` with a
 
 Code commits since `10b0a0d`, through `08954bd` (0.3.18, 2026-11-02):
 
-| Commit    | What                                                                                                                                                                                                                                                                    | Perf | For us                                                                                       |
-| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- | -------------------------------------------------------------------------------------------- |
-| `909a5a8` | Caches shoal and cluster aggregation per data version. Patches the IDW field in place and re-uploads only the changed rectangle. Scales surface quality to a 10 ms frame budget. Drops the forced 2× pixel ratio.                                                       | yes  | Only with an image renderer                                                                  |
-| `174a7a9` | Caches the rendered surface and overlay as bitmaps, keyed on field version, box, size and settings                                                                                                                                                                      | yes  | Only with an image renderer                                                                  |
-| `ecbb4bd` | Reuses the output canvas, which had been a fresh 13 MB one each frame, and renders 25% past the view to crop on pan                                                                                                                                                     | yes  | Only with an image renderer                                                                  |
-| `95c1308` | Fetches tiles for a padded box and skips refetching and rebuilding while the view stays in it                                                                                                                                                                           | yes  | Only with an image renderer; Freeboard fetches our tiles                                     |
-| `4c63f7e` | Pads by 10%, matching Freeboard's overlay margin                                                                                                                                                                                                                        | yes  | Only with an image renderer                                                                  |
-| `b360ec8` | Pauses timers, fetches and the frame cycle while the tab is hidden                                                                                                                                                                                                      | yes  | **Yes**: our runtime polls in a hidden tab (see above)                                       |
-| `ab5cec7` | Recovers from WebGL context loss; a 4 s watchdog on a stalled worker                                                                                                                                                                                                    | no   | The watchdog idea: our runtime's `busy` flag waits forever on a host call that never settles |
-| `f1e6391` | Re-registers the plotter extension provider on every plugin start                                                                                                                                                                                                       | no   | Already so: our `provider.ts` registers on every start                                       |
-| `1249930` | Offers tide-compensated depth paths as sources                                                                                                                                                                                                                          | no   | A product call; the plugin does its own tide reduction                                       |
-| `184fd39` | Versions the render worker's URL against stale caches                                                                                                                                                                                                                   | no   | Marginal: our runtime is served to revalidate                                                |
-| Others    | Soundings from every vessel (`248793b`); a transducer offset sign (`3a868b7`); a nearby vessel's implausible depth (`c00f606`); linear fill, vector contours, palette, clusters and settings UI (10-23/24); tiles as the only source (`c546285`); docs, CI and releases | no   | No                                                                                           |
+| Commit    | What                                                                                                                                                                                                                                                                    | Perf | For us                                                                                   |
+| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- | ---------------------------------------------------------------------------------------- |
+| `909a5a8` | Caches shoal and cluster aggregation per data version. Patches the IDW field in place and re-uploads only the changed rectangle. Scales surface quality to a 10 ms frame budget. Drops the forced 2× pixel ratio.                                                       | yes  | Only with an image renderer                                                              |
+| `174a7a9` | Caches the rendered surface and overlay as bitmaps, keyed on field version, box, size and settings                                                                                                                                                                      | yes  | Only with an image renderer                                                              |
+| `ecbb4bd` | Reuses the output canvas, which had been a fresh 13 MB one each frame, and renders 25% past the view to crop on pan                                                                                                                                                     | yes  | Only with an image renderer                                                              |
+| `95c1308` | Fetches tiles for a padded box and skips refetching and rebuilding while the view stays in it                                                                                                                                                                           | yes  | Only with an image renderer; Freeboard fetches our tiles                                 |
+| `4c63f7e` | Pads by 10%, matching Freeboard's overlay margin                                                                                                                                                                                                                        | yes  | Only with an image renderer                                                              |
+| `b360ec8` | Pauses timers, fetches and the frame cycle while the tab is hidden                                                                                                                                                                                                      | yes  | **Yes**: our runtime polls in a hidden tab (see above)                                   |
+| `ab5cec7` | Recovers from WebGL context loss; a 4 s watchdog on a stalled worker                                                                                                                                                                                                    | no   | The watchdog idea: our runtime's `busy` flag waits forever on a fetch that never settles |
+| `f1e6391` | Re-registers the plotter extension provider on every plugin start                                                                                                                                                                                                       | no   | Already so: our `provider.ts` registers on every start                                   |
+| `1249930` | Offers tide-compensated depth paths as sources                                                                                                                                                                                                                          | no   | A product call; the plugin does its own tide reduction                                   |
+| `184fd39` | Versions the render worker's URL against stale caches                                                                                                                                                                                                                   | no   | Marginal: our runtime is served to revalidate                                            |
+| Others    | Soundings from every vessel (`248793b`); a transducer offset sign (`3a868b7`); a nearby vessel's implausible depth (`c00f606`); linear fill, vector contours, palette, clusters and settings UI (10-23/24); tiles as the only source (`c546285`); docs, CI and releases | no   | No                                                                                       |
 
 No upstream commit touches the server's tile or store cost. Upstream's performance work all goes to keeping a client renderer cheap per frame, and going back to one would mean doing our surface, portrayal and statistic work in every plotter's browser. Only the hidden-tab pause carries over as is. We take no upstream code in this plan, so [THIRD_PARTY_NOTICES.md](../../../packages/signalk-plugin/THIRD_PARTY_NOTICES.md) stays as it is; adopting `b360ec8` would mean writing our own listener, not copying it.
 
@@ -190,18 +190,52 @@ A tile could also carry only the user's unit's contours, which would take off ab
 
 Do A, B's small parts, and E's small parts first. They're local changes that need no new storage, and together they halve what a plotter draws and take an eighth to a quarter off what the Pi computes per tile. Then C, which bounds memory and makes views after a restart free. Measure on a Pi before D, which is the large one. Propose the Freeboard change in parallel. Leave F and G.
 
-| Stage | Change                                                                                | Expected                                                                                                                            |
-| ----- | ------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| 1     | Simplify to half a pixel, finer at zoom 15; coarser coverage                          | z13 view vertices about −55% and bytes −45% (measured, simplification alone), less at z15; client stall and heap down in proportion |
-| 1     | Early-stopping neighbour search; typed arrays in `surface()`                          | Tile build −12% measured, perhaps −25% with typed arrays                                                                            |
-| 1     | Runtime: pause while hidden; timeouts on fetches and host calls; provisional upserts  | No polling from background tabs; no stuck runtime                                                                                   |
-| 2     | Tile cache bounded by bytes; encoded tiles persisted in SQLite, versioned             | Plugin memory bounded at tens of MB; restarts don't rebuild                                                                         |
-| 2     | Contours of one unit per tile, once Freeboard's fetching of hidden sources is checked | Another 9 to 29% of vertices                                                                                                        |
-| 2     | Latitude-sized rasters, if seams can be held                                          | Surface −45% at 37° N, more further north                                                                                           |
-| 3     | Incremental zoom 14 surfaces, with zoom 13 and below assembled from them              | A refresh rebuilds a pass's neighbourhood, not whole tiles; to be measured on a Pi first                                            |
-| —     | Freeboard: `overlay.refresh` re-keys only the tiles it names                          | No redraw of the whole layer per refresh; refresh every few seconds instead of every 30                                             |
+| Stage | Change                                                                                | Expected                                                                                                                |
+| ----- | ------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| 1     | Simplify to half a pixel, finer at zoom 15; coarser coverage                          | Done, but coverage is simplified as lines, not traced coarser: z13 view vertices −42% and bytes −34%, z15 −17% and −13% |
+| 1     | Early-stopping neighbour search; typed arrays in `surface()`                          | The search is done, byte-identical; typed arrays are not, and carry over to stage 2                                     |
+| 1     | Runtime: pause while hidden; timeouts on fetches and host calls; provisional upserts  | Done: no polling from background tabs; no stuck runtime                                                                 |
+| 2     | Tile cache bounded by bytes; encoded tiles persisted in SQLite, versioned             | Plugin memory bounded at tens of MB; restarts don't rebuild                                                             |
+| 2     | Contours of one unit per tile, once Freeboard's fetching of hidden sources is checked | Another 9 to 29% of vertices                                                                                            |
+| 2     | Latitude-sized rasters, if seams can be held                                          | Surface −45% at 37° N, more further north                                                                               |
+| 3     | Incremental zoom 14 surfaces, with zoom 13 and below assembled from them              | A refresh rebuilds a pass's neighbourhood, not whole tiles; to be measured on a Pi first                                |
+| —     | Freeboard: `overlay.refresh` re-keys only the tiles it names                          | No redraw of the whole layer per refresh; refresh every few seconds instead of every 30                                 |
 
 Rendering changes in stage 1 and 2 come with before-and-after screenshots on real data, as any change to how tiles render does.
+
+## Stage 1 results
+
+Stage 1 changes four things:
+
+- **Simplification:** contours and coverage are simplified to half a screen pixel of a 256-pixel tile, 8 units, and depth areas to an eighth, 2 units, since neighbouring bands simplify their shared edge apart and on a steep slope the gap shows as a light seam. Zoom 15 tiles take a quarter of each, never under a unit. A closed contour or polygon that would collapse, such as a loop round a small shoal or a lone pass's coverage, is kept to within a unit.
+- **Neighbour search:** buckets are visited nearest first, and the search stops once none left can hold a nearer cell than the 12th found. With the old simplification, the hashes of 348 tiles, zooms 10 to 15 at both details on both stores below, matched those built before it, and a test checks it against a full search.
+- **Runtime:** it polls only while the overlay is drawn and the tab is showing, gives up a fetch after 10 s, and sends provisional soundings as upserts and removals by id, in full when it starts polling and with each tile refresh.
+- **Encoding:** a polygon whose outer ring collapses takes its holes with it.
+
+`scripts/bench-view.mjs`, before and after, on the same laptop. "Synthetic" is the 1.48M-cell store above; "real" is 300,212 cells folded by the plugin's backfill writer from one vessel's 5.2M NOAA CSB soundings in the Chesapeake, 2025 to 2026, viewed where it has the most cells:
+
+| View of 20 tiles        |           Vertices |                   Bytes |
+| ----------------------- | -----------------: | ----------------------: |
+| Synthetic z13           | 853k → 494k (−42%) | 1,944 → 1,274 KB (−34%) |
+| Synthetic z14           | 435k → 224k (−49%) |   1,010 → 629 KB (−38%) |
+| Synthetic z15           | 254k → 211k (−17%) |     610 → 533 KB (−13%) |
+| Synthetic z13, Standard | 416k → 223k (−46%) |     928 → 570 KB (−39%) |
+| Real z13                | 273k → 148k (−46%) |     639 → 402 KB (−37%) |
+| Real z14                | 253k → 128k (−49%) |     617 → 380 KB (−38%) |
+| Real z15                | 215k → 177k (−18%) |     552 → 479 KB (−13%) |
+
+Build times, the median of three runs, main and stage 1 interleaved under the same load, a load average of 6 to 7 with another job running:
+
+| View of 20 tiles, one thread | Synthetic           | Real                |
+| ---------------------------- | ------------------- | ------------------- |
+| z13                          | 6.9 → 5.0 s (−28%)  | 5.4 → 2.0 s (−64%)  |
+| z14                          | 2.7 → 1.9 s (−28%)  | 4.3 → 1.4 s (−68%)  |
+| z15                          | 1.6 → 1.2 s (−22%)  | 2.6 → 1.1 s (−57%)  |
+| Zoomed in from 13 to 15      | 11.2 → 8.1 s (−28%) | 12.4 → 4.5 s (−64%) |
+
+The real store gains far more than the synthetic one. A boat sounding once a second leaves dense tracks, where the search stops early almost everywhere; the synthetic lanes are sounded every 10 s.
+
+The vertex cut is less than the prototype's −55% because depth areas, a third of the vertices, are simplified a quarter as far, and collapsing loops are kept. Zoom 15 gains least, at a quarter of the tolerance.
 
 ## Numbers from a Pi
 

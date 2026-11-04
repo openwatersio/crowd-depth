@@ -35,8 +35,8 @@ test("refreshes are batched, and soundings stay drawn until their tiles land", (
       [15, 1, 2],
     ],
   });
-  expect(refreshed.upsert).toBeUndefined();
-  expect(refreshed.remove).toBeUndefined();
+  // With the refresh, every sounding, in case the host lost them.
+  expect(refreshed.data).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }]);
   batch.taken();
   // A poll later its tile has loaded, so sounding 1 goes.
   t = 33_000;
@@ -118,4 +118,17 @@ test("a fetch that fails while the host holds the soundings keeps sending change
   // The next fetch failed: nothing was offered, so the host still holds 1 and 2.
   batch.failed();
   expect(batch.next(live(2, [2]))).toEqual({ remove: [1] });
+});
+
+test("after a pause, every sounding is sent again, even past a poll in flight", () => {
+  const batch = createBatch(30_000, () => 0);
+  batch.next(live(1, [1, 2]));
+  batch.taken();
+  expect(batch.next(live(2, [1, 2, 3]))).toEqual({ upsert: [{ id: 3 }] });
+  // Polling stopped and resumed while that answer was in flight.
+  batch.resend();
+  batch.taken();
+  expect(batch.next(live(2, [1, 2, 3]))).toEqual({
+    data: [{ id: 1 }, { id: 2 }, { id: 3 }],
+  });
 });

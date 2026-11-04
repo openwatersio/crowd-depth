@@ -250,12 +250,6 @@ export function surface(
     sigma: cellSigma(s.cell),
   }));
 
-  // The source in each pixel, for the search.
-  const bucket = new Int32Array(size * size).fill(-1);
-  sources.forEach((s, j) => {
-    bucket[Math.floor(s.y) * size + Math.floor(s.x)] = j;
-  });
-
   // Zoomed out, a pixel is wider than the radius; it still sees every cell inside it.
   const searchM = Math.max(RADIUS_M, pm * Math.SQRT1_2);
   const reach = Math.ceil(searchM / pm);
@@ -274,74 +268,16 @@ export function surface(
       }
     }
   }
-  // The buckets within reach, nearest first by how close to a pixel's centre a cell in
-  // each can be: once MAX_POINTS are found, the search stops at the first bucket that
-  // can't hold one nearer than the last of them. Dense water stops early; between
-  // tracks, the whole radius is still searched.
-  const r2 = searchM * searchM;
-  // More than the rounding of a squared distance in metres, so no bucket that could
-  // hold a nearer cell is passed over.
-  const EPS = 1e-6;
-  const offsets: { ox: number; oy: number; d2: number }[] = [];
-  for (let oy = -reach; oy <= reach; oy++) {
-    for (let ox = -reach; ox <= reach; ox++) {
-      const gx = Math.max(0, Math.abs(ox) - 0.5) * pm;
-      const gy = Math.max(0, Math.abs(oy) - 0.5) * pm;
-      const d2 = gx * gx + gy * gy;
-      if (d2 - EPS <= r2) offsets.push({ ox, oy, d2 });
-    }
-  }
-  offsets.sort((a, b) => a.d2 - b.d2);
-  // The nearest found so far, at most MAX_POINTS, in the order a full search sorted
-  // them: by distance, then by bucket, row by row. So the sums and ties come out the
-  // same, and so do the tiles.
-  const nearest: {
-    s: Source;
-    d2: number;
-    dx: number;
-    dy: number;
-    b: number;
-  }[] = [];
+  const search = nearestSearch(sources, size, pm, searchM, MAX_POINTS);
+  const nearest: Neighbour[] = [];
   for (let py = 0; py < size; py++) {
     for (let px = 0; px < size; px++) {
       const i = py * size + px;
       if (!candidates[i]) continue;
-      const cx = px + 0.5;
-      const cy = py + 0.5;
-      nearest.length = 0;
-      for (const o of offsets) {
-        if (
-          nearest.length === MAX_POINTS &&
-          o.d2 - EPS > nearest[MAX_POINTS - 1].d2
-        ) {
-          break;
-        }
-        const by = py + o.oy;
-        const bx = px + o.ox;
-        if (by < 0 || by >= size || bx < 0 || bx >= size) continue;
-        const b = by * size + bx;
-        const j = bucket[b];
-        if (j < 0) continue;
-        const s = sources[j];
-        const dx = (s.x - cx) * pm;
-        const dy = (s.y - cy) * pm;
-        const d2 = dx * dx + dy * dy;
-        if (d2 > r2) continue;
-        let k = nearest.length;
-        while (
-          k > 0 &&
-          (nearest[k - 1].d2 > d2 ||
-            (nearest[k - 1].d2 === d2 && nearest[k - 1].b > b))
-        ) {
-          k--;
-        }
-        if (k >= MAX_POINTS) continue;
-        nearest.splice(k, 0, { s, d2, dx, dy, b });
-        if (nearest.length > MAX_POINTS) nearest.pop();
-      }
+      search(px, py, nearest);
       if (nearest.length === 0) continue;
       near[i] = Math.sqrt(nearest[0].d2);
-      nearSigma[i] = nearest[0].s.sigma;
+      nearSigma[i] = sources[nearest[0].j].sigma;
       // Between tracks, the grid's rule: three cells or more, one in each quadrant. A
       // pixel the boat sounded keeps a depth whatever surrounds it, so its own track
       // draws as areas, not only soundings.
@@ -358,7 +294,7 @@ export function surface(
       for (const f of nearest) {
         const w = 1 / (f.d2 + SMOOTHING_M * SMOOTHING_M);
         sw += w;
-        swm += w * f.s.m;
+        swm += w * sources[f.j].m;
       }
       median[i] = swm / sw;
     }
@@ -440,6 +376,84 @@ export function surface(
     shoalest,
     shoal,
     wet,
+  };
+}
+
+/** One of a pixel's nearest sources: its index, its squared distance and offset in
+ * metres, and the pixel it's in. */
+export interface Neighbour {
+  j: number;
+  d2: number;
+  dx: number;
+  dy: number;
+  b: number;
+}
+
+/**
+ * A search for the `max` nearest of `points`, at most one in each pixel of a raster
+ * `size` a side, within `searchM` metres of a pixel's centre, `pm` metres a pixel. It
+ * fills `out` in the order a full search sorts them: by distance, then by pixel, row by
+ * row, so the sums and ties that follow come out the same.
+ *
+ * It visits the pixels within reach nearest first, by how close to the centre a point
+ * in each can be, and stops at the first that can't hold one nearer than the `max`-th
+ * found: dense water stops early; between tracks, the whole radius is still searched.
+ */
+export function nearestSearch(
+  points: { x: number; y: number }[],
+  size: number,
+  pm: number,
+  searchM: number,
+  max: number,
+): (px: number, py: number, out: Neighbour[]) => void {
+  const bucket = new Int32Array(size * size).fill(-1);
+  points.forEach((s, j) => {
+    bucket[Math.floor(s.y) * size + Math.floor(s.x)] = j;
+  });
+  const reach = Math.ceil(searchM / pm);
+  const r2 = searchM * searchM;
+  // More than the rounding of a squared distance in metres, so no pixel that could hold
+  // a nearer point is passed over.
+  const EPS = 1e-6;
+  const offsets: { ox: number; oy: number; d2: number }[] = [];
+  for (let oy = -reach; oy <= reach; oy++) {
+    for (let ox = -reach; ox <= reach; ox++) {
+      // A point in a pixel `ox` across is at least |ox| - 0.5 pixels from the centre.
+      const gx = Math.max(0, Math.abs(ox) - 0.5) * pm;
+      const gy = Math.max(0, Math.abs(oy) - 0.5) * pm;
+      const d2 = gx * gx + gy * gy;
+      if (d2 - EPS <= r2) offsets.push({ ox, oy, d2 });
+    }
+  }
+  offsets.sort((a, b) => a.d2 - b.d2);
+  return (px, py, out) => {
+    const cx = px + 0.5;
+    const cy = py + 0.5;
+    out.length = 0;
+    for (const o of offsets) {
+      if (out.length === max && o.d2 - EPS > out[max - 1].d2) break;
+      const by = py + o.oy;
+      const bx = px + o.ox;
+      if (by < 0 || by >= size || bx < 0 || bx >= size) continue;
+      const b = by * size + bx;
+      const j = bucket[b];
+      if (j < 0) continue;
+      const s = points[j];
+      const dx = (s.x - cx) * pm;
+      const dy = (s.y - cy) * pm;
+      const d2 = dx * dx + dy * dy;
+      if (d2 > r2) continue;
+      let k = out.length;
+      while (
+        k > 0 &&
+        (out[k - 1].d2 > d2 || (out[k - 1].d2 === d2 && out[k - 1].b > b))
+      ) {
+        k--;
+      }
+      if (k >= max) continue;
+      out.splice(k, 0, { j, d2, dx, dy, b });
+      if (out.length > max) out.pop();
+    }
   };
 }
 

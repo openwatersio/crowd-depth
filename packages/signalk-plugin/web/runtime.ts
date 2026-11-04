@@ -17,13 +17,13 @@ import { createBatch, type Live } from "./batch.js";
 const overlayId = "depth";
 const POLL_MS = 2000;
 const REFRESH_MS = 30_000;
-/** How long a poll or a host call may take before it's given up, and the next poll
- * tries again. */
+/** How long a poll may take before it's given up, and the next poll tries again. Host
+ * calls give up after the bus's own default, also 10 s. */
 const TIMEOUT_MS = 10_000;
 const LIVE_URL = "/plotterext/crowd-depth/live";
 const M_PER_FT = 0.3048;
 
-const client = await connectExtension({ callTimeoutMs: TIMEOUT_MS });
+const client = await connectExtension();
 
 let drawn = true;
 let busy = false;
@@ -33,10 +33,13 @@ const batch = createBatch(REFRESH_MS);
 async function poll(): Promise<void> {
   if (busy) return;
   busy = true;
+  // Not `AbortSignal.timeout`, which Safari before 16 lacks.
+  const abort = new AbortController();
+  const timeout = setTimeout(() => abort.abort(), TIMEOUT_MS);
   try {
     const res = await fetch(`${LIVE_URL}?since=${batch.rev}`, {
       credentials: "include",
-      signal: AbortSignal.timeout(TIMEOUT_MS),
+      signal: abort.signal,
     });
     if (!res.ok) return;
     const { refresh, data, upsert, remove } = batch.next(
@@ -69,6 +72,7 @@ async function poll(): Promise<void> {
     // poll tries again.
     batch.failed();
   } finally {
+    clearTimeout(timeout);
     busy = false;
   }
 }
@@ -78,6 +82,8 @@ async function poll(): Promise<void> {
 function schedule(): void {
   const active = drawn && document.visibilityState === "visible";
   if (active && !timer) {
+    // The host may have dropped the soundings while the overlay was off.
+    batch.resend();
     timer = setInterval(() => void poll(), POLL_MS);
     void poll();
   } else if (!active && timer) {

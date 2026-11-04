@@ -464,21 +464,24 @@ export function polygons(
       crop[y * cw + x] = field[(y + y0) * m + x + x0];
   }
   const [shape] = contours().size([cw, ch]).thresholds([0])(crop);
-  return shape.coordinates.map((poly) =>
-    poly.map((ring) =>
-      simplifyRing(
-        ring.map(([x, y]) => [t.toTile(x + x0), t.toTile(y + y0)] as Point),
-        tolerance,
-      ),
-    ),
-  );
+  return shape.coordinates.map((poly) => {
+    const rings = poly.map((ring) =>
+      ring.map(([x, y]) => [t.toTile(x + x0), t.toTile(y + y0)] as Point),
+    );
+    // One narrower than the tolerance, as a lone pass's coverage, would collapse, so
+    // it's kept within a unit.
+    const simplified = rings.map((r) => simplifyRing(r, tolerance));
+    return distinct(simplified[0]) >= 3
+      ? simplified
+      : rings.map((r) => simplifyRing(r, 1));
+  });
 }
 
 /**
  * The contours at each of `levels`, in metres, within the extent, as lines in tile
  * coordinates, simplified to within `tolerance` tile units; in one pass over the samples. Each
- * crosses where its distance does, as the bands' edges do, so a contour lies on the edge
- * its bands share.
+ * crosses where its distance does, as the bands' edges do, so as traced a contour lies on
+ * the edge its bands share; simplified, within `tolerance` of it.
  */
 export function isolines(
   t: Traced,
@@ -578,22 +581,26 @@ export function isolines(
       join(s)
         .map((line) => {
           const [a, b] = [line[0], line[line.length - 1]];
-          // A closed contour's ends meet: simplified as a ring.
-          return a[0] === b[0] && a[1] === b[1]
-            ? simplifyRing(line, tolerance)
-            : simplify(line, tolerance);
+          if (a[0] !== b[0] || a[1] !== b[1]) return simplify(line, tolerance);
+          // A closed contour's ends meet: simplified as a ring. One round a shoal
+          // narrower than the tolerance would collapse, so it's kept within a unit.
+          const ring = simplifyRing(line, tolerance);
+          return distinct(ring) > 2 ? ring : simplifyRing(line, 1);
         })
         // A loop round a single sample rounds to a point, or a line to a dot: not
         // drawn. A straight line simplifies to its two ends, and is.
         .filter((line) => {
           const [a, b] = [line[0], line[line.length - 1]];
           const closed = a[0] === b[0] && a[1] === b[1];
-          return (
-            new Set(line.map(([x, y]) => `${x},${y}`)).size > (closed ? 2 : 1)
-          );
+          return distinct(line) > (closed ? 2 : 1);
         }),
     ]),
   );
+}
+
+/** How many different points a line has. */
+function distinct(line: Point[]): number {
+  return new Set(line.map(([x, y]) => `${x},${y}`)).size;
 }
 
 /** Join segments that share ends into lines. */

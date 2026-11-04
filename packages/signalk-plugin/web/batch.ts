@@ -84,7 +84,9 @@ export function createBatch(refreshMs: number, now = () => Date.now()) {
         [...shown].map(([id, f]) => [id, JSON.stringify(f)]),
       );
       offered = json;
-      if (!held) return { refresh, data: [...shown.values()] };
+      // In full with each refresh too, which redraws the whole layer anyway: if the
+      // host has lost them unannounced, they're back within a refresh.
+      if (!held || refresh) return { refresh, data: [...shown.values()] };
       const upsert = [...shown.values()].filter(
         (f) => held!.get(f.id) !== json.get(f.id),
       );
@@ -103,6 +105,12 @@ export function createBatch(refreshMs: number, now = () => Date.now()) {
     taken() {
       lastAsked = undefined;
       if (offered) held = offered;
+      offered = undefined;
+    },
+    /** Send every sounding next time, not what changed: the host may not hold them. */
+    resend() {
+      held = undefined;
+      // Nor what a poll still in flight offers.
       offered = undefined;
     },
     /** The host didn't take the last answer: ask for its refresh again, and send every
