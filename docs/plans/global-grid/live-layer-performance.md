@@ -268,7 +268,7 @@ The real store gains less than the synthetic one; 11 of its view's 20 tiles have
 | z13 view after a restart                | 1.90 s → 0 s              | 0.74 s → 0 s          |
 | z14 and z15 views after a restart       | 0.73 and 0.45 s → 0 s     | 0.53 and 0.47 s → 0 s |
 
-So the cache is bounded, and a restart builds nothing it has built before, but for tiles under soundings the restart's backfill finds, and round overview blocks whose cells tie for shoalest: the live writer keeps the latest of them, and the backfill's closing rebuild the first. But it was never most of the plugin's memory. Resident memory rose from 89 MB to 800 to 950 MB within the first 180 tiles, with the main thread's heap at 10 MB: it's the tile threads. Their V8 heaps grow toward the laptop's default limit before collecting the cells and rasters each build allocates. Capping each thread's old generation at 64 or 128 MB with `resourceLimits` brought the synthetic run to about 400 MB, with builds about 18% slower and no thread running out. That's not in this stage: the limit a large tile needs isn't measured, and V8 sizes its default by the machine's memory, so the Pi's own figure comes first.
+So the cache is bounded, and a restart builds nothing it has built before, but for tiles under soundings the restart's backfill finds, and round overview blocks whose cells tie for shoalest: the live writer keeps the latest of them, and the backfill's closing rebuild the first. But it was never most of the plugin's memory. Resident memory rose from 89 MB to 800 to 950 MB within the first 180 tiles, with the main thread's heap at 10 MB: it's the tile threads. Their V8 heaps grow toward the laptop's default limit before collecting the cells and rasters each build allocates. Capping each thread's old generation at 64 or 128 MB with `resourceLimits` brought the synthetic run to about 400 MB, with builds about 18% slower and no thread running out. That's not in this stage: the limit a large tile needs isn't measured, and V8 sizes its default by the machine's memory, so the Pi's own figure came first: see [Stage 2 on the Pi](#stage-2-on-the-pi).
 
 With triggers on them, SQLite deletes a table's rows one at a time rather than at once, so a rebuild's clearing of the synthetic store's cells took 10.6 s, against 1.1 s without. The plugin's `clear()` drops the triggers for the moment, in its transaction, and takes 0.45 s; an older build after a rollback pays the full cost.
 
@@ -299,14 +299,14 @@ node scripts/bench-view.mjs ~/.signalk/plugin-config-data/crowd-depth/bathymetry
 And what the cache holds and costs as a plotter pans, and a restart, on a copy of the database, which this one writes to:
 
 ```bash
-node -e 'new (require("node:sqlite").DatabaseSync)(process.argv[1],{readOnly:true}).exec(`VACUUM INTO "/tmp/bench-copy.sqlite"`)' ~/.signalk/plugin-config-data/crowd-depth/bathymetry.sqlite && node --expose-gc scripts/bench-cache.mjs /tmp/bench-copy.sqlite
+rm -f /tmp/bench-copy.sqlite && node -e 'new (require("node:sqlite").DatabaseSync)(process.argv[1],{readOnly:true}).prepare("VACUUM INTO ?").run(process.argv[2])' ~/.signalk/plugin-config-data/crowd-depth/bathymetry.sqlite /tmp/bench-copy.sqlite && node --expose-gc scripts/bench-cache.mjs /tmp/bench-copy.sqlite
 ```
 
 Along with the Pi's model and memory, these give the factor this note assumes, and a view's cost on the boat's own soundings.
 
 ### First Pi run
 
-The boat's own Pi, model and memory not yet recorded, on the stage 1 build. Its tile sizes match the laptop's stage 1 build to the tenth of a KB, so the two are compared directly. The laptop ran at a load average of 6 to 9 with other work.
+The boat's own Pi, a Raspberry Pi 5 with 8 GB, on the stage 1 build. Its tile sizes match the laptop's stage 1 build to the tenth of a KB, so the two are compared directly. The laptop ran at a load average of 6 to 9 with other work.
 
 `bench-live-layer.mjs 400000`, a store of 431,666 cells:
 
@@ -331,4 +331,43 @@ So a Pi core builds tiles about 5 times slower than the laptop's, not 10 to 15 t
 | z15              |                   12 |             2.1 s | 55 KB |   17,566 |
 | 13 → 15          |                      |             9.6 s |       |          |
 
-The same view on `main` isn't measured yet, so stage 1's gain on the Pi is inferred from the laptop's.
+Stage 1's gain on the Pi is inferred from the laptop's: `main` before it wasn't measured there.
+
+### Stage 2 on the Pi
+
+The same Pi, running its Signal K server alongside at a load average of 1 to 4, with `main` and stage 2 interleaved. Node 24.18.
+
+`bench-live-layer.mjs 400000`, two runs each, main → stage 2:
+
+| What                           |                        Main |                     Stage 2 |
+| ------------------------------ | --------------------------: | --------------------------: |
+| Live writer                    | 1,390 and 1,359 soundings/s | 1,357 and 1,268 soundings/s |
+| Backfill writer                | 4,521 and 5,531 soundings/s | 4,811 and 5,053 soundings/s |
+| Filling the store              | 2,838 and 2,822 soundings/s | 2,786 and 2,787 soundings/s |
+| Cold z13 tile                  |          1,241 and 1,235 ms |              757 and 786 ms |
+| 20 z13 tiles on 3 tile threads |               8.5 and 9.7 s |               5.1 and 5.7 s |
+
+On the Pi the triggers cost the writers little: filling the store is 1 to 2% slower, the live writer 2 to 7%, and the backfill writer's runs overlap. Writing to the SD card, not the triggers, is most of a write's cost there. A zoom 13 view's worth of tiles takes about 5.4 s on the three tile threads, not 9. Other zooms' cold tiles were within 15% either way, run to run.
+
+`bench-view.mjs` on the boat's own store, 373,026 cells, medians of three:
+
+| View of 20 tiles |    Build, one thread |      Bytes |             Vertices |
+| ---------------- | -------------------: | ---------: | -------------------: |
+| z13              | 4.47 → 3.65 s (−18%) | 30 → 28 KB | 8,176 → 7,294 (−11%) |
+| z14              |        2.61 → 2.91 s |      31 KB |                7,995 |
+| z15              |        2.25 → 2.44 s |      55 KB |               17,566 |
+| 13 → 15          |          9.5 → 8.9 s |            |                      |
+
+Zoom 14 and 15 tiles are the same as main's, byte for byte, but built 8 to 12% slower at the median: 2.54 to 2.93 s against 2.58 to 2.82 at zoom 14, and 2.35 to 2.53 against 2.25 to 2.32 at zoom 15. Nothing they run changed; the laptop showed no difference.
+
+`bench-cache.mjs` on a copy of the boat's store, one run each:
+
+| What                                |            Main |                 Stage 2 |
+| ----------------------------------- | --------------: | ----------------------: |
+| Panning 1,080 tiles, zooms 10 to 15 |          41.2 s |                  42.3 s |
+| Kept on disk                        |                 | 1,080 tiles, under 1 MB |
+| Process resident memory, at the end |          490 MB |                  524 MB |
+| z13 view after a restart            |          3.50 s |                     0 s |
+| z14 and z15 views after a restart   | 3.00 and 2.01 s |                     0 s |
+
+Most of the walk is unsounded, so the tiles kept are mostly empty. Resident memory rose from 78 MB to about 380 MB with the first 180 tiles, and to about 500 MB by the end, with the main thread's heap at 10 MB: the tile threads again, though at half the laptop's 800 to 950 MB, since V8 sizes its heaps by the machine. Within 8 GB that's room enough, so stage 2 leaves the threads' heaps unlimited. A 1 or 2 GB Pi, where V8 would size them smaller still, hasn't been measured.
