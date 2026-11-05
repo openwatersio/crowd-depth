@@ -85,7 +85,8 @@ function geometry(feature: Feature): { type: number; commands: number[] } {
     return { type: 2, commands: out };
   }
   for (const rings of feature.polygons) {
-    rings.forEach((ring, i) => {
+    for (let i = 0; i < rings.length; i++) {
+      const ring = rings[i];
       // A closed ring repeats its first point, which MVT leaves to ClosePath.
       const open =
         ring.length > 1 &&
@@ -93,11 +94,15 @@ function geometry(feature: Feature): { type: number; commands: number[] } {
         ring[0][1] === ring[ring.length - 1][1]
           ? ring.slice(0, -1)
           : ring;
-      if (open.length < 3) return;
-      const a = area(open);
-      if (a === 0) return;
+      const a = open.length < 3 ? 0 : area(open);
+      // Simplified to nothing. Without its outer ring, a polygon's holes would read as
+      // the polygon before's.
+      if (a === 0) {
+        if (i === 0) break;
+        continue;
+      }
       path((i === 0) === a > 0 ? open : [...open].reverse(), true);
-    });
+    }
   }
   return { type: 3, commands: out };
 }

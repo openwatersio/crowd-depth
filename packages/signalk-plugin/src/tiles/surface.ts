@@ -60,6 +60,16 @@ const EDGE_M = 0.005;
 const SOUNDINGS_PER_SIDE = 8;
 /** The finest zoom built; clients overzoom past it, as the grid's overlay. */
 export const MAX_ZOOM = 15;
+/** How far a line may move when simplified, in tile units: half a screen pixel of a
+ * 256-pixel tile. Tiles at MAX_ZOOM a quarter of that, since plotters stretch them
+ * past it, where half a pixel at 15 is two at 17. */
+const SIMPLIFY_UNITS = EXTENT / 256 / 2;
+const SIMPLIFY_MAX_ZOOM_UNITS = SIMPLIFY_UNITS / 4;
+/** Depth areas are simplified a quarter as far, and never less than a unit: two bands
+ * share each edge but simplify it apart, and on a steep slope, where bands are thin, the
+ * gap between them shows as a light seam. Coverage, a faint tint, is simplified as far
+ * as lines: where its edge parts from the areas' by half a pixel, it doesn't show. */
+const AREA_SHARE = 1 / 4;
 export const MIN_ZOOM = 4;
 const LEVELS = P.isobaths_m.filter((l) => l <= MAX_AREA_DEPTH_M);
 /** Depths finely drawn reach as deep as this; past it, the chart's isobaths. */
@@ -240,12 +250,6 @@ export function surface(
     sigma: cellSigma(s.cell),
   }));
 
-  // The source in each pixel, for the search.
-  const bucket = new Int32Array(size * size).fill(-1);
-  sources.forEach((s, j) => {
-    bucket[Math.floor(s.y) * size + Math.floor(s.x)] = j;
-  });
-
   // Zoomed out, a pixel is wider than the radius; it still sees every cell inside it.
   const searchM = Math.max(RADIUS_M, pm * Math.SQRT1_2);
   const reach = Math.ceil(searchM / pm);
@@ -264,32 +268,16 @@ export function surface(
       }
     }
   }
-  const found: { s: Source; d2: number; dx: number; dy: number }[] = [];
+  const search = nearestSearch(sources, size, pm, searchM, MAX_POINTS);
+  const nearest: Neighbour[] = [];
   for (let py = 0; py < size; py++) {
     for (let px = 0; px < size; px++) {
       const i = py * size + px;
       if (!candidates[i]) continue;
-      const cx = px + 0.5;
-      const cy = py + 0.5;
-      found.length = 0;
-      for (let by = py - reach; by <= py + reach; by++) {
-        if (by < 0 || by >= size) continue;
-        for (let bx = px - reach; bx <= px + reach; bx++) {
-          if (bx < 0 || bx >= size) continue;
-          const j = bucket[by * size + bx];
-          if (j < 0) continue;
-          const s = sources[j];
-          const dx = (s.x - cx) * pm;
-          const dy = (s.y - cy) * pm;
-          const d2 = dx * dx + dy * dy;
-          if (d2 <= searchM * searchM) found.push({ s, d2, dx, dy });
-        }
-      }
-      if (found.length === 0) continue;
-      found.sort((a, b) => a.d2 - b.d2);
-      const nearest = found.slice(0, MAX_POINTS);
+      search(px, py, nearest);
+      if (nearest.length === 0) continue;
       near[i] = Math.sqrt(nearest[0].d2);
-      nearSigma[i] = nearest[0].s.sigma;
+      nearSigma[i] = sources[nearest[0].j].sigma;
       // Between tracks, the grid's rule: three cells or more, one in each quadrant. A
       // pixel the boat sounded keeps a depth whatever surrounds it, so its own track
       // draws as areas, not only soundings.
@@ -306,7 +294,7 @@ export function surface(
       for (const f of nearest) {
         const w = 1 / (f.d2 + SMOOTHING_M * SMOOTHING_M);
         sw += w;
-        swm += w * f.s.m;
+        swm += w * sources[f.j].m;
       }
       median[i] = swm / sw;
     }
@@ -388,6 +376,84 @@ export function surface(
     shoalest,
     shoal,
     wet,
+  };
+}
+
+/** One of a pixel's nearest sources: its index, its squared distance and offset in
+ * metres, and the pixel it's in. */
+export interface Neighbour {
+  j: number;
+  d2: number;
+  dx: number;
+  dy: number;
+  b: number;
+}
+
+/**
+ * A search for the `max` nearest of `points`, at most one in each pixel of a raster
+ * `size` a side, within `searchM` metres of a pixel's centre, `pm` metres a pixel. It
+ * fills `out` in the order a full search sorts them: by distance, then by pixel, row by
+ * row, so the sums and ties that follow come out the same.
+ *
+ * It visits the pixels within reach nearest first, by how close to the centre a point
+ * in each can be, and stops at the first that can't hold one nearer than the `max`-th
+ * found: dense water stops early; between tracks, the whole radius is still searched.
+ */
+export function nearestSearch(
+  points: { x: number; y: number }[],
+  size: number,
+  pm: number,
+  searchM: number,
+  max: number,
+): (px: number, py: number, out: Neighbour[]) => void {
+  const bucket = new Int32Array(size * size).fill(-1);
+  points.forEach((s, j) => {
+    bucket[Math.floor(s.y) * size + Math.floor(s.x)] = j;
+  });
+  const reach = Math.ceil(searchM / pm);
+  const r2 = searchM * searchM;
+  // More than the rounding of a squared distance in metres, so no pixel that could hold
+  // a nearer point is passed over.
+  const EPS = 1e-6;
+  const offsets: { ox: number; oy: number; d2: number }[] = [];
+  for (let oy = -reach; oy <= reach; oy++) {
+    for (let ox = -reach; ox <= reach; ox++) {
+      // A point in a pixel `ox` across is at least |ox| - 0.5 pixels from the centre.
+      const gx = Math.max(0, Math.abs(ox) - 0.5) * pm;
+      const gy = Math.max(0, Math.abs(oy) - 0.5) * pm;
+      const d2 = gx * gx + gy * gy;
+      if (d2 - EPS <= r2) offsets.push({ ox, oy, d2 });
+    }
+  }
+  offsets.sort((a, b) => a.d2 - b.d2);
+  return (px, py, out) => {
+    const cx = px + 0.5;
+    const cy = py + 0.5;
+    out.length = 0;
+    for (const o of offsets) {
+      if (out.length === max && o.d2 - EPS > out[max - 1].d2) break;
+      const by = py + o.oy;
+      const bx = px + o.ox;
+      if (by < 0 || by >= size || bx < 0 || bx >= size) continue;
+      const b = by * size + bx;
+      const j = bucket[b];
+      if (j < 0) continue;
+      const s = points[j];
+      const dx = (s.x - cx) * pm;
+      const dy = (s.y - cy) * pm;
+      const d2 = dx * dx + dy * dy;
+      if (d2 > r2) continue;
+      let k = out.length;
+      while (
+        k > 0 &&
+        (out[k - 1].d2 > d2 || (out[k - 1].d2 === d2 && out[k - 1].b > b))
+      ) {
+        k--;
+      }
+      if (k >= max) continue;
+      out.splice(k, 0, { j, d2, dx, dy, b });
+      if (out.length > max) out.pop();
+    }
   };
 }
 
@@ -479,6 +545,8 @@ export function buildTile(
   const n = rasterSize(z);
   const t = cut(prepared, (x - (a.x << a.k)) * n, (y - (a.y << a.k)) * n, n);
   const fine = detail === "high" && z >= FINE_ZOOM;
+  const tolerance = z >= MAX_ZOOM ? SIMPLIFY_MAX_ZOOM_UNITS : SIMPLIFY_UNITS;
+  const areaTolerance = Math.max(1, tolerance * AREA_SHARE);
   let shoalest = Infinity;
   let deepest = -Infinity;
   t.extent.forEach((e, i) => {
@@ -493,7 +561,7 @@ export function buildTile(
     // Each edge a few millimetres shoaler than the band's: water at exactly a band's
     // depth, as water capped at a shoal's, is inside it, not on its edge.
     if (hi - EDGE_M <= shoalest || lo - EDGE_M > deepest) continue;
-    const polys = polygons(t, band(t, lo - EDGE_M, hi - EDGE_M));
+    const polys = polygons(t, band(t, lo - EDGE_M, hi - EDGE_M), areaTolerance);
     if (polys.length) {
       DEPARE.push({
         type: "Polygon",
@@ -510,6 +578,7 @@ export function buildTile(
   const traced = isolines(
     t,
     levels.filter((l) => l.m >= shoalest && l.m <= deepest).map((l) => l.m),
+    tolerance,
   );
   for (const level of levels) {
     const lines = traced.get(level.m) ?? [];
@@ -625,6 +694,7 @@ export function buildTile(
   const measured = polygons(
     t,
     t.extent.map((e, i) => Math.min(e, t.measured[i])),
+    tolerance,
   );
   if (measured.length) {
     M_QUAL.push({
@@ -636,6 +706,7 @@ export function buildTile(
   const between = polygons(
     t,
     t.extent.map((e, i) => Math.min(e, -t.measured[i])),
+    tolerance,
   );
   if (between.length) {
     M_QUAL.push({
