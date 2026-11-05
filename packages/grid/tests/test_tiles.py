@@ -54,7 +54,7 @@ def two_tiles(env):  # noqa: F811
 
 def test_resources_grow_with_soundings():
     assert tiles.resources("cells", 50_000) == (512, 1)
-    assert tiles.resources("cells", 5_000_000) == (2304, 2)
+    assert tiles.resources("cells", 5_000_000) == (1792, 2)
     # A surface takes one thread, however dense its tile.
     assert tiles.resources("surface", 30_000_000) == (2304, 1)
     assert tiles.resources("overlay", 30_000_000) == (2560, 4)
@@ -138,6 +138,27 @@ def test_a_relative_store_is_read_from_the_run_directory(env, tmp_path, monkeypa
     monkeypatch.chdir(tmp_path / "run")
     with tiles.open_job(Path("."), [SOUTH]) as con:
         assert con.execute("SELECT count(*) FROM lake.points").fetchone()[0] == 120
+
+
+def test_a_cells_job_gives_duckdb_less_memory_than_the_others(env, tmp_path, monkeypatch):  # noqa: F811
+    two_tiles(env)
+    run = tmp_path / "run"
+    tiles.prepare(env.store, run)
+
+    def setting(con):
+        return con.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+
+    seen = []
+    monkeypatch.setattr(cells, "build", lambda con, _: seen.append(setting(con)))
+    tiles.do_cells(run, SOUTH, 1)
+    with tiles.open_job(run, [SOUTH]) as con:
+        seen.append(setting(con))
+    want = []
+    for limit in (tiles.CELLS_MEMORY_LIMIT, tiles.JOB_MEMORY_LIMIT):
+        con = duckdb.connect()
+        con.execute("SET memory_limit = ?", [limit])
+        want.append(setting(con))
+    assert seen == want and want[0] != want[1]
 
 
 def test_one_run_at_a_time_in_a_run_directory(env, tmp_path):  # noqa: F811

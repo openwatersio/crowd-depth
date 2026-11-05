@@ -1031,6 +1031,54 @@ def test_consensus_widens_where_vessels_disagree(env):  # noqa: F811
     assert consensus(env, [20, 35, 45, 60], [("SLOPE", 70.0)]) == set()
 
 
+@pytest.mark.parametrize("seed", range(20))
+def test_shoals_another_vessel_read_are_those_every_pair_finds(seed):
+    # cells.CORROBORATED checks each shoal against the nearest other vessel's depth on
+    # each side; joining every shoal to every depth in its block finds the same ones.
+    # Depths on a quarter-metre grid land on each other; few vessels make long runs of
+    # one vessel's depths; two tiles share block numbers; a NULL vessel, noisy depths and
+    # shoals left out (hunting, too shallow) are in the mix.
+    rng = random.Random(seed)
+    vessels = ["A", "B", "C", None][: rng.randint(1, 4)]
+    top = rng.choice([40, 800])
+    rows = []
+    for i in range(rng.randint(1, 400)):
+        raw = rng.choice([qc.SHALLOW_M - 0.5] + [qc.SHALLOW_M + 1] * 9)
+        rows.append(
+            (
+                i,
+                rng.randint(1, 2),
+                rng.randint(0, 1),
+                rng.randint(0, 1),
+                rng.randint(0, top) / 4,
+                raw,
+                rng.choice([None, None, None, "noisy"]),
+                rng.random() < 0.1,
+                rng.choice(vessels),
+                rng.random() < 0.3,
+            )
+        )
+    con = duckdb.connect()
+    con.execute(
+        """CREATE TABLE unit_points (point_id INTEGER, tile_id INTEGER, br INTEGER,
+        bc INTEGER, d FLOAT, raw FLOAT, flag VARCHAR, hunting BOOLEAN, vessel VARCHAR,
+        shoal BOOLEAN)"""
+    )
+    con.executemany("INSERT INTO unit_points VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+    shoals = "shoals AS (SELECT * FROM unit_points WHERE shoal)"
+    got = con.execute(
+        f"WITH {shoals}, {cells.CORROBORATED} SELECT point_id FROM corroborated"
+    ).fetchall()
+    every_pair = con.execute(
+        f"""WITH {shoals} SELECT DISTINCT s.point_id FROM shoals s JOIN unit_points o
+        ON o.tile_id = s.tile_id AND o.br = s.br AND o.bc = s.bc
+        AND abs(o.d - s.d) <= 2 + 0.05 * s.d AND o.vessel <> s.vessel
+        WHERE s.raw >= {qc.SHALLOW_M} AND NOT s.hunting AND o.raw >= {qc.SHALLOW_M}
+          AND o.flag IS DISTINCT FROM 'noisy' AND NOT o.hunting"""
+    ).fetchall()
+    assert sorted(got) == sorted(every_pair)
+
+
 @pytest.mark.parametrize(
     "box", ["-76,37,-76,38", "179.5,-1,-179.5,1", "-76,38,-75,37", "-181,37,-179,38", "0,0,inf,1"]
 )

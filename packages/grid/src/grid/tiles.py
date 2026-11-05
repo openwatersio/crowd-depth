@@ -41,8 +41,14 @@ SNAKEFILE = Path(__file__).with_name("Snakefile")
 # The zoom web jobs are cut at: every pyramid level shown at it or past it nests in its
 # tiles, so they are exact; the levels shown below it are reduced in the low job.
 Z = 8
-# DuckDB's budget in each job; the peaks below were measured with it.
+# DuckDB's budget in each job but cells; the peaks below were measured with it.
 JOB_MEMORY_LIMIT = "1200MB"
+# A cells job's, with which its peaks below were measured: what the job holds outside
+# DuckDB's limit stays about 0.7 GB, and DuckDB runs at its limit, spilling the rest.
+# The densest Chesapeake tile's per-pixel medians (cells.sigmas), which can't spill,
+# fit in it; at 800 MB they ran out. Its peaks were measured on OrbStack's VM, where
+# main's read 0.36 GB lower than on Colima's, so its entries keep that much over them.
+CELLS_MEMORY_LIMIT = "1GB"
 # Tables a job writes; everything else is a view over the frozen catalog.
 WRITTEN = ("cells", "qc_flags", "shoals", "cells_built", "store_meta", "tile_changes")
 # Peak memory of a job, Python and the tools it runs, by its tile's active soundings:
@@ -55,7 +61,7 @@ WRITTEN = ("cells", "qc_flags", "shoals", "cells_built", "store_meta", "tile_cha
 # GEOS validates at 1.4 GB, needs 2.2 GB, and the rest of its row 1.3 GB.
 # ponytail: measured on one region; refit once the planet's densest tiles have run
 MEMORY_MB = {
-    "cells": [(100_000, 512), (1_000_000, 1536), (10_000_000, 2304), (None, 2560)],
+    "cells": [(100_000, 512), (1_000_000, 1536), (10_000_000, 1792), (None, 2304)],
     "surface": [(1_000_000, 1792), (None, 2304)],
     "overlay": [(1_000_000, 1536), (None, 2560)],
 }
@@ -285,11 +291,11 @@ def forget(run: Path, tile: int):
 
 
 @contextlib.contextmanager
-def scratch(run: Path, threads=1):
+def scratch(run: Path, threads=1, memory_limit=JOB_MEMORY_LIMIT):
     """A connection with an empty in-memory `lake`, for a job's work."""
     data_url = (run / "data_url").read_text().strip()
     with tempfile.TemporaryDirectory(dir=os.environ.get("GRID_TEMP_DIR") or None) as spill:
-        con = catalog.session(data_url, spill, JOB_MEMORY_LIMIT)
+        con = catalog.session(data_url, spill, memory_limit)
         try:
             con.execute("SET threads = ?", [threads])
             con.execute("ATTACH ':memory:' AS lake")
@@ -301,30 +307,31 @@ def scratch(run: Path, threads=1):
 
 
 @contextlib.contextmanager
-def snapshot(run: Path, alias="store", threads=1):
+def snapshot(run: Path, alias="store", threads=1, memory_limit=None):
     """A connection with the run's frozen catalog attached read-only as `alias`; as `store`,
-    beside an empty in-memory `lake`."""
+    beside an empty in-memory `lake`. DuckDB's limit is `memory_limit`, or by default a
+    job's, or as `lake` the run's own."""
     data_url = (run / "data_url").read_text().strip()
     if alias == "lake":
         with tempfile.TemporaryDirectory(dir=os.environ.get("GRID_TEMP_DIR") or None) as spill:
-            con = catalog.session(data_url, spill)
+            con = catalog.session(data_url, spill, memory_limit)
             try:
                 catalog.attach(con, str(run / "snapshot.ducklake"), data_url, read_only=True)
                 yield con
             finally:
                 con.close()
         return
-    with scratch(run, threads) as con:
+    with scratch(run, threads, memory_limit or JOB_MEMORY_LIMIT) as con:
         catalog.attach(con, str(run / "snapshot.ducklake"), data_url, alias, read_only=True)
         yield con
 
 
 @contextlib.contextmanager
-def open_job(run: Path, tiles: list[int], threads=1):
+def open_job(run: Path, tiles: list[int], threads=1, memory_limit=JOB_MEMORY_LIMIT):
     """A connection whose `lake` holds the frozen catalog's tables as views, points limited
     to `tiles`, track QC's flags for them copied in, and empty tables for what the job
     writes."""
-    with snapshot(run, threads=threads) as con:
+    with snapshot(run, threads=threads, memory_limit=memory_limit) as con:
         tables = [
             t
             for (t,) in con.execute(
@@ -385,7 +392,7 @@ def export(con, query, path: Path):
 
 
 def do_cells(run: Path, tile: int, threads):
-    with open_job(run, [tile], threads) as con:
+    with open_job(run, [tile], threads, CELLS_MEMORY_LIMIT) as con:
         if con.execute("SELECT count(*) FROM lake.points").fetchone()[0]:
             cells.build(con, [tile])
         export(
