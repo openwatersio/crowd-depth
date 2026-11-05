@@ -1,6 +1,6 @@
 # Live layer performance
 
-The "My soundings" layer ([live-layer.md](live-layer.md)) is slow to fill a view and heavy for a Raspberry Pi and the plotter that draws it. Most of the cost is two things. The plugin rebuilds each tile's depth surface from the cells every time the tile is asked for, and the zoom-13 to 15 tiles it sends carry far more geometry than a screen can show. This note measures both, reviews what upstream signalk-livedepth-plugin has done since we adapted it, and proposes a staged plan. The measurements describe the layer before stage 1; [Stage 1 results](#stage-1-results) measures what it changed.
+The "My soundings" layer ([live-layer.md](live-layer.md)) is slow to fill a view and heavy for a Raspberry Pi and the plotter that draws it. Most of the cost is two things. The plugin rebuilds each tile's depth surface from the cells every time the tile is asked for, and the zoom-13 to 15 tiles it sends carry far more geometry than a screen can show. This note measures both, reviews what upstream signalk-livedepth-plugin has done since we adapted it, and proposes a staged plan. The measurements describe the layer before stage 1; [Stage 1 results](#stage-1-results) and [Stage 2 results](#stage-2-results) measure what each changed.
 
 ## How the layer worked before stage 1
 
@@ -146,7 +146,7 @@ No upstream commit touches the server's tile or store cost. Upstream's performan
 - Cost: contours and area edges move by up to half a pixel, which needs before-and-after screenshots, including zoom 17 and 18 over stretched zoom 15 tiles.
 - Effort: small.
 
-A tile could also carry only the user's unit's contours, which would take off about another 9% (feet users) to 29% (metres). But the style's tile URL is fixed by the server, which doesn't know the viewer's unit, and the plotter bus can't change a source's URL. Two sources, one per unit, with the other unit's layers hidden by `overlay.setLayer`, would work only if Freeboard skips fetching a source none of whose layers are drawn, which isn't checked. A server-side unit setting would break two plotters in different units. So this needs a check of Freeboard first, or a Freeboard change, and isn't in stage 1.
+A tile could also carry only the user's unit's contours, which would take off about another 9% (feet users) to 29% (metres). But the style's tile URL is fixed by the server, which doesn't know the viewer's unit, and the plotter bus can't change a source's URL. Two sources, one per unit, with the other unit's layers hidden by `overlay.setLayer`, would work only if Freeboard skips fetching a source none of whose layers are drawn, which isn't checked. A server-side unit setting would break two plotters in different units. So this needs a check of Freeboard first, or a Freeboard change, and isn't in stage 1. Stage 2 checked: Freeboard fetches a hidden source's tiles anyway ([Stage 2 results](#stage-2-results)).
 
 **B. Make the surface cheaper.**
 
@@ -190,16 +190,16 @@ A tile could also carry only the user's unit's contours, which would take off ab
 
 Do A, B's small parts, and E's small parts first. They're local changes that need no new storage, and together they halve what a plotter draws and take an eighth to a quarter off what the Pi computes per tile. Then C, which bounds memory and makes views after a restart free. Measure on a Pi before D, which is the large one. Propose the Freeboard change in parallel. Leave F and G.
 
-| Stage | Change                                                                                | Expected                                                                                                                |
-| ----- | ------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| 1     | Simplify to half a pixel, finer at zoom 15; coarser coverage                          | Done, but coverage is simplified as lines, not traced coarser: z13 view vertices −42% and bytes −34%, z15 −17% and −13% |
-| 1     | Early-stopping neighbour search; typed arrays in `surface()`                          | The search is done, byte-identical; typed arrays are not, and carry over to stage 2                                     |
-| 1     | Runtime: pause while hidden; timeouts on fetches and host calls; provisional upserts  | Done: no polling from background tabs; no stuck runtime                                                                 |
-| 2     | Tile cache bounded by bytes; encoded tiles persisted in SQLite, versioned             | Plugin memory bounded at tens of MB; restarts don't rebuild                                                             |
-| 2     | Contours of one unit per tile, once Freeboard's fetching of hidden sources is checked | Another 9 to 29% of vertices                                                                                            |
-| 2     | Latitude-sized rasters, if seams can be held                                          | Surface −45% at 37° N, more further north                                                                               |
-| 3     | Incremental zoom 14 surfaces, with zoom 13 and below assembled from them              | A refresh rebuilds a pass's neighbourhood, not whole tiles; to be measured on a Pi first                                |
-| —     | Freeboard: `overlay.refresh` re-keys only the tiles it names                          | No redraw of the whole layer per refresh; refresh every few seconds instead of every 30                                 |
+| Stage | Change                                                                                | Expected                                                                                                                                      |
+| ----- | ------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1     | Simplify to half a pixel, finer at zoom 15; coarser coverage                          | Done, but coverage is simplified as lines, not traced coarser: z13 view vertices −42% and bytes −34%, z15 −17% and −13%                       |
+| 1     | Early-stopping neighbour search; typed arrays in `surface()`                          | The search is done, byte-identical; typed arrays are not, and carry over to stage 2                                                           |
+| 1     | Runtime: pause while hidden; timeouts on fetches and host calls; provisional upserts  | Done: no polling from background tabs; no stuck runtime                                                                                       |
+| 2     | Tile cache bounded by bytes; encoded tiles persisted in SQLite, versioned             | Done: the cache is 16 MB in memory, 64 MB on disk, and a restart builds nothing. The plugin's memory is dominated by its tile threads instead |
+| 2     | Contours of one unit per tile, once Freeboard's fetching of hidden sources is checked | Not done: Freeboard fetches tiles for a source whose layers are all hidden                                                                    |
+| 2     | Latitude-sized rasters, if seams can be held                                          | Done below zoom 14: a zoom 13 view builds 35 to 44% faster. Zooms 14 and 15 are unchanged                                                     |
+| 3     | Incremental zoom 14 surfaces, with zoom 13 and below assembled from them              | A refresh rebuilds a pass's neighbourhood, not whole tiles; to be measured on a Pi first                                                      |
+| —     | Freeboard: `overlay.refresh` re-keys only the tiles it names                          | No redraw of the whole layer per refresh; refresh every few seconds instead of every 30                                                       |
 
 Rendering changes in stage 1 and 2 come with before-and-after screenshots on real data, as any change to how tiles render does.
 
@@ -237,6 +237,43 @@ The real store gains far more than the synthetic one. A boat sounding once a sec
 
 The vertex cut is less than the prototype's −55% because depth areas, a third of the vertices, are simplified a quarter as far, and collapsing loops are kept. Zoom 15 gains least, at a quarter of the tolerance.
 
+## Stage 2 results
+
+Stage 2 changes two things, and checks a third:
+
+- **Kept tiles.** Encoded tiles are kept in the plugin's database (`kept.ts`), and memory holds the most recently used, up to 16 MB, rather than up to 2,000 tiles. On disk they're bounded at 64 MB, the oldest built going first. Before a tile is built, it's reserved with the boxes of cells it's built from, its ancestor's for a zoom 15 tile, one box per 1° band. Triggers on `cells`, `overviews` and `shoals`, made by the migration that adds the tables, drop every kept tile under a row that's inserted, updated or deleted. An overview block reaches 2^level cells past the cell it holds. They fire on any connection and under any build, so a backfill's writes and an older plugin's after a rollback drop tiles too. A build that read the cells before a write finds its reservation gone, and isn't kept. Tiles drawn by other code, hashed from the tile modules and `definitions.json`, are dropped when the layer starts.
+- **Latitude-sized rasters below zoom 14.** A pixel is about a cell at the tile's latitude, in steps of 16 pixels, so at 37.5° N a zoom 13 tile interpolates 192² pixels rather than 256². Zooms 14 and 15 stay as they were. With them sized by latitude too, a zoom 15 tile at 37.5° N is 48 pixels, not 64, and stretched to zoom 17 and 18, small shoals drew visibly larger and blockier. Below zoom 13 a tile is 256 pixels anyway, short of about 58° N.
+- **Contours of one unit per tile: not done.** Freeboard-SK 3.4.1 draws an `overlays.data` overlay with its own component, one OpenLayers layer per run of style layers on a source. It styles them with ol-mapbox-style's `stylefunction`, but not through `apply`, whose `manageVisibility` hides an OpenLayers layer none of whose layers is visible. `overlay.setLayer` with `visibility: none` only skips the features when drawing; the layer stays visible and its tiles load. A `global-state` filter that comes out false also still fetches. Two overlays, one per unit, would work, since a hidden overlay fetches nothing, but each is a toggle the user sees. The extension can learn the unit from the host's `units.get`.
+
+Seams where the raster size steps were measured with contours crossing the edge between two tiles, north over south, at 39.64° N, where a zoom 13 tile steps from 176 to 192 pixels. Over a synthetic slope, metre contours met within 0.12 pixels at the median and 0.82 at most, against 0.11 and 1.16 on main for the same edge, and 0.06 and 0.28 between two tiles of one size. In the real store, a lone track crosses that edge without a break.
+
+`scripts/bench-view.mjs`, main and stage 2 interleaved, medians of three, on the laptop at a load average of 3 to 5. Zoom 14 and 15 tiles hashed the same as main's:
+
+| View of 20 tiles, one thread | Synthetic              | Real                 |
+| ---------------------------- | ---------------------- | -------------------- |
+| z13 build                    | 4.70 → 2.62 s (−44%)   | 1.84 → 1.19 s (−35%) |
+| z13 vertices                 | 494k → 457k (−7%)      | 148k → 146k (−1%)    |
+| z13 bytes                    | 1,274 → 1,204 KB (−5%) | 402 → 402 KB         |
+| z14, z15                     | unchanged              | unchanged            |
+
+The real store gains less than the synthetic one; 11 of its view's 20 tiles have no soundings.
+
+`scripts/bench-cache.mjs` (added with stage 2) pans a 5 × 4 view over a 3 × 3 grid of positions at each zoom from 10 to 15, 1,080 tiles, on the three tile threads, then restarts the service and asks for the middle view at zooms 13 to 15:
+
+| What                                    | Synthetic, main → stage 2 | Real, main → stage 2  |
+| --------------------------------------- | ------------------------- | --------------------- |
+| Buffers in memory, mostly encoded tiles | 31 → 18 MB                | 5 → 5 MB              |
+| Kept on disk                            | 29 MB                     | 4 MB                  |
+| Process resident memory, at the end     | 946 → 931 MB              | 818 → 808 MB          |
+| z13 view after a restart                | 1.90 s → 0 s              | 0.74 s → 0 s          |
+| z14 and z15 views after a restart       | 0.73 and 0.45 s → 0 s     | 0.53 and 0.47 s → 0 s |
+
+So the cache is bounded, and a restart builds nothing it has built before. But it was never most of the plugin's memory. Resident memory rose from 89 MB to 800 to 950 MB within the first 180 tiles, with the main thread's heap at 10 MB: it's the tile threads. Their V8 heaps grow toward the laptop's default limit before collecting the cells and rasters each build allocates. Capping each thread's old generation at 64 or 128 MB with `resourceLimits` brought the synthetic run to about 400 MB, with builds about 18% slower and no thread running out. That's not in this stage: the limit a large tile needs isn't measured, and V8 sizes its default by the machine's memory, so the Pi's own figure comes first.
+
+The triggers cost the backfill. `bench-live-layer.mjs 400000`, one run each, with nothing kept: the live writer was unchanged (5,908 → 5,827 soundings/s), the backfill writer 17% slower (44,253 → 36,534), and filling the store on its worker 22% slower (26,884 → 20,875). Cold tiles were unchanged but for zoom 13, 221 → 140 ms, and 20 z13 tiles on the three threads, 1.11 → 0.57 s.
+
+Screenshots of zoom 13 on the real store show the change. An unconfirmed shoal's cap reaches a fixed number of pixels, so with pixels about a cell rather than three quarters of one, the rings round shoals draw larger, as they already did near the equator. In the view of 20 tiles, shoals add 61 small closed metre contours, against 29 on main.
+
 ## Numbers from a Pi
 
 The figures above are from a fast laptop. To size the plan on the hardware that matters, run these on a Pi whose plugin is a build with the live layer, which no release has yet: a [preview](../../../CONTRIBUTING.md#plugin-previews) from `main` or later, with its backfill finished. The published plugin has no scripts, so they need a checkout of this repository on the Pi, with the plugin's dependencies installed and the plugin built. Installing only the plugin's workspace skips the API's dev tools, which have no 32-bit ARM builds:
@@ -253,6 +290,12 @@ node scripts/bench-live-layer.mjs 400000
 
 ```bash
 node scripts/bench-view.mjs ~/.signalk/plugin-config-data/crowd-depth/bathymetry.sqlite
+```
+
+And what the cache holds and costs as a plotter pans, and a restart, on a copy of the database, which this one writes to:
+
+```bash
+node -e 'new (require("node:sqlite").DatabaseSync)(process.argv[1],{readOnly:true}).exec(`VACUUM INTO "/tmp/bench-copy.sqlite"`)' ~/.signalk/plugin-config-data/crowd-depth/bathymetry.sqlite && node --expose-gc scripts/bench-cache.mjs /tmp/bench-copy.sqlite
 ```
 
 Along with the Pi's model and memory, these give the factor this note assumes, and a view's cost on the boat's own soundings.
