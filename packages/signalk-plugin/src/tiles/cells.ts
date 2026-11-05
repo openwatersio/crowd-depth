@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { keptTileTriggers } from "../storage.js";
+import { hasKeptTiles, keptTileTriggers } from "../storage.js";
 import { DEFINITIONS, cellAt, cellRanges } from "./geometry.js";
 
 /** Overview levels: blocks of 2^level cells a side (about 41 m, 82 m, 330 m and 1.3 km),
@@ -376,11 +376,17 @@ export function createCellStore(db: DatabaseSync) {
       // Without the kept tiles' triggers for the moment, so the tables are cleared at
       // once rather than row by row, about ten times faster for a busy store.
       transaction(() => {
-        keptTileTriggers(db, false);
-        db.exec(`
-          DELETE FROM kept_tile_boxes; DELETE FROM kept_tile_box_owners; DELETE FROM kept_tiles;
-          DELETE FROM cells; DELETE FROM overviews; DELETE FROM shoals;`);
-        keptTileTriggers(db, true);
+        const kept = hasKeptTiles(db);
+        if (kept) {
+          keptTileTriggers(db, false);
+          db.exec(
+            "DELETE FROM kept_tile_boxes; DELETE FROM kept_tile_box_owners; DELETE FROM kept_tiles;",
+          );
+        }
+        db.exec(
+          "DELETE FROM cells; DELETE FROM overviews; DELETE FROM shoals;",
+        );
+        if (kept) keptTileTriggers(db, true);
       });
     },
 

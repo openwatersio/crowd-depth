@@ -3,7 +3,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { DatabaseSync } from "node:sqlite";
-import { keptTileTriggers } from "../storage.js";
+import { keptTileSchema } from "../storage.js";
 import {
   cellRanges,
   M_PER_DEG_LAT,
@@ -77,8 +77,8 @@ function drawnBy(): string {
 export type KeptTiles = ReturnType<typeof createKeptTiles>;
 
 /**
- * Encoded tiles kept in the plugin's database (tables and triggers made by a migration
- * in storage.ts), so tiles built once are read back after a restart, and memory holds
+ * Encoded tiles kept in the plugin's database (tables and triggers made here, by
+ * keptTileSchema in storage.ts), so tiles built once are read back after a restart, and memory holds
  * only the few most used.
  *
  * A tile is reserved before it's built, as a row with no tile and its boxes, the cells
@@ -91,9 +91,8 @@ export function createKeptTiles(
   detail: Detail,
   { maxBytes = KEPT_BYTES, version = drawnBy() } = {},
 ) {
-  // Made by the migration; made again should a later one have dropped them with a
-  // table they're on.
-  keptTileTriggers(db, true);
+  // Throws where they can't be made, leaving the database without them.
+  keptTileSchema(db);
   const getVersion = db.prepare("SELECT value FROM tile_meta WHERE key = ?");
   if (
     (getVersion.get(VERSION_KEY) as { value: string } | undefined)?.value !==

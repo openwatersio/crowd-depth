@@ -127,41 +127,65 @@ export function createDB(filename: string): DatabaseSync {
       db.exec("DROP INDEX IF EXISTS idx_bathymetry_location");
     },
     () => {
-      // The chart layer's encoded tiles, kept so a restart doesn't build them again;
-      // see tiles/kept.ts. A tile's boxes are the cells, overview blocks and shoals it
-      // was built from, one per 1° band, whose columns are its own. The triggers drop a
-      // tile whenever a row under one of its boxes changes, whichever build of the
-      // plugin writes it, so a kept tile never outlives what it was built from, even
-      // after a rollback to a build that doesn't know about them.
-      db.exec(`
-        CREATE TABLE IF NOT EXISTS kept_tiles(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          z INTEGER NOT NULL,
-          x INTEGER NOT NULL,
-          y INTEGER NOT NULL,
-          detail TEXT NOT NULL,
-          tile BLOB,
-          UNIQUE(z, x, y, detail)
-        );
-        CREATE VIRTUAL TABLE IF NOT EXISTS kept_tile_boxes USING rtree_i32(id, py0, py1, px0, px1);
-        -- Each box's tile, indexed: an R*Tree can't index a column of its own but by id.
-        CREATE TABLE IF NOT EXISTS kept_tile_box_owners(
-          box INTEGER PRIMARY KEY,
-          tile INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS kept_tile_box_owners_tile
-          ON kept_tile_box_owners(tile);
-        CREATE TRIGGER IF NOT EXISTS kept_tiles_drop AFTER DELETE ON kept_tiles BEGIN
-          DELETE FROM kept_tile_boxes WHERE id IN (
-            SELECT box FROM kept_tile_box_owners WHERE tile = OLD.id);
-          DELETE FROM kept_tile_box_owners WHERE tile = OLD.id;
-        END;
-      `);
-      keptTileTriggers(db, true);
+      // Once the kept tiles' tables, made since by keptTileSchema, outside the
+      // migrations: they're optional, and a build that can't make them must still start.
     },
   ]);
 
   return db;
+}
+
+/**
+ * Make the chart layer's kept tiles' tables and triggers (tiles/kept.ts), all or none:
+ * a database where they can't be made, such as one without R*Tree, is left as it was.
+ * A tile's boxes are the cells, overview blocks and shoals it was built from, one per
+ * 1° band, whose columns are its own. The triggers drop a tile whenever a row under one
+ * of its boxes changes, whichever build of the plugin writes it, so a kept tile never
+ * outlives what it was built from, even after a rollback to a build that doesn't know
+ * about them.
+ */
+export function keptTileSchema(db: DatabaseSync) {
+  db.exec("SAVEPOINT kept_tile_schema");
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS kept_tiles(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        z INTEGER NOT NULL,
+        x INTEGER NOT NULL,
+        y INTEGER NOT NULL,
+        detail TEXT NOT NULL,
+        tile BLOB,
+        UNIQUE(z, x, y, detail)
+      );
+      CREATE VIRTUAL TABLE IF NOT EXISTS kept_tile_boxes USING rtree_i32(id, py0, py1, px0, px1);
+      -- Each box's tile, indexed: an R*Tree can't index a column of its own but by id.
+      CREATE TABLE IF NOT EXISTS kept_tile_box_owners(
+        box INTEGER PRIMARY KEY,
+        tile INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS kept_tile_box_owners_tile
+        ON kept_tile_box_owners(tile);
+      CREATE TRIGGER IF NOT EXISTS kept_tiles_drop AFTER DELETE ON kept_tiles BEGIN
+        DELETE FROM kept_tile_boxes WHERE id IN (
+          SELECT box FROM kept_tile_box_owners WHERE tile = OLD.id);
+        DELETE FROM kept_tile_box_owners WHERE tile = OLD.id;
+      END;
+    `);
+    keptTileTriggers(db, true);
+    db.exec("RELEASE kept_tile_schema");
+  } catch (err) {
+    db.exec("ROLLBACK TO kept_tile_schema; RELEASE kept_tile_schema");
+    throw err;
+  }
+}
+
+/** Whether the database has the kept tiles' tables, made by keptTileSchema. */
+export function hasKeptTiles(db: DatabaseSync) {
+  return !!db
+    .prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'kept_tiles'",
+    )
+    .get();
 }
 
 const KEPT_TILE_SOURCES = [
@@ -174,7 +198,8 @@ const KEPT_TILE_SOURCES = [
 /**
  * Make, with `on`, or drop the triggers that drop a kept tile (tiles/kept.ts) when a row
  * it was built from is written. Dropped only for a moment, in a transaction, to clear
- * the tables they're on at once: with them, SQLite deletes row by row.
+ * the tables they're on at once: with them, SQLite deletes row by row. Made only where
+ * the kept tiles' tables are: without them, every write the triggers fire on fails.
  */
 export function keptTileTriggers(db: DatabaseSync, on: boolean) {
   const under = (row: string, reach: string) => `

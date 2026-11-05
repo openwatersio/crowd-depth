@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { createDB, keptTileTriggers } from "../../src/storage.js";
+import { createDB, hasKeptTiles } from "../../src/storage.js";
 import { createCellStore } from "../../src/tiles/cells.js";
 import { cellAt, cellRanges, tileFraction } from "../../src/tiles/geometry.js";
 import { createKeptTiles, tileReach } from "../../src/tiles/kept.js";
@@ -241,11 +241,7 @@ test("a database from before kept tiles takes them on", () => {
   const db = createDB(file);
   const store = createCellStore(db);
   store.addPasses(pass(8));
-  // Back to user_version 7, before the kept tiles' tables.
-  db.exec(`
-    DROP TABLE kept_tiles; DROP TABLE kept_tile_boxes; DROP TABLE kept_tile_box_owners;
-    PRAGMA user_version = 7;`);
-  keptTileTriggers(db, false);
+  expect(hasKeptTiles(db)).toBe(false);
   db.close();
   const again = createDB(file);
   const kept = createKeptTiles(again, "high");
@@ -256,6 +252,24 @@ test("a database from before kept tiles takes them on", () => {
   reread.addPasses(pass(20));
   expect(kept.get(...at)).toBeUndefined();
   again.close();
+});
+
+test("a database that can't keep tiles still writes and clears its cells", () => {
+  const db = createDB(file);
+  // A view where a table should be: indexing it fails partway through the schema, as a
+  // build of SQLite without R*Tree would.
+  db.exec("CREATE VIEW kept_tile_box_owners AS SELECT 1 AS box, 1 AS tile");
+  expect(() => createKeptTiles(db, "high")).toThrow();
+  expect(hasKeptTiles(db)).toBe(false);
+  expect(
+    db.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger'").all(),
+  ).toEqual([]);
+  const store = createCellStore(db);
+  store.addPasses(pass(8));
+  store.clear();
+  store.addPasses(pass(8));
+  expect(readTile(store, ...tileAt(14)).length).toBeGreaterThan(0);
+  db.close();
 });
 
 test("tiles built while a backfill writes aren't kept", async () => {
@@ -316,6 +330,7 @@ test("a tile changed in the last few minutes isn't kept", async () => {
 
 test("dropping a kept tile finds its boxes by index, not by scanning them", () => {
   const db = createDB(file);
+  createKeptTiles(db, "high");
   const plan = (sql: string) =>
     (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all() as { detail: string }[]).map(
       (r) => r.detail,
