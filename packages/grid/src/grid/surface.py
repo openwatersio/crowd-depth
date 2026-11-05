@@ -15,8 +15,9 @@ What is interpolated is each pixel's median of vessels' medians; the depth is th
 surface less K times σ (statistic.py). A pixel with a depth and no sounding is
 interpolated, and its σ widens with its distance from the nearest sounding.
 
-Each tile is a cloud-optimized GeoTIFF with four bands: depth (positive down), the
-distance in metres to the nearest sounding, the soundings in the pixel, and σ. The whole
+Each tile is a cloud-optimized GeoTIFF with five bands: depth (positive down), the
+distance in metres to the nearest sounding, the soundings in the pixel, σ, and 1 where
+the depth is the band's, in a pixel interpolation left empty, or 0. The whole
 tile is worked in 512-pixel blocks: only the extent of the blocks with a sounding within
 the search radius is interpolated, and only those blocks are blurred, guarded, measured
 and written; the rest are left out of the file, and read as no data in every band.
@@ -313,6 +314,7 @@ def grid_tile(tile_id: int, got, out: Path):
             key: np.full((r1 - r0, c1 - c0), NODATA, dtype=np.float32)
             for key, (r0, c0, r1, c1, *_) in windows.items()
         }
+        only_near = {key: np.zeros(a.shape, dtype=bool) for key, a in central.items()}
         rows_at, cols_at = ROWS - 1 - upy, upx
         near = Near(rows_at, cols_at, medians, dy, dx)
         inside = (rows_at >= 0) & (rows_at < ROWS) & (cols_at >= 0) & (cols_at < cols)
@@ -338,6 +340,8 @@ def grid_tile(tile_id: int, got, out: Path):
                 central[key] = np.where(
                     between == NODATA, banded[inner], np.minimum(between, banded[inner])
                 )
+                only_near[key] = (between == NODATA) & (central[key] != NODATA)
+        del near
         # Interpolation needs a sounding in every quadrant, so the outermost tracks' own
         # pixels have no interpolated surface: there, as past the tile's edge, the pixel's
         # own median.
@@ -364,8 +368,9 @@ def grid_tile(tile_id: int, got, out: Path):
                 depth = finish(surface, sigma, around(confirmed)[inner])
                 distance[depth == NODATA] = NODATA
                 sigma[depth == NODATA] = NODATA
+                near_px = np.where(depth == NODATA, NODATA, only_near.pop(key)).astype(np.float32)
                 dst.write(
-                    np.stack([depth, distance, count[inner], sigma]),
+                    np.stack([depth, distance, count[inner], sigma, near_px]),
                     window=Window(c0, r0, c1 - c0, r1 - r0),
                 )
         rasterio.shutil.copy(sparse, path, driver="COG", compress="deflate", sparse_ok=True)
@@ -495,10 +500,10 @@ def open_sparse(path, lon0, lat0, shape):
     """A tiled GeoTIFF for a 1° tile's bands, which leaves out blocks never written."""
     rows, cols = shape
     dst = rasterio.open(
-        path, "w", driver="GTiff", width=cols, height=rows, count=4, dtype="float32",
+        path, "w", driver="GTiff", width=cols, height=rows, count=5, dtype="float32",
         crs="EPSG:4326", transform=from_bounds(lon0, lat0, lon0 + 1, lat0 + 1, cols, rows),
         nodata=NODATA, tiled=True, blockxsize=BLOCK, blockysize=BLOCK, sparse_ok=True,
     )  # fmt: skip
-    for band, name in enumerate(("depth", "distance_m", "soundings", "sigma"), start=1):
+    for band, name in enumerate(("depth", "distance_m", "soundings", "sigma", "near"), start=1):
         dst.set_band_description(band, name)
     return dst

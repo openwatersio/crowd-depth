@@ -40,6 +40,7 @@ def write_cog(path, depth, count, lon0=LON0):
                     np.zeros_like(depth[block]),
                     count[block],
                     np.full_like(depth[block], 0.5),
+                    np.zeros_like(depth[block]),
                 ]
             ),
             window=Window(0, r0, surface.BLOCK, r1 - r0),

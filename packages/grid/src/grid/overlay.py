@@ -319,14 +319,17 @@ def surface_bands(path, soundings=None):
 
     Bands come from `gdal_contour -p`, which follows the surface between pixels rather
     than around them, on the surface's depths carried FILL_PX past its edge, and are cut
-    to the surface's `outline`. A carried depth is never deeper than one of `soundings`,
-    (lon, lat, depth) arrays of the published soundings in and beside the tile, in its
-    pixel or next to it, as the surface guards its own pixels. All water past
+    to the surface's `outline`. A carried depth, or one the surface took from the band
+    beside a track, is never deeper than one of `soundings`, (lon, lat, depth) arrays of
+    the published soundings in and beside the tile, in its pixel or next to it, as the
+    surface guards its own pixels. All water past
     MAX_AREA_DEPTH_M is one more band, kept for the contour at its edge but never
     published: `gdal_contour -p` makes no polygon past its last level.
     """
     levels = [lv for lv in LEVELS if lv <= MAX_AREA_DEPTH_M] + [MAX_DEPTH_M]
     with rasterio.open(path) as src:
+        if src.count < 5:
+            raise ValueError(f"{path} has no band marking the band beside a track: rebuild it")
         depth, count = src.read(1), src.read(3)
         # Worked on the window the tile's depths and soundings reach, WINDOW_PX past them:
         # outside it every band is empty, and nothing here looks further than that.
@@ -345,6 +348,7 @@ def surface_bands(path, soundings=None):
         # Copies, so the whole tile's bands are freed while the window is worked.
         depth, count = depth[r0:r1, c0:c1].copy(), count[r0:r1, c0:c1].copy()
         sigma = src.read(4, window=window)
+        near_only = src.read(5, window=window) == 1
         transform = src.window_transform(window)
         profile = src.profile | {"width": c1 - c0, "height": r1 - r0, "transform": transform}
     valid = depth != surface.NODATA
@@ -402,16 +406,19 @@ def surface_bands(path, soundings=None):
             inside = (row >= 0) & (row < depth.shape[0]) & (col >= 0) & (col < depth.shape[1])
             row, col, d = row[inside], col[inside], d[inside].astype(np.float32)
             # Each sounding's pixel and the eight around it, so only pixels beside one are
-            # touched: a sparse tile's window is most of the tile.
+            # touched: a sparse tile's window is most of the tile. Capped there: the carried
+            # pixels, and those the surface took from the band beside a track. A cell's
+            # sounding is its shoalest base cell, which can read shoaler than the medians
+            # the band takes.
             for dr, dc in np.argwhere(around) - 1:
                 r, c = row + dr, col + dc
                 ok = (r >= 0) & (r < depth.shape[0]) & (c >= 0) & (c < depth.shape[1])
                 r, c, v = r[ok], c[ok], d[ok]
-                empty = ~valid[r, c]
-                np.minimum.at(grown, (r[empty], c[empty]), v[empty])
+                capped = ~valid[r, c] | near_only[r, c]
+                np.minimum.at(grown, (r[capped], c[capped]), v[capped])
         # The window's rasters go before its bands are built: validating a dense tile's
         # contour polygons is the job's peak.
-        del depth, count, valid
+        del depth, count, valid, near_only
         reach = shapely.MultiPolygon(
             [
                 shapely.geometry.shape(g)
@@ -431,9 +438,10 @@ def surface_bands(path, soundings=None):
             # A depth exactly on a level is in the band it starts, as `band` reads it.
             # gdal_contour reads it as below the level, and where nothing is truly below,
             # labels the polygon with the band under it: water held at 0 m by the margin's
-            # floor drew as drying.
+            # floor drew as drying. A millimetre, not the next float: past 0 that's a
+            # denormal, which a flush-to-zero build reads as 0.
             on_level = np.isin(grown, levels)
-            grown[on_level] = np.nextafter(grown[on_level], np.float32(np.inf))
+            grown[on_level] += np.float32(1e-3)
             del on_level
             with rasterio.open(src_path, "w", **profile) as dst:
                 dst.write(grown, 1)

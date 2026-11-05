@@ -256,12 +256,14 @@ def test_a_drying_bank_has_its_area_drying_line_and_least_depth(tmp_path):
     assert -0.5 in {f["properties"]["depth_m"] for f in got["SOUNDG"]}
 
 
-def write_surface(path, lon0, lat0, depth, distance, count, sigma=None):
+def write_surface(path, lon0, lat0, depth, distance, count, sigma=None, near=None):
     """A whole tile's bands as its surface COG, written as build_tile writes one."""
     sparse = path.with_suffix(".sparse.tif")
     sigma = np.zeros_like(depth) if sigma is None else sigma
+    near = np.zeros_like(depth) if near is None else near.astype(np.float32)
+    near = np.where(depth == surface.NODATA, surface.NODATA, near)
     with surface.open_sparse(sparse, lon0, lat0, depth.shape) as dst:
-        dst.write(np.stack([depth, distance, count, sigma]))
+        dst.write(np.stack([depth, distance, count, sigma, near]))
     rasterio.shutil.copy(sparse, path, driver="COG", compress="deflate", sparse_ok=True)
 
 
@@ -417,6 +419,41 @@ def test_the_grown_edge_is_never_deeper_than_a_sounding_beside_it(tmp_path):
     # Away from the sounding, the grown edge takes the water's own depth.
     far = shapely.Point(-78 + 49.3 / 100, 34 - 10.5 / 100)
     assert [overlay.LEVELS[b] for b, a in bands.items() if a.contains(far)] == [10]
+
+
+def test_a_surface_without_the_band_marked_is_refused(tmp_path):
+    # A surface from before the band was marked: its band pixels can't be told from
+    # interpolated ones, so its areas would miss the cap.
+    depth = np.full((100, 100), 12.0, dtype=np.float32)
+    path = tmp_path / "t.tif"
+    with rasterio.open(path, "w", driver="GTiff", width=100, height=100, count=4,
+                       dtype="float32", crs="EPSG:4326", nodata=surface.NODATA,
+                       transform=rasterio.transform.from_bounds(-78, 33, -77, 34, 100, 100)) as dst:  # fmt: skip
+        dst.write(
+            np.stack([depth, np.zeros_like(depth), np.zeros_like(depth), np.zeros_like(depth)])
+        )
+    with pytest.raises(ValueError, match="rebuild"):
+        overlay.surface_bands(path)
+
+
+def test_the_band_beside_a_track_is_never_deeper_than_a_sounding_in_it(tmp_path):
+    # 12 m water, its west half interpolated and its east half the band beside a track,
+    # with a 3 m sounding in each: the band is capped at the sounding, as the grown edge
+    # is, and interpolated water isn't.
+    depth = np.full((100, 100), 12.0, dtype=np.float32)
+    near = np.zeros_like(depth)
+    near[:, 50:] = 1
+    write_surface(tmp_path / "t.tif", -78, 33, depth, np.zeros_like(depth),
+                  np.zeros_like(depth), near=near)  # fmt: skip
+    soundings = ([-78 + 20.5 / 100, -78 + 80.5 / 100], [33.495, 33.495], [3.0, 3.0])
+    bands, *_ = overlay.surface_bands(tmp_path / "t.tif", soundings)
+
+    def levels(x):
+        point = shapely.Point(-78 + x / 100, 33.495)
+        return [overlay.LEVELS[b] for b, a in bands.items() if a.contains(point)]
+
+    assert levels(80.5)[0] < 3
+    assert levels(20.5) == [10]
 
 
 def test_the_grown_edge_of_interpolated_water_is_interpolated(tmp_path):
@@ -596,6 +633,8 @@ def test_the_band_never_deepens_the_interpolated_surface(env, monkeypatch):  # n
             return src.read(1)
 
     after = depth("after")
+    with rasterio.open(env.store.root / "after" / f"{tile}.tif") as src:
+        near = src.read(5)
     # Without the band: the interpolation alone.
     monkeypatch.setattr(
         surface.Near,
@@ -606,8 +645,10 @@ def test_the_band_never_deepens_the_interpolated_surface(env, monkeypatch):  # n
     had = before != surface.NODATA
     assert had.any() and (after[had] != surface.NODATA).all()
     assert (after[had] <= before[had]).all()
-    # The band adds the outer tracks' sides and the tracks' ends.
+    # The band adds the outer tracks' sides and the tracks' ends, and marks them.
     assert (after != surface.NODATA).sum() > had.sum()
+    assert np.array_equal(near == 1, (after != surface.NODATA) & ~had)
+    assert np.array_equal(near == surface.NODATA, after == surface.NODATA)
 
 
 def test_near_takes_the_shoalest_median_within_reach():
@@ -805,7 +846,7 @@ def test_interpolated_pixels_widen_with_distance_and_are_marked(env, monkeypatch
         [(partition,)] = con.execute("SELECT DISTINCT cell_id FROM lake.cells").fetchall()
         path = surface.build_tile(con, tile, partition, tmp_path)
     with rasterio.open(path) as src:
-        depth, distance, count, sigma = src.read()
+        depth, distance, count, sigma = src.read([1, 2, 3, 4])
     near, mid = (at_pixel(sigma, r, 30) for r in (5002, 5006))
     # The corrections' σ, wider with each metre from the nearest track.
     assert CSIG < near < mid
