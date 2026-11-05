@@ -28,6 +28,7 @@ import {
   createCellStore,
   createCellWriter,
   createTileService,
+  createKeptTiles,
   startRebuild,
   recordBackfillFailure,
   registerLayerRoutes,
@@ -133,10 +134,14 @@ export function startChart({
   // Before the live writer starts, so its marker doesn't hide the gap.
   addPendingBackfill(store, startedAt, historySpan(config));
 
+  const detail =
+    config.chart?.contourDetail === "standard" ? "standard" : "high";
+  const file = db.location() ?? undefined;
   const tiles = createTileService(
     store,
-    db.location() ?? undefined,
-    config.chart?.contourDetail === "standard" ? "standard" : "high",
+    file,
+    detail,
+    file ? createKeptTiles(db, detail) : undefined,
   );
   // Off the main thread, given a database file to say the plugin is built and running.
   const qc = db.location() ? createQCThread() : undefined;

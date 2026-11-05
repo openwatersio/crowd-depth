@@ -126,6 +126,54 @@ export function createDB(filename: string): DatabaseSync {
       // position, and it took a third of the file.
       db.exec("DROP INDEX IF EXISTS idx_bathymetry_location");
     },
+    () => {
+      // The chart layer's encoded tiles, kept so a restart doesn't build them again;
+      // see tiles/kept.ts. A tile's boxes are the cells, overview blocks and shoals it
+      // was built from, one per 1° band, whose columns are its own. The triggers drop a
+      // tile whenever a row under one of its boxes changes, whichever build of the
+      // plugin writes it, so a kept tile never outlives what it was built from, even
+      // after a rollback to a build that doesn't know about them.
+      db.exec(`
+        CREATE TABLE kept_tiles(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          z INTEGER NOT NULL,
+          x INTEGER NOT NULL,
+          y INTEGER NOT NULL,
+          detail TEXT NOT NULL,
+          tile BLOB,
+          UNIQUE(z, x, y, detail)
+        );
+        CREATE VIRTUAL TABLE kept_tile_boxes USING rtree_i32(id, py0, py1, px0, px1, +tile);
+        CREATE TRIGGER kept_tiles_drop AFTER DELETE ON kept_tiles BEGIN
+          DELETE FROM kept_tile_boxes WHERE tile = OLD.id;
+        END;
+      `);
+      const under = (row: string, reach = "0") => `
+        DELETE FROM kept_tiles WHERE id IN (
+          SELECT tile FROM kept_tile_boxes
+          WHERE py0 <= ${row}.py + ${reach} AND py1 >= ${row}.py - ${reach}
+            AND px0 <= ${row}.px + ${reach} AND px1 >= ${row}.px - ${reach});`;
+      // An overview block reaches 2^level cells from the cell it holds.
+      for (const [table, reach] of [
+        ["cells", "0"],
+        ["shoals", "0"],
+        ["overviews", "(1 << {}.level)"],
+      ]) {
+        const r = (row: string) => reach.replace("{}", row);
+        db.exec(`
+          CREATE TRIGGER kept_tiles_${table}_insert AFTER INSERT ON ${table} BEGIN
+            ${under("NEW", r("NEW"))}
+          END;
+          CREATE TRIGGER kept_tiles_${table}_update AFTER UPDATE ON ${table} BEGIN
+            ${under("OLD", r("OLD"))}
+            ${under("NEW", r("NEW"))}
+          END;
+          CREATE TRIGGER kept_tiles_${table}_delete AFTER DELETE ON ${table} BEGIN
+            ${under("OLD", r("OLD"))}
+          END;
+        `);
+      }
+    },
   ]);
 
   return db;

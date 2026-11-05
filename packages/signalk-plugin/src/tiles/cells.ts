@@ -364,7 +364,10 @@ export function createCellStore(db: DatabaseSync) {
     },
     transaction,
     clear() {
-      db.exec("DELETE FROM cells; DELETE FROM overviews; DELETE FROM shoals;");
+      // The kept tiles first, which the rows' triggers would otherwise look for each.
+      db.exec(
+        "DELETE FROM kept_tiles; DELETE FROM cells; DELETE FROM overviews; DELETE FROM shoals;",
+      );
     },
 
     /** Find every overview block's shoalest cell again, a stretch of rows at a time,
