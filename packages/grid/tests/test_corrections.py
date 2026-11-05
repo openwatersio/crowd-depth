@@ -1408,6 +1408,32 @@ def test_lost_runs_set_aside_the_soundings_each_one_holds(env):  # noqa: F811
     assert len(got) == 432 and 10 < sum(lost for *_, lost in got) < 100 and got == want
 
 
+def test_a_sounding_under_a_tile_run_and_a_run_with_no_tile_comes_out_once(env):  # noqa: F811
+    # A store not yet recalibrated keeps a run with no tile beside the tile's own runs that
+    # cover the same soundings, both across midnight: each sounding still comes out once.
+    put_dated(env, 1, [(i * 1200, *at(5000, i % 3), 5.0) for i in range(216)], "AQM-A")
+    env.run("noaa")
+    t = T0.replace(hour=0) + timedelta(days=1)
+    runs = [
+        (TILE, t - timedelta(hours=1), t + timedelta(hours=2)),
+        (TILE, t + timedelta(hours=1), t + timedelta(hours=3)),
+        (None, t - timedelta(minutes=30), t + timedelta(hours=4)),
+        (None, t + timedelta(hours=3), t + timedelta(hours=5)),
+    ]
+    with open_store(env.store) as con:
+        con.executemany(
+            "INSERT INTO lake.lost_runs"
+            " SELECT content_hash, 'AQM-A', ?, ?, ? FROM lake.files",
+            runs,
+        )
+    got = corrected(env, "lost_bottom")
+    both = [at_ for _, at_, _ in got if t <= at_ <= t + timedelta(hours=2)]
+    assert len(got) == 216 and len({at_ for _, at_, _ in got}) == 216 and len(both) == 7
+    assert got == [
+        (u, at_, any(t0 <= at_ <= t1 for _, t0, t1 in runs)) for u, at_, _ in got
+    ]
+
+
 def test_a_run_with_no_tile_holds_in_every_tile_until_recalibration(env, tmp_path, monkeypatch):  # noqa: F811
     # An upgrade reaches the overlay without a calibrate, and the overlay reads these too.
     calibrated(env, FLEET, reference(tmp_path / "ref.tif", (0, 110)), monkeypatch)
