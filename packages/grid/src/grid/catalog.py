@@ -270,18 +270,46 @@ WITH c AS (
 ),
 -- Only the stations of these tiles' cells, so the join holds their levels alone.
 l AS (SELECT * FROM lake.tide_levels WHERE station_id IN (SELECT station_id FROM c)),
+-- The lost runs of these tiles (or of none) and vessels, merged where they overlap for each
+-- content, vessel and tile, so a sounding falls in at most one, and listed under each UTC day
+-- they touch, so a sounding is joined to its day's alone: one file of the Chesapeake holds
+-- 5,402 runs, and checking each sounding against all of its file's held more than 768 MB for
+-- one vessel's 5.3M.
+r AS (
+  SELECT *, max(t_end) OVER (PARTITION BY content_hash, vessel, tile_id ORDER BY t_start, t_end
+      ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS reach
+  FROM lake.lost_runs
+  WHERE (tile_id IS NULL OR len(tiles) = 0 OR list_contains(tiles, tile_id))
+    AND (len(vessels) = 0 OR list_contains(vessels, vessel))
+),
+s AS (
+  SELECT content_hash, vessel, tile_id, min(t_start) AS t_start, max(t_end) AS t_end FROM (
+    SELECT *, sum(coalesce(t_start > reach, true)::INTEGER) OVER (
+        PARTITION BY content_hash, vessel, tile_id ORDER BY t_start, t_end) AS island
+    FROM r
+  ) GROUP BY content_hash, vessel, tile_id, island
+),
+-- By file, as each file holding the content takes its runs.
+d AS (
+  SELECT f.file_id, s.vessel, s.tile_id, s.t_start, s.t_end,
+    unnest(generate_series(date_trunc('day', s.t_start), date_trunc('day', s.t_end),
+      INTERVAL 1 DAY)) AS day
+  FROM s JOIN lake.files f USING (content_hash)
+),
 p AS (
-  SELECT p.*, c.tide_cell IS NOT NULL AS tide_assigned, c.station_id AS tide_station,
-    coalesce(o.excluded, false) AS excluded,
-    coalesce(o.lost_bottom, false) OR EXISTS (
-      SELECT 1 FROM lake.lost_runs r JOIN lake.files f USING (content_hash)
-      WHERE f.file_id = p.file_id AND r.vessel = p.unique_id
-        AND (r.tile_id IS NULL OR r.tile_id = p.tile_id)
-        AND p.time BETWEEN r.t_start AND r.t_end
-    ) AS lost_bottom,
+  SELECT p.*, c.tide_cell IS NOT NULL AS tide_assigned,
+    c.station_id AS tide_station, coalesce(o.excluded, false) AS excluded,
+    coalesce(o.lost_bottom, false) OR r.t_start IS NOT NULL OR a.t_start IS NOT NULL
+      AS lost_bottom,
     l.level + l.slope * epoch(p.time - l.slot) AS tide,
     sqrt(l.sigma ^ 2 + (c.km * {TIDE_KM_SIGMA}) ^ 2) AS tide_sigma, o.offset_m, o.se_m
   FROM active_points_in(cell, tiles, rlo, rhi, vessels := vessels) p
+  LEFT JOIN (FROM d WHERE tile_id IS NOT NULL) r ON r.file_id = p.file_id
+    AND r.vessel = p.unique_id AND r.tile_id = p.tile_id AND r.day = date_trunc('day', p.time)
+    AND p.time BETWEEN r.t_start AND r.t_end
+  LEFT JOIN (FROM d WHERE tile_id IS NULL) a ON a.file_id = p.file_id
+    AND a.vessel = p.unique_id AND a.day = date_trunc('day', p.time)
+    AND p.time BETWEEN a.t_start AND a.t_end
   LEFT JOIN c ON c.tide_cell = {TIDE_CELL}
   LEFT JOIN l ON l.station_id = c.station_id AND l.slot = time_bucket(INTERVAL 30 MINUTE, p.time)
   LEFT JOIN lake.file_offsets o ON o.file_id = p.file_id AND o.vessel = p.unique_id
