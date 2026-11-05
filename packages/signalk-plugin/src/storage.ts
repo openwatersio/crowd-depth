@@ -126,9 +126,108 @@ export function createDB(filename: string): DatabaseSync {
       // position, and it took a third of the file.
       db.exec("DROP INDEX IF EXISTS idx_bathymetry_location");
     },
+    () => {
+      // Once the kept tiles' tables, made since by keptTileSchema, outside the
+      // migrations: they're optional, and a build that can't make them must still start.
+    },
   ]);
 
   return db;
+}
+
+/**
+ * Make the chart layer's kept tiles' tables and triggers (tiles/kept.ts), all or none:
+ * a database where they can't be made, such as one without R*Tree, is left as it was.
+ * A tile's boxes are the cells, overview blocks and shoals it was built from, one per
+ * 1° band, whose columns are its own. The triggers drop a tile whenever a row under one
+ * of its boxes changes, whichever build of the plugin writes it, so a kept tile never
+ * outlives what it was built from, even after a rollback to a build that doesn't know
+ * about them.
+ */
+export function keptTileSchema(db: DatabaseSync) {
+  db.exec("SAVEPOINT kept_tile_schema");
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS kept_tiles(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        z INTEGER NOT NULL,
+        x INTEGER NOT NULL,
+        y INTEGER NOT NULL,
+        detail TEXT NOT NULL,
+        tile BLOB,
+        UNIQUE(z, x, y, detail)
+      );
+      CREATE VIRTUAL TABLE IF NOT EXISTS kept_tile_boxes USING rtree_i32(id, py0, py1, px0, px1);
+      -- Each box's tile, indexed: an R*Tree can't index a column of its own but by id.
+      CREATE TABLE IF NOT EXISTS kept_tile_box_owners(
+        box INTEGER PRIMARY KEY,
+        tile INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS kept_tile_box_owners_tile
+        ON kept_tile_box_owners(tile);
+      CREATE TRIGGER IF NOT EXISTS kept_tiles_drop AFTER DELETE ON kept_tiles BEGIN
+        DELETE FROM kept_tile_boxes WHERE id IN (
+          SELECT box FROM kept_tile_box_owners WHERE tile = OLD.id);
+        DELETE FROM kept_tile_box_owners WHERE tile = OLD.id;
+      END;
+    `);
+    keptTileTriggers(db, true);
+    db.exec("RELEASE kept_tile_schema");
+  } catch (err) {
+    db.exec("ROLLBACK TO kept_tile_schema; RELEASE kept_tile_schema");
+    throw err;
+  }
+}
+
+/** Whether the database has the kept tiles' tables, made by keptTileSchema. */
+export function hasKeptTiles(db: DatabaseSync) {
+  return !!db
+    .prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'kept_tiles'",
+    )
+    .get();
+}
+
+const KEPT_TILE_SOURCES = [
+  // An overview block reaches 2^level cells from the cell it holds.
+  ["cells", "0"],
+  ["shoals", "0"],
+  ["overviews", "(1 << {}.level)"],
+] as const;
+
+/**
+ * Make, with `on`, or drop the triggers that drop a kept tile (tiles/kept.ts) when a row
+ * it was built from is written. Dropped only for a moment, in a transaction, to clear
+ * the tables they're on at once: with them, SQLite deletes row by row. Made only where
+ * the kept tiles' tables are: without them, every write the triggers fire on fails.
+ */
+export function keptTileTriggers(db: DatabaseSync, on: boolean) {
+  const under = (row: string, reach: string) => `
+    DELETE FROM kept_tiles WHERE id IN (
+      SELECT o.tile FROM kept_tile_boxes b JOIN kept_tile_box_owners o ON o.box = b.id
+      WHERE b.py0 <= ${row}.py + ${reach} AND b.py1 >= ${row}.py - ${reach}
+        AND b.px0 <= ${row}.px + ${reach} AND b.px1 >= ${row}.px - ${reach});`;
+  for (const [table, reach] of KEPT_TILE_SOURCES) {
+    const r = (row: string) => reach.replace("{}", row);
+    db.exec(
+      on
+        ? `
+      CREATE TRIGGER IF NOT EXISTS kept_tiles_${table}_insert AFTER INSERT ON ${table} BEGIN
+        ${under("NEW", r("NEW"))}
+      END;
+      CREATE TRIGGER IF NOT EXISTS kept_tiles_${table}_update AFTER UPDATE ON ${table} BEGIN
+        ${under("OLD", r("OLD"))}
+        ${under("NEW", r("NEW"))}
+      END;
+      CREATE TRIGGER IF NOT EXISTS kept_tiles_${table}_delete AFTER DELETE ON ${table} BEGIN
+        ${under("OLD", r("OLD"))}
+      END;`
+        : `
+      DROP TRIGGER IF EXISTS kept_tiles_${table}_insert;
+      DROP TRIGGER IF EXISTS kept_tiles_${table}_update;
+      DROP TRIGGER IF EXISTS kept_tiles_${table}_delete;`,
+    );
+  }
 }
 
 export type Migration = (db: DatabaseSync) => void;
