@@ -3,9 +3,9 @@
 // S-57 overlay layers (overlay.py), for one vessel.
 //
 // The grid works on its 2/3″ pixels per 1° tile. A chart tile here is a square raster in
-// Web Mercator of at most 256 pixels a side, the power of two nearest a cell, so at the
-// cells' zoom a pixel is about a cell; zoomed out, a pixel holds the shoalest of its cells, as
-// the grid aggregates. Distances are in metres, so the radius, smoothing and blur mean
+// Web Mercator of at most 256 pixels a side, sized so a pixel is about a cell (see
+// `rasterSize`); zoomed out, a pixel holds the shoalest of its cells, as the grid
+// aggregates. Distances are in metres, so the radius, smoothing and blur mean
 // what they mean in the grid at every zoom.
 import { Cell, Shoal, cellDepth, cellSigma } from "./cells.js";
 import {

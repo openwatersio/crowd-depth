@@ -3,6 +3,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { DatabaseSync } from "node:sqlite";
+import { keptTileTriggers } from "../storage.js";
 import {
   cellRanges,
   M_PER_DEG_LAT,
@@ -32,10 +33,28 @@ export function tileReach(z: number, x: number, y: number, own = false) {
   };
 }
 
+/** Bytes each kept row is counted as besides its tile: its key, index entries and
+ * boxes. So empty tiles count toward the bound too. */
+const ROW_BYTES = 256;
+
+/** The installed version of a dependency, found as Node finds it from `dir`. */
+function installed(dir: string, name: string): string {
+  for (let d = dir; ; d = dirname(d)) {
+    try {
+      return JSON.parse(
+        readFileSync(join(d, "node_modules", name, "package.json"), "utf8"),
+      ).version;
+    } catch {
+      if (dirname(d) === d) return "";
+    }
+  }
+}
+
 /**
- * What tiles are drawn with: the tile code and the grid's definitions as this build
- * has them. A tile kept by another build is built again, so any change to how tiles
- * are drawn shows without anyone remembering to bump a number.
+ * What tiles are drawn with: the tile code, the grid's definitions and the installed
+ * versions of the plugin's dependencies, as this build has them. A tile kept by
+ * another build is built again, so a change to how tiles are drawn shows without
+ * anyone remembering to bump a number.
  */
 function drawnBy(): string {
   const here = dirname(fileURLToPath(import.meta.url));
@@ -45,8 +64,12 @@ function drawnBy(): string {
       hash.update(f).update(readFileSync(join(here, f)));
     }
   }
-  for (const f of ["definitions.json"]) {
-    hash.update(readFileSync(join(here, "..", f)));
+  hash.update(readFileSync(join(here, "..", "definitions.json")));
+  const pkg = JSON.parse(
+    readFileSync(join(here, "..", "..", "package.json"), "utf8"),
+  );
+  for (const name of Object.keys(pkg.dependencies ?? {}).sort()) {
+    hash.update(`${name}@${installed(here, name)}`);
   }
   return hash.digest("hex").slice(0, 16);
 }
@@ -68,38 +91,58 @@ export function createKeptTiles(
   detail: Detail,
   { maxBytes = KEPT_BYTES, version = drawnBy() } = {},
 ) {
+  // Made by the migration; made again should a later one have dropped them with a
+  // table they're on.
+  keptTileTriggers(db, true);
   const getVersion = db.prepare("SELECT value FROM tile_meta WHERE key = ?");
   if (
     (getVersion.get(VERSION_KEY) as { value: string } | undefined)?.value !==
     version
   ) {
-    db.exec("DELETE FROM kept_tiles");
+    // The boxes first, so the trigger finds none to drop.
+    db.exec(
+      "DELETE FROM kept_tile_boxes; DELETE FROM kept_tile_box_owners; DELETE FROM kept_tiles;",
+    );
     db.prepare(
       `INSERT INTO tile_meta(key, value) VALUES(?, ?)
        ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
     ).run(VERSION_KEY, version);
   }
-  // Reserved by a start that stopped before its builds came back.
-  db.exec("DELETE FROM kept_tiles WHERE tile IS NULL");
+  // Reserved by a start that stopped before its builds came back, and any boxes left
+  // without a tile.
+  db.exec(`
+    DELETE FROM kept_tiles WHERE tile IS NULL;
+    DELETE FROM kept_tile_box_owners WHERE tile NOT IN (SELECT id FROM kept_tiles);
+    DELETE FROM kept_tile_boxes
+    WHERE id NOT IN (SELECT box FROM kept_tile_box_owners);`);
 
   const read = db.prepare(
     `SELECT tile FROM kept_tiles
      WHERE z = ? AND x = ? AND y = ? AND detail = ? AND tile IS NOT NULL`,
   );
-  // A tile reserved again replaces its row, and the trigger takes its boxes.
+  // A tile reserved again drops its row first, so the trigger takes its boxes: a
+  // REPLACE wouldn't fire it.
+  const unreserve = db.prepare(
+    "DELETE FROM kept_tiles WHERE z = ? AND x = ? AND y = ? AND detail = ?",
+  );
   const reserveTile = db.prepare(
-    `INSERT OR REPLACE INTO kept_tiles(z, x, y, detail, tile) VALUES(?, ?, ?, ?, NULL)
+    `INSERT INTO kept_tiles(z, x, y, detail, tile) VALUES(?, ?, ?, ?, NULL)
      RETURNING id`,
   );
   const addBox = db.prepare(
-    "INSERT INTO kept_tile_boxes(py0, py1, px0, px1, tile) VALUES(?, ?, ?, ?, ?)",
+    "INSERT INTO kept_tile_boxes(py0, py1, px0, px1) VALUES(?, ?, ?, ?)",
+  );
+  const addOwner = db.prepare(
+    "INSERT INTO kept_tile_box_owners(box, tile) VALUES(?, ?)",
   );
   const fillTile = db.prepare(
     "UPDATE kept_tiles SET tile = ? WHERE id = ? AND tile IS NULL",
   );
-  const total = db.prepare("SELECT total(length(tile)) AS n FROM kept_tiles");
+  const total = db.prepare(
+    `SELECT total(length(tile)) + ${ROW_BYTES} * count(*) AS n FROM kept_tiles`,
+  );
   const oldest = db.prepare(
-    "SELECT id, length(tile) AS n FROM kept_tiles ORDER BY id",
+    `SELECT id, ifnull(length(tile), 0) + ${ROW_BYTES} AS n FROM kept_tiles ORDER BY id`,
   );
   const dropThrough = db.prepare("DELETE FROM kept_tiles WHERE id <= ?");
 
@@ -129,11 +172,12 @@ export function createKeptTiles(
     let last: number | undefined;
     for (const row of oldest.iterate() as Iterable<{ id: number; n: number }>) {
       last = row.id;
-      over -= row.n ?? 0;
-      bytes -= row.n ?? 0;
+      over -= row.n;
+      bytes -= row.n;
       if (over <= 0) break;
     }
-    if (last !== undefined) dropThrough.run(last);
+    if (last === undefined) return;
+    dropThrough.run(last);
   };
 
   return {
@@ -150,9 +194,11 @@ export function createKeptTiles(
       let id = 0;
       const r = tileReach(z, x, y);
       transaction(() => {
+        unreserve.run(z, x, y, detail);
         ({ id } = reserveTile.get(z, x, y, detail) as { id: number });
         for (const b of cellRanges(r.west, r.south, r.east, r.north)) {
-          addBox.run(b.py0, b.py1, b.px0, b.px1, id);
+          const box = addBox.run(b.py0, b.py1, b.px0, b.px1).lastInsertRowid;
+          addOwner.run(box, id);
         }
       });
       return id;
@@ -160,7 +206,7 @@ export function createKeptTiles(
 
     /** Keep a reserved tile, unless a write under it dropped its reservation. */
     keep(id: number, tile: Buffer | undefined) {
-      const n = tile?.length ?? 0;
+      const n = (tile?.length ?? 0) + ROW_BYTES;
       if (Number(fillTile.run(tile ?? new Uint8Array(0), id).changes) === 0) {
         return;
       }

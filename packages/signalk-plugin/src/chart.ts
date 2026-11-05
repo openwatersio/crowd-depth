@@ -2,6 +2,7 @@ import { pipeline } from "stream/promises";
 import { setTimeout } from "node:timers/promises";
 import { BATHY_REPORT_DELAY } from "./constants.js";
 import { DatabaseSync } from "node:sqlite";
+import type { Detail } from "./tiles/surface.js";
 import { Temporal } from "@js-temporal/polyfill";
 import { transform } from "stream-transform";
 import { ServerAPI } from "@signalk/server-api";
@@ -141,7 +142,7 @@ export function startChart({
     store,
     file,
     detail,
-    file ? createKeptTiles(db, detail) : undefined,
+    file ? keepTiles(db, detail, app) : undefined,
   );
   // Off the main thread, given a database file to say the plugin is built and running.
   const qc = db.location() ? createQCThread() : undefined;
@@ -289,6 +290,16 @@ function syncConfig(
     store.setMeta(POSITION_CONFIG_KEY, position);
   }
   store.setMeta(DEPTH_CONFIG_KEY, depth);
+}
+
+/** Tiles kept on disk, or none where they can't be: they only ever save building. */
+function keepTiles(db: DatabaseSync, detail: Detail, app: ServerAPI) {
+  try {
+    return createKeptTiles(db, detail);
+  } catch (err) {
+    app.error(`Chart layer keeps no tiles on disk: ${err}`);
+    return undefined;
+  }
 }
 
 /**

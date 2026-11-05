@@ -143,40 +143,66 @@ export function createDB(filename: string): DatabaseSync {
           tile BLOB,
           UNIQUE(z, x, y, detail)
         );
-        CREATE VIRTUAL TABLE IF NOT EXISTS kept_tile_boxes USING rtree_i32(id, py0, py1, px0, px1, +tile);
+        CREATE VIRTUAL TABLE IF NOT EXISTS kept_tile_boxes USING rtree_i32(id, py0, py1, px0, px1);
+        -- Each box's tile, indexed: an R*Tree can't index a column of its own but by id.
+        CREATE TABLE IF NOT EXISTS kept_tile_box_owners(
+          box INTEGER PRIMARY KEY,
+          tile INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS kept_tile_box_owners_tile
+          ON kept_tile_box_owners(tile);
         CREATE TRIGGER IF NOT EXISTS kept_tiles_drop AFTER DELETE ON kept_tiles BEGIN
-          DELETE FROM kept_tile_boxes WHERE tile = OLD.id;
+          DELETE FROM kept_tile_boxes WHERE id IN (
+            SELECT box FROM kept_tile_box_owners WHERE tile = OLD.id);
+          DELETE FROM kept_tile_box_owners WHERE tile = OLD.id;
         END;
       `);
-      const under = (row: string, reach = "0") => `
-        DELETE FROM kept_tiles WHERE id IN (
-          SELECT tile FROM kept_tile_boxes
-          WHERE py0 <= ${row}.py + ${reach} AND py1 >= ${row}.py - ${reach}
-            AND px0 <= ${row}.px + ${reach} AND px1 >= ${row}.px - ${reach});`;
-      // An overview block reaches 2^level cells from the cell it holds.
-      for (const [table, reach] of [
-        ["cells", "0"],
-        ["shoals", "0"],
-        ["overviews", "(1 << {}.level)"],
-      ]) {
-        const r = (row: string) => reach.replace("{}", row);
-        db.exec(`
-          CREATE TRIGGER IF NOT EXISTS kept_tiles_${table}_insert AFTER INSERT ON ${table} BEGIN
-            ${under("NEW", r("NEW"))}
-          END;
-          CREATE TRIGGER IF NOT EXISTS kept_tiles_${table}_update AFTER UPDATE ON ${table} BEGIN
-            ${under("OLD", r("OLD"))}
-            ${under("NEW", r("NEW"))}
-          END;
-          CREATE TRIGGER IF NOT EXISTS kept_tiles_${table}_delete AFTER DELETE ON ${table} BEGIN
-            ${under("OLD", r("OLD"))}
-          END;
-        `);
-      }
+      keptTileTriggers(db, true);
     },
   ]);
 
   return db;
+}
+
+const KEPT_TILE_SOURCES = [
+  // An overview block reaches 2^level cells from the cell it holds.
+  ["cells", "0"],
+  ["shoals", "0"],
+  ["overviews", "(1 << {}.level)"],
+] as const;
+
+/**
+ * Make, with `on`, or drop the triggers that drop a kept tile (tiles/kept.ts) when a row
+ * it was built from is written. Dropped only for a moment, in a transaction, to clear
+ * the tables they're on at once: with them, SQLite deletes row by row.
+ */
+export function keptTileTriggers(db: DatabaseSync, on: boolean) {
+  const under = (row: string, reach: string) => `
+    DELETE FROM kept_tiles WHERE id IN (
+      SELECT o.tile FROM kept_tile_boxes b JOIN kept_tile_box_owners o ON o.box = b.id
+      WHERE b.py0 <= ${row}.py + ${reach} AND b.py1 >= ${row}.py - ${reach}
+        AND b.px0 <= ${row}.px + ${reach} AND b.px1 >= ${row}.px - ${reach});`;
+  for (const [table, reach] of KEPT_TILE_SOURCES) {
+    const r = (row: string) => reach.replace("{}", row);
+    db.exec(
+      on
+        ? `
+      CREATE TRIGGER IF NOT EXISTS kept_tiles_${table}_insert AFTER INSERT ON ${table} BEGIN
+        ${under("NEW", r("NEW"))}
+      END;
+      CREATE TRIGGER IF NOT EXISTS kept_tiles_${table}_update AFTER UPDATE ON ${table} BEGIN
+        ${under("OLD", r("OLD"))}
+        ${under("NEW", r("NEW"))}
+      END;
+      CREATE TRIGGER IF NOT EXISTS kept_tiles_${table}_delete AFTER DELETE ON ${table} BEGIN
+        ${under("OLD", r("OLD"))}
+      END;`
+        : `
+      DROP TRIGGER IF EXISTS kept_tiles_${table}_insert;
+      DROP TRIGGER IF EXISTS kept_tiles_${table}_update;
+      DROP TRIGGER IF EXISTS kept_tiles_${table}_delete;`,
+    );
+  }
 }
 
 export type Migration = (db: DatabaseSync) => void;

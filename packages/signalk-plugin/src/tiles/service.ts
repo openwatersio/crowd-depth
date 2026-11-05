@@ -42,6 +42,9 @@ const ENTRY_BYTES = 100;
  * the boat's latest pass hardly shows: those tiles refresh on a slow timer. */
 const SLOW_BELOW_ZOOM = 10;
 export const SLOW_REFRESH_MS = 5 * 60_000;
+/** A tile changed within this long isn't kept on disk: underway, the tiles round the
+ * boat change with every flush, and keeping each would only wear the SD card. */
+export const KEEP_QUIET_MS = 10 * 60_000;
 /** Revisions of changed tiles a client can catch up on before it refetches them all. */
 const HISTORY = 500;
 
@@ -217,7 +220,14 @@ export function createTileService(
       return undefined;
     }
   };
+  /** When each tile last changed, for those changed within KEEP_QUIET_MS. */
+  const changedAt = new Map<string, number>();
+  const quiet = (k: string) =>
+    Date.now() - (changedAt.get(k) ?? -Infinity) >= KEEP_QUIET_MS;
   const reserve = (z: number, x: number, y: number) => {
+    // Not while a backfill writes: its transactions hold the write lock, which this
+    // would wait on with the server's thread, and its writes drop the tile anyway.
+    if (!sharing || !quiet(`${z}/${x}/${y}`)) return undefined;
     try {
       return kept?.reserve(z, x, y);
     } catch {
@@ -298,7 +308,8 @@ export function createTileService(
       });
       building.set(k, result);
       const tile = await result;
-      if (id !== undefined) {
+      // Not once a backfill has started meanwhile, whose write lock this would wait on.
+      if (id !== undefined && sharing) {
         try {
           kept!.keep(id, tile);
         } catch {
@@ -315,6 +326,10 @@ export function createTileService(
       clearShared(store, keys);
       for (const w of workers) w.clear(keys);
       const now = new Map<string, TileId>();
+      const at = Date.now();
+      for (const [k, t] of changedAt) {
+        if (at - t >= KEEP_QUIET_MS) changedAt.delete(k);
+      }
       for (const { lon, lat } of positions) {
         const dLat = MARGIN_M / M_PER_DEG_LAT;
         const dLon = MARGIN_M / mPerDegLon(Math.min(Math.abs(lat), 85));
@@ -326,7 +341,9 @@ export function createTileService(
             for (let y = Math.floor(a.y); y <= Math.floor(b.y); y++) {
               // Across the antimeridian, the tile on the other side.
               const id: TileId = [z, ((x % n) + n) % n, y];
-              (z < SLOW_BELOW_ZOOM ? slow : now).set(id.join("/"), id);
+              const k = id.join("/");
+              (z < SLOW_BELOW_ZOOM ? slow : now).set(k, id);
+              changedAt.set(k, at);
             }
           }
         }

@@ -1,12 +1,16 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, expect, test } from "vitest";
-import { createDB } from "../../src/storage.js";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { createDB, keptTileTriggers } from "../../src/storage.js";
 import { createCellStore } from "../../src/tiles/cells.js";
 import { cellAt, cellRanges, tileFraction } from "../../src/tiles/geometry.js";
 import { createKeptTiles, tileReach } from "../../src/tiles/kept.js";
-import { createTileService, readTile } from "../../src/tiles/service.js";
+import {
+  KEEP_QUIET_MS,
+  createTileService,
+  readTile,
+} from "../../src/tiles/service.js";
 
 const LON = -76.2;
 const LAT = 36.98;
@@ -149,12 +153,178 @@ test("tiles drawn by another build are dropped", () => {
 
 test("the oldest kept tiles go first past the bound", () => {
   const db = createDB(file);
-  const kept = createKeptTiles(db, "high", { maxBytes: 1000 });
+  const kept = createKeptTiles(db, "high", { maxBytes: 2000 });
   const tile = Buffer.alloc(300, 1);
+  // Each counted with its row, 556 bytes.
   for (let x = 0; x < 6; x++) kept.keep(kept.reserve(14, x, 100), tile);
   const left = [0, 1, 2, 3, 4, 5].filter(
     (x) => kept.get(14, x, 100) !== undefined,
   );
-  expect(left).toEqual([4, 5]);
+  expect(left).toEqual([3, 4, 5]);
+  db.close();
+});
+
+test("a tile reserved again leaves none of its old boxes", () => {
+  const db = createDB(file);
+  const kept = createKeptTiles(db, "high");
+  const boxes = () =>
+    (
+      db.prepare("SELECT count(*) AS n FROM kept_tile_boxes").get() as {
+        n: number;
+      }
+    ).n;
+  kept.reserve(...tileAt(8));
+  const one = boxes();
+  expect(one).toBeGreaterThan(0);
+  // As after a build that failed, asked for again.
+  kept.reserve(...tileAt(8));
+  expect(boxes()).toBe(one);
+  // Boxes left without a tile, or with none at all, go on start.
+  db.exec(`
+    INSERT INTO kept_tile_boxes(id, py0, py1, px0, px1) VALUES(99998, 0, 1, 0, 1);
+    INSERT INTO kept_tile_box_owners(box, tile) VALUES(99998, 99999);
+    INSERT INTO kept_tile_boxes(id, py0, py1, px0, px1) VALUES(99997, 0, 1, 0, 1);`);
+  createKeptTiles(db, "high");
+  expect(boxes()).toBe(0);
+  db.close();
+});
+
+test("empty tiles count toward the bound", () => {
+  const db = createDB(file);
+  const kept = createKeptTiles(db, "high", { maxBytes: 2000 });
+  for (let x = 0; x < 40; x++) kept.keep(kept.reserve(14, x, 100), undefined);
+  const left = Array.from({ length: 40 }, (_, x) => kept.get(14, x, 100));
+  expect(left.filter((t) => t === null).length).toBeLessThan(10);
+  expect(left.at(-1)).toBeNull();
+  db.close();
+});
+
+test("an overview block whose cell moves away drops the tiles it was under", () => {
+  const db = createDB(file);
+  const store = createCellStore(db);
+  store.addPasses(pass(8));
+  const kept = createKeptTiles(db, "high");
+  const at = tileAt(14, LON + 0.5);
+  const r = tileReach(...at);
+  const box = cellRanges(r.west, r.south, r.east, r.north)[0];
+  // Written as the cell store writes blocks: an upsert, which updates the row.
+  const block = db.prepare(
+    `INSERT INTO overviews(level, oy, ox, py, px, m, d, passes, first, last)
+     VALUES(4, 1, 1, ?, ?, 100, 1, 1, 1, 1)
+     ON CONFLICT(level, oy, ox) DO UPDATE SET py = excluded.py, px = excluded.px`,
+  );
+  block.run(box.py0, box.px0);
+  kept.keep(kept.reserve(...at), readTile(store, ...at));
+  expect(kept.get(...at)).toBeDefined();
+  block.run(box.py0 + 10_000, box.px0);
+  expect(kept.get(...at)).toBeUndefined();
+  db.close();
+});
+
+test("clearing the cells drops every kept tile, and later writes still do", () => {
+  const db = createDB(file);
+  const store = createCellStore(db);
+  store.addPasses(pass(8));
+  const kept = createKeptTiles(db, "high");
+  const at = tileAt(14);
+  kept.keep(kept.reserve(...at), readTile(store, ...at));
+  store.clear();
+  expect(kept.get(...at)).toBeUndefined();
+  kept.keep(kept.reserve(...at), readTile(store, ...at));
+  expect(kept.get(...at)).toBeNull();
+  store.addPasses(pass(8));
+  expect(kept.get(...at)).toBeUndefined();
+  db.close();
+});
+
+test("a database from before kept tiles takes them on", () => {
+  const db = createDB(file);
+  const store = createCellStore(db);
+  store.addPasses(pass(8));
+  // Back to user_version 7, before the kept tiles' tables.
+  db.exec(`
+    DROP TABLE kept_tiles; DROP TABLE kept_tile_boxes; DROP TABLE kept_tile_box_owners;
+    PRAGMA user_version = 7;`);
+  keptTileTriggers(db, false);
+  db.close();
+  const again = createDB(file);
+  const kept = createKeptTiles(again, "high");
+  const at = tileAt(14);
+  const reread = createCellStore(again);
+  kept.keep(kept.reserve(...at), readTile(reread, ...at));
+  expect(kept.get(...at)?.length).toBeGreaterThan(0);
+  reread.addPasses(pass(20));
+  expect(kept.get(...at)).toBeUndefined();
+  again.close();
+});
+
+test("tiles built while a backfill writes aren't kept", async () => {
+  const db = createDB(file);
+  const store = createCellStore(db);
+  store.addPasses(pass(8));
+  const kept = createKeptTiles(db, "high");
+  const tiles = createTileService(store, undefined, "high", kept);
+  const at = tileAt(14);
+  tiles.share(false);
+  expect((await tiles.get(...at))?.length).toBeGreaterThan(0);
+  expect(kept.get(...at)).toBeUndefined();
+  tiles.share(true);
+  tiles.reset();
+  await tiles.get(...at);
+  expect(kept.get(...at)?.length).toBeGreaterThan(0);
+  tiles.close();
+  db.close();
+});
+
+test("rebuilding the overviews keeps the tiles whose blocks stay the same", () => {
+  const db = createDB(file);
+  const store = createCellStore(db);
+  // Each cell a depth of its own, so each block's shoalest is one cell, picked alike by
+  // the live writer and the rebuild.
+  store.addPasses(pass(8).map((p, i) => ({ ...p, depth: 8 + i / 10 })));
+  const kept = createKeptTiles(db, "high");
+  const at = tileAt(12);
+  kept.keep(kept.reserve(...at), readTile(store, ...at));
+  // As every backfill ends, however few soundings it found.
+  store.rebuildOverviews();
+  expect(kept.get(...at)?.length).toBeGreaterThan(0);
+  db.close();
+});
+
+test("a tile changed in the last few minutes isn't kept", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  try {
+    const db = createDB(file);
+    const store = createCellStore(db);
+    store.addPasses(pass(8));
+    const kept = createKeptTiles(db, "high");
+    const tiles = createTileService(store, undefined, "high", kept);
+    const at = tileAt(14);
+    tiles.changed([{ lon: LON, lat: LAT }]);
+    await tiles.get(...at);
+    expect(kept.get(...at)).toBeUndefined();
+    vi.setSystemTime(Date.now() + KEEP_QUIET_MS);
+    tiles.reset();
+    await tiles.get(...at);
+    expect(kept.get(...at)?.length).toBeGreaterThan(0);
+    tiles.close();
+    db.close();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("dropping a kept tile finds its boxes by index, not by scanning them", () => {
+  const db = createDB(file);
+  const plan = (sql: string) =>
+    (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all() as { detail: string }[]).map(
+      (r) => r.detail,
+    );
+  // INDEX 1 is the R*Tree's lookup by id; INDEX 2 with no constraints reads it whole.
+  expect(
+    plan(
+      "DELETE FROM kept_tile_boxes WHERE id IN (SELECT box FROM kept_tile_box_owners WHERE tile = 1)",
+    ),
+  ).toContain("SCAN kept_tile_boxes VIRTUAL TABLE INDEX 1:");
   db.close();
 });
