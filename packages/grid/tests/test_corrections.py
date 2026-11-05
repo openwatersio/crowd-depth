@@ -11,7 +11,7 @@ import pytest
 import rasterio
 from rasterio.transform import from_bounds
 from rasterio.warp import transform_bounds
-from test_grid import LAT0, LON0, T0, at, put
+from test_grid import LAT0, LON0, T0, at, put, put_dated
 from test_ingest import env  # noqa: F401  (a fixture)
 
 from grid import calibrate, catalog, cells, cli, ingest, overlay, tide
@@ -310,7 +310,10 @@ FLEET = [
 ]
 
 
-def test_offsets_per_step_segment_from_anchors_and_crossings(env, tmp_path, monkeypatch):  # noqa: F811
+# Each transit's medians a file at a time give the same steps and offsets as all at once.
+@pytest.mark.parametrize("batch", [calibrate.TRANSIT_ROWS, 1])
+def test_offsets_per_step_segment_from_anchors_and_crossings(env, tmp_path, monkeypatch, batch):  # noqa: F811
+    monkeypatch.setattr(calibrate, "TRANSIT_ROWS", batch)
     ref = reference(tmp_path / "ref.tif", (0, 110))
     totals = calibrated(env, FLEET, ref, monkeypatch)
     assert totals["steps"] == 1
@@ -358,9 +361,9 @@ def test_calibration_reads_a_dense_tile_in_bands_as_it_would_whole(env, monkeypa
         untided(con)
         calibrate.reduce(con)
         whole = sorted(con.execute("FROM cal_obs").fetchall())
-        monkeypatch.setattr(cells, "BATCH_POINTS", 1)
+        monkeypatch.setattr(calibrate, "REDUCE_POINTS", 1)
         [(partition,)] = con.execute("SELECT DISTINCT cell_id FROM lake.points").fetchall()
-        assert len(cells.units(con, partition, [], rows=18)) > 1
+        assert len(cells.units(con, partition, [], rows=18, points=calibrate.REDUCE_POINTS)) > 1
         calibrate.reduce(con, full=True)
         banded = sorted(con.execute("FROM cal_obs").fetchall())
     assert len(whole) > 100 and banded == whole
@@ -1359,6 +1362,78 @@ def test_a_month_is_set_aside_only_in_the_tiles_it_read_lost(env, tmp_path, monk
     assert (TILE + 1,) in env.query("SELECT DISTINCT tile_id FROM lake.tile_changes")
 
 
+def test_lost_runs_set_aside_the_soundings_each_one_holds(env):  # noqa: F811
+    # Two vessels' files over three days, a sounding every 20 minutes in one tile and then
+    # the next, under runs that overlap, nest, cross midnight, share a day with another
+    # stretch, end on a sounding, hold in the next tile, or in every tile, and one of B's
+    # content on A's times.
+    for n, vessel in ((1, "AQM-A"), (2, "AQM-B")):
+        rows = [(i * 1200, *at(5000, (i // 3 % 2) * cells.BASE + i % 3), 5.0) for i in range(216)]
+        put_dated(env, n, rows, vessel)
+    env.run("noaa")
+    day = timedelta(days=1)
+    t = T0.replace(hour=0) + day  # midnight after the first sounding
+    runs = [
+        ("A", TILE, t - timedelta(hours=1), t + timedelta(hours=1)),
+        ("A", TILE, t + timedelta(minutes=30), t + timedelta(hours=2)),
+        ("A", TILE, t + timedelta(minutes=110), t + timedelta(minutes=115)),
+        ("A", TILE, t + timedelta(hours=4), t + timedelta(hours=5)),
+        ("A", TILE + 1, t + timedelta(hours=10), t + timedelta(hours=12)),
+        ("A", None, t + day + timedelta(hours=5), t + day + timedelta(hours=6)),
+        ("A", TILE, t + day + timedelta(hours=3), t + day + timedelta(hours=3)),
+        ("B", TILE, t + timedelta(hours=20), t + timedelta(hours=23)),
+    ]
+    with open_store(env.store) as con:
+        content = dict(
+            con.execute("SELECT right(vessel, 1), content_hash FROM lake.files").fetchall()
+        )
+        for owner, tile, t0, t1 in runs:
+            con.execute(
+                "INSERT INTO lake.lost_runs VALUES (?, 'AQM-A', ?, ?, ?)",
+                [content[owner], tile, t0, t1],
+            )
+    got = corrected(env, "tile_id, lost_bottom")
+    want = [
+        (
+            u,
+            at_,
+            tile,
+            u == "AQM-A"
+            and any(
+                o == "A" and (r is None or r == tile) and t0 <= at_ <= t1 for o, r, t0, t1 in runs
+            ),
+        )
+        for u, at_, tile, _ in got
+    ]
+    assert len(got) == 432 and 10 < sum(lost for *_, lost in got) < 100 and got == want
+
+
+def test_a_sounding_under_a_tile_run_and_a_run_with_no_tile_comes_out_once(env):  # noqa: F811
+    # A store not yet recalibrated keeps a run with no tile beside the tile's own runs that
+    # cover the same soundings, both across midnight: each sounding still comes out once.
+    put_dated(env, 1, [(i * 1200, *at(5000, i % 3), 5.0) for i in range(216)], "AQM-A")
+    env.run("noaa")
+    t = T0.replace(hour=0) + timedelta(days=1)
+    runs = [
+        (TILE, t - timedelta(hours=1), t + timedelta(hours=2)),
+        (TILE, t + timedelta(hours=1), t + timedelta(hours=3)),
+        (None, t - timedelta(minutes=30), t + timedelta(hours=4)),
+        (None, t + timedelta(hours=3), t + timedelta(hours=5)),
+    ]
+    with open_store(env.store) as con:
+        con.executemany(
+            "INSERT INTO lake.lost_runs"
+            " SELECT content_hash, 'AQM-A', ?, ?, ? FROM lake.files",
+            runs,
+        )
+    got = corrected(env, "lost_bottom")
+    both = [at_ for _, at_, _ in got if t <= at_ <= t + timedelta(hours=2)]
+    assert len(got) == 216 and len({at_ for _, at_, _ in got}) == 216 and len(both) == 7
+    assert got == [
+        (u, at_, any(t0 <= at_ <= t1 for _, t0, t1 in runs)) for u, at_, _ in got
+    ]
+
+
 def test_a_run_with_no_tile_holds_in_every_tile_until_recalibration(env, tmp_path, monkeypatch):  # noqa: F811
     # An upgrade reaches the overlay without a calibrate, and the overlay reads these too.
     calibrated(env, FLEET, reference(tmp_path / "ref.tif", (0, 110)), monkeypatch)
@@ -1484,18 +1559,22 @@ def test_lost_readings_at_a_mooring_over_flat_water_are_kept(env, tmp_path, monk
 
 
 @pytest.mark.parametrize("relief, set_aside", [(calibrate.FLAT_RELIEF_M, True), (0, False)])
+# A batch of each file alone finds the same stretches as all of a vessel's files at once.
+@pytest.mark.parametrize("search", [calibrate.SEARCH_POINTS, 1])
 def test_lost_readings_that_wander_over_flat_water_are_set_aside(
     env,  # noqa: F811
     tmp_path,
     monkeypatch,
     relief,
     set_aside,
+    search,
 ):
     # T's month reads true but for one transit's stretches of 8 readings at 0.4 to 1.4 m,
     # never a stuck run and a few percent of its pixels: over the flat survey, they're set
     # aside and the readings between them kept; over relief, all of them are kept.
     monkeypatch.setattr(calibrate, "STUCK_SHARE", 0.01)
     monkeypatch.setattr(calibrate, "FLAT_RELIEF_M", relief)
+    monkeypatch.setattr(calibrate, "SEARCH_POINTS", search)
     n, rows, vessel = transit(20, "AQM-T", 5.4, (0, 240), 20)
     rows = [
         (ts, x, y, 0.4 + 0.2 * (i % 6) if i % 40 < 8 else d) for i, (ts, x, y, d) in enumerate(rows)
@@ -1512,8 +1591,11 @@ def test_lost_readings_that_wander_over_flat_water_are_set_aside(
     assert got == ({(True, True), (False, False)} if set_aside else {(True, False), (False, False)})
 
 
-def test_a_stuck_run_holds_through_a_stray_reading(env, tmp_path, monkeypatch):  # noqa: F811
+# A batch of each file alone finds the same run as all of a vessel's files at once.
+@pytest.mark.parametrize("search", [calibrate.SEARCH_POINTS, 1])
+def test_a_stuck_run_holds_through_a_stray_reading(env, tmp_path, monkeypatch, search):  # noqa: F811
     # One reading in 15 jumps to 1.6 m: still lost, and two to a window, under its top tenth.
+    monkeypatch.setattr(calibrate, "SEARCH_POINTS", search)
     n, rows, vessel = stuck(20, "AQM-T", 0.8, 20)
     rows = [(ts, x, y, 1.6 if i % 15 == 7 else d) for i, (ts, x, y, d) in enumerate(rows)]
     fleet = [
@@ -1543,15 +1625,18 @@ def test_stuck_runs_are_searched_where_a_vessel_holds_only_held_depths(env):  # 
         con.execute(
             "CREATE TEMP TABLE stuck_vessels AS SELECT 'AQM-A' AS vessel UNION SELECT 'AQM-B'"
         )
-        got = {(t, v) for _, t, v in calibrate.stuck_pairs(con)}
+        got = {(t, v) for _, t, v, _ in calibrate.stuck_pairs(con)}
     assert got == {(t, v) for t in (TILE, second) for v in ("AQM-A", "AQM-B")}
 
 
 def test_stuck_run_windows_order_soundings_the_same_every_time():
     # Soundings of one file can share a time and depth: ordered by those alone, which of
     # them a window holds, and so the runs found, could change from run to run.
-    orders = re.findall(r"ORDER BY ([^)\n]*?)(?:\s+ROWS|\)|\n)", calibrate.STUCK + calibrate.FLAT)
-    assert len(orders) == 6 and all(o.strip() == "time, raw, row" for o in orders), orders
+    orders = re.findall(
+        r"ORDER BY ([^)\n]*?)(?:\s+ROWS|\)|\n)",
+        "\n".join((*calibrate.SEARCH, calibrate.STUCK, calibrate.FLAT)),
+    )
+    assert len(orders) == 5 and all(o.strip() == "time, raw, row" for o in orders), orders
 
 
 def test_a_sounder_holding_one_depth_is_a_stuck_run(env, tmp_path, monkeypatch):  # noqa: F811
@@ -1681,6 +1766,15 @@ def test_stuck_runs_from_another_flat_water_rule_arent_current(
 ):
     calibrated(env, FLEET, reference(tmp_path / "ref.tif", (0, 110)), monkeypatch)
     monkeypatch.setattr(calibrate, constant, getattr(calibrate, constant) + 0.1)
+    with open_store(env.store) as con:
+        assert not calibrate.runs_current(con)
+
+
+def test_stuck_runs_from_another_search_arent_current(env, tmp_path, monkeypatch):  # noqa: F811
+    # The soundings a search reads are part of its rule, as its windows are.
+    calibrated(env, FLEET, reference(tmp_path / "ref.tif", (0, 110)), monkeypatch)
+    soundings, judged = calibrate.SEARCH
+    monkeypatch.setattr(calibrate, "SEARCH", (soundings.replace("'noisy'", "'noisy', 'x'"), judged))
     with open_store(env.store) as con:
         assert not calibrate.runs_current(con)
 

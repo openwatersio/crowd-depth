@@ -38,15 +38,17 @@ No depth scale factor is fitted: at 2–20 m it barely narrows the spread.
 import bisect
 import hashlib
 import inspect
+import itertools
 import logging
 import math
+from datetime import datetime
 
 import numpy as np
 from scipy.sparse import coo_matrix, csc_matrix, csr_matrix, diags
 from scipy.sparse.csgraph import connected_components
 from scipy.sparse.linalg import splu
 
-from . import catalog, cells, manifest, reference
+from . import catalog, cells, manifest, reference, release
 from .cells import BASE, K_LIST
 from .qc import QC_VERSION, TRACK_REASONS
 
@@ -126,6 +128,14 @@ CROWD_VESSELS = 3
 # reads true corrected too deep. Only readings the solve can already tell from the rest: where
 # lost ones are most of a vessel's, its offset settles among them and none reads lost.
 LOST_PASSES = 3
+# Soundings per batch of a vessel's files in a tile, searched for stuck runs at once: one
+# vessel's 5.0M in a Chesapeake tile ran out of memory at a 768 MB limit.
+SEARCH_POINTS = 1_000_000
+# DuckDB threads for the stuck-run search: each holds its own share of a pair's soundings,
+# and on 4 a vessel's 5.0M in one tile took under 512 MB, against more than 640 MB on 18.
+SEARCH_THREADS = 4
+# Rows per batch of files whose per-transit medians are taken at once (transit_offsets).
+TRANSIT_ROWS = 2_000_000
 # A vessel's calendar month in a 1° tile with MONTH_SHARE or more of its pixels there
 # reading lost (from MONTH_PIXELS judged) is set aside in that tile, so a sounder that lost
 # the bottom in one bay keeps its soundings in the next: with stuck runs and stretches, 2.54M
@@ -163,6 +173,12 @@ WHERE p.file_id IN (SELECT file_id FROM cal_dirty)
       AND flag IN ('reject', 'unconfirmed', 'noisy'))
 GROUP BY ALL
 """
+
+# Soundings per unit of REDUCE's work: its per-pixel medians can't spill, and at a 768 MB
+# limit and 18 threads a band of tile 45463 ran out of memory in units of cells' 5M.
+REDUCE_POINTS = 1_250_000
+# Base rows per band: an even number, so no pixel is split between two.
+REDUCE_ROWS = 18
 
 # Each active file's soundings per tile and their batches, keyed so a file whose
 # soundings moved has its tide cells found again (FILE_TIDE_CELLS).
@@ -272,34 +288,39 @@ FROM cal_obs o JOIN anchor_px r USING (tile_id, py, px)
 WHERE abs(o.m - r.depth) < {ANCHOR_DIFF_M}
 """
 
-# One tile's soundings of the vessels in `$vessels`: each file's in order (ties broken by
-# row, so a run comes out the same every time), and whether each reads lost over a seabed
-# (`unit_offsets`, `seabed_px`).
-SEARCHED = f"""
-WITH p AS (
-  SELECT p.file_id, p.row, p.unique_id AS vessel, p.time, p.lon, p.lat, p.depth_raw AS raw,
-    p.depth_raw - coalesce(p.tide, 0) AS tr,
-    floor((p.lat - (p.tile_id // 360 - 90)) * {BASE} / 2)::INTEGER AS py,
-    floor((p.lon - (p.tile_id % 360 - 180)) * {BASE}
-      / {K_LIST}[p.tile_id // 360 - 90 + 91] / 2)::INTEGER AS px
-  FROM corrected_points_in($partition, [$tile], 0, {BASE}, vessels := $vessels) p
-  WHERE p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M} AND p.time IS NOT NULL
-    AND (p.tide IS NOT NULL OR (p.tide_assigned AND p.tide_station IS NULL))
-    AND p.point_id NOT IN (
-      SELECT point_id FROM lake.qc_flags WHERE cell_id = $partition AND tile_id = $tile
-        AND qc_version = {QC_VERSION} AND list_contains({TRACK_REASONS}, reason)
-        AND flag IN ('reject', 'unconfirmed', 'noisy')
-        -- A held depth is what a stuck sounder reads: in, or the run breaks around it.
-        AND NOT (flag = 'unconfirmed' AND reason = 'flatline'))
-),
-w AS (
-  SELECT p.*,
-    coalesce(tr < {LOST_BOTTOM} * (u.o + s.z) AND tr < u.o + s.z - {LOST_MARGIN_M}, false) AS lost,
-    coalesce(s.flat, false) AS flat,
-    row_number() OVER (PARTITION BY p.file_id ORDER BY time, raw, row) AS i
-  FROM p JOIN unit_offsets u USING (vessel, file_id)
-  LEFT JOIN seabed_px s ON s.tile_id = $tile AND s.py = p.py AND s.px = p.px
-)"""
+# The temp table `searched`: one tile's soundings of the vessel in `$vessels`, each file's in
+# order (ties broken by row, so a run comes out the same every time), and whether each reads
+# lost over a seabed (`unit_offsets`, `seabed_px`). Two statements, on SEARCH_THREADS: as one,
+# on 18, a vessel's 5.0M soundings in a Chesapeake tile ran out of memory at a 768 MB limit.
+SEARCH = (
+    f"""
+CREATE OR REPLACE TEMP TABLE search_soundings AS
+SELECT p.file_id, p.row, p.unique_id AS vessel, p.time, p.lon, p.lat, p.depth_raw AS raw,
+  p.depth_raw - coalesce(p.tide, 0) AS tr,
+  floor((p.lat - (p.tile_id // 360 - 90)) * {BASE} / 2)::INTEGER AS py,
+  floor((p.lon - (p.tile_id % 360 - 180)) * {BASE}
+    / {K_LIST}[p.tile_id // 360 - 90 + 91] / 2)::INTEGER AS px
+FROM corrected_points_in($partition, [$tile], 0, {BASE}, vessels := $vessels) p
+WHERE p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M} AND p.time IS NOT NULL
+  AND (p.tide IS NOT NULL OR (p.tide_assigned AND p.tide_station IS NULL))
+  AND p.point_id NOT IN (
+    SELECT point_id FROM lake.qc_flags WHERE cell_id = $partition AND tile_id = $tile
+      AND qc_version = {QC_VERSION} AND list_contains({TRACK_REASONS}, reason)
+      AND flag IN ('reject', 'unconfirmed', 'noisy')
+      -- A held depth is what a stuck sounder reads: in, or the run breaks around it.
+      AND NOT (flag = 'unconfirmed' AND reason = 'flatline'))""",
+    f"""
+CREATE OR REPLACE TEMP TABLE searched AS
+SELECT p.*,
+  coalesce(tr < {LOST_BOTTOM} * (u.o + s.z) AND tr < u.o + s.z - {LOST_MARGIN_M}, false) AS lost,
+  coalesce(s.flat, false) AS flat,
+  row_number() OVER (PARTITION BY p.file_id ORDER BY time, raw, row) AS i
+FROM search_soundings p JOIN unit_offsets u USING (vessel, file_id)
+LEFT JOIN seabed_px s ON s.tile_id = $tile AND s.py = p.py AND s.px = p.px""",
+)
+# Those of a batch of files at a time, a run of file ids in order read as their range `$lo`
+# to `$hi`: every window and run is within a file.
+SEARCHED = "WITH w AS (FROM searched WHERE file_id BETWEEN $lo AND $hi)"
 
 # Stuck runs: stuck windows joined where they overlap. A run counts from STUCK_RUN stuck
 # windows across STUCK_REACH_M, and starts and ends on a lost reading, so a bank crossed
@@ -388,7 +409,8 @@ def fill_tide_cells(con):
 def reduce(con, full=False):
     """Fill the temp table `cal_obs` from each active file's kept medians, after reducing
     again the files whose inputs moved (MEDIAN_INPUTS, DEPENDENTS), or every file if
-    `full`, in cells' units of work, so memory follows a unit rather than the densest tile.
+    `full`, in units of REDUCE_POINTS soundings, so memory follows a unit rather than the
+    densest tile.
     Returns how many tiles and files it read."""
     manifest.ensure_file_tiles(con)
     fill_tide_cells(con)
@@ -420,8 +442,9 @@ def reduce(con, full=False):
     ).fetchall()
     tiles = set()
     for partition, dirty_tiles, vessels in parts:
-        # Bands of 18 base rows: an even number, so no pixel is split between two.
-        for unit, rlo, rhi in cells.units(con, partition, dirty_tiles, rows=18):
+        for unit, rlo, rhi in cells.units(
+            con, partition, dirty_tiles, rows=REDUCE_ROWS, points=REDUCE_POINTS
+        ):
             con.execute(
                 REDUCE,
                 {
@@ -432,6 +455,7 @@ def reduce(con, full=False):
                     "vessels": vessels,
                 },
             )
+            release()
             tiles.update(unit)
     con.execute(
         """INSERT INTO lake.file_median_inputs
@@ -499,18 +523,28 @@ def stuck_runs(con, offset, status):
         SELECT u.vessel, u.file_id, o.o FROM file_units u JOIN offsets_np o USING (unit)"""
     )
     con.unregister("offsets_np")
+    # A tile at a time: the medians can't spill, and every row of a pixel is in its tile.
     con.execute(
-        f"""CREATE OR REPLACE TEMP TABLE seabed_px AS
-        WITH crowd AS (
-          SELECT tile_id, py, px, median(z) AS z FROM (
-            SELECT o.tile_id, o.py, o.px, o.vessel, median(o.m - u.o) AS z
-            FROM cal_obs o JOIN unit_offsets u USING (vessel, file_id) GROUP BY ALL)
-          GROUP BY ALL HAVING count(*) >= {CROWD_VESSELS}
-        )
-        -- least() passes over a NULL: either alone, or the shallower of both.
-        SELECT tile_id, py, px, least(s.depth, c.z) AS z, s.flat
-        FROM survey_px s FULL JOIN crowd c USING (tile_id, py, px)"""
+        """CREATE OR REPLACE TEMP TABLE seabed_px (tile_id INTEGER, py INTEGER, px INTEGER,
+        z DOUBLE, flat BOOLEAN)"""
     )
+    for (tile,) in con.execute("SELECT DISTINCT tile_id FROM cal_obs ORDER BY 1").fetchall():
+        con.execute(
+            f"""INSERT INTO seabed_px
+            WITH crowd AS (
+              SELECT tile_id, py, px, median(z) AS z FROM (
+                SELECT o.tile_id, o.py, o.px, o.vessel, median(o.m - u.o) AS z
+                FROM cal_obs o JOIN unit_offsets u USING (vessel, file_id)
+                WHERE o.tile_id = $tile GROUP BY ALL)
+              GROUP BY ALL HAVING count(*) >= {CROWD_VESSELS}
+            )
+            -- least() passes over a NULL: either alone, or the shallower of both.
+            SELECT tile_id, py, px, least(s.depth, c.z) AS z, s.flat
+            FROM (FROM survey_px WHERE tile_id = $tile) s FULL JOIN crowd c
+              USING (tile_id, py, px)""",
+            {"tile": tile},
+        )
+        release()
     # Each vessel's calendar months in each tile: how many of its file-pixel medians were
     # judged, and how many read lost.
     lost = f"o.m < {LOST_BOTTOM} * (s.z + u.o) AND o.m < s.z + u.o - {LOST_MARGIN_M}"
@@ -552,26 +586,51 @@ def stuck_runs(con, offset, status):
     # ponytail: a file's run is found and applied per tile, so one that crosses a tile edge
     # is two; judge across tiles if the seams show
     # One vessel of one tile at a time, so memory follows the largest vessel's soundings in a
-    # tile rather than every searched vessel's. ponytail: one vessel's years at its mooring
-    # still go in at once; band by file time if a liveaboard outgrows the limit
-    for partition, tile, vessel in stuck_pairs(con):
-        params = {"partition": partition, "tile": tile, "vessels": [vessel]}
-        runs += con.execute(STUCK, params).fetchall() + con.execute(FLAT, params).fetchall()
+    # tile rather than every searched vessel's, and its windows a batch of files at a time.
+    # ponytail: a vessel's soundings in a tile are still read at once (5.3M on the
+    # Chesapeake); read them a range of files at a time if a liveaboard outgrows the limit
+    threads = con.execute("SELECT current_setting('threads')").fetchone()[0]
+    con.execute(f"SET threads = {min(threads, SEARCH_THREADS)}")
+    try:
+        for partition, tile, vessel, batches in stuck_pairs(con):
+            soundings, judged = SEARCH
+            con.execute(soundings, {"partition": partition, "tile": tile, "vessels": [vessel]})
+            con.execute(judged, {"tile": tile})
+            for files in batches:
+                params = {"tile": tile, "lo": files[0], "hi": files[-1]}
+                runs += con.execute(STUCK, params).fetchall() + con.execute(FLAT, params).fetchall()
+                release()
+    finally:
+        con.execute(f"SET threads = {threads}")
+        con.execute("DROP TABLE IF EXISTS search_soundings")
+        con.execute("DROP TABLE IF EXISTS searched")
     # A stretch can be a run to the reading.
     return list(dict.fromkeys(runs))
 
 
 def stuck_pairs(con):
-    """(partition, tile, vessel) for each vessel in `stuck_vessels` with soundings in a tile
-    any of them has medians in: a vessel whose soundings in a tile are all held depths has
-    none of its own there, and is searched all the same."""
-    return con.execute(
-        """SELECT DISTINCT cell_id, tile_id, unique_id FROM lake.points
+    """(partition, tile, vessel, batches of file ids) for each vessel in `stuck_vessels` with
+    soundings in a tile any of them has medians in: a vessel whose soundings in a tile are
+    all held depths has none of its own there, and is searched all the same. Its files there
+    are searched in batches of about SEARCH_POINTS soundings. Memory a pair's search freed is
+    handed back before the next."""
+    rows = con.execute(
+        """SELECT cell_id, tile_id, unique_id, file_id, count(*) FROM lake.points
         WHERE unique_id IN (SELECT vessel FROM stuck_vessels)
           AND tile_id IN (SELECT tile_id FROM cal_obs
             WHERE vessel IN (SELECT vessel FROM stuck_vessels))
-        ORDER BY ALL"""
+        GROUP BY ALL ORDER BY ALL"""
     ).fetchall()
+    for key, files in itertools.groupby(rows, lambda r: r[:3]):
+        batches, size = [[]], 0
+        for *_, file_id, n in files:
+            if batches[-1] and size + n > SEARCH_POINTS:
+                batches.append([])
+                size = 0
+            batches[-1].append(file_id)
+            size += n
+        release()
+        yield (*key, batches)
 
 
 def units_for(con, segments):
@@ -611,26 +670,49 @@ def crossings(con):
     Only `solved` pixels, which two units share without their lost rows, enter the solve:
     the others only give a transit that lost the bottom a depth to show it against, as the
     lost rows `xobs` keeps do."""
+    # A tile at a time: the medians can't spill, and every row of a pixel is in its tile.
+    tiles = [
+        t for (t,) in con.execute("SELECT DISTINCT tile_id FROM cal_obs ORDER BY 1").fetchall()
+    ]
     con.execute(
         """CREATE OR REPLACE TEMP TABLE xobs AS
-        WITH o AS (SELECT o.*, u.unit FROM cal_obs o JOIN file_units u USING (vessel, file_id)),
-        shared AS (
-          SELECT tile_id, py, px, count(DISTINCT unit) FILTER (WHERE NOT lost) >= 2 AS solved
-          FROM o GROUP BY ALL HAVING count(DISTINCT unit) >= 2
+        SELECT o.*, u.unit, true AS solved FROM cal_obs o JOIN file_units u USING (vessel, file_id)
+        LIMIT 0"""
+    )
+    for tile in tiles:
+        con.execute(
+            """INSERT INTO xobs
+            WITH o AS (
+              SELECT o.*, u.unit FROM cal_obs o JOIN file_units u USING (vessel, file_id)
+              WHERE o.tile_id = $tile
+            ),
+            shared AS (
+              SELECT tile_id, py, px, count(DISTINCT unit) FILTER (WHERE NOT lost) >= 2 AS solved
+              FROM o GROUP BY ALL HAVING count(DISTINCT unit) >= 2
+            )
+            SELECT o.*, shared.solved FROM o JOIN shared USING (tile_id, py, px)""",
+            {"tile": tile},
         )
-        SELECT o.*, shared.solved FROM o JOIN shared USING (tile_id, py, px)"""
+    con.execute(
+        """CREATE OR REPLACE TEMP TABLE xweights AS
+        SELECT vessel, file_id, count(*) FILTER (WHERE solved) AS solved_n, count(*) AS n
+        FROM xobs WHERE NOT lost GROUP BY ALL"""
     )
     con.execute(
-        """CREATE OR REPLACE TEMP TABLE xrows AS
-        WITH x AS (FROM xobs WHERE NOT lost),
-        n AS (
-          SELECT vessel, file_id, count(*) FILTER (WHERE solved) AS solved_n, count(*) AS n
-          FROM x GROUP BY ALL
-        )
-        SELECT tile_id, py, px, unit, solved, median(m) AS m,
-          sum(1.0 / CASE WHEN solved THEN n.solved_n ELSE n.n END) AS b
-        FROM x JOIN n USING (vessel, file_id) GROUP BY ALL ORDER BY tile_id"""
+        """CREATE OR REPLACE TEMP TABLE xrows (tile_id INTEGER, py INTEGER, px INTEGER,
+        unit INTEGER, solved BOOLEAN, m FLOAT, b DOUBLE)"""
     )
+    for tile in tiles:
+        con.execute(
+            """INSERT INTO xrows
+            SELECT tile_id, py, px, unit, solved, median(m) AS m,
+              sum(1.0 / CASE WHEN solved THEN n.solved_n ELSE n.n END) AS b
+            FROM xobs x JOIN xweights n USING (vessel, file_id)
+            WHERE x.tile_id = $tile AND NOT x.lost GROUP BY ALL""",
+            {"tile": tile},
+        )
+        release()
+    con.execute("DROP TABLE xweights")
 
 
 def anchors(con, n_units):
@@ -698,6 +780,7 @@ def solve(con, n_units, anchor, anchor_se):
             n, y = pixel_terms(p, u, m, w, n_units)
             terms.append(n.tocoo())
             rhs += y
+            release()
         # The robust spread of row residuals sets where Huber weights start to fall.
         if hist.sum():
             half = np.searchsorted(np.cumsum(hist), hist.sum() / 2)
@@ -770,8 +853,9 @@ def transit_offsets(con, offset, lost=False):
     show as a step. A transit that lost the bottom shows it the same way."""
     whole = f"{bool(lost)} OR count(*) FILTER (WHERE NOT e.lost) < {STEP_PIXELS}"
     con.register("offsets_np", {"unit": np.arange(len(offset)), "o": offset})
-    rows = con.execute(
-        f"""WITH x AS (SELECT x.*, o.o FROM xrows x JOIN offsets_np o USING (unit)),
+    con.execute(
+        f"""CREATE OR REPLACE TEMP TABLE transit_e AS
+        WITH x AS (SELECT x.*, o.o FROM xrows x JOIN offsets_np o USING (unit)),
         px AS (
           SELECT tile_id, py, px, sum(b * (m - o)) AS t, sum(b) AS w FROM x GROUP BY ALL
         ),
@@ -783,19 +867,39 @@ def transit_offsets(con, offset, lost=False):
           FROM (SELECT DISTINCT tile_id, py, px, unit FROM xobs)
           JOIN px USING (tile_id, py, px) LEFT JOIN x USING (tile_id, py, px, unit)
           WHERE px.w > coalesce(x.b, 0)
-        ),
-        e AS (
-          SELECT o.vessel, o.file_id, o.t, o.m - z.z AS e, z.z AS z, o.lost
-          FROM xobs o JOIN others z USING (tile_id, py, px, unit)
-          UNION ALL BY NAME {ANCHOR_ROWS}
         )
-        SELECT e.vessel, e.file_id, f.time_min AS t,
-          CASE WHEN {whole} THEN median(e.e) ELSE median(e.e) FILTER (WHERE NOT e.lost) END,
-          CASE WHEN {whole} THEN median(e.z) ELSE median(e.z) FILTER (WHERE NOT e.lost) END
-        FROM e JOIN lake.files f USING (file_id) GROUP BY e.vessel, e.file_id, f.time_min
-        HAVING count(*) >= {STEP_PIXELS} ORDER BY e.vessel, t, e.file_id"""
-    ).fetchall()
+        SELECT o.vessel, o.file_id, o.t, o.m - z.z AS e, z.z AS z, o.lost
+        FROM xobs o JOIN others z USING (tile_id, py, px, unit)
+        UNION ALL BY NAME {ANCHOR_ROWS}"""
+    )
     con.unregister("offsets_np")
+    # The medians can't spill: a batch of files at a time, as each is a file's alone. A
+    # batch is a run of file ids in order, so it's read as their range.
+    sizes = con.execute("SELECT file_id, count(*) FROM transit_e GROUP BY 1 ORDER BY 1").fetchall()
+    batches, batch, size = [], [], 0
+    for file_id, n in sizes:
+        if batch and size + n > TRANSIT_ROWS:
+            batches.append(batch)
+            batch, size = [], 0
+        batch.append(file_id)
+        size += n
+    if batch:
+        batches.append(batch)
+    rows = []
+    for files in batches:
+        rows += con.execute(
+            f"""SELECT e.vessel, e.file_id, f.time_min AS t,
+              CASE WHEN {whole} THEN median(e.e) ELSE median(e.e) FILTER (WHERE NOT e.lost) END,
+              CASE WHEN {whole} THEN median(e.z) ELSE median(e.z) FILTER (WHERE NOT e.lost) END
+            FROM transit_e e JOIN lake.files f USING (file_id)
+            WHERE e.file_id BETWEEN $lo AND $hi GROUP BY e.vessel, e.file_id, f.time_min
+            HAVING count(*) >= {STEP_PIXELS}""",
+            {"lo": files[0], "hi": files[-1]},
+        ).fetchall()
+        release()
+    con.execute("DROP TABLE transit_e")
+    # In time order per vessel, as ORDER BY vessel, t, file_id would give them, nulls last.
+    rows.sort(key=lambda r: (r[0], r[2] is None, r[2] or datetime.min, r[1]))
     return rows
 
 
@@ -960,6 +1064,7 @@ def judge_lost(con, offset, anchored):
             {"tile": tile},
         )
         changed += con.execute("SELECT count(*) FROM lost_change").fetchone()[0]
+        release()
     con.execute("DROP TABLE lost_change")
     log.info("calibrate: %d medians judged lost or no longer lost", changed)
     return changed
@@ -1154,6 +1259,7 @@ def calibrated_by(rows) -> str:
     )
     # The runs' queries, their constants, and the QC whose flags they read.
     rule = (
+        *SEARCH,
         STUCK,
         FLAT,
         inspect.getsource(reference_px),
