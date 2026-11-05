@@ -274,7 +274,7 @@ With triggers on them, SQLite deletes a table's rows one at a time rather than a
 
 An R*Tree indexes nothing but its id, so each box's tile is in a table of its own, indexed by tile: dropping a tile finds its boxes by id rather than reading them all. With 14,269 tiles kept past the bound, 1 in 10 of 40 KB, keeping a tile took at most 19 ms, eviction included, and a pass of 60 cells dropping 36 kept tiles took 4 ms.
 
-The triggers cost the backfill. `bench-live-layer.mjs 400000`, one run each, with nothing kept: the live writer was unchanged (5,908 → 5,827 soundings/s), the backfill writer 17% slower (44,253 → 36,534), and filling the store on its worker 22% slower (26,884 → 20,875). Cold tiles were unchanged but for zoom 13, 221 → 140 ms, and 20 z13 tiles on the three threads, 1.11 → 0.57 s.
+The triggers cost the backfill. `bench-live-layer.mjs 400000`, two runs each, with nothing kept, main → stage 2: the live writer 5,908 and 6,071 → 5,827 and 5,741 soundings/s (−1 to −5%); the backfill writer 44,253 and 45,518 → 36,534 and 36,460 (−17 to −20%); and filling the store on its worker 26,884 and 27,359 → 20,875 and 24,767 (−9 to −22%). Cold tiles were unchanged but for zoom 13, 221 → 140 ms, and 20 z13 tiles on the three threads, 1.1 → 0.57 s.
 
 Screenshots of zoom 13 on the real store show the change. An unconfirmed shoal's cap reaches a fixed number of pixels, so with pixels about a cell rather than three quarters of one, the rings round shoals draw larger, as they already did near the equator. In the view of 20 tiles, shoals add 61 small closed metre contours, against 29 on main.
 
