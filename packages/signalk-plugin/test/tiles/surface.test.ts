@@ -411,7 +411,8 @@ test("a tile draws the water between two tracks as interpolated", () => {
 });
 
 test("water between two tracks close together stays interpolated", () => {
-  const cells = [...lane(LON, () => 10), ...lane(LON + 0.0005, () => 10)];
+  // About 53 m apart: the gap between them is wider than a raster pixel, about a cell.
+  const cells = [...lane(LON, () => 10), ...lane(LON + 0.0006, () => 10)];
   const t = decode(buildTile(13, tileAt(13).x, tileAt(13).y, cells, [])!);
   expect(features(t, "M_QUAL").map((m) => m.properties.kind)).toContain(
     "interpolated",

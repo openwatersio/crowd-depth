@@ -108,14 +108,24 @@ const INFORM = {
     "This boat's own soundings, recorded by its Crowd Depth plugin. Not reduced for tide or to chart datum, and not calibrated. Not for navigation.",
 };
 
-/** Raster pixels a side for a tile: at most 256, and a pixel about a cell. */
-export function rasterSize(z: number, _lat?: number): number {
-  // Sized by zoom alone, as at the equator, so neighbouring tiles share a pixel grid and
-  // their areas meet without a seam. Away from it pixels are finer than a cell. A power
-  // of two, so a tile's pixels are its parent's, and tiles past SHARED_ZOOM share
-  // their parent's surface.
-  const fit = tileMetres(z, 0) / CELL_M;
-  return Math.min(256, 2 ** Math.max(0, Math.round(Math.log2(fit))));
+/** Raster sizes below SHARED_ZOOM step by this many pixels. */
+const RASTER_STEP = 16;
+
+/** Raster pixels a side for a tile centred at `lat`: at most 256, and a pixel about a
+ * cell. */
+export function rasterSize(z: number, lat = 0): number {
+  if (z >= SHARED_ZOOM) {
+    // Sized as at the equator, finer than a cell away from it, since plotters stretch
+    // these past MAX_ZOOM. A power of two, so tiles past SHARED_ZOOM are cut from their
+    // ancestor's surface.
+    const fit = tileMetres(z, 0) / CELL_M;
+    return Math.min(256, 2 ** Math.max(0, Math.round(Math.log2(fit))));
+  }
+  // At the tile's latitude, in steps, so neighbours north and south mostly share a size,
+  // and with it a pixel grid. Where the size steps, every few degrees, their lines meet
+  // about as closely as elsewhere: a few tenths of a pixel, and under one.
+  const fit = tileMetres(z, lat) / CELL_M / RASTER_STEP;
+  return Math.min(256, RASTER_STEP * Math.max(1, Math.round(fit)));
 }
 
 /** The least a raster reaches past its tile, in pixels: as far as it's traced. */
@@ -542,7 +552,9 @@ export function buildTile(
     shared?.delete(key);
     shared?.set(key, prepared);
   }
-  const n = rasterSize(z);
+  // The surface's pixels, as `surface` sized them.
+  const ab = tileBounds(a.z, a.x, a.y);
+  const n = rasterSize(a.z, (ab.north + ab.south) / 2) / 2 ** a.k;
   const t = cut(prepared, (x - (a.x << a.k)) * n, (y - (a.y << a.k)) * n, n);
   const fine = detail === "high" && z >= FINE_ZOOM;
   const tolerance = z >= MAX_ZOOM ? SIMPLIFY_MAX_ZOOM_UNITS : SIMPLIFY_UNITS;
