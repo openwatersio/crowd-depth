@@ -134,7 +134,7 @@ export function createDB(filename: string): DatabaseSync {
       // plugin writes it, so a kept tile never outlives what it was built from, even
       // after a rollback to a build that doesn't know about them.
       db.exec(`
-        CREATE TABLE kept_tiles(
+        CREATE TABLE IF NOT EXISTS kept_tiles(
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           z INTEGER NOT NULL,
           x INTEGER NOT NULL,
@@ -143,8 +143,8 @@ export function createDB(filename: string): DatabaseSync {
           tile BLOB,
           UNIQUE(z, x, y, detail)
         );
-        CREATE VIRTUAL TABLE kept_tile_boxes USING rtree_i32(id, py0, py1, px0, px1, +tile);
-        CREATE TRIGGER kept_tiles_drop AFTER DELETE ON kept_tiles BEGIN
+        CREATE VIRTUAL TABLE IF NOT EXISTS kept_tile_boxes USING rtree_i32(id, py0, py1, px0, px1, +tile);
+        CREATE TRIGGER IF NOT EXISTS kept_tiles_drop AFTER DELETE ON kept_tiles BEGIN
           DELETE FROM kept_tile_boxes WHERE tile = OLD.id;
         END;
       `);
@@ -161,14 +161,14 @@ export function createDB(filename: string): DatabaseSync {
       ]) {
         const r = (row: string) => reach.replace("{}", row);
         db.exec(`
-          CREATE TRIGGER kept_tiles_${table}_insert AFTER INSERT ON ${table} BEGIN
+          CREATE TRIGGER IF NOT EXISTS kept_tiles_${table}_insert AFTER INSERT ON ${table} BEGIN
             ${under("NEW", r("NEW"))}
           END;
-          CREATE TRIGGER kept_tiles_${table}_update AFTER UPDATE ON ${table} BEGIN
+          CREATE TRIGGER IF NOT EXISTS kept_tiles_${table}_update AFTER UPDATE ON ${table} BEGIN
             ${under("OLD", r("OLD"))}
             ${under("NEW", r("NEW"))}
           END;
-          CREATE TRIGGER kept_tiles_${table}_delete AFTER DELETE ON ${table} BEGIN
+          CREATE TRIGGER IF NOT EXISTS kept_tiles_${table}_delete AFTER DELETE ON ${table} BEGIN
             ${under("OLD", r("OLD"))}
           END;
         `);
