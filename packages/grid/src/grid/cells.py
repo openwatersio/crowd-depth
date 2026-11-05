@@ -517,8 +517,11 @@ WHERE NOT p.excluded AND NOT p.awaiting_tide
 """
 
 
-def units(con, partition: int, tiles: list[int], rows=9) -> list[tuple[list[int], int, int]]:
-    """A partition's work in units of about BATCH_POINTS points: (tiles, first base row, end row).
+def units(
+    con, partition: int, tiles: list[int], rows=9, points=None
+) -> list[tuple[list[int], int, int]]:
+    """A partition's work in units of about `points` points, by default BATCH_POINTS: (tiles,
+    first base row, end row).
 
     Small tiles are grouped whole. A denser tile is split into bands of `rows` base rows,
     by default 3″, so every cell, and the levels and outliers judged within it, falls in
@@ -531,14 +534,15 @@ def units(con, partition: int, tiles: list[int], rows=9) -> list[tuple[list[int]
         GROUP BY ALL ORDER BY ALL""",
         {"partition": partition, "tiles": tiles, "rows": rows},
     ).fetchall()
+    points = points or BATCH_POINTS
     by_tile = {}
     for tile, band, n in counts:
         by_tile.setdefault(tile, []).append((band, n))
     result, group, size = [], [], 0
     for tile, bands in by_tile.items():
         total = sum(n for _, n in bands)
-        if total <= BATCH_POINTS:
-            if group and size + total > BATCH_POINTS:
+        if total <= points:
+            if group and size + total > points:
                 result.append((group, 0, BASE))
                 group, size = [], 0
             group.append(tile)
@@ -547,7 +551,7 @@ def units(con, partition: int, tiles: list[int], rows=9) -> list[tuple[list[int]
         start, size_band = 0, 0
         for band, n in bands:
             # ponytail: one band of `rows` over the budget still runs alone
-            if size_band and size_band + n > BATCH_POINTS:
+            if size_band and size_band + n > points:
                 result.append(([tile], start * rows, band * rows))
                 start, size_band = band, 0
             size_band += n

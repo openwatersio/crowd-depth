@@ -16,6 +16,13 @@ The manifest names the store its tiles came from, and a run from another store i
 The archive is replaced whole at its own key, as clients expect of a PMTiles URL: one PUT,
 or a multipart upload that appears only when complete, so a reader sees the old archive or
 the new one, and a reader by range that sent the old ETag gets a 412 and starts over.
+
+The lock is renewed on its own thread throughout, and checked before each tile file, each
+part of the archive, the archive's completion, the manifest and each delete. A run that lost
+it stops at the next check, before it replaces the archive or writes the manifest. Both
+those writes are conditional too, on the archive as listed before its upload and the manifest
+as read at the start, so a run that stalled past its last check can't overwrite another
+run's archive or manifest. Deletes can't be conditional, so they rely on the checks alone.
 """
 
 import hashlib
@@ -144,12 +151,15 @@ def publish_locked(run, objects, lock, now):
         raise RuntimeError(f"couldn't list {objects.url}tiles/")
     there = {o.key for o in listed}
     todo = [(k, p) for k, p in uploads if k not in there]
+
+    def upload(kp):
+        # A tile file can't clobber anything, but a run that lost the lock stops here.
+        lock.check()
+        objects.upload(kp[0], kp[1], TYPES[kp[1].suffix], TILE_CACHE, threads=False)
+
     pool = ThreadPoolExecutor(PARALLEL)
     try:
-        for _ in pool.map(
-            lambda kp: objects.upload(kp[0], kp[1], TYPES[kp[1].suffix], TILE_CACHE, threads=False),
-            todo,
-        ):
+        for _ in pool.map(upload, todo):
             pass
     finally:
         # Stopped or failed, the uploads still queued don't start.
@@ -163,8 +173,22 @@ def publish_locked(run, objects, lock, now):
         digest = sha256(archive)
         replaced = not (was and live and was["sha256"] == digest and was.get("etag") == live.etag)
         if replaced:
-            lock.check()
-            objects.upload(ARCHIVE, archive, TYPES[".pmtiles"], REVALIDATE)
+            # A planet's archive takes an hour or two to go up. The lock is checked before
+            # each part and again just before the new archive replaces the live one. That
+            # replacement is conditional on the archive this run listed just now, so a run
+            # that stalled past those checks can't overwrite one another run published since.
+            try:
+                objects.upload(
+                    ARCHIVE,
+                    archive,
+                    TYPES[".pmtiles"],
+                    REVALIDATE,
+                    check=lock.check,
+                    if_match=live.etag if live else None,
+                    if_none_match=live is None,
+                )
+            except Conflict:
+                raise RuntimeError(f"{objects.url}{ARCHIVE} changed while publishing") from None
             live = stored(objects, ARCHIVE)
         about = {"key": ARCHIVE, "sha256": digest, "size": live.size, "etag": live.etag}
     else:

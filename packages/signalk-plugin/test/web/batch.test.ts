@@ -14,16 +14,18 @@ test("refreshes are batched, and soundings stay drawn until their tiles land", (
   expect(batch.next({ ...live(1, [1, 2]), all: true })).toEqual({
     data: [{ id: 1 }, { id: 2 }],
   });
+  batch.taken();
   // Sounding 1 is written into a cell; its tile changed, but it's too soon to refresh.
+  // It stays drawn, so only the new one is sent.
   t = 10_000;
   expect(batch.next({ ...live(2, [2, 3], [[15, 1, 1]]), stored: [1] })).toEqual(
-    {
-      data: [{ id: 1 }, { id: 2 }, { id: 3 }],
-    },
+    { upsert: [{ id: 3 }] },
   );
+  batch.taken();
   // Nothing new: nothing to send.
   t = 12_000;
   expect(batch.next(live(2, [2, 3]))).toEqual({});
+  batch.taken();
   // Time to refresh, with every tile changed since; sounding 1 is still drawn.
   t = 31_000;
   const refreshed = batch.next(live(3, [2, 3], [[15, 1, 2]]));
@@ -33,10 +35,12 @@ test("refreshes are batched, and soundings stay drawn until their tiles land", (
       [15, 1, 2],
     ],
   });
-  expect(refreshed.data).toBeUndefined();
+  // With the refresh, every sounding, in case the host lost them.
+  expect(refreshed.data).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }]);
+  batch.taken();
   // A poll later its tile has loaded, so sounding 1 goes.
   t = 33_000;
-  expect(batch.next(live(3, [2, 3]))).toEqual({ data: [{ id: 2 }, { id: 3 }] });
+  expect(batch.next(live(3, [2, 3]))).toEqual({ remove: [1] });
 });
 
 test("a feed that no longer reaches back refetches everything at the next refresh", () => {
@@ -76,4 +80,55 @@ test("a fetch that fails after the host took a refresh doesn't refresh again ear
   batch.failed();
   t = 42_000;
   expect(batch.next(live(2, [])).refresh).toBeUndefined();
+});
+
+test("once the host holds the soundings, only those that came, changed or went are sent", () => {
+  const batch = createBatch(30_000, () => 0);
+  // Until the host has taken them, every sounding.
+  expect(batch.next(live(1, [1, 2]))).toEqual({ data: [{ id: 1 }, { id: 2 }] });
+  batch.taken();
+  expect(batch.next(live(2, [2, 3]))).toEqual({
+    upsert: [{ id: 3 }],
+    remove: [1],
+  });
+  batch.taken();
+  expect(batch.next(live(2, [2, 3]))).toEqual({});
+  // A sounding whose depth changed under the same id is sent again.
+  const changed = live(3, [2, 3]);
+  changed.provisional.features[0] = { id: 2, depth: 4 } as never;
+  expect(batch.next(changed)).toEqual({ upsert: [{ id: 2, depth: 4 }] });
+});
+
+test("an answer the host may not have taken sends every sounding again", () => {
+  const batch = createBatch(30_000, () => 0);
+  batch.next(live(1, [1, 2]));
+  batch.taken();
+  expect(batch.next(live(2, [2, 3]))).toEqual({
+    upsert: [{ id: 3 }],
+    remove: [1],
+  });
+  batch.failed();
+  expect(batch.next(live(2, [2, 3]))).toEqual({ data: [{ id: 2 }, { id: 3 }] });
+});
+
+test("a fetch that fails while the host holds the soundings keeps sending changes", () => {
+  const batch = createBatch(30_000, () => 0);
+  batch.next(live(1, [1, 2]));
+  batch.taken();
+  // The next fetch failed: nothing was offered, so the host still holds 1 and 2.
+  batch.failed();
+  expect(batch.next(live(2, [2]))).toEqual({ remove: [1] });
+});
+
+test("after a pause, every sounding is sent again, even past a poll in flight", () => {
+  const batch = createBatch(30_000, () => 0);
+  batch.next(live(1, [1, 2]));
+  batch.taken();
+  expect(batch.next(live(2, [1, 2, 3]))).toEqual({ upsert: [{ id: 3 }] });
+  // Polling stopped and resumed while that answer was in flight.
+  batch.resend();
+  batch.taken();
+  expect(batch.next(live(2, [1, 2, 3]))).toEqual({
+    data: [{ id: 1 }, { id: 2 }, { id: 3 }],
+  });
 });

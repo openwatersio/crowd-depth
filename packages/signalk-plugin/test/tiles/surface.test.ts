@@ -10,7 +10,12 @@ import {
   createTileService,
   readTile,
 } from "../../src/tiles/service.js";
-import { buildTile, contourLevels, surface } from "../../src/tiles/surface.js";
+import {
+  buildTile,
+  contourLevels,
+  nearestSearch,
+  surface,
+} from "../../src/tiles/surface.js";
 
 const Z = 14;
 const LON = -76.2;
@@ -396,6 +401,15 @@ test("zoomed out, cells past one edge of a tile don't draw at its other", () => 
   }
 });
 
+test("a tile draws the water between two tracks as interpolated", () => {
+  // About 110 m apart: the strip between is wider than half a screen pixel at z13.
+  const cells = [...lane(LON, () => 10), ...lane(LON + 0.00125, () => 10)];
+  const t = decode(buildTile(13, tileAt(13).x, tileAt(13).y, cells, [])!);
+  expect(features(t, "M_QUAL").map((m) => m.properties.kind)).toContain(
+    "interpolated",
+  );
+});
+
 test("water between two tracks close together stays interpolated", () => {
   const cells = [...lane(LON, () => 10), ...lane(LON + 0.0005, () => 10)];
   const t = decode(buildTile(13, tileAt(13).x, tileAt(13).y, cells, [])!);
@@ -467,4 +481,54 @@ test("a pass drops the shared surface it reaches", async () => {
   expect(before.length).toBeGreaterThan(0);
   expect(sibling.length).toBeGreaterThan(0);
   expect(Math.min(...sibling)).toBeGreaterThan(Math.max(...before));
+});
+
+test("the nearest-first search finds the neighbours a full search does, in its order", () => {
+  let seed = 7;
+  const random = () => ((seed = (seed * 16807) % 2147483647) - 1) / 2147483646;
+  const size = 48;
+  for (const [pm, searchM, density] of [
+    [15, 200, 0.6],
+    [15, 200, 0.05],
+    [300, 300 * Math.SQRT1_2, 0.3],
+  ]) {
+    // At most one point a pixel, some at its corner or edge, so distances tie.
+    const points: { x: number; y: number }[] = [];
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        if (random() > density) continue;
+        const r = random();
+        points.push(
+          r < 0.3
+            ? { x, y }
+            : r < 0.5
+              ? { x: x + 0.5, y }
+              : { x: x + random(), y: y + random() },
+        );
+      }
+    }
+    const search = nearestSearch(points, size, pm, searchM, 12);
+    const out: { j: number }[] = [];
+    for (let py = 0; py < size; py++) {
+      for (let px = 0; px < size; px++) {
+        // A full search: every point in range, by distance, then by pixel, row by row.
+        const full = points
+          .map((p, j) => {
+            const dx = (p.x - px - 0.5) * pm;
+            const dy = (p.y - py - 0.5) * pm;
+            return {
+              j,
+              d2: dx * dx + dy * dy,
+              b: Math.floor(p.y) * size + Math.floor(p.x),
+            };
+          })
+          .filter((f) => f.d2 <= searchM * searchM)
+          .sort((a, b) => a.d2 - b.d2 || a.b - b.b)
+          .slice(0, 12)
+          .map((f) => f.j);
+        search(px, py, out as never);
+        expect(out.map((f) => f.j)).toEqual(full);
+      }
+    }
+  }
 });

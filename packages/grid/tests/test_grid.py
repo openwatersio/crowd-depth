@@ -1065,6 +1065,18 @@ def test_a_bbox_names_the_tiles_it_touches():
     assert (36 + 90) * 360 + (-78 + 180) in tiles and (39 + 90) * 360 + (-76 + 180) in tiles
 
 
+def test_freed_memory_goes_back_where_the_allocator_is_glibcs():
+    import platform
+
+    import grid
+
+    # Calibrate fits a 2 GB worker only by handing glibc's free pages back.
+    if platform.libc_ver()[0] != "glibc":
+        pytest.skip("not glibc")
+    assert grid._malloc_trim is not None
+    grid.release()
+
+
 JEMALLOC_DECAY = """
 import ctypes, sys
 import grid, _duckdb
