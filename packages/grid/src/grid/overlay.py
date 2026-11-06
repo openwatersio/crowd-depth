@@ -356,12 +356,19 @@ def surface_bands(path, soundings=None):
     # Grown a pixel all round, as coverage is, so the two trace alike.
     surfaced = outline(binary_dilation(valid, structure=around), transform)
     # Where interpolation starts is drawn more loosely than the edge of the water, on the
-    # surface as it's grown, so the growth is measured only beside a sounding. It's grown a
-    # pixel into the measured part too: rounding would lose a strip a pixel wide, and
-    # interpolated water must never be drawn as measured.
+    # surface as it's grown, so the growth is measured only beside a sounding. Water
+    # interpolated between tracks is grown a pixel into the measured part too: rounding
+    # would lose a strip a pixel wide, and interpolated water is never to be drawn as
+    # measured, save where the tracing rounds a corner. The band beside a track isn't: grown both ways it would cover the track's
+    # own strip, three pixels wide. It's traced as closely as the water's edge instead, a
+    # pixel past its other sides so it meets them with no gap, and any of its pixels the
+    # tracing misses joins whole.
     far_from_soundings = ~binary_dilation(count > 0, structure=around)
-    grown_interpolated = binary_dilation(valid, structure=around) & far_from_soundings
-    grown_interpolated = binary_dilation(grown_interpolated, structure=around)
+    grown_band = binary_dilation(valid, structure=around) & far_from_soundings
+    between_tracks = binary_dilation(valid & ~near_only, structure=around) & far_from_soundings
+    between_tracks = binary_dilation(between_tracks, structure=around)
+    grown_band &= ~between_tracks
+    grown_interpolated = between_tracks | grown_band
     # Its uncertainty is the largest of the surface's pixels it's drawn over or beside.
     interpolated = valid & binary_dilation(grown_interpolated, structure=around)
     d, s = depth[interpolated], sigma[interpolated]
@@ -370,7 +377,18 @@ def surface_bands(path, soundings=None):
         if len(d)
         else None
     )
-    between = outline(grown_interpolated, transform, INTERPOLATED_TOLERANCE_PX)
+    between = outline(between_tracks, transform, INTERPOLATED_TOLERANCE_PX)
+    band = binary_dilation(grown_band, structure=around) & far_from_soundings
+    between = shapely.union(between, outline(band, transform))
+    del band
+    shapely.prepare(between)
+    row, col = np.nonzero(grown_band)
+    missed = ~shapely.contains_xy(between, *rasterio.transform.xy(transform, row, col))
+    if missed.any():
+        between = shapely.union(
+            between, shapely.union_all(boxes(transform, row[missed], col[missed]))
+        )
+    del row, col, missed
     between = polygonal(shapely.intersection(between, surfaced))
     # Coverage is the surface, and the soundings off it grown a pixel all round and traced
     # on their own: tracing them together would bend the surface's edge wherever a sounding
@@ -381,15 +399,24 @@ def surface_bands(path, soundings=None):
     # pixels within a few of the edge can be.
     covered = binary_dilation(valid | (count > 0), structure=around)
     rim = covered & ~binary_erosion(covered, structure=around, iterations=3)
-    row, col = np.nonzero((count > 0) & rim)
-    x0, y0 = rasterio.transform.xy(transform, row, col, offset="ul")
-    x1, y1 = rasterio.transform.xy(transform, row, col, offset="lr")
-    pixels = shapely.box(x0, y0, x1, y1)
+    pixels = boxes(transform, *np.nonzero((count > 0) & rim))
     shapely.prepare(footprint)
     shaved = pixels[~shapely.covers(footprint, pixels)]
     if len(shaved):
         footprint = polygonal(shapely.union(footprint, shapely.union_all(shaved)))
-    del far_from_soundings, grown_interpolated, interpolated, lone, covered, rim, d, s
+    # Measured water holds a sounding. A part of the footprint that holds none, as where two
+    # traced edges of interpolated water fail to meet, or a track's strip whose soundings
+    # are in the next tile, is interpolated too.
+    parts = shapely.get_parts(polygonal(shapely.difference(footprint, between)))
+    strays = [part for part in parts if not holds_sounding(part, count, transform)]
+    if strays:
+        # Grown a thousandth of a pixel, so it overlaps the edges it fills rather than
+        # leaving the measured part dust along them.
+        filled = shapely.buffer(shapely.union_all(strays), 1e-3 * abs(transform.a))
+        between = polygonal(shapely.union(between, shapely.intersection(filled, footprint)))
+    del parts, strays
+    del far_from_soundings, grown_band, between_tracks, grown_interpolated, interpolated
+    del lone, covered, rim, d, s
     del sigma
     bands = {}
     if valid.any():
@@ -637,6 +664,28 @@ def svg_rings(d, tolerance, turn_step):
             at = p3
             i += 6
     return [r for r in rings if len(r) > 2]
+
+
+def holds_sounding(part, count, transform):
+    """Whether `part` holds the centre of a pixel with a sounding in `count`, a raster with
+    `transform`. Tested a block at a time, so a part holding many stops at the first."""
+    west, south, east, north = part.bounds
+    (left, top), (right, bottom) = ~transform @ (west, north), ~transform @ (east, south)
+    top, left = max(math.floor(top), 0), max(math.floor(left), 0)
+    i, j = np.nonzero(count[top : math.ceil(bottom), left : math.ceil(right)] > 0)
+    x, y = transform @ (j + left + 0.5, i + top + 0.5)
+    block = 4096
+    return any(
+        shapely.contains_xy(part, x[k : k + block], y[k : k + block]).any()
+        for k in range(0, len(x), block)
+    )
+
+
+def boxes(transform, row, col):
+    """Pixels (row, col) of a raster with `transform`, each as its square."""
+    x0, y0 = rasterio.transform.xy(transform, row, col, offset="ul")
+    x1, y1 = rasterio.transform.xy(transform, row, col, offset="lr")
+    return shapely.box(x0, y0, x1, y1)
 
 
 def polygonal(geometry):
