@@ -145,9 +145,10 @@ def scheme_cost(day, scheme):
         if not d.any():
             continue
         if g.sum() < DENSE:
-            # A sparse tile rebuilds whole, its cells too once they read across edges.
-            cells_read += int(g.sum())
-            surf_read += int(g.sum())
+            # A sparse tile rebuilds whole, reading its halo across edges for cells too.
+            read = int(counts[F - ry : 2 * F + ry, F - rx : 2 * F + rx].sum())
+            cells_read += read
+            surf_read += read
             units += 1
             continue
         if scheme[0] == "win":

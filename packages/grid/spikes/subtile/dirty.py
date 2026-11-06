@@ -41,9 +41,7 @@ with tiles.snapshot(a.run, "lake") as con:
           least(floor((lon - {lon0}) * {w}), {w - 1})::INT AS wx,
           count(*), count(*) FILTER (WHERE new) FROM pts GROUP BY ALL"""
     ).fetchall()
-    new = con.execute(
-        "SELECT DISTINCT lat, lon FROM pts WHERE new"
-    ).fetchnumpy()
+    new = con.execute("SELECT DISTINCT lat, lon FROM pts WHERE new").fetchnumpy()
 lat, lon = (np.asarray(v, dtype=float) for v in new.values())
 dirty = set()
 # Every window from the reach's south-west corner to its north-east one, however narrow.
