@@ -56,10 +56,15 @@ export const FINE_ZOOM = 13;
 /** How much shoaler than a band's depths its edges are traced, so a band holds its
  * lower depth and not its upper: too little to see. */
 const EDGE_M = 0.005;
-/** Soundings per tile side, as the grid's lattice. */
-const SOUNDINGS_PER_SIDE = 8;
 /** The finest zoom built; clients overzoom past it, as the grid's overlay. */
 export const MAX_ZOOM = 15;
+/** Soundings per tile side, as the grid's lattice: 32 px apart on a 256 px tile. Tiles at
+ * MAX_ZOOM twice as many, since plotters stretch them past it: 128 px apart at
+ * Freeboard-SK's zoom 18, MapLibre's 17. At 15 the
+ * plotter hides those that collide, keeping the shoalest within a tile. 32 a side cost
+ * half again the bytes of a well-sounded view. */
+const SOUNDINGS_PER_SIDE = 8;
+const SOUNDINGS_PER_SIDE_MAX_ZOOM = 16;
 /** How far a line may move when simplified, in tile units: half a screen pixel of a
  * 256-pixel tile. Tiles at MAX_ZOOM a quarter of that, since plotters stretch them
  * past it, where half a pixel at 15 is two at 17. */
@@ -614,14 +619,14 @@ export function buildTile(
     number,
     { p: Point; d: number; unconfirmed: boolean }
   >();
+  const perSide =
+    z >= MAX_ZOOM ? SOUNDINGS_PER_SIDE_MAX_ZOOM : SOUNDINGS_PER_SIDE;
   const place = (lon: number, lat: number, d: number, unconfirmed: boolean) => {
     const f = tileFraction(lon, lat, z);
     const fx = f.x - x;
     const fy = f.y - y;
     if (fx < 0 || fy < 0 || fx >= 1 || fy >= 1) return;
-    const i =
-      Math.floor(fy * SOUNDINGS_PER_SIDE) * SOUNDINGS_PER_SIDE +
-      Math.floor(fx * SOUNDINGS_PER_SIDE);
+    const i = Math.floor(fy * perSide) * perSide + Math.floor(fx * perSide);
     const was = lattice.get(i);
     if (!was || d < was.d) {
       lattice.set(i, {
@@ -667,8 +672,10 @@ export function buildTile(
     passes += cell.passes;
   }
   for (const s of shoals) place(s.lon, s.lat, s.depth, true);
-  const SOUNDG: Feature[] = [...lattice.values()].map(
-    ({ p, d, unconfirmed }) => ({
+  // Shoalest first: where labels collide, plotters keep the one placed first.
+  const SOUNDG: Feature[] = [...lattice.values()]
+    .sort((a, b) => a.d - b.d)
+    .map(({ p, d, unconfirmed }) => ({
       type: "Point",
       points: [p],
       properties: {
@@ -679,8 +686,7 @@ export function buildTile(
         TECSOU,
         ...(unconfirmed ? { unconfirmed: 1 } : {}),
       },
-    }),
-  );
+    }));
 
   const date = (day: number) =>
     new Date(day * 86_400_000).toISOString().slice(0, 10).replaceAll("-", "");

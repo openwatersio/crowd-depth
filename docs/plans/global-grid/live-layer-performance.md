@@ -278,6 +278,20 @@ The triggers cost the backfill. `bench-live-layer.mjs 400000`, two runs each, wi
 
 Screenshots of zoom 13 on the real store show the change. An unconfirmed shoal's cap reaches a fixed number of pixels, so with pixels about a cell rather than three quarters of one, the rings round shoals draw larger, as they already did near the equator. In the view of 20 tiles, shoals add 61 small closed metre contours, against 29 on main.
 
+## Denser soundings zoomed in
+
+Plotters stretch zoom 15 tiles past zoom 15. With 8 soundings a side, Freeboard-SK's zoom 18 drew them 256 px apart, further where a lone track crossed few of the lattice's squares. Zoom 15 tiles carry 16 a side, 128 px apart at zoom 18, listed shoalest first, since Freeboard-SK and MapLibre both keep the first of the labels that collide within a tile; Freeboard-SK refuses a layer with `symbol-sort-key`, so the order in the tile is what keeps the shoalest. Soundings take 8 px of padding at the style's zoom 15 (Freeboard-SK's 16) and 5 px at 16, against the default 2 px below 15 and from 17, so a zoom 15 view isn't crowded. Below zoom 15 the live layer has the grid overlay's 8 a side.
+
+`scripts/bench-view.mjs`, main and this change interleaved, three runs at a load average of 6 to 9, on the real store, at its busiest block and at a channel with a few tracks (−76.33546, 36.96009). Only zoom 15 tiles change:
+
+| View of 20 z15 tiles, one thread | Busiest block       | Channel            |
+| -------------------------------- | ------------------- | ------------------ |
+| Soundings                        | 763 → 2,621         | 170 → 417          |
+| Bytes                            | 479 → 544 KB (+14%) | 108 → 116 KB (+7%) |
+| Build, median                    | 1.30 → 1.20 s       | 0.48 → 0.48 s      |
+
+32 soundings a side drew them 64 px apart at zoom 18, but cost 730 KB (+52%) and 130 KB (+20%), with 8,277 soundings in the busy view for the plotter to place. The bytes and build time on a Pi aren't measured yet; [Numbers from a Pi](#numbers-from-a-pi) has the commands.
+
 ## Numbers from a Pi
 
 The figures above are from a fast laptop. To size the plan on the hardware that matters, run these on a Pi whose plugin is a build with the live layer, which no release has yet: a [preview](../../../CONTRIBUTING.md#plugin-previews) from `main` or later, with its backfill finished. The published plugin has no scripts, so they need a checkout of this repository on the Pi, with the plugin's dependencies installed and the plugin built. Installing only the plugin's workspace skips the API's dev tools, which have no 32-bit ARM builds:

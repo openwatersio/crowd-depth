@@ -17,3 +17,21 @@ test("contour labels sit above deeper soundings and below shoal ones", () => {
   ) as { minzoom?: number };
   expect(minor.minzoom).toBe(15);
 });
+
+test("soundings get extra padding only from zoom 15, where tiles are denser", () => {
+  const soundg = buildStyle({ tiles: "t", safetyDepth: 2 }).layers.find(
+    (l) => l.id === "soundg",
+  ) as { layout: Record<string, unknown> };
+  // The default 2 px below zoom 15, where tiles hold 8 soundings a side.
+  expect(soundg.layout["text-padding"]).toEqual([
+    "step",
+    ["zoom"],
+    2,
+    15,
+    8,
+    16,
+    5,
+    17,
+    2,
+  ]);
+});

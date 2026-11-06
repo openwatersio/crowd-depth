@@ -533,3 +533,19 @@ test("the nearest-first search finds the neighbours a full search does, in its o
     }
   }
 });
+
+test("soundings are denser in tiles plotters stretch, the shoalest first", () => {
+  const cells = lane(LON, (i) => 4 + (i % 7));
+  const soundings = (z: number) => {
+    const { x, y } = tileAt(z);
+    return features(decode(buildTile(z, x, y, cells, [])!), "SOUNDG").map(
+      (f) => f.properties.VALSOU as number,
+    );
+  };
+  const z14 = soundings(14);
+  const z15 = soundings(15);
+  // About 240 m apart at 14, along 600 m of track, and 60 m at 15.
+  expect(z14.length).toBeLessThanOrEqual(4);
+  expect(z15.length).toBeGreaterThanOrEqual(8);
+  expect(z15).toEqual([...z15].sort((a, b) => a - b));
+});
