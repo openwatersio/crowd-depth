@@ -1422,16 +1422,13 @@ def test_a_sounding_under_a_tile_run_and_a_run_with_no_tile_comes_out_once(env):
     ]
     with open_store(env.store) as con:
         con.executemany(
-            "INSERT INTO lake.lost_runs"
-            " SELECT content_hash, 'AQM-A', ?, ?, ? FROM lake.files",
+            "INSERT INTO lake.lost_runs SELECT content_hash, 'AQM-A', ?, ?, ? FROM lake.files",
             runs,
         )
     got = corrected(env, "lost_bottom")
     both = [at_ for _, at_, _ in got if t <= at_ <= t + timedelta(hours=2)]
     assert len(got) == 216 and len({at_ for _, at_, _ in got}) == 216 and len(both) == 7
-    assert got == [
-        (u, at_, any(t0 <= at_ <= t1 for _, t0, t1 in runs)) for u, at_, _ in got
-    ]
+    assert got == [(u, at_, any(t0 <= at_ <= t1 for _, t0, t1 in runs)) for u, at_, _ in got]
 
 
 def test_a_run_with_no_tile_holds_in_every_tile_until_recalibration(env, tmp_path, monkeypatch):  # noqa: F811
