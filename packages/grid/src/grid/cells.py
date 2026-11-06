@@ -196,6 +196,53 @@ FAR = (
     f"{QC['lone_deep_factor']} * greatest(c.most, {QC['lone_deep_floor_m']})"
     f" + {QC['lone_deep_abs_m']}"
 )
+# The consensus shoals (CTE `shoals`) another vessel's reading corroborates: one within
+# the shoal's tolerance in its block. The shoals' blocks are read as one row per depth
+# read there, with `solo`, the one vessel that read it, or NULL where several did, so a
+# busy harbor block costs its distinct depths. A depth is another vessel's unless
+# `solo` is the shoal's own. A nearer depth is never outside the tolerance when a
+# farther one on the same side is within it, so only the nearest other vessel's depth
+# below and above each shoal is checked: the nearest depth by ASOF join or, where only
+# the shoal's vessel read that one, the depth just past its run of such depths. A
+# mooring block's 300,000 candidates against as many depths is then a sort, not a
+# join of every pair. A NULL vessel corroborates nothing and is corroborated by
+# nothing, as `<>` has it.
+CORROBORATED = f"""
+depths AS (
+  SELECT tile_id, br, bc, d, CASE WHEN min(vessel) = max(vessel) THEN min(vessel) END AS solo
+  FROM unit_points
+  WHERE (tile_id, br, bc) IN (SELECT tile_id, br, bc FROM shoals) AND raw >= {SHALLOW_M}
+    AND flag IS DISTINCT FROM 'noisy' AND NOT hunting AND vessel IS NOT NULL
+  GROUP BY ALL
+),
+edges AS (
+  SELECT *, solo IS DISTINCT FROM lag(solo) OVER w AS starts,
+    solo IS DISTINCT FROM lead(solo) OVER w AS ends, lag(d) OVER w AS prev, lead(d) OVER w AS next
+  FROM depths WINDOW w AS (PARTITION BY tile_id, br, bc ORDER BY d)
+),
+-- Each depth with the depths just below and above its run of the same `solo`, which
+-- that `solo` didn't read alone.
+runs AS (
+  SELECT tile_id, br, bc, d, solo,
+    max(prev) FILTER (WHERE starts) OVER (PARTITION BY tile_id, br, bc ORDER BY d
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS before,
+    min(next) FILTER (WHERE ends) OVER (PARTITION BY tile_id, br, bc ORDER BY d
+      ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS after
+  FROM edges
+),
+corroborated AS (
+  SELECT s.point_id FROM shoals s
+  ASOF LEFT JOIN runs lo
+    ON lo.tile_id = s.tile_id AND lo.br = s.br AND lo.bc = s.bc AND s.d >= lo.d
+  ASOF LEFT JOIN runs hi
+    ON hi.tile_id = s.tile_id AND hi.br = s.br AND hi.bc = s.bc AND s.d <= hi.d
+  WHERE s.raw >= {SHALLOW_M} AND NOT s.hunting AND s.vessel IS NOT NULL
+    AND (abs(CASE WHEN lo.solo IS DISTINCT FROM s.vessel THEN lo.d ELSE lo.before END - s.d)
+        <= 2 + 0.05 * s.d
+      OR abs(CASE WHEN hi.solo IS DISTINCT FROM s.vessel THEN hi.d ELSE hi.after END - s.d)
+        <= 2 + 0.05 * s.d)
+)"""
+
 CONSENSUS = f"""
 CREATE OR REPLACE TEMP TABLE votes AS
 SELECT tile_id, br, bc, vessel,
@@ -233,22 +280,7 @@ WITH shoals AS (
   WHERE d < m AND flag IS DISTINCT FROM 'noisy'
     AND len(list_filter(meds, x -> abs(x - m) <= tol)) >= {DISPROVE}
 ),
--- The shoal candidates' blocks, one row per depth read there with the least and
--- greatest vessel that read it, so a busy harbor block costs its distinct depths, not
--- its soundings times the candidates. A depth some other vessel read has a least or
--- greatest vessel other than the shoal's.
-depths AS (
-  SELECT tile_id, br, bc, d, min(vessel) AS vmin, max(vessel) AS vmax FROM unit_points
-  WHERE (tile_id, br, bc) IN (SELECT tile_id, br, bc FROM shoals) AND raw >= {SHALLOW_M}
-    AND flag IS DISTINCT FROM 'noisy' AND NOT hunting
-  GROUP BY ALL
-),
-corroborated AS (
-  SELECT DISTINCT s.point_id FROM shoals s JOIN depths o
-    ON o.tile_id = s.tile_id AND o.br = s.br AND o.bc = s.bc
-    AND abs(o.d - s.d) <= 2 + 0.05 * s.d AND (o.vmin <> s.vessel OR o.vmax <> s.vessel)
-    AND s.raw >= {SHALLOW_M} AND NOT s.hunting
-)
+{CORROBORATED}
 SELECT point_id, 'reject' AS flag,
   CASE WHEN n >= 2 AND d > m + tol THEN 'consensus_deep' ELSE 'consensus_far_deep' END AS reason
 FROM consensus_judged WHERE d > m
