@@ -2,8 +2,14 @@ import { expect, test } from "vitest";
 import { VectorTile } from "@mapbox/vector-tile";
 import { PbfReader as Pbf } from "pbf";
 import { Cell, cellDepth } from "../../src/tiles/cells.js";
-import { cellAt, cellCenter, tileFraction } from "../../src/tiles/geometry.js";
+import {
+  cellAt,
+  cellCenter,
+  tileBounds,
+  tileFraction,
+} from "../../src/tiles/geometry.js";
 import { createDB } from "../../src/storage.js";
+import { prepare, smoothFields } from "../../src/tiles/portray.js";
 import { createCellStore } from "../../src/tiles/index.js";
 import {
   clearShared,
@@ -14,6 +20,7 @@ import {
   buildTile,
   contourLevels,
   nearestSearch,
+  neighbours,
   surface,
 } from "../../src/tiles/surface.js";
 
@@ -509,7 +516,7 @@ test("the nearest-first search finds the neighbours a full search does, in its o
       }
     }
     const search = nearestSearch(points, size, pm, searchM, 12);
-    const out: { j: number }[] = [];
+    const out = neighbours(12);
     for (let py = 0; py < size; py++) {
       for (let px = 0; px < size; px++) {
         // A full search: every point in range, by distance, then by pixel, row by row.
@@ -527,9 +534,43 @@ test("the nearest-first search finds the neighbours a full search does, in its o
           .sort((a, b) => a.d2 - b.d2 || a.b - b.b)
           .slice(0, 12)
           .map((f) => f.j);
-        search(px, py, out as never);
-        expect(out.map((f) => f.j)).toEqual(full);
+        search(px, py, out);
+        expect([...out.j.subarray(0, out.n)]).toEqual(full);
       }
+    }
+  }
+});
+
+test("fields worked only where the depths reach draw the tiles fields worked everywhere do", () => {
+  // A lone track by the tile's west edge, so the window's other edges are inside the
+  // raster; and nothing at all.
+  const west = tileBounds(Z, tile.x, tile.y).west;
+  for (const cells of [lane(west + 0.0005, (i) => 4 + (i % 7)), []]) {
+    const r = surface(Z, tile.x, tile.y, cells);
+    const windowed = prepare(r);
+    const { w } = windowed;
+    const o = r.halo - (w - r.n) / 2;
+    const whole = {
+      w,
+      ...smoothFields(r, o, o, w, w),
+      window: [0, 0, w - 1, w - 1] as [number, number, number, number],
+    };
+    if (cells.length) expect(windowed.window[2]).toBeLessThan(w - 1);
+    for (const k of ["depth", "wet", "extent", "measured", "shoal"] as const) {
+      expect(windowed[k]).toEqual(whole[k]);
+    }
+    // Each quarter of it, cut at the zoom past.
+    for (const [dx, dy] of [
+      [0, 0],
+      [1, 0],
+      [0, 1],
+      [1, 1],
+    ]) {
+      const [x, y] = [tile.x * 2 + dx, tile.y * 2 + dy];
+      const key = `${Z}/${tile.x}/${tile.y}`;
+      const built = (p: typeof windowed) =>
+        buildTile(Z + 1, x, y, cells, [], "high", new Map([[key, p]]));
+      expect(built(windowed)).toEqual(built(whole));
     }
   }
 });

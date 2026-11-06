@@ -267,44 +267,40 @@ export function surface(
   const median = new Float32Array(size * size).fill(NaN);
   const near = new Float32Array(size * size).fill(Infinity);
   const nearSigma = new Float32Array(size * size);
-  const candidates = new Uint8Array(size * size);
-  for (const s of sources) {
-    for (let dy = -reach; dy <= reach; dy++) {
-      const yy = Math.floor(s.y) + dy;
-      if (yy < 0 || yy >= size) continue;
-      for (let dx = -reach; dx <= reach; dx++) {
-        const xx = Math.floor(s.x) + dx;
-        if (xx >= 0 && xx < size) candidates[yy * size + xx] = 1;
-      }
-    }
-  }
+  // Only pixels within reach of a source are searched.
+  const sourced = new Uint8Array(size * size);
+  for (const s of sources)
+    sourced[Math.floor(s.y) * size + Math.floor(s.x)] = 1;
+  const candidates = dilate(sourced, size, reach);
   const search = nearestSearch(sources, size, pm, searchM, MAX_POINTS);
-  const nearest: Neighbour[] = [];
+  const nearest = neighbours(MAX_POINTS);
   for (let py = 0; py < size; py++) {
     for (let px = 0; px < size; px++) {
       const i = py * size + px;
       if (!candidates[i]) continue;
       search(px, py, nearest);
-      if (nearest.length === 0) continue;
-      near[i] = Math.sqrt(nearest[0].d2);
-      nearSigma[i] = sources[nearest[0].j].sigma;
+      const count = nearest.n;
+      if (count === 0) continue;
+      near[i] = Math.sqrt(nearest.d2[0]);
+      nearSigma[i] = sources[nearest.j[0]].sigma;
       // Between tracks, the grid's rule: three cells or more, one in each quadrant. A
       // pixel the boat sounded keeps a depth whatever surrounds it, so its own track
       // draws as areas, not only soundings.
       if (near[i] > measuredM) {
-        if (nearest.length < MIN_POINTS) continue;
+        if (count < MIN_POINTS) continue;
         let quadrants = 0;
-        for (const f of nearest) {
-          quadrants |= 1 << ((f.dx >= 0 ? 1 : 0) + (f.dy >= 0 ? 2 : 0));
+        for (let k = 0; k < count; k++) {
+          quadrants |=
+            1 << ((nearest.dx[k] >= 0 ? 1 : 0) + (nearest.dy[k] >= 0 ? 2 : 0));
         }
         if (quadrants !== 0b1111) continue;
       }
       let sw = 0;
       let swm = 0;
-      for (const f of nearest) {
-        const w = 1 / (f.d2 + SMOOTHING_M * SMOOTHING_M);
+      for (let k = 0; k < count; k++) {
+        const w = 1 / (nearest.d2[k] + SMOOTHING_M * SMOOTHING_M);
         sw += w;
-        swm += w * sources[f.j].m;
+        swm += w * sources[nearest.j[k]].m;
       }
       median[i] = swm / sw;
     }
@@ -344,30 +340,36 @@ export function surface(
   }
   const shoalest = new Float32Array(size * size).fill(Infinity);
   const shoal = new Float32Array(size * size).fill(Infinity);
+  // Beside neither, a pixel's caps stay Infinity.
+  const capped = dilate(
+    Uint8Array.from(bySurface, (d, i) =>
+      d !== Infinity || byShoal[i] !== Infinity ? 1 : 0,
+    ),
+    size,
+    1,
+  );
   for (let py = 0; py < size; py++) {
+    const y0 = Math.max(0, py - 1);
+    const y1 = Math.min(size - 1, py + 1);
     for (let px = 0; px < size; px++) {
       const i = py * size + px;
-      const carried = Number.isNaN(median[i]);
-      for (
-        let yy = Math.max(0, py - 1);
-        yy <= Math.min(size - 1, py + 1);
-        yy++
-      ) {
+      // The interpolated pixels follow their cells as the grid's do, capped by none.
+      if (!Number.isNaN(median[i]) || !capped[i]) continue;
+      let least = Infinity;
+      let byShoals = Infinity;
+      for (let yy = y0; yy <= y1; yy++) {
         for (
-          let xx = Math.max(0, px - 1);
-          xx <= Math.min(size - 1, px + 1);
-          xx++
+          let j = yy * size + Math.max(0, px - 1);
+          j <= yy * size + Math.min(size - 1, px + 1);
+          j++
         ) {
-          const j = yy * size + xx;
-          shoalest[i] = Math.min(shoalest[i], bySurface[j], byShoal[j]);
-          shoal[i] = Math.min(shoal[i], byShoal[j]);
+          least = Math.min(least, bySurface[j], byShoal[j]);
+          byShoals = Math.min(byShoals, byShoal[j]);
         }
       }
-      if (carried && !Number.isNaN(depth[i])) {
-        depth[i] = Math.min(depth[i], shoalest[i]);
-      }
-      // The interpolated pixels follow their cells as the grid's do, capped by none.
-      if (!carried) shoalest[i] = shoal[i] = Infinity;
+      shoalest[i] = least;
+      shoal[i] = byShoals;
+      if (!Number.isNaN(depth[i])) depth[i] = Math.min(depth[i], least);
     }
   }
   const wet = depth.map((d, i) =>
@@ -389,14 +391,27 @@ export function surface(
   };
 }
 
-/** One of a pixel's nearest sources: its index, its squared distance and offset in
- * metres, and the pixel it's in. */
-export interface Neighbour {
-  j: number;
-  d2: number;
-  dx: number;
-  dy: number;
-  b: number;
+/** A pixel's nearest sources, nearest first, `n` of them: each one's index, its squared
+ * distance and offset in metres, and the pixel it's in. */
+export interface Neighbours {
+  n: number;
+  j: Int32Array;
+  d2: Float64Array;
+  dx: Float64Array;
+  dy: Float64Array;
+  b: Int32Array;
+}
+
+/** Room for `max` neighbours, which a search fills. */
+export function neighbours(max: number): Neighbours {
+  return {
+    n: 0,
+    j: new Int32Array(max),
+    d2: new Float64Array(max),
+    dx: new Float64Array(max),
+    dy: new Float64Array(max),
+    b: new Int32Array(max),
+  };
 }
 
 /**
@@ -415,10 +430,14 @@ export function nearestSearch(
   pm: number,
   searchM: number,
   max: number,
-): (px: number, py: number, out: Neighbour[]) => void {
+): (px: number, py: number, out: Neighbours) => void {
   const bucket = new Int32Array(size * size).fill(-1);
+  const xs = new Float64Array(points.length);
+  const ys = new Float64Array(points.length);
   points.forEach((s, j) => {
     bucket[Math.floor(s.y) * size + Math.floor(s.x)] = j;
+    xs[j] = s.x;
+    ys[j] = s.y;
   });
   const reach = Math.ceil(searchM / pm);
   const r2 = searchM * searchM;
@@ -436,35 +455,75 @@ export function nearestSearch(
     }
   }
   offsets.sort((a, b) => a.d2 - b.d2);
+  const count = offsets.length;
+  const oxs = Int32Array.from(offsets, (o) => o.ox);
+  const oys = Int32Array.from(offsets, (o) => o.oy);
+  const od2 = Float64Array.from(offsets, (o) => o.d2);
   return (px, py, out) => {
     const cx = px + 0.5;
     const cy = py + 0.5;
-    out.length = 0;
-    for (const o of offsets) {
-      if (out.length === max && o.d2 - EPS > out[max - 1].d2) break;
-      const by = py + o.oy;
-      const bx = px + o.ox;
+    const { j: js, d2: d2s, dx: dxs, dy: dys, b: bs } = out;
+    let n = 0;
+    for (let o = 0; o < count; o++) {
+      if (n === max && od2[o] - EPS > d2s[max - 1]) break;
+      const by = py + oys[o];
+      const bx = px + oxs[o];
       if (by < 0 || by >= size || bx < 0 || bx >= size) continue;
       const b = by * size + bx;
       const j = bucket[b];
       if (j < 0) continue;
-      const s = points[j];
-      const dx = (s.x - cx) * pm;
-      const dy = (s.y - cy) * pm;
+      const dx = (xs[j] - cx) * pm;
+      const dy = (ys[j] - cy) * pm;
       const d2 = dx * dx + dy * dy;
       if (d2 > r2) continue;
-      let k = out.length;
+      let k = n;
       while (
         k > 0 &&
-        (out[k - 1].d2 > d2 || (out[k - 1].d2 === d2 && out[k - 1].b > b))
+        (d2s[k - 1] > d2 || (d2s[k - 1] === d2 && bs[k - 1] > b))
       ) {
         k--;
       }
       if (k >= max) continue;
-      out.splice(k, 0, { j, d2, dx, dy, b });
-      if (out.length > max) out.pop();
+      // Those after it move down one, the last falling off when the list is full.
+      for (let q = n < max ? n : max - 1; q > k; q--) {
+        js[q] = js[q - 1];
+        d2s[q] = d2s[q - 1];
+        dxs[q] = dxs[q - 1];
+        dys[q] = dys[q - 1];
+        bs[q] = bs[q - 1];
+      }
+      js[k] = j;
+      d2s[k] = d2;
+      dxs[k] = dx;
+      dys[k] = dy;
+      bs[k] = b;
+      if (n < max) n++;
     }
+    out.n = n;
   };
+}
+
+/** The pixels within `r` of one set in `mask`, across and down: a square about each. */
+function dilate(mask: Uint8Array, size: number, r: number): Uint8Array {
+  // Along each row, then each column, from the nearest set pixel either side.
+  const along = (src: Uint8Array, step: number, stride: number) => {
+    const out = new Uint8Array(src.length);
+    for (let line = 0; line < size; line++) {
+      const at = (p: number) => line * stride + p * step;
+      let last = -Infinity;
+      for (let p = 0; p < size; p++) {
+        if (src[at(p)]) last = p;
+        if (p - last <= r) out[at(p)] = 1;
+      }
+      last = Infinity;
+      for (let p = size - 1; p >= 0; p--) {
+        if (src[at(p)]) last = p;
+        if (last - p <= r) out[at(p)] = 1;
+      }
+    }
+    return out;
+  };
+  return along(along(mask, 1, size), size, 1);
 }
 
 /**
@@ -485,26 +544,35 @@ function blur(
     };
   }
   const r = Math.ceil(3 * sigma);
-  const kernel = Array.from({ length: 2 * r + 1 }, (_, i) =>
+  const kernel = Float64Array.from({ length: 2 * r + 1 }, (_, i) =>
     Math.exp(-((i - r) ** 2) / (2 * sigma * sigma)),
   );
+  // Each line's taps, past the raster's edge left out. A window none of whose weights
+  // is set sums to 0, as it's left.
+  const set = new Int32Array(size + 1);
   const pass = (src: Float32Array, wsrc: Float32Array, horizontal: boolean) => {
     const out = new Float32Array(src.length);
     const wout = new Float32Array(src.length);
-    for (let y = 0; y < size; y++) {
-      for (let x = 0; x < size; x++) {
+    const step = horizontal ? 1 : size;
+    const stride = horizontal ? size : 1;
+    for (let line = 0; line < size; line++) {
+      const first = line * stride;
+      for (let p = 0; p < size; p++) {
+        set[p + 1] = set[p] + (wsrc[first + p * step] !== 0 ? 1 : 0);
+      }
+      for (let p = 0; p < size; p++) {
+        const lo = Math.max(-r, -p);
+        const hi = Math.min(r, size - 1 - p);
+        if (set[p + hi + 1] === set[p + lo]) continue;
+        const i = first + p * step;
         let s = 0;
         let w = 0;
-        for (let j = -r; j <= r; j++) {
-          const xx = horizontal ? x + j : x;
-          const yy = horizontal ? y : y + j;
-          if (xx < 0 || yy < 0 || xx >= size || yy >= size) continue;
-          const i = yy * size + xx;
-          s += kernel[j + r] * src[i];
-          w += kernel[j + r] * wsrc[i];
+        for (let j = lo; j <= hi; j++) {
+          s += kernel[j + r] * src[i + j * step];
+          w += kernel[j + r] * wsrc[i + j * step];
         }
-        out[y * size + x] = s;
-        wout[y * size + x] = w;
+        out[i] = s;
+        wout[i] = w;
       }
     }
     return [out, wout];
@@ -513,9 +581,27 @@ function blur(
   const zeroed = values.map((v) => (Number.isNaN(v) ? 0 : v));
   const [h, wh] = pass(zeroed, valid, true);
   const [v, wv] = pass(h, wh, false);
-  const ones = new Float32Array(values.length).fill(1);
-  const [, wo1] = pass(ones, ones, true);
-  const [, wo] = pass(wo1, wo1, false);
+  // The weight a window would have were every pixel valid, a row's in single precision
+  // and then down its column, as the passes take it: wanted only where some is valid.
+  const row = new Float32Array(size);
+  for (let x = 0; x < size; x++) {
+    let w = 0;
+    for (let j = Math.max(-r, -x); j <= Math.min(r, size - 1 - x); j++) {
+      w += kernel[j + r];
+    }
+    row[x] = w;
+  }
+  const whole = (x: number, y: number) => {
+    let w = 0;
+    for (let j = Math.max(-r, -y); j <= Math.min(r, size - 1 - y); j++) {
+      w += kernel[j + r] * row[x];
+    }
+    return Math.fround(w);
+  };
+  const cover = new Float32Array(values.length);
+  for (let i = 0; i < cover.length; i++) {
+    if (wv[i] !== 0) cover[i] = wv[i] / whole(i % size, Math.floor(i / size));
+  }
   return {
     values: values.map((d, i) =>
       wv[i] <= 0
@@ -524,7 +610,7 @@ function blur(
           ? v[i] / wv[i]
           : Math.min(v[i] / wv[i], d),
     ),
-    cover: wv.map((w, i) => w / wo[i]),
+    cover,
   };
 }
 
