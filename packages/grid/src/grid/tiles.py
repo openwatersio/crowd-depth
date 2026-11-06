@@ -57,13 +57,13 @@ WRITTEN = ("cells", "qc_flags", "shoals", "cells_built", "store_meta", "tile_cha
 # soundings, where a tile with few soundings can have a large surface. A stage's last
 # entry covers the rest. A dense surface runs in a 2 GB cgroup, where the kernel takes
 # back what it can, but 45463's reached 2.05 GB run alone. Overlay peaks follow the
-# tile's surface more than its soundings: one overlay, of a tile whose contour bands
-# GEOS validates at 1.4 GB, needs 2.2 GB, and the rest of its row 1.3 GB.
+# tile's surface more than its soundings: past 1M soundings at most 1.9 GB (45464),
+# measured on OrbStack, so kept about 0.4 GB over it, near the gap cells allows for.
 # ponytail: measured on one region; refit once the planet's densest tiles have run
 MEMORY_MB = {
     "cells": [(100_000, 512), (1_000_000, 1536), (10_000_000, 1792), (None, 2304)],
     "surface": [(1_000_000, 1792), (None, 2304)],
-    "overlay": [(1_000_000, 1536), (None, 2560)],
+    "overlay": [(1_000_000, 1536), (None, 2304)],
 }
 WEB_MEMORY_MB = 2048
 # GDAL's block cache in each job, in MB.
