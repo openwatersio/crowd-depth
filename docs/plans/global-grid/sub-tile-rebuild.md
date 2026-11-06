@@ -178,6 +178,6 @@ The leaf jobs' own cost is about 40% of some 8,000 planet leaves rebuilt a day, 
 - Days whose tide levels or offsets move, which dirty more than arrivals.
 - Reading a leaf's points from DuckLake on R2, and the memory of Norfolk's leaves with their halos.
 - A whole tile spliced from leaves, as against windows checked one at a time.
-- Cells and surfaces reading across tile edges, and the seams that leaves.
+- Cells and surfaces reading across tile edges, and whether leaves leave seams of their own.
 - The planet's hot spots. Its densest tiles are rivers and ports this store doesn't have.
 - Timings without other jobs on the machine.

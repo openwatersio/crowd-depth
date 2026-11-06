@@ -140,6 +140,7 @@ with tiles.snapshot(a.run, threads=a.threads, memory_limit=limit) as con:
             a.out / tiles.TILE_FILES["flags"].format(a.tile),
         )
     else:
+        have = {t for (t,) in con.execute("SELECT DISTINCT tile_id FROM lake.points").fetchall()}
         for t in around:
             for d in [a.out, *a.flags]:
                 f = d / tiles.TILE_FILES["flags"].format(t)
@@ -148,6 +149,10 @@ with tiles.snapshot(a.run, threads=a.threads, memory_limit=limit) as con:
                         "INSERT INTO lake.qc_flags BY NAME SELECT * FROM read_parquet(?)", [str(f)]
                     )
                     break
+            else:
+                # Without cell-level flags the surface keeps rejected soundings.
+                if t in have:
+                    sys.exit(f"no cell-level flags for tile {t}: pass --flags")
         got = surface.tile_entries(con, a.tile, tiles.partition(a.tile))
 if got:
     path = a.out / tiles.TILE_FILES["surface"].format(a.tile)

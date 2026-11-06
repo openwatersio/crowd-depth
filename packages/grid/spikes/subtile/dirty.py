@@ -42,7 +42,7 @@ with tiles.snapshot(a.run, "lake") as con:
           count(*), count(*) FILTER (WHERE new) FROM pts GROUP BY ALL"""
     ).fetchall()
     new = con.execute(
-        "SELECT DISTINCT round(lat, 4), round(lon, 4) FROM pts WHERE new"
+        "SELECT DISTINCT lat, lon FROM pts WHERE new"
     ).fetchnumpy()
 lat, lon = (np.asarray(v, dtype=float) for v in new.values())
 dirty = set()
