@@ -101,7 +101,7 @@ Universal](https://creativecommons.org/publicdomain/zero/1.0/).
 - **Tint over sounded water** — Off, faint, normal or strong (normal by default).
 - **Draw depth contours** — Draw the layer's depth contours (on by default).
 - **Fill the layer from** — The last 30 days, the last year or all recorded history (the last year by default): how far back the layer fills in from recorded soundings when it starts or rebuilds. Changing it rebuilds the layer.
-- **Contour detail** — High draws a contour every metre, or every foot, from zoom 13 in, with every fifth one bold and labelled (the default). Standard draws the chart's depth contours. Zoomed out, both draw the chart's.
+- **Contour detail** — High draws a contour every metre, or every foot, from zoom 13 in, with every fifth one bold and labelled, and the rest labelled too once you zoom in close (the default). Standard draws the chart's depth contours. Zoomed out, both draw the chart's.
 
 ## My soundings on the chart
 

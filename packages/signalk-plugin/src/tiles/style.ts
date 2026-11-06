@@ -59,6 +59,12 @@ export const DEFAULT_OWN_STYLE: OwnStyle = {
   contours: true,
 };
 
+/** Minor contours are labelled from this zoom, where a metre's contours are far enough
+ * apart to read. */
+const MINOR_LABEL_ZOOM = 15;
+/** Pixels between labels along a contour. */
+const LABEL_SPACING = 150;
+
 /** Small float error in a safety depth set on a band edge stays inside the band. */
 const EPS = 0.01;
 
@@ -90,7 +96,7 @@ export function buildStyle({
     }
   });
   // A contour in the other unit than the user's isn't drawn; one of every five, or
-  // the chart's isobaths, which have no unit, are drawn bold and labelled.
+  // the chart's isobaths, which have no unit, are drawn bold and always labelled.
   const otherUnit = [
     "all",
     ["has", "unit"],
@@ -102,6 +108,76 @@ export function buildStyle({
     ["get", "DRVAL1"],
     ["-", ["global-state", "safetyDepth"], EPS],
   ];
+  // Shoaler than the safety depth, or unconfirmed: drawn above the contour labels, so
+  // within a tile a label never hides one.
+  const shoalSounding = [
+    "any",
+    ["<", ["get", "VALSOU"], ["global-state", "safetyDepth"]],
+    ["has", "unconfirmed"],
+  ];
+  const sounding = (id: string, filter: unknown) => ({
+    id,
+    type: "symbol",
+    source: "cells",
+    "source-layer": "SOUNDG",
+    filter,
+    layout: {
+      "text-field": ["to-string", ["get", ["global-state", "depthLabel"]]],
+      "text-font": DEPTH_FONT,
+      "text-size": 12,
+      "text-allow-overlap": false,
+    },
+    paint: {
+      "text-color": [
+        "case",
+        ["<", ["get", "VALSOU"], ["global-state", "safetyDepth"]],
+        ["global-state", "ownShoal"],
+        ["global-state", "ownColor"],
+      ],
+      // An unconfirmed shoal is a warning, not a measured depth: drawn fainter.
+      "text-opacity": ["case", ["has", "unconfirmed"], 0.7, 1],
+      "text-halo-color": DAY.labelHalo,
+      "text-halo-width": 1.5,
+    },
+  });
+  const contourLabel = (id: string, which: unknown, minzoom?: number) => ({
+    id,
+    type: "symbol",
+    source: "cells",
+    "source-layer": "DEPCNT",
+    ...(minzoom !== undefined && { minzoom }),
+    layout: {
+      "symbol-placement": "line",
+      // Closer than the default 250, so a contour crossing the view is labelled more
+      // than once, and a short one that loses one place to a sounding has another.
+      "symbol-spacing": LABEL_SPACING,
+      "text-field": [
+        "case",
+        ["any", otherUnit, ["!", which]],
+        "",
+        [
+          "number-format",
+          // Floored, as soundings are, so a label never reads deeper than the contour.
+          [
+            "floor",
+            [
+              "+",
+              ["/", ["get", "VALDCO"], ["global-state", "metresPerUnit"]],
+              1e-9,
+            ],
+          ],
+          { "max-fraction-digits": 0 },
+        ],
+      ],
+      "text-font": LABEL_FONT,
+      "text-size": 11,
+    },
+    paint: {
+      "text-color": ["global-state", "ownColor"],
+      "text-halo-color": DAY.labelHalo,
+      "text-halo-width": 1,
+    },
+  });
   return {
     version: 8,
     // Plotters that draw text in their own fonts ignore this, but the style spec wants a
@@ -179,64 +255,13 @@ export function buildStyle({
           "line-opacity": ["case", otherUnit, 0, major, 0.9, 0.35],
         },
       },
-      {
-        id: "depcnt-label",
-        type: "symbol",
-        source: "cells",
-        "source-layer": "DEPCNT",
-        layout: {
-          "symbol-placement": "line",
-          "text-field": [
-            "case",
-            ["any", otherUnit, ["!", major]],
-            "",
-            [
-              "number-format",
-              // Floored, as soundings are, so a label never reads deeper than the contour.
-              [
-                "floor",
-                [
-                  "+",
-                  ["/", ["get", "VALDCO"], ["global-state", "metresPerUnit"]],
-                  1e-9,
-                ],
-              ],
-              { "max-fraction-digits": 0 },
-            ],
-          ],
-          "text-font": LABEL_FONT,
-          "text-size": 10,
-        },
-        paint: {
-          "text-color": ["global-state", "ownColor"],
-          "text-halo-color": DAY.labelHalo,
-          "text-halo-width": 1,
-        },
-      },
-      {
-        id: "soundg",
-        type: "symbol",
-        source: "cells",
-        "source-layer": "SOUNDG",
-        layout: {
-          "text-field": ["to-string", ["get", ["global-state", "depthLabel"]]],
-          "text-font": DEPTH_FONT,
-          "text-size": 12,
-          "text-allow-overlap": false,
-        },
-        paint: {
-          "text-color": [
-            "case",
-            ["<", ["get", "VALSOU"], ["global-state", "safetyDepth"]],
-            ["global-state", "ownShoal"],
-            ["global-state", "ownColor"],
-          ],
-          // An unconfirmed shoal is a warning, not a measured depth: drawn fainter.
-          "text-opacity": ["case", ["has", "unconfirmed"], 0.7, 1],
-          "text-halo-color": DAY.labelHalo,
-          "text-halo-width": 1.5,
-        },
-      },
+      // MapLibre, and OpenLayers within a tile, place the top layer's labels first.
+      // Contour labels above the deeper soundings, so a contour near one keeps its
+      // label, minor ones below the major; shoal soundings above them all.
+      sounding("soundg", ["!", shoalSounding]),
+      contourLabel("depcnt-label-minor", ["!", major], MINOR_LABEL_ZOOM),
+      contourLabel("depcnt-label", major),
+      sounding("soundg-shoal", shoalSounding),
       {
         id: "provisional",
         type: "circle",
