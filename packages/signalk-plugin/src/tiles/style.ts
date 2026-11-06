@@ -126,7 +126,7 @@ export function buildStyle({
       "text-font": DEPTH_FONT,
       "text-size": 12,
       "text-allow-overlap": false,
-      // Room round each where zoom 15 tiles, denser than the rest, are drawn small;
+      // Room around each where zoom 15 tiles, denser than the rest, are drawn small;
       // the default 2 px below zoom 15 and from 17.
       "text-padding": ["step", ["zoom"], 2, 15, 8, 16, 5, 17, 2],
     },
