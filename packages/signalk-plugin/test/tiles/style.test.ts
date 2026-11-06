@@ -5,7 +5,9 @@ test("contour labels sit above deeper soundings and below shoal ones", () => {
   const ids = buildStyle({ tiles: "t", safetyDepth: 2 }).layers.map(
     (l) => l.id,
   );
-  expect(ids.indexOf("depcnt-label")).toBeGreaterThan(ids.indexOf("soundg"));
+  expect(ids.indexOf("depcnt-label-minor")).toBeGreaterThan(
+    ids.indexOf("soundg"),
+  );
   expect(ids.indexOf("depcnt-label")).toBeGreaterThan(
     ids.indexOf("depcnt-label-minor"),
   );
