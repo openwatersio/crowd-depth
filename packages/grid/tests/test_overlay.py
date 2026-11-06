@@ -256,12 +256,14 @@ def test_a_drying_bank_has_its_area_drying_line_and_least_depth(tmp_path):
     assert -0.5 in {f["properties"]["depth_m"] for f in got["SOUNDG"]}
 
 
-def write_surface(path, lon0, lat0, depth, distance, count, sigma=None):
+def write_surface(path, lon0, lat0, depth, distance, count, sigma=None, near=None):
     """A whole tile's bands as its surface COG, written as build_tile writes one."""
     sparse = path.with_suffix(".sparse.tif")
     sigma = np.zeros_like(depth) if sigma is None else sigma
+    near = np.zeros_like(depth) if near is None else near.astype(np.float32)
+    near = np.where(depth == surface.NODATA, surface.NODATA, near)
     with surface.open_sparse(sparse, lon0, lat0, depth.shape) as dst:
-        dst.write(np.stack([depth, distance, count, sigma]))
+        dst.write(np.stack([depth, distance, count, sigma, near]))
     rasterio.shutil.copy(sparse, path, driver="COG", compress="deflate", sparse_ok=True)
 
 
@@ -419,6 +421,41 @@ def test_the_grown_edge_is_never_deeper_than_a_sounding_beside_it(tmp_path):
     assert [overlay.LEVELS[b] for b, a in bands.items() if a.contains(far)] == [10]
 
 
+def test_a_surface_without_the_band_marked_is_refused(tmp_path):
+    # A surface from before the band was marked: its band pixels can't be told from
+    # interpolated ones, so its areas would miss the cap.
+    depth = np.full((100, 100), 12.0, dtype=np.float32)
+    path = tmp_path / "t.tif"
+    with rasterio.open(path, "w", driver="GTiff", width=100, height=100, count=4,
+                       dtype="float32", crs="EPSG:4326", nodata=surface.NODATA,
+                       transform=rasterio.transform.from_bounds(-78, 33, -77, 34, 100, 100)) as dst:  # fmt: skip
+        dst.write(
+            np.stack([depth, np.zeros_like(depth), np.zeros_like(depth), np.zeros_like(depth)])
+        )
+    with pytest.raises(ValueError, match="rebuild"):
+        overlay.surface_bands(path)
+
+
+def test_the_band_beside_a_track_is_never_deeper_than_a_sounding_in_it(tmp_path):
+    # 12 m water, its west half interpolated and its east half the band beside a track,
+    # with a 3 m sounding in each: the band is capped at the sounding, as the grown edge
+    # is, and interpolated water isn't.
+    depth = np.full((100, 100), 12.0, dtype=np.float32)
+    near = np.zeros_like(depth)
+    near[:, 50:] = 1
+    write_surface(tmp_path / "t.tif", -78, 33, depth, np.zeros_like(depth),
+                  np.zeros_like(depth), near=near)  # fmt: skip
+    soundings = ([-78 + 20.5 / 100, -78 + 80.5 / 100], [33.495, 33.495], [3.0, 3.0])
+    bands, *_ = overlay.surface_bands(tmp_path / "t.tif", soundings)
+
+    def levels(x):
+        point = shapely.Point(-78 + x / 100, 33.495)
+        return [overlay.LEVELS[b] for b, a in bands.items() if a.contains(point)]
+
+    assert levels(80.5)[0] < 3
+    assert levels(20.5) == [10]
+
+
 def test_the_grown_edge_of_interpolated_water_is_interpolated(tmp_path):
     # A surface with no soundings in it is all interpolated, its grown edge included.
     depth = np.full((100, 100), surface.NODATA, dtype=np.float32)
@@ -479,6 +516,17 @@ def test_holes_and_islands_in_holes_are_traced():
     assert len(outer.interiors) == 1
     assert outer.contains(shapely.Point(8, 8)) and not traced.contains(shapely.Point(14, 14))
     assert traced.contains(shapely.Point(20, 20))
+
+
+def test_water_held_at_0_m_is_never_drawn_drying(tmp_path):
+    # 0 to 2 m water with pixels at exactly 0 m, where the margin's floor holds them, and
+    # none below: all of it is in the 0-2 m band, as `band` reads 0 m.
+    depth = np.full((100, 100), surface.NODATA, dtype=np.float32)
+    depth[30:70, 30:70] = 0.8
+    depth[45:55, 45:55] = 0.0
+    write_surface(tmp_path / "t.tif", -78, 33, depth, np.zeros_like(depth), np.ones_like(depth))
+    bands, *_ = overlay.surface_bands(tmp_path / "t.tif")
+    assert set(bands) == {overlay.LEVELS.index(0)}
 
 
 def test_a_shoal_is_closed_only_away_from_the_surface_edge(tmp_path):
@@ -546,9 +594,75 @@ def test_surface_fills_between_tracks_but_not_past_their_ends(env, monkeypatch):
     # Between them, 10 m less K σ: each track agrees with itself, so σ is the corrections'.
     assert at_pixel(depth, 5006, 30) == pytest.approx(10.0 - statistic.K * CSIG, abs=0.05)
     # Past their ends, though within the radius of both: interpolating needs a
-    # sounding on every side, so the surface doesn't run on beyond them.
+    # sounding on every side, so the surface doesn't run on beyond them past the band.
     assert at_pixel(depth, 5006, 70) == surface.NODATA
     assert at_pixel(depth, 5300, 30) == surface.NODATA  # far from both
+
+
+def varied(row, length=300):
+    """One track along base row `row`, varied, or a kilometre of one depth reads as a
+    stuck sounder."""
+    return [(i, row, i, 10 + i % 7 / 5) for i in range(length)]
+
+
+def test_a_lone_track_draws_a_narrow_band(env):  # noqa: F811
+    # Pixels here are about 20.6 m north to south and 18.5 m east to west, so the band
+    # reaches a pixel north and south, and two east and west (37 m).
+    depth = surface_from(env, [("A", varied(5000))])
+    assert at_pixel(depth, 5000, 150) != surface.NODATA
+    assert at_pixel(depth, 5002, 150) != surface.NODATA  # a pixel off, 21 m
+    assert at_pixel(depth, 5004, 150) == surface.NODATA  # two pixels off, 41 m
+    # Past its end, as far.
+    assert at_pixel(depth, 5000, 302) != surface.NODATA  # two pixels on, 37 m
+    assert at_pixel(depth, 5000, 304) == surface.NODATA  # three, 56 m
+    # Never deeper than the track reads anywhere, less the margin.
+    band = depth[depth != surface.NODATA]
+    assert band.max() <= 11.2 - statistic.K * CSIG + 1e-6
+
+
+def test_the_band_never_deepens_the_interpolated_surface(env, monkeypatch):  # noqa: F811
+    put_tracks(env, parallel())
+    test_grid.build(env)
+    tile = tile_of(test_grid.LAT0, test_grid.LON0)
+
+    def depth(name):
+        with open_store(env.store, write=False) as con:
+            [(partition,)] = con.execute("SELECT DISTINCT cell_id FROM lake.cells").fetchall()
+            path = surface.build_tile(con, tile, partition, env.store.root / name)
+        with rasterio.open(path) as src:
+            return src.read(1)
+
+    after = depth("after")
+    with rasterio.open(env.store.root / "after" / f"{tile}.tif") as src:
+        near = src.read(5)
+    # Without the band: the interpolation alone.
+    monkeypatch.setattr(
+        surface.Near,
+        "shoalest",
+        lambda self, r0, c0, r1, c1: np.full((r1 - r0, c1 - c0), surface.NODATA, np.float32),
+    )
+    before = depth("before")
+    had = before != surface.NODATA
+    assert had.any() and (after[had] != surface.NODATA).all()
+    assert (after[had] <= before[had]).all()
+    # The band adds the outer tracks' sides and the tracks' ends, and marks them.
+    assert (after != surface.NODATA).sum() > had.sum()
+    assert np.array_equal(near == 1, (after != surface.NODATA) & ~had)
+    assert np.array_equal(near == surface.NODATA, after == surface.NODATA)
+
+
+def test_near_takes_the_shoalest_median_within_reach():
+    # 20 m rows and 15 m columns: 40 m is two rows, or two columns, or a row and two
+    # columns (25 m and 36 m), but not two rows and a column (42 m).
+    near = surface.Near([0, 0, -2], [0, 4, 10], [8.0, 6.0, 4.0], dy=20, dx=15)
+    got = near.shoalest(0, 0, 3, 13)
+    nodata = surface.NODATA
+    assert got[0, 0] == 8.0 and got[2, 0] == 8.0 and got[1, 1] == 8.0
+    assert got[2, 1] == nodata
+    # Where two reach, the shoaler.
+    assert got[0, 2] == 6.0 and got[1, 2] == 6.0 and got[0, 3] == 6.0
+    # A vote two rows north of the window, past the tile's edge, reaches its first row.
+    assert got[0, 10] == 4.0 and got[1, 10] == nodata
 
 
 def test_skipping_empty_blocks_changes_no_pixel(env, monkeypatch):  # noqa: F811
@@ -732,7 +846,7 @@ def test_interpolated_pixels_widen_with_distance_and_are_marked(env, monkeypatch
         [(partition,)] = con.execute("SELECT DISTINCT cell_id FROM lake.cells").fetchall()
         path = surface.build_tile(con, tile, partition, tmp_path)
     with rasterio.open(path) as src:
-        depth, distance, count, sigma = src.read()
+        depth, distance, count, sigma = src.read([1, 2, 3, 4])
     near, mid = (at_pixel(sigma, r, 30) for r in (5002, 5006))
     # The corrections' σ, wider with each metre from the nearest track.
     assert CSIG < near < mid
@@ -742,13 +856,16 @@ def test_interpolated_pixels_widen_with_distance_and_are_marked(env, monkeypatch
     # The overlay marks where the surface is drawn between tracks.
     bands, footprint, surfaced, interpolated, tvu = overlay.surface_bands(path)
     assert interpolated.contains(shapely.Point(*test_grid.at(5006, 30)))
-    assert not interpolated.contains(shapely.Point(*test_grid.at(5000, 30)))
+    # The band beside the tracks is more than a pixel from them too, so with water drawn
+    # on both sides, each track's own strip is drawn as interpolated: interpolated water is
+    # never drawn as measured, and a strip a pixel wide between two of it isn't kept.
+    assert interpolated.contains(shapely.Point(*test_grid.at(5000, 30)))
     assert tvu == pytest.approx(max(2 + 0.05 * float(depth[count == 0].min()), 1.96 * mid), abs=0.5)
     got = by_layer(
         overlay.tile_areas(([], [], []), PROPERTIES, bands, footprint, surfaced,
                            (interpolated, overlay.quality(None, None, 0, tvu)))
     )  # fmt: skip
-    assert sorted(f["properties"]["kind"] for f in got["M_QUAL"]) == ["interpolated", "measured"]
+    assert [f["properties"]["kind"] for f in got["M_QUAL"]] == ["interpolated"]
 
 
 def test_soundings_skip_latitudes_web_mercator_cant_hold(lake):
@@ -790,12 +907,12 @@ def test_build_writes_pmtiles_with_every_layer(env, tmp_path):  # noqa: F811
     assert metadata["type"] == "S-57" and metadata["version"] == str(overlay.GRID_VERSION)
     assert not (tmp_path / "overlay.mbtiles").exists()
     areas = [json.loads(line) for line in (tmp_path / "areas.geojsons").read_text().splitlines()]
-    # The lone track's soundings sit inside coverage, though the surface can't reach them.
+    # The lone track's soundings sit inside coverage.
     quality = {f["properties"]["kind"]: f for f in areas if f["tippecanoe"]["layer"] == "M_QUAL"}
-    assert sorted(quality) == ["interpolated", "measured"]
-    coverage = geometry(quality["measured"])
+    assert "interpolated" in quality
+    coverage = shapely.union_all([geometry(f) for f in quality.values()])
     # Its survey ends at the end of the cells' month or year, but never after today.
-    props = quality["measured"]["properties"]
+    props = quality["interpolated"]["properties"]
     # Capped at today in UTC, as DuckDB's current_date is in the store's UTC session.
     today = datetime.now(UTC).date()
     assert props["SUREND"] == min(date(2026, 12, 31), today).strftime("%Y%m%d")
