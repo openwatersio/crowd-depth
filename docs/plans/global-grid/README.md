@@ -14,6 +14,7 @@ Supporting notes:
 - [Planet size](planet-size.md): how many 1° tiles the archive covers, how skewed they are, and how a day's arrivals spread.
 - [Rebuild cost](rebuild-cost.md): what a daily planet rebuild costs, and what brings it within a day on cheap hardware.
 - [Per-tile pipeline](per-tile-pipeline.md): how `grid tiles` rebuilds only the tiles whose inputs moved, and the spikes behind it.
+- [Sub-tile rebuild](sub-tile-rebuild.md): rebuilding only the parts of dense tiles a day's data touched, and closing the seams between tiles.
 - [Point store layout](store-layout.md) and [Track QC as pure functions](qc-functions.md): spikes on the Chesapeake set.
 - [Live layer](live-layer.md): the plugin's own-boat layer, drawn on top of the overlay with the same QC and corrections, and the same portrayal or, zoomed in, finer contours.
 - [Live layer performance](live-layer-performance.md): where the live layer's time and memory go on a Pi and in the plotter, and a staged plan to cut them.
