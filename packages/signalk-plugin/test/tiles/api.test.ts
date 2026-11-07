@@ -119,6 +119,7 @@ test("draws the boat's own data in the colour, tint and contours set", async () 
   expect(style.state.ownTint.default).toBe(2);
   expect(style.layers.map((l) => l.id)).not.toContain("depcnt");
   expect(style.layers.map((l) => l.id)).not.toContain("depcnt-label");
+  expect(style.layers.map((l) => l.id)).not.toContain("depcnt-label-minor");
 });
 
 test("serves a tile as MVT bytes, and nothing where there are no cells", async () => {
