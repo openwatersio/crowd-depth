@@ -1,6 +1,6 @@
 # Live layer performance
 
-The "My soundings" layer ([live-layer.md](live-layer.md)) is slow to fill a view and heavy for a Raspberry Pi and the plotter that draws it. Most of the cost is two things. The plugin rebuilds each tile's depth surface from the cells every time the tile is asked for, and the zoom-13 to 15 tiles it sends carry far more geometry than a screen can show. This note measures both, reviews what upstream signalk-livedepth-plugin has done since we adapted it, and proposes a staged plan. The measurements describe the layer before stage 1; [Stage 1 results](#stage-1-results) and [Stage 2 results](#stage-2-results) measure what each changed.
+The "My soundings" layer ([live-layer.md](live-layer.md)) is slow to fill a view and heavy for a Raspberry Pi and the plotter that draws it. Most of the cost is two things. The plugin rebuilds each tile's depth surface from the cells every time the tile is asked for, and the zoom-13 to 15 tiles it sends carry far more geometry than a screen can show. This note measures both, reviews what upstream signalk-livedepth-plugin has done since we adapted it, and proposes a staged plan. The measurements describe the layer before stage 1; [Stage 1 results](#stage-1-results), [Stage 2 results](#stage-2-results) and [Stage 3 results](#stage-3-results) measure what each changed, and [Live and instant](#live-and-instant) designs what comes next.
 
 ## How the layer worked before stage 1
 
@@ -83,7 +83,7 @@ Each was tried on the same store and then reverted. They're listed here as evide
 | Simplification tolerance 8 units (half a pixel)                | z13 view 855k → 387k vertices (−55%), 1.95 → 1.07 MB (−45%); z15 view 207k → 76k |
 | Surfaces shared from zoom 13 rather than 14                    | No gain: 10.5 → 10.9 s for the 13 → 15 zoom-in                                   |
 
-The neighbour search spends most of its time between tracks, where fewer than 12 cells lie within 200 m and the whole radius has to be scanned, so stopping early only helps on dense water. The rest of `surface()` allocates an object per candidate neighbour and sorts per pixel; rewriting it over typed arrays is not yet measured.
+The neighbour search spends most of its time between tracks, where fewer than 12 cells lie within 200 m and the whole radius has to be scanned, so stopping early only helps on dense water. The rest of `surface()` allocated an object per candidate neighbour and sorted per pixel; [stage 3](#stage-3-results) rewrites it over typed arrays.
 
 ### Client: Freeboard drawing the layer
 
@@ -151,7 +151,7 @@ A tile could also carry only the user's unit's contours, which would take off ab
 **B. Make the surface cheaper.**
 
 - Search nearest-first and stop early: exact, −12% at z13, measured.
-- Rewrite the search over typed arrays, without a per-pixel sort: unmeasured, likely as much again.
+- Rewrite the search over typed arrays, without a per-pixel sort: done in stage 3, with the rest of the surface worked only where soundings reach.
 - Size rasters by latitude, so a pixel is about a cell everywhere: at 37.5° N, 0.55 times the pixels. It needs neighbours to agree on a grid, for example by fixing the pixel size per latitude band of tiles, and keeping zoom 15 tiles cut from their parents.
 - Effort: small for the first two, medium for the third.
 
@@ -190,16 +190,15 @@ A tile could also carry only the user's unit's contours, which would take off ab
 
 Do A, B's small parts, and E's small parts first. They're local changes that need no new storage, and together they halve what a plotter draws and take an eighth to a quarter off what the Pi computes per tile. Then C, which bounds memory and makes views after a restart free. Measure on a Pi before D, which is the large one. Propose the Freeboard change in parallel. Leave F and G.
 
-| Stage | Change                                                                                | Expected                                                                                                                                      |
-| ----- | ------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1     | Simplify to half a pixel, finer at zoom 15; coarser coverage                          | Done, but coverage is simplified as lines, not traced coarser: z13 view vertices −42% and bytes −34%, z15 −17% and −13%                       |
-| 1     | Early-stopping neighbour search; typed arrays in `surface()`                          | The search is done, byte-identical; typed arrays are not, and carry over to stage 2                                                           |
-| 1     | Runtime: pause while hidden; timeouts on fetches and host calls; provisional upserts  | Done: no polling from background tabs; no stuck runtime                                                                                       |
-| 2     | Tile cache bounded by bytes; encoded tiles persisted in SQLite, versioned             | Done: the cache is 16 MB in memory, 64 MB on disk, and a restart builds nothing. The plugin's memory is dominated by its tile threads instead |
-| 2     | Contours of one unit per tile, once Freeboard's fetching of hidden sources is checked | Not done: Freeboard fetches tiles for a source whose layers are all hidden                                                                    |
-| 2     | Latitude-sized rasters, if seams can be held                                          | Done below zoom 14: a zoom 13 view builds 35 to 44% faster. Zooms 14 and 15 are unchanged                                                     |
-| 3     | Incremental zoom 14 surfaces, with zoom 13 and below assembled from them              | A refresh rebuilds a pass's neighbourhood, not whole tiles; to be measured on a Pi first                                                      |
-| —     | Freeboard: `overlay.refresh` re-keys only the tiles it names                          | No redraw of the whole layer per refresh; refresh every few seconds instead of every 30                                                       |
+| Stage | Change                                                                                | Expected                                                                                                                                         |
+| ----- | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1     | Simplify to half a pixel, finer at zoom 15; coarser coverage                          | Done, but coverage is simplified as lines, not traced coarser: z13 view vertices −42% and bytes −34%, z15 −17% and −13%                          |
+| 1     | Early-stopping neighbour search; typed arrays in `surface()`                          | The search is done, byte-identical; typed arrays are in stage 3                                                                                  |
+| 1     | Runtime: pause while hidden; timeouts on fetches and host calls; provisional upserts  | Done: no polling from background tabs; no stuck runtime                                                                                          |
+| 2     | Tile cache bounded by bytes; encoded tiles persisted in SQLite, versioned             | Done: the cache is 16 MB in memory, 64 MB on disk, and a restart builds nothing. The plugin's memory is dominated by its tile threads instead    |
+| 2     | Contours of one unit per tile, once Freeboard's fetching of hidden sources is checked | Not done: Freeboard fetches tiles for a source whose layers are all hidden                                                                       |
+| 2     | Latitude-sized rasters, if seams can be held                                          | Done below zoom 14: a zoom 13 view builds 35 to 44% faster. Zooms 14 and 15 are unchanged                                                        |
+| 3     | Typed arrays in `surface()`; the surface worked only where soundings reach            | Done, byte-identical: the boat's view on its Pi 8.0 → 4.6 s for the zoom 13 to 15 walk. What follows is in [Live and instant](#live-and-instant) |
 
 Rendering changes in stage 1 and 2 come with before-and-after screenshots on real data, as any change to how tiles render does.
 
@@ -371,3 +370,102 @@ Zoom 14 and 15 tiles are the same as main's, byte for byte, but built 8 to 12% s
 | z14 and z15 views after a restart   | 3.00 and 2.01 s |                     0 s |
 
 Most of the walk is unsounded, so the tiles kept are mostly empty. Resident memory rose from 78 MB to about 380 MB with the first 180 tiles, and to about 500 MB by the end, with the main thread's heap at 10 MB: the tile threads again, though at half the laptop's 800 to 950 MB, since V8 sizes its heaps by the machine. Within 8 GB that's room enough, so stage 2 leaves the threads' heaps unlimited. A 1 or 2 GB Pi, where V8 would size them smaller still, hasn't been measured.
+
+## Stage 3 results
+
+A CPU profile of the boat's own view on its Pi, on `main` after stage 2, put a third of the time in `prepare` and a quarter in `surface()`, but little of it in the neighbour search, 9%. The rest went to passes over every pixel of the raster: the blurs, `soften`, `carry`, the 3 × 3 shoal caps, upsampling and slopes. A zoom 13 tile with 46 cells took about as long as one with 1,658, 92 and 112 ms on the laptop, so the time was the raster's, not the soundings'. Most of a raster on the boat's store is empty water: on its view, the soundings and what they reach cover 1% to 100% of a tile's raster, 40% on average.
+
+Stage 3 changes how the surface is worked, not what it draws:
+
+- **Only where soundings reach.** `prepare` works its fields over the box the surface's depths and shoals reach, plus `REACH_PX`: the depth blur's reach, the carry's passes, and the bicubic's and a slope's past them, 15 pixels. Past it every field is what it is far from any depth, and is filled. `cut` upsamples and takes slopes only over that box's samples. The surface's caps beside shoals are worked only beside a depth or a shoal.
+- **No empty windows.** The blurs skip a window none of whose weights is set, which sums to 0 either way, and the coverage's normalising weight is worked only where some pixel is valid.
+- **Typed arrays.** The neighbour search keeps its neighbours in typed arrays, without an object per candidate, and `soften`, `carry` and the growth of the masks run as plain loops. A carry stops once a pass carries nothing.
+
+Tiles are byte-identical: 528 tiles, zooms 10 to 15 at both details over the boat's, the real and the synthetic stores, hashed the same as `main`'s on the laptop and on the Pi. A test checks that the windowed fields equal those worked over the whole raster, and that tiles cut from them encode the same; it fails with the window 6 pixels short.
+
+Two things were tried and left out:
+
+- **Searching only pixels that can be interpolated.** A pixel between tracks takes a depth only with a cell in each quadrant, and a count of cells in each quadrant's box, from a summed table, says when one is empty, so such a pixel needs only its nearest cell. On the Pi it gained nothing, 4.6 → 4.7 s for the boat's view, so it isn't kept.
+- **Latitude-sized rasters at zooms 14 and 15.** At the boat's 23.5° N they'd drop the rasters from 128 to 112 pixels a side, 23% of their pixels and about a tenth of a view, and stage 2's objection, shoals drawn blockier where zoom 15 tiles are stretched, is the pixel size itself. Not taken.
+
+`scripts/bench-view.mjs` on the boat's Pi, a Raspberry Pi 5 with 8 GB, on a copy of its own store, 373,164 cells, `main` and stage 3 interleaved, three runs each, at a load average of 2:
+
+| View of 20 tiles, one thread | Main        | Stage 3     |
+| ---------------------------- | ----------- | ----------- |
+| z13                          | 3.19–3.50 s | 1.64–1.72 s |
+| z14                          | 2.38–2.73 s | 1.40–1.53 s |
+| z15                          | 2.07–2.22 s | 1.47–1.58 s |
+| 13 → 15                      | 7.9–8.1 s   | 4.6–4.8 s   |
+
+On the laptop, the same walk on each store, medians of three: the boat's 1.9 → 1.0 s (−47%), the real one 4.1 → 3.2 s (−20%) and the synthetic one 6.9 → 6.3 s (−9%). Dense water gains least: its time is the neighbour search, which stage 3 makes no shorter.
+
+### What the boat feels
+
+Measured on the Pi itself: a second Signal K server, 2.33.0 with Freeboard-SK 3.4.1 and `signalk-tides`, on a copy of the boat's store and its plugin settings, beside the boat's own server, with the boat's position set where it has the most cells. Headless Chromium on the laptop drew Freeboard from it at 1280 × 800 with the CPU throttled 6×, through an SSH tunnel on the local network. Each run started the server on a fresh copy, so nothing was built before. Two runs each, `main` → stage 3:
+
+| What                                                  | Main           | Stage 3     |
+| ----------------------------------------------------- | -------------- | ----------- |
+| Cold view at map zoom 13, until its last tile         | 2.5–2.7 s      | 1.9–2.1 s   |
+| Zoom 13 → 14, until its last tile                     | 2.0 s          | 1.3 s       |
+| Zoom 14 → 15                                          | 2.1–2.3 s      | 1.4–1.7 s   |
+| Sailing at 6 kn, map zoom 13: a refresh's tile, built | 0.57–0.69 s    | 0.35–0.51 s |
+| Sailing: frames over 50 ms; worst frame               | none; 17–33 ms | none; 17 ms |
+
+Freeboard asks for tiles a zoom below the map's, 512 pixels a side, so a view at map zoom 13 is 12 zoom 12 tiles. The cold view's time includes Freeboard starting up under the throttle.
+
+On the boat's store, Freeboard doesn't freeze on a refresh: a view holds 9 to 25 KB of tiles, against 0.6 to 0.8 MB on the synthetic store, where [stage 1](#client-freeboard-drawing-the-layer) measured a 0.6 s freeze. What a sounding waits for is the batching:
+
+- **As a provisional sounding:** the next poll of `/live`, within 2 s.
+- **In the surface:** the writer's flush, every 10 s; then the runtime's batch, one refresh per 30 s; then the next poll, and the tile's build, 0.4 s. So up to 42 s, about 20 s on average.
+
+With the batch at 5 s rather than 30, in a build made for the test, the boat sailing at map zoom 13 and 15 refreshed 10 times in 95 s, as often as the writer flushed, each a tile built in 0.24 to 0.42 s, with no frame over 17 ms. A sounding reached the surface within 17 s, about 10 s on average, at under 5% of a core on the Pi.
+
+Building ahead costs little on this store: every tile with a cell under it, zooms 4 to 15, is 13,313 tiles and 29 MB at High detail, built in 23.4 min on one of the Pi's threads, about 105 ms a tile. Zoom 15 is half the tiles and half the time.
+
+## Live and instant
+
+Two targets, which the stages so far haven't met:
+
+1. **Live.** Under way, the surface under the boat redraws every few seconds as it moves, without freezing the map.
+2. **Instant.** Panning and zooming draw tiles already built, as any other chart's do, not after seconds of interpolation.
+
+### Instant: build tiles ahead
+
+Build every tile with a cell under it, at every zoom, in the background, nearest the boat first, and keep them, so a plotter's request is read from disk. On the boat's store that's 13,313 tiles and 29 MB, about 8 min from nothing if the three tile threads share it evenly, which wasn't measured. A restart already builds nothing (stage 2).
+
+- **Queue.** Tiles to build, nearest the boat first, zoom 13 and out before zooms 14 and 15, which plotters ask for only closer in. A plotter's request jumps the queue. The builder runs on the tile threads only when no request waits, and yields to them.
+- **Invalidation.** Already there: the triggers on `cells`, `overviews` and `shoals` drop every kept tile under a changed row (stage 2). The builder queues what they drop.
+- **Changed tiles under way.** Stage 2 doesn't keep a tile changed in the last 10 minutes, to spare the SD card from a rewrite every flush. Rebuilt ahead, such tiles stay in memory, and are kept once they settle.
+- **Bound.** The kept bound is 64 MB, twice this store's every tile. A busier store holds more, not measured here; past the bound, the oldest-built go first, as now, and the builder skips what it would only evict.
+- **Cost.** A flush drops 1 to 4 tiles at each of zooms 10 to 15 round the boat, and zooms 4 to 9 every 5 minutes: 6 to 24 tiles, about 0.6 to 2.5 s of a thread every 10 s under way.
+
+### Live: refresh every few seconds
+
+What holds the surface back is the 30 s batch, which exists because Freeboard redraws the whole layer on any refresh (option E). Its cost scales with what's drawn: none on the boat's store today, 0.6 s on a dense store at map zoom 13.
+
+- **Shorter batch.** A batch of 5 s puts a sounding into the surface within about 10 s, at under 5% of a core on the Pi, and no freeze on the boat's store. On a dense store it would freeze the map for 0.6 s every 10 s until Freeboard changes.
+- **Freeboard re-keying only the named tiles.** Freeboard-SK 3.4.1 already invalidates just the tiles `overlay.refresh` names, in its tile fetcher, and counts each tile's revisions (`fb-data-overlay`'s `onRefresh`). Then `applyRekeys` sets a new key on the whole OpenLayers source, which re-parses, restyles and declutters every tile in view. With a list of tiles, it could reload those tiles alone, and keep the source's key. Drafted below.
+- **The pass, drawn at once.** Provisional soundings are drawn within 2 s as points. Drawn as a ribbon, a line along the pass styled by its depth band, as wide as the cells, the boat would see the surface's colour under it at once, and the tiles would replace it as they refresh. It's a GeoJSON source the runtime already sends, so it costs the Pi nothing, and the plotter a line of the last few minutes' points.
+- **Incremental surfaces (option D).** A refresh costs a tile built in 0.24 to 0.51 s here, once every 10 s. Patching a kept zoom 14 surface would cut that to the pass's neighbourhood, but at these numbers it buys little for its size. Leave it unless a dense store's refresh builds prove too slow.
+
+### Recommendation
+
+| Stage | Change                                                                               | Target                                                                    |
+| ----- | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------- |
+| 3     | The surface worked only where soundings reach; typed arrays                          | Done: a view 40 to 50% faster on the boat's Pi, byte-identical            |
+| 4     | Tiles built ahead in the background, nearest the boat first, at every zoom, and kept | Instant: pan and zoom read built tiles                                    |
+| 5     | The batch at 5 s; the pass drawn as a ribbon until its tiles land                    | Live: the colour under the boat within 2 s, the surface within about 10 s |
+| —     | Freeboard: `overlay.refresh` with tiles reloads those tiles alone                    | No freeze on dense stores at a 5 s batch                                  |
+| Later | Incremental zoom 14 surfaces (option D)                                              | Only if refresh builds on dense stores prove too slow                     |
+
+Stage 5's batch could go to 5 s at once on stores as light as the boat's. Whether to wait for the Freeboard change, or to choose the batch by how much a view holds, is a decision for the owner.
+
+### Freeboard-SK issue, drafted
+
+> **`overlay.refresh` with `tiles` redraws the whole overlay**
+>
+> A plotter extension's `overlays.data` overlay asks for changed tiles with `overlay.refresh({ source, tiles })`. Freeboard-SK 3.4.1 invalidates just those tiles in the overlay's tile fetcher (`onRefresh` in `fb-data-overlay`), which is right. But it then re-keys the whole OpenLayers source in `applyRekeys`, so OpenLayers reloads, re-parses, restyles and re-declutters every tile in view, though only the named ones changed.
+>
+> With a few hundred kilobytes of vector tiles in view, at a 6× CPU throttle standing in for a tablet, that's a 0.6 s freeze of the map per refresh. Our extension (the Crowd Depth plugin's "My soundings" layer) batches refreshes to one every 30 s because of it, while the boat's soundings change the tiles round it every 10 s.
+>
+> Could `overlay.refresh` with `tiles` reload only those tiles, and keep the source's key, re-keying the whole source only when `tiles` is left out? The fetcher's per-tile invalidation and revisions are already there; what's needed is to drop the named tiles from the OpenLayers source's tile cache and redraw, rather than changing the source's key. We're glad to test a build against our overlay, and can send a PR if that approach suits you.

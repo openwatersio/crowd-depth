@@ -33,6 +33,8 @@ const BUFFER_PX = 3;
 const SUPPORT_PX = 2;
 /** Samples a tile side is upsampled to, at least. */
 const SAMPLES = 256;
+/** Where there's no depth, upsampled: deep, outside any band the extent lets through. */
+const DEEP = 1e4;
 
 /** The tile's surface as traced: upsampled, with the fields its edges come from, each
  * about the distance in samples to its edge, so where two meet the lesser is where both
@@ -69,19 +71,83 @@ export interface Prepared {
   /** Each pixel's softened cap past the interpolated pixels from unconfirmed shoals:
    * Infinity where none. */
   shoal: Float64Array;
+  /** The pixels outside which each field is as far from any depth; none when the last
+   * is before the first. */
+  window: Window;
 }
+
+/** Pixels or samples, first and last across and down. */
+type Window = [number, number, number, number];
+
+/** Passes `carry` makes, each a pixel further past the depths. */
+const CARRY_PX = SUPPORT_PX + BUFFER_PX + 2;
+/** How far past the surface's depths and shoals `prepare` works its fields, pixels: the
+ * blur's reach and the carry's, where the depth stops differing from water far from any,
+ * and the bicubic's and a slope's past that, so `cut` sees only far water past it. The
+ * extent and coverage reach less: the growth's pixel and their blur's 3. */
+const REACH_PX = Math.ceil(3 * SMOOTH_PX) + CARRY_PX + SUPPORT_PX + 1;
+/** The extent and measured fields far from any depth. */
+const FAR_EXTENT = logit(Float64Array.of(0))[0];
+const FAR_MEASURED = Math.min(FAR_EXTENT, -FAR_EXTENT);
 
 /** The smooth fields over the raster's tile and PAD_PX past it. */
 export function prepare(r: Raster): Prepared {
   const { n, halo, size } = r;
   const pad = PAD_PX;
-  const x0 = halo - pad;
+  const o = halo - pad;
   const w = n + 2 * pad;
-  const at = (x: number, y: number) => (y + x0) * size + x + x0;
+  // Worked only over the window the depths and shoals reach; past it, each field is as
+  // far from any.
+  let [x0, y0, x1, y1] = [w, w, -1, -1];
+  for (let y = 0; y < w; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y + o) * size + x + o;
+      if (Number.isNaN(r.depth[i]) && r.shoalest[i] === Infinity) continue;
+      x0 = Math.min(x0, x);
+      x1 = Math.max(x1, x);
+      y0 = Math.min(y0, y);
+      y1 = Math.max(y1, y);
+    }
+  }
+  const p: Prepared = {
+    w,
+    depth: new Float64Array(w * w).fill(NaN),
+    wet: new Float64Array(w * w).fill(NaN),
+    extent: new Float64Array(w * w).fill(FAR_EXTENT),
+    measured: new Float64Array(w * w).fill(FAR_MEASURED),
+    shoal: new Float64Array(w * w).fill(Infinity),
+    window: [0, 0, -1, -1],
+  };
+  if (x1 < 0) return p;
+  x0 = Math.max(0, x0 - REACH_PX);
+  y0 = Math.max(0, y0 - REACH_PX);
+  x1 = Math.min(w - 1, x1 + REACH_PX);
+  y1 = Math.min(w - 1, y1 + REACH_PX);
+  p.window = [x0, y0, x1, y1];
+  const ww = x1 - x0 + 1;
+  const wh = y1 - y0 + 1;
+  const part = smoothFields(r, x0 + o, y0 + o, ww, wh);
+  for (const k of ["depth", "wet", "extent", "measured", "shoal"] as const) {
+    for (let y = 0; y < wh; y++) {
+      p[k].set(part[k].subarray(y * ww, (y + 1) * ww), (y + y0) * w + x0);
+    }
+  }
+  return p;
+}
+
+/** The smooth fields over `w` by `h` pixels of the raster from (`x0`, `y0`). */
+export function smoothFields(
+  r: Raster,
+  x0: number,
+  y0: number,
+  w: number,
+  h: number,
+) {
+  const { size } = r;
   const region = (f: (i: number) => number) => {
-    const a = new Float64Array(w * w);
-    for (let y = 0; y < w; y++) {
-      for (let x = 0; x < w; x++) a[y * w + x] = f(at(x, y));
+    const a = new Float64Array(w * h);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) a[y * w + x] = f((y + y0) * size + x + x0);
     }
     return a;
   };
@@ -100,21 +166,25 @@ export function prepare(r: Raster): Prepared {
   );
   // Each grown a pixel all round, as the grid's surface is, so a lone pass stays
   // visible; the measured part never over interpolated water.
-  const grow = (mask: Float64Array) =>
-    mask.map((_, i) => {
-      const x = i % w;
-      const y = Math.floor(i / w);
-      for (let dy = -1; dy <= 1; dy++) {
-        for (let dx = -1; dx <= 1; dx++) {
-          const xx = x + dx;
-          const yy = y + dy;
-          if (xx >= 0 && yy >= 0 && xx < w && yy < w && mask[yy * w + xx]) {
-            return 1;
+  const grow = (mask: Float64Array) => {
+    const out = new Float64Array(mask.length);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let any = 0;
+        for (let yy = Math.max(0, y - 1); yy <= Math.min(h - 1, y + 1); yy++) {
+          for (
+            let xx = Math.max(0, x - 1);
+            xx <= Math.min(w - 1, x + 1);
+            xx++
+          ) {
+            if (mask[yy * w + xx]) any = 1;
           }
         }
+        out[y * w + x] = any;
       }
-      return 0;
-    });
+    }
+    return out;
+  };
   const grown = grow(sounded.map((v, i) => v || between[i]));
   const grownMeasured = grow(sounded).map((v, i) => (between[i] ? 0 : v));
 
@@ -127,12 +197,13 @@ export function prepare(r: Raster): Prepared {
   const carried = soften(
     region((i) => r.shoalest[i]),
     w,
+    h,
   );
   const cap = carried.map((c, i) =>
     Number.isNaN(raw[i]) ? c : Math.min(c, raw[i] + TOLERANCE_M),
   );
   const smooth = (v: Float64Array) => {
-    const blurred = gauss(v, w, SMOOTH_PX);
+    const blurred = gauss(v, w, h, SMOOTH_PX);
     return carry(
       blurred.map((d, i) => (Number.isNaN(d) ? d : Math.min(d, cap[i]))),
       w,
@@ -140,25 +211,19 @@ export function prepare(r: Raster): Prepared {
   };
   const depth = smooth(raw);
   const wet = smooth(region((i) => r.wet[i]));
-  const extent = logit(gauss(grown, w, 1, false));
+  const extent = logit(gauss(grown, w, h, 1, false));
   // Interpolated water stays interpolated, however narrow: blurred less, so a strip a
   // pixel wide still reaches a half, and it outranks the measured.
-  const interpolated = logit(gauss(between, w, 0.5, false));
-  const measured = logit(gauss(grownMeasured, w, 1, false)).map((m, i) =>
+  const interpolated = logit(gauss(between, w, h, 0.5, false));
+  const measured = logit(gauss(grownMeasured, w, h, 1, false)).map((m, i) =>
     Math.min(m, -interpolated[i]),
   );
-
-  return {
+  const shoal = soften(
+    region((i) => r.shoal[i]),
     w,
-    depth,
-    wet,
-    extent,
-    measured,
-    shoal: soften(
-      region((i) => r.shoal[i]),
-      w,
-    ),
-  };
+    h,
+  );
+  return { depth, wet, extent, measured, shoal };
 }
 
 /** The tile `n` pixels a side whose pixels start at (`ox`, `oy`) past PAD_PX in `p`,
@@ -207,69 +272,110 @@ export function cut(p: Prepared, ox: number, oy: number, n: number): Traced {
       }
     }
   }
-  const fine = upsample(slice(p.depth), w, u, true).map((d, i) =>
+  // Upsampled only over the samples of `p`'s window; past it, as far from any depth.
+  const [x0, y0, x1, y1] = p.window;
+  const samples: Window = [
+    Math.max(0, x0 - ox) * u,
+    Math.max(0, y0 - oy) * u,
+    (Math.min(w - 1, x1 - ox) + 1) * u - 1,
+    (Math.min(w - 1, y1 - oy) + 1) * u - 1,
+  ];
+  const fine = upsample(slice(p.depth), w, u, true, samples, DEEP).map((d, i) =>
     Math.min(d, caps[i]),
   );
-  const fineWet = upsample(slice(p.wet), w, u, true).map((d, i) =>
-    Math.min(d, caps[i]),
+  const fineWet = upsample(slice(p.wet), w, u, true, samples, DEEP).map(
+    (d, i) => Math.min(d, caps[i]),
   );
-  const depthSlope = slope(fine, m);
+  const depthSlope = slope(fine, m, samples);
   return {
     m,
     u,
     depth: fine,
     wet: fineWet,
     depthSlope,
-    wetSlope: slope(fineWet, m),
-    extent: upsample(slice(p.extent), w, u, false).map((e) => e * u),
-    measured: upsample(slice(p.measured), w, u, false).map((e) => e * u),
+    wetSlope: slope(fineWet, m, samples),
+    extent: upsample(slice(p.extent), w, u, false, samples, FAR_EXTENT).map(
+      (e) => e * u,
+    ),
+    measured: upsample(
+      slice(p.measured),
+      w,
+      u,
+      false,
+      samples,
+      FAR_MEASURED,
+    ).map((e) => e * u),
     toTile: (s: number) => Math.round((s / u - PAD_PX) * scale),
   };
 }
 
-/** A gaussian blur of the values that are numbers, normalised by how much of the window
- * holds them; NaN where none does. With `valid` false, every value counts. */
-function gauss(v: Float64Array, w: number, sigma: number, valid = true) {
+/** A gaussian blur of the values that are numbers, `w` by `h`, normalised by how much of
+ * the window holds them; NaN where none does. With `valid` false, every value counts. */
+function gauss(
+  v: Float64Array,
+  w: number,
+  h: number,
+  sigma: number,
+  valid = true,
+) {
   const r = Math.ceil(3 * sigma);
-  const k = Array.from({ length: 2 * r + 1 }, (_, i) =>
+  const k = Float64Array.from({ length: 2 * r + 1 }, (_, i) =>
     Math.exp(-((i - r) ** 2) / (2 * sigma * sigma)),
   );
-  const pass = (s: Float64Array, c: Float64Array, horizontal: boolean) => {
+  // Each line's taps, past the raster's edge left out; and `c`'s too, when it's given. A
+  // window none of whose weights is set sums to 0, as it's left.
+  const set = new Int32Array(Math.max(w, h) + 1);
+  const pass = (
+    s: Float64Array,
+    c: Float64Array | undefined,
+    horizontal: boolean,
+  ) => {
     const o = new Float64Array(s.length);
-    const oc = new Float64Array(s.length);
+    const oc = c && new Float64Array(s.length);
+    const weights = c ?? s;
     const step = horizontal ? 1 : w;
-    for (let y = 0; y < w; y++) {
-      for (let x = 0; x < w; x++) {
-        const p = horizontal ? x : y;
-        const i = y * w + x;
+    const stride = horizontal ? w : 1;
+    const [lines, length] = horizontal ? [h, w] : [w, h];
+    for (let line = 0; line < lines; line++) {
+      const first = line * stride;
+      for (let p = 0; p < length; p++) {
+        set[p + 1] = set[p] + (weights[first + p * step] !== 0 ? 1 : 0);
+      }
+      for (let p = 0; p < length; p++) {
+        const lo = Math.max(-r, -p);
+        const hi = Math.min(r, length - 1 - p);
+        if (set[p + hi + 1] === set[p + lo]) continue;
+        const i = first + p * step;
         let a = 0;
-        let b = 0;
-        for (let j = Math.max(-r, -p); j <= Math.min(r, w - 1 - p); j++) {
-          a += k[j + r] * s[i + j * step];
-          b += k[j + r] * c[i + j * step];
-        }
+        for (let j = lo; j <= hi; j++) a += k[j + r] * s[i + j * step];
         o[i] = a;
-        oc[i] = b;
+        if (c && oc) {
+          let b = 0;
+          for (let j = lo; j <= hi; j++) b += k[j + r] * c[i + j * step];
+          oc[i] = b;
+        }
       }
     }
-    return [o, oc];
+    return [o, oc ?? o];
   };
   if (!valid) {
     // Normalised by the share of the window inside the raster, a row's times a column's.
-    const inside = new Float64Array(w).map((_, p) => {
-      let a = 0;
-      for (let j = Math.max(-r, -p); j <= Math.min(r, w - 1 - p); j++)
-        a += k[j + r];
-      return a;
-    });
-    const [h] = pass(v, v, true);
-    const [s] = pass(h, h, false);
-    return s.map((a, i) => a / (inside[i % w] * inside[Math.floor(i / w)]));
+    const inside = (length: number) =>
+      new Float64Array(length).map((_, p) => {
+        let a = 0;
+        for (let j = Math.max(-r, -p); j <= Math.min(r, length - 1 - p); j++)
+          a += k[j + r];
+        return a;
+      });
+    const [across, down] = [inside(w), inside(h)];
+    const [rows] = pass(v, undefined, true);
+    const [s] = pass(rows, undefined, false);
+    return s.map((a, i) => a / (across[i % w] * down[Math.floor(i / w)]));
   }
   const has = v.map((d) => (Number.isNaN(d) ? 0 : 1));
   const zero = v.map((d) => (Number.isNaN(d) ? 0 : d));
-  const [h, hc] = pass(zero, has, true);
-  const [s, c] = pass(h, hc, false);
+  const [rows, rc] = pass(zero, has, true);
+  const [s, c] = pass(rows, rc, false);
   return s.map((a, i) => (c[i] > 1e-6 ? a / c[i] : NaN));
 }
 
@@ -278,48 +384,73 @@ function gauss(v: Float64Array, w: number, sigma: number, valid = true) {
  * so it doesn't draw squares where it binds: each pixel takes the mean of its 3×3's own
  * shoalest in their 3×3s. Each of those holds the pixel's own, so the mean is never deeper than it.
  */
-function soften(cap: Float64Array, w: number) {
-  const around = (v: Float64Array, pick: (vals: number[]) => number) =>
-    v.map((_, i) => {
-      const x = i % w;
-      const y = Math.floor(i / w);
-      const vals: number[] = [];
-      for (let yy = Math.max(0, y - 1); yy <= Math.min(w - 1, y + 1); yy++) {
-        for (let xx = Math.max(0, x - 1); xx <= Math.min(w - 1, x + 1); xx++) {
-          vals.push(v[yy * w + xx]);
+function soften(cap: Float64Array, w: number, h: number) {
+  const least = new Float64Array(cap.length);
+  const out = new Float64Array(cap.length);
+  for (let y = 0; y < h; y++) {
+    const y0 = Math.max(0, y - 1);
+    const y1 = Math.min(h - 1, y + 1);
+    for (let x = 0; x < w; x++) {
+      const x0 = Math.max(0, x - 1);
+      const x1 = Math.min(w - 1, x + 1);
+      let m = Infinity;
+      for (let yy = y0; yy <= y1; yy++) {
+        for (let xx = x0; xx <= x1; xx++) m = Math.min(m, cap[yy * w + xx]);
+      }
+      least[y * w + x] = m;
+    }
+  }
+  // Only where each of them has one: past a sounding's reach, the pixel's own.
+  for (let y = 0; y < h; y++) {
+    const y0 = Math.max(0, y - 1);
+    const y1 = Math.min(h - 1, y + 1);
+    for (let x = 0; x < w; x++) {
+      const x0 = Math.max(0, x - 1);
+      const x1 = Math.min(w - 1, x + 1);
+      let sum = 0;
+      let all = true;
+      for (let yy = y0; yy <= y1 && all; yy++) {
+        for (let xx = x0; xx <= x1 && all; xx++) {
+          const v = least[yy * w + xx];
+          all = Number.isFinite(v);
+          sum += v;
         }
       }
-      return pick(vals);
-    });
-  const least = around(cap, (vals) => Math.min(...vals));
-  // Only where each of them has one: past a sounding's reach, the pixel's own.
-  return around(least, (vals) =>
-    vals.every(Number.isFinite)
-      ? vals.reduce((a, b) => a + b, 0) / vals.length
-      : Infinity,
-  ).map((v, i) => Math.min(v, cap[i]));
+      const mean = all ? sum / ((y1 - y0 + 1) * (x1 - x0 + 1)) : Infinity;
+      out[y * w + x] = Math.min(mean, cap[y * w + x]);
+    }
+  }
+  return out;
 }
 
 /** Each pixel without a value takes the shoalest of its neighbours', a few times over. */
 function carry(v: Float64Array, w: number) {
   let a = v;
-  for (let pass = 0; pass < SUPPORT_PX + BUFFER_PX + 2; pass++) {
+  for (let pass = 0; pass < CARRY_PX; pass++) {
     const prev = a;
-    a = prev.map((d, i) => {
-      if (!Number.isNaN(d)) return d;
+    const next = prev.slice();
+    let changed = false;
+    for (let i = 0; i < prev.length; i++) {
+      if (!Number.isNaN(prev[i])) continue;
       const x = i % w;
       let best = NaN;
-      for (const j of [
-        x > 0 ? i - 1 : -1,
-        x < w - 1 ? i + 1 : -1,
-        i - w,
-        i + w,
-      ]) {
-        if (j < 0 || j >= prev.length || Number.isNaN(prev[j])) continue;
-        if (!(prev[j] >= best)) best = prev[j];
+      // Left, right, up and down, the shoalest first found winning a tie.
+      const take = (j: number) => {
+        const p = prev[j];
+        if (!Number.isNaN(p) && !(p >= best)) best = p;
+      };
+      if (x > 0) take(i - 1);
+      if (x < w - 1) take(i + 1);
+      if (i - w >= 0) take(i - w);
+      if (i + w < prev.length) take(i + w);
+      if (!Number.isNaN(best)) {
+        next[i] = best;
+        changed = true;
       }
-      return best;
-    });
+    }
+    // A pass that carries nothing leaves every later one the same.
+    if (!changed) break;
+    a = next;
   }
   return a;
 }
@@ -338,10 +469,24 @@ function logit(share: Float64Array) {
  * nearest values so it can't overshoot them, or bilinear. NaN past the values reads as
  * deep, outside any band the extent lets through.
  */
-function upsample(v: Float64Array, w: number, u: number, cubic: boolean) {
-  if (u === 1) return v.map((d) => (Number.isNaN(d) ? 1e4 : d));
+function upsample(
+  v: Float64Array,
+  w: number,
+  u: number,
+  cubic: boolean,
+  [X0, Y0, X1, Y1]: Window,
+  far: number,
+) {
   const m = w * u;
-  const src = v.map((d) => (Number.isNaN(d) ? 1e4 : d));
+  const o = new Float64Array(m * m).fill(far);
+  if (X1 < X0 || Y1 < Y0) return o;
+  const src = v.map((d) => (Number.isNaN(d) ? DEEP : d));
+  if (u === 1) {
+    for (let Y = Y0; Y <= Y1; Y++) {
+      o.set(src.subarray(Y * w + X0, Y * w + X1 + 1), Y * m + X0);
+    }
+    return o;
+  }
   // Each sample's four source pixels along an axis, and their weights: Catmull-Rom's,
   // or linear; the same for rows and columns, so it's done in two passes.
   const taps = 4;
@@ -368,8 +513,8 @@ function upsample(v: Float64Array, w: number, u: number, cubic: boolean) {
     }
   }
   const rows = new Float64Array(w * m);
-  for (let y = 0; y < w; y++) {
-    for (let X = 0; X < m; X++) {
+  for (let y = index[Y0 * taps]; y <= index[Y1 * taps + taps - 1]; y++) {
+    for (let X = X0; X <= X1; X++) {
       let s = 0;
       for (let k = 0; k < taps; k++) {
         s += weight[X * taps + k] * src[y * w + index[X * taps + k]];
@@ -377,11 +522,10 @@ function upsample(v: Float64Array, w: number, u: number, cubic: boolean) {
       rows[y * m + X] = s;
     }
   }
-  const o = new Float64Array(m * m);
   const at = (x: number, y: number) =>
     src[Math.max(0, Math.min(w - 1, y)) * w + Math.max(0, Math.min(w - 1, x))];
-  for (let Y = 0; Y < m; Y++) {
-    for (let X = 0; X < m; X++) {
+  for (let Y = Y0; Y <= Y1; Y++) {
+    for (let X = X0; X <= X1; X++) {
       let s = 0;
       for (let k = 0; k < taps; k++) {
         s += weight[Y * taps + k] * rows[index[Y * taps + k] * m + X];
@@ -421,10 +565,16 @@ export function band(t: Traced, lo: number, hi: number): Float64Array {
 
 /** How fast `v` changes per sample, `m` a side; never quite flat, so flat water is far
  * from every level. */
-function slope(v: Float64Array, m: number): Float64Array {
-  const out = new Float64Array(v.length);
-  for (let i = 0; i < v.length; i++) {
+function slope(
+  v: Float64Array,
+  m: number,
+  [X0, Y0, X1, Y1]: Window,
+): Float64Array {
+  // Past the window, flat.
+  const out = new Float64Array(v.length).fill(1e-3);
+  for (let i = Y0 * m + X0; i <= Y1 * m + X1; i++) {
     const x = i % m;
+    if (x < X0 || x > X1) continue;
     const dx = (v[x < m - 1 ? i + 1 : i] - v[x > 0 ? i - 1 : i]) / 2;
     const dy = (v[i + m < v.length ? i + m : i] - v[i >= m ? i - m : i]) / 2;
     out[i] = Math.max(Math.hypot(dx, dy), 1e-3);
