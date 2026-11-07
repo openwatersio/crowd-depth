@@ -6,10 +6,10 @@ the robust spread of their medians around a plane fitted to them over that windo
 slope doesn't count as noise. Each vessel counts once per pixel, however fast it logs.
 
 A pixel's σ is measured where its window holds enough entries, and taken from the
-nearest pixel that has one elsewhere. Measured in surface-statistic.md, which this
-matches on a pixel's own votes: K = 1.75 is the smallest that keeps Thimble Shoal Channel's
-channel under 0.5% of pixels more than 1 m too deep. Votes are smoothed along each vessel's
-coverage (`smoothed`) before the statistic sees them.
+nearest pixel within FALLBACK_PX that has one elsewhere. Measured in surface-statistic.md,
+which this matches on a pixel's own votes: K = 1.75 is the smallest that keeps Thimble
+Shoal Channel's channel under 0.5% of pixels more than 1 m too deep. Votes are smoothed
+along each vessel's coverage (`smoothed`) before the statistic sees them.
 """
 
 import itertools
@@ -24,6 +24,13 @@ WINDOW = STATISTIC["window_px"]
 # How fast an interpolated pixel's σ grows with its distance from the nearest sounding.
 SIGMA_PER_M = STATISTIC["sigma_per_m"]
 MAD = 1.4826
+# How far, in pixels, a pixel without a measured spread looks for one (about 515 m), and
+# how many equally near pixels that reach can hold: at most 24 grid points lie at one
+# distance under 25 pixels.
+FALLBACK_PX = 25
+TIES = 32
+# The σ a sounding with neither correction has (catalog's).
+UNCORRECTED_SIGMA = float(np.hypot(STATISTIC["untided_sigma_m"], STATISTIC["uncalibrated_sigma_m"]))
 # Window entries a call holds at once, about 150 bytes each: a busy harbour's pixels hold
 # many vessels, so work is cut by entries, not pixels.
 CHUNK = 2_000_000
@@ -195,26 +202,48 @@ def sigma_b(px, py, m, s, central=None):
     return upx, upy, central, spread, csig
 
 
-def nearest(x, y, values):
-    """A function of query points giving `values` at the point (x, y) nearest each; NaN
-    values are skipped, and with none to take from, it gives NaN."""
+def nearest(x, y, values, default=np.nan):
+    """A function of query points giving `values` at the point (x, y) nearest each within
+    FALLBACK_PX, and among points equally near, the largest value; NaN values are skipped,
+    and with none in reach, it gives `default`.
+
+    Bounded and with ties settled by value, a pixel's answer depends only on the pixels
+    within FALLBACK_PX of it, so a window of a tile gets the same answer as the tile: a
+    k-d tree picks among equally near points by its layout, which every point in it sets.
+    """
     have = ~np.isnan(values)
     if not have.any():
-        return lambda qx, qy: np.full(len(qx), np.nan)
+        return lambda qx, qy: np.full(len(qx), default)
     tree = cKDTree(np.stack([x[have], y[have]], axis=1))
-    taken = values[have]
-    return lambda qx, qy: taken[tree.query(np.stack([qx, qy], axis=1))[1]]
+    taken = np.append(values[have], np.nan)
+
+    def at(qx, qy):
+        q = np.stack([np.asarray(qx), np.asarray(qy)], axis=1)
+        d, i = tree.query(q, distance_upper_bound=FALLBACK_PX)
+        out = np.where(np.isfinite(d), taken[i], default)
+        # Points sit on a grid of whole pixels, one per pixel, so only a query that isn't
+        # on one can tie, and equal distances are exactly equal.
+        tie = np.flatnonzero(np.isfinite(d) & (d > 0))
+        if len(tie):
+            dd, ii = tree.query(q[tie], k=TIES, distance_upper_bound=FALLBACK_PX)
+            assert not (np.isfinite(dd[:, -1]) & (dd[:, -1] == dd[:, :1])).any(), "ties past k"
+            out[tie] = np.where(dd == dd[:, :1], taken[ii], -np.inf).max(axis=1)
+        return out
+
+    return at
 
 
 def sigma_at(px, py, spread, csig):
     """A function of query pixels, and their distances in metres from a sounding, giving σ:
-    spread and correction σ each from the nearest pixel that has one, combined, and
-    widened by the distance.
+    spread and correction σ each from the nearest pixel within FALLBACK_PX that has one
+    (`nearest`), combined, and widened by the distance. With no spread in reach a pixel
+    takes none; with no correction σ in reach, that of an uncorrected sounding.
 
-    # ponytail: a tile with no spread anywhere (every window too thin) takes none; a
-    # floor if lone tracks prove too deep
+    # ponytail: a lone track with no measured spread in reach takes its corrections' σ
+    # alone; floor it if lone tracks prove too deep
     """
-    sp, cs = nearest(px, py, spread), nearest(px, py, csig)
+    sp = nearest(px, py, spread)
+    cs = nearest(px, py, csig, default=UNCORRECTED_SIGMA)
 
     def at(qx, qy, distance_m=0.0):
         s = np.nan_to_num(sp(qx, qy))

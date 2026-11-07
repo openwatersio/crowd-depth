@@ -370,7 +370,17 @@ def grid_tile(tile_id: int, got, out: Path):
                 sigma[depth == NODATA] = NODATA
                 near_px = np.where(depth == NODATA, NODATA, only_near.pop(key)).astype(np.float32)
                 dst.write(
-                    np.stack([depth, distance, count[inner], sigma, near_px]),
+                    # No soundings is no data, as a block left out reads: a leaf's
+                    # splice writes only blocks it has data in (tiles.do_surface).
+                    np.stack(
+                        [
+                            depth,
+                            distance,
+                            np.where(count[inner] > 0, count[inner], NODATA),
+                            sigma,
+                            near_px,
+                        ]
+                    ),  # fmt: skip
                     window=Window(c0, r0, c1 - c0, r1 - r0),
                 )
         rasterio.shutil.copy(sparse, path, driver="COG", compress="deflate", sparse_ok=True)
