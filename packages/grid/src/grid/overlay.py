@@ -9,6 +9,7 @@ unconfirmed shoals publish alongside the cells' soundings with a flag of their o
 
 import contextlib
 import json
+import logging
 import math
 import os
 import re
@@ -38,6 +39,8 @@ from .catalog import MIN_DEPTH_M, TIDE_CELL
 from .cells import GRID_VERSION
 from .definitions import PORTRAYAL
 from .qc import MAX_DEPTH_M
+
+log = logging.getLogger(__name__)
 
 M_PER_FT = PORTRAYAL["m_per_ft"]
 M_PER_FATHOM = PORTRAYAL["m_per_fathom"]
@@ -481,7 +484,7 @@ def surface_bands(path, soundings=None):
             text = out.read_text()
         for f in collection_features(text):
             b = int(np.searchsorted(LEVELS, f["properties"]["lo"], side="right")) - 1
-            part = shapely.make_valid(shapely.from_geojson(json.dumps(f["geometry"])))
+            part = contour_band(shapely.from_geojson(json.dumps(f["geometry"])))
             bands[b] = shapely.union(bands[b], part) if b in bands else part
             del f, part
         del text
@@ -686,6 +689,61 @@ def boxes(transform, row, col):
     x0, y0 = rasterio.transform.xy(transform, row, col, offset="ul")
     x1, y1 = rasterio.transform.xy(transform, row, col, offset="lr")
     return shapely.box(x0, y0, x1, y1)
+
+
+def contour_band(geometry):
+    """One band of `gdal_contour -p`, as valid polygons: the area `shapely.make_valid`
+    reads from it whole, inside an odd number of its distinct rings, built a ring at a time.
+
+    gdal_contour can give a hole to a polygon other than the one around it, and pinches
+    a ring against itself at a saddle, so its bands are invalid. Their rings never cross,
+    so each hole is the ring just inside it, and the band needs no noding: make_valid
+    on a dense tile's whole band took 1.4 GB. A band whose shells still overlap, where
+    rings cross or share an edge, is made valid whole.
+    """
+    rings = []
+    for p in shapely.get_parts(geometry):
+        for r in (p.exterior, *p.interiors):
+            ring = shapely.Polygon(r)
+            if ring.is_valid:
+                rings.append(ring)
+                continue
+            # Pinched: the simple rings it makes enclose the same odd-count area.
+            for q in shapely.get_parts(polygonal(shapely.make_valid(ring))):
+                rings.extend(shapely.Polygon(x) for x in (q.exterior, *q.interiors))
+    if not rings:
+        return shapely.MultiPolygon()
+    rings, n = np.array(rings, dtype=object), len(rings)
+    outer, inner = shapely.STRtree(rings).query(rings, predicate="covers")
+    # A ring and its duplicate cover each other; make_valid keeps one.
+    mutual = (outer != inner) & np.isin(inner * n + outer, outer * n + inner)
+    dropped = np.zeros(n, dtype=bool)
+    dropped[np.maximum(outer, inner)[mutual]] = True
+    keep = (outer != inner) & ~dropped[outer] & ~dropped[inner]
+    outer, inner = outer[keep], inner[keep]
+    depth = np.where(dropped, -1, np.bincount(inner, minlength=n))
+    parent = (depth[inner] % 2 == 1) & (depth[outer] == depth[inner] - 1)
+    holes = {}
+    for o, i in zip(outer[parent].tolist(), inner[parent].tolist()):
+        holes.setdefault(o, []).append(rings[i].exterior)
+    shells = np.array(
+        [
+            shapely.Polygon(rings[k].exterior, holes.get(k, []))
+            for k in np.flatnonzero(depth % 2 == 0)
+        ],
+        dtype=object,
+    )
+    # A hole touching its shell twice splits it: made valid alone, with its own holes.
+    bad = ~shapely.is_valid(shells)
+    parts = list(shells[~bad])
+    for p in shells[bad]:
+        parts.extend(shapely.get_parts(polygonal(shapely.make_valid(p))))
+    band = shapely.MultiPolygon(parts)
+    if band.is_valid:
+        return band
+    del rings, outer, inner, holes, shells, parts, band
+    log.warning("contour band of %d points made valid whole", shapely.get_num_coordinates(geometry))
+    return polygonal(shapely.make_valid(geometry))
 
 
 def polygonal(geometry):

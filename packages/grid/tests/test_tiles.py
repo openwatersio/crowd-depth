@@ -57,7 +57,7 @@ def test_resources_grow_with_soundings():
     assert tiles.resources("cells", 5_000_000) == (1792, 2)
     # A surface takes one thread, however dense its tile.
     assert tiles.resources("surface", 30_000_000) == (2304, 1)
-    assert tiles.resources("overlay", 30_000_000) == (2560, 4)
+    assert tiles.resources("overlay", 30_000_000) == (2304, 4)
     assert tiles.resources("web", 10) == (tiles.WEB_MEMORY_MB, 1)
 
 

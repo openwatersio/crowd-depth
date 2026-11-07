@@ -11,7 +11,7 @@ import rasterio.shutil
 import shapely
 import test_grid
 from pmtiles.reader import MmapSource, Reader
-from scipy.ndimage import binary_dilation, distance_transform_edt
+from scipy.ndimage import binary_dilation, distance_transform_edt, gaussian_filter
 from test_grid import CSIG
 from test_ingest import env  # noqa: F401  (env is a fixture)
 
@@ -419,6 +419,90 @@ def test_the_grown_edge_is_never_deeper_than_a_sounding_beside_it(tmp_path):
     # Away from the sounding, the grown edge takes the water's own depth.
     far = shapely.Point(-78 + 49.3 / 100, 34 - 10.5 / 100)
     assert [overlay.LEVELS[b] for b, a in bands.items() if a.contains(far)] == [10]
+
+
+def ring_by_ring(band, monkeypatch):
+    """`overlay.contour_band(band)`, failing if it makes the band valid whole."""
+    make_valid = shapely.make_valid
+
+    def per_ring(g, *args, **kwargs):
+        assert g is not band, "made valid whole"
+        return make_valid(g, *args, **kwargs)
+
+    with monkeypatch.context() as m:
+        m.setattr(shapely, "make_valid", per_ring)
+        return overlay.contour_band(band)
+
+
+def test_a_contour_band_is_the_area_make_valid_reads_from_it_whole(monkeypatch):
+    box, ring = shapely.box, lambda *xy: shapely.LinearRing(xy)
+    band = shapely.MultiPolygon(
+        [
+            # A hole of its own, an island in it, and a hole written for the next shell.
+            shapely.Polygon(box(0, 0, 10, 10).exterior, [box(1, 1, 3, 3).exterior, box(20, 1, 22, 3).exterior]),
+            box(1.5, 1.5, 2.5, 2.5),
+            # A hole inside the island, written for another shell.
+            shapely.Polygon(box(18, 0, 24, 6).exterior, [box(1.75, 1.75, 2.25, 2.25).exterior]),
+            # Pinched at (31, 1), with a pinched hole in its first lobe.
+            shapely.Polygon(
+                ring((30, 0), (34, 0), (31, 1), (34, 4), (30, 4), (31, 1)),
+                [ring((31, 0.1), (32, 0.1), (31.5, 0.3), (32, 0.5), (31, 0.5), (31.5, 0.3))],
+            ),
+            box(40, 0, 41, 1),
+            box(40, 0, 41, 1),
+            # A hole touching its shell at two points, splitting it.
+            shapely.Polygon(box(50, 0, 60, 10).exterior, [ring((50, 5), (55, 4), (60, 5), (55, 6))]),
+        ]
+    )  # fmt: skip
+    assert not band.is_valid
+    got = ring_by_ring(band, monkeypatch)
+    want = overlay.polygonal(shapely.make_valid(band))
+    assert got.is_valid
+    assert shapely.equals(got, want)
+    assert got.area == pytest.approx(
+        (100 - 4 + 1 - 0.25) + (36 - 4) + (2 + 6 - 0.2) + 1 + (100 - 10)
+    )
+
+
+def test_a_contour_band_with_crossing_rings_or_none_is_still_what_make_valid_reads():
+    crossing = shapely.Polygon(
+        shapely.box(0, 0, 10, 10).exterior, [shapely.box(9, 1, 11, 3).exterior]
+    )
+    got = overlay.contour_band(crossing)
+    assert got.is_valid
+    assert shapely.equals(got, overlay.polygonal(shapely.make_valid(crossing)))
+    assert overlay.contour_band(shapely.MultiPolygon()).is_empty
+    assert overlay.contour_band(shapely.Polygon([(0, 0), (1, 0), (2, 0)])).is_empty
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_contour_bands_of_random_surfaces_are_what_make_valid_reads(tmp_path, seed, monkeypatch):
+    rng = np.random.default_rng(seed)
+    depth = gaussian_filter(rng.normal(size=(80, 80)), 2.5).astype(np.float32)
+    depth = (depth - depth.min()) / np.ptp(depth) * 40 - 2
+    depth[rng.random(depth.shape) < 0.05] = surface.NODATA
+    src, out = tmp_path / "d.tif", tmp_path / "b.geojson"
+    with rasterio.open(
+        src,
+        "w",
+        driver="GTiff",
+        width=80,
+        height=80,
+        count=1,
+        dtype="float32",
+        nodata=surface.NODATA,
+        transform=rasterio.transform.from_origin(0, 1, 0.01, 0.01),
+    ) as dst:
+        dst.write(depth, 1)  # fmt: skip
+    subprocess.run(["gdal_contour", "-q", "-p", "-amin", "lo", "-amax", "hi",
+                    "-fl", "0", "2", "5", "10", "20", "30", str(src), str(out)], check=True)  # fmt: skip
+    features = list(overlay.collection_features(out.read_text()))
+    assert features
+    for f in features:
+        band = shapely.from_geojson(json.dumps(f["geometry"]))
+        got = ring_by_ring(band, monkeypatch)
+        assert got.is_valid
+        assert shapely.equals(got, overlay.polygonal(shapely.make_valid(band)))
 
 
 def test_a_surface_without_the_band_marked_is_refused(tmp_path):
