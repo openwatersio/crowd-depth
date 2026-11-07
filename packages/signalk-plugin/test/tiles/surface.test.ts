@@ -541,7 +541,7 @@ test("the nearest-first search finds the neighbours a full search does, in its o
   }
 });
 
-test("fields worked only where the depths reach draw the tiles fields worked everywhere do", () => {
+test("fields worked only near the depths match fields worked over the whole raster, and cut the same tiles", () => {
   // A lone track by the tile's west edge, so the window's other edges are inside the
   // raster; and nothing at all.
   const west = tileBounds(Z, tile.x, tile.y).west;
