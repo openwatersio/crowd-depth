@@ -36,11 +36,13 @@ No depth scale factor is fitted: at 2–20 m it barely narrows the spread.
 """
 
 import bisect
+import contextlib
 import hashlib
 import inspect
 import itertools
 import logging
 import math
+import time
 from datetime import datetime
 
 import numpy as np
@@ -53,6 +55,16 @@ from .cells import BASE, K_LIST
 from .qc import QC_VERSION, TRACK_REASONS
 
 log = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def step(name):
+    """Log a step's start and its seconds once done, so a long step never goes silent."""
+    log.info("calibrate: %s", name)
+    t = time.monotonic()
+    yield
+    log.info("calibrate: %s took %.0f s", name, time.monotonic() - t)
+
 
 MAX_DEPTH_M = 200
 # Flat, well-surveyed seabed at shallow-to-moderate depth, where a small position
@@ -131,6 +143,12 @@ LOST_PASSES = 3
 # Soundings per batch of a vessel's files in a tile, searched for stuck runs at once: one
 # vessel's 5.0M in a Chesapeake tile ran out of memory at a 768 MB limit.
 SEARCH_POINTS = 1_000_000
+# Soundings and vessels of one tile read at once for the stuck-run search, which then takes
+# each vessel's from them: read per vessel, a tile was read once for each of its searched
+# vessels. Each read holds its soundings, and the vessel list is checked for each of the
+# tile's soundings.
+SEARCH_READ = 3_000_000
+SEARCH_VESSELS = 64
 # DuckDB threads for the stuck-run search: each holds its own share of a pair's soundings,
 # and on 4 a vessel's 5.0M in one tile took under 512 MB, against more than 640 MB on 18.
 SEARCH_THREADS = 4
@@ -288,10 +306,11 @@ FROM cal_obs o JOIN anchor_px r USING (tile_id, py, px)
 WHERE abs(o.m - r.depth) < {ANCHOR_DIFF_M}
 """
 
-# The temp table `searched`: one tile's soundings of the vessel in `$vessels`, each file's in
-# order (ties broken by row, so a run comes out the same every time), and whether each reads
-# lost over a seabed (`unit_offsets`, `seabed_px`). Two statements, on SEARCH_THREADS: as one,
-# on 18, a vessel's 5.0M soundings in a Chesapeake tile ran out of memory at a 768 MB limit.
+# The temp table `search_soundings`: one tile's soundings of the vessels in `$vessels`; then
+# `searched`: those of `$vessel`, each file's in order (ties broken by row, so a run comes out
+# the same every time), and whether each reads lost over a seabed (`unit_offsets`,
+# `seabed_px`). Two statements, on SEARCH_THREADS: as one, on 18, a vessel's 5.0M soundings in
+# a Chesapeake tile ran out of memory at a 768 MB limit.
 SEARCH = (
     f"""
 CREATE OR REPLACE TEMP TABLE search_soundings AS
@@ -316,7 +335,8 @@ SELECT p.*,
   coalesce(s.flat, false) AS flat,
   row_number() OVER (PARTITION BY p.file_id ORDER BY time, raw, row) AS i
 FROM search_soundings p JOIN unit_offsets u USING (vessel, file_id)
-LEFT JOIN seabed_px s ON s.tile_id = $tile AND s.py = p.py AND s.px = p.px""",
+LEFT JOIN seabed_px s ON s.tile_id = $tile AND s.py = p.py AND s.px = p.px
+WHERE p.vessel = $vessel""",
 )
 # Those of a batch of files at a time, a run of file ids in order read as their range `$lo`
 # to `$hi`: every window and run is within a file.
@@ -374,6 +394,41 @@ s AS (
 )
 SELECT content_hash, vessel, $tile AS tile_id, t_start, t_end FROM s
 WHERE reach >= {FLAT_REACH_M} AND reach >= {FLAT_SPEED_MS} * epoch(t_end - t_start)
+"""
+
+
+# The tiles of soundings under a run in `old_runs` or `lake.lost_runs` but not both. The
+# changed runs are merged where they overlap for each content and tile, so a sounding falls
+# in at most one and is matched to the last that starts before it, by ASOF join: on a first
+# calibrate every run is new, and checking each sounding against all of its file's runs is
+# its soundings times its runs (9.1 billion pairs on the Chesapeake, up to 3,130 runs a file).
+CHANGED_RUN_TILES = """
+WITH c AS (
+  (SELECT * FROM old_runs EXCEPT SELECT * FROM lake.lost_runs)
+  UNION ALL (SELECT * FROM lake.lost_runs EXCEPT SELECT * FROM old_runs)
+),
+r AS (
+  SELECT *, max(t_end) OVER (PARTITION BY content_hash, tile_id ORDER BY t_start, t_end
+      ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS reach
+  FROM c
+),
+s AS (
+  SELECT content_hash, tile_id, min(t_start) AS t_start, max(t_end) AS t_end FROM (
+    SELECT *, sum(coalesce(t_start > reach, true)::INTEGER) OVER (
+        PARTITION BY content_hash, tile_id ORDER BY t_start, t_end) AS island
+    FROM r
+  ) GROUP BY content_hash, tile_id, island
+),
+d AS (SELECT f.file_id, s.tile_id, s.t_start, s.t_end FROM s JOIN lake.files f USING (content_hash)),
+p AS (SELECT file_id, tile_id, time FROM lake.points WHERE file_id IN (SELECT file_id FROM d))
+SELECT p.tile_id FROM p ASOF JOIN (FROM d WHERE tile_id IS NOT NULL) d
+  ON d.file_id = p.file_id AND d.tile_id = p.tile_id AND p.time >= d.t_start
+WHERE p.time <= d.t_end
+UNION ALL
+-- A run with no tile, from a store not yet recalibrated, holds in every tile.
+SELECT p.tile_id FROM p ASOF JOIN (FROM d WHERE tile_id IS NULL) d
+  ON d.file_id = p.file_id AND p.time >= d.t_start
+WHERE p.time <= d.t_end
 """
 
 
@@ -585,21 +640,38 @@ def stuck_runs(con, offset, status):
     ).fetchall()
     # ponytail: a file's run is found and applied per tile, so one that crosses a tile edge
     # is two; judge across tiles if the seams show
-    # One vessel of one tile at a time, so memory follows the largest vessel's soundings in a
-    # tile rather than every searched vessel's, and its windows a batch of files at a time.
+    # A tile's soundings for a group of its vessels at a time (SEARCH_READ), then one vessel's
+    # of those, and its windows a batch of files at a time, so memory follows a read rather
+    # than every searched vessel's soundings in the tile.
     # ponytail: a vessel's soundings in a tile are still read at once (5.3M on the
     # Chesapeake); read them a range of files at a time if a liveaboard outgrows the limit
     threads = con.execute("SELECT current_setting('threads')").fetchone()[0]
     con.execute(f"SET threads = {min(threads, SEARCH_THREADS)}")
     try:
-        for partition, tile, vessel, batches in stuck_pairs(con):
+        for partition, tile, vessels in stuck_reads(con):
+            t = time.monotonic()
             soundings, judged = SEARCH
-            con.execute(soundings, {"partition": partition, "tile": tile, "vessels": [vessel]})
-            con.execute(judged, {"tile": tile})
-            for files in batches:
-                params = {"tile": tile, "lo": files[0], "hi": files[-1]}
-                runs += con.execute(STUCK, params).fetchall() + con.execute(FLAT, params).fetchall()
-                release()
+            [(n,)] = con.execute(
+                soundings,
+                {"partition": partition, "tile": tile, "vessels": [v for v, _ in vessels]},
+            ).fetchall()
+            found = len(runs)
+            for vessel, batches in vessels:
+                con.execute(judged, {"tile": tile, "vessel": vessel})
+                for files in batches:
+                    params = {"tile": tile, "lo": files[0], "hi": files[-1]}
+                    runs += (
+                        con.execute(STUCK, params).fetchall() + con.execute(FLAT, params).fetchall()
+                    )
+                    release()
+            log.info(
+                "calibrate: searched tile %d for %d vessels: %d soundings, %d runs, %.1f s",
+                tile,
+                len(vessels),
+                n,
+                len(runs) - found,
+                time.monotonic() - t,
+            )
     finally:
         con.execute(f"SET threads = {threads}")
         con.execute("DROP TABLE IF EXISTS search_soundings")
@@ -608,12 +680,13 @@ def stuck_runs(con, offset, status):
     return list(dict.fromkeys(runs))
 
 
-def stuck_pairs(con):
-    """(partition, tile, vessel, batches of file ids) for each vessel in `stuck_vessels` with
-    soundings in a tile any of them has medians in: a vessel whose soundings in a tile are
-    all held depths has none of its own there, and is searched all the same. Its files there
-    are searched in batches of about SEARCH_POINTS soundings. Memory a pair's search freed is
-    handed back before the next."""
+def stuck_reads(con):
+    """(partition, tile, [(vessel, batches of file ids)]) for the vessels in `stuck_vessels`
+    with soundings in a tile any of them has medians in: a vessel whose soundings in a tile
+    are all held depths has none of its own there, and is searched all the same. A tile's
+    vessels are read in groups of up to SEARCH_READ soundings and SEARCH_VESSELS vessels, or
+    one vessel with more, and a vessel's files searched in batches of about SEARCH_POINTS.
+    Memory a read's search freed is handed back before the next."""
     rows = con.execute(
         """SELECT cell_id, tile_id, unique_id, file_id, count(*) FROM lake.points
         WHERE unique_id IN (SELECT vessel FROM stuck_vessels)
@@ -621,16 +694,24 @@ def stuck_pairs(con):
             WHERE vessel IN (SELECT vessel FROM stuck_vessels))
         GROUP BY ALL ORDER BY ALL"""
     ).fetchall()
-    for key, files in itertools.groupby(rows, lambda r: r[:3]):
-        batches, size = [[]], 0
-        for *_, file_id, n in files:
-            if batches[-1] and size + n > SEARCH_POINTS:
-                batches.append([])
-                size = 0
-            batches[-1].append(file_id)
-            size += n
+    for key, pairs in itertools.groupby(rows, lambda r: r[:2]):
+        group, read = [], 0
+        for vessel, files in itertools.groupby(pairs, lambda r: r[2]):
+            batches, size, total = [[]], 0, 0
+            for *_, file_id, n in files:
+                if batches[-1] and size + n > SEARCH_POINTS:
+                    batches.append([])
+                    size = 0
+                batches[-1].append(file_id)
+                size += n
+                total += n
+            if group and (read + total > SEARCH_READ or len(group) == SEARCH_VESSELS):
+                yield (*key, group)
+                group, read = [], 0
+            group.append((vessel, batches))
+            read += total
         release()
-        yield (*key, batches)
+        yield (*key, group)
 
 
 def units_for(con, segments):
@@ -1104,8 +1185,9 @@ def run(con, references=(), accept_losses=False) -> dict:
         )
     names = units_for(con, segments)
     offset, se, anchored, anchor, pixels, transits = solve_without_lost(con, len(names))
-    crossed = crossing_transits(con, len(names))
-    stray = outliers(con, transit_offsets(con, offset, lost=True), offset, se, anchored)
+    with step("judging transits"):
+        crossed = crossing_transits(con, len(names))
+        stray = outliers(con, transit_offsets(con, offset, lost=True), offset, se, anchored)
     status = np.where(
         ~np.isnan(anchor),
         "anchored",
@@ -1136,8 +1218,10 @@ def run(con, references=(), accept_losses=False) -> dict:
         )
     # Judged by the offsets that will apply.
     kept = np.array([np.nan if r[4] is None else r[4] for r in keep(con, rows)])
-    runs = stuck_runs(con, kept, status)
-    dirty = publish(con, rows, stray, accept_losses, runs)
+    with step("finding stuck runs"):
+        runs = stuck_runs(con, kept, status)
+    with step("publishing"):
+        dirty = publish(con, rows, stray, accept_losses, runs)
     # The tide the offsets were solved against: once it changes, they are stale.
     con.execute("DELETE FROM lake.store_meta WHERE key = 'calibration_tide'")
     con.execute("INSERT INTO lake.store_meta VALUES ('calibration_tide', ?)", [cells.tides(con)])
@@ -1224,17 +1308,7 @@ def publish(con, rows, stray=(), accept_losses=False, runs=()):
             con.executemany("INSERT INTO lake.lost_runs VALUES (?, ?, ?, ?, ?)", runs)
         # The tiles of soundings a run now takes, or no longer takes. A store calibrated
         # before months were judged by tile holds months with no tile, in every tile.
-        dirty = cells.stale(
-            con,
-            """SELECT p.tile_id FROM lake.points p JOIN lake.files f USING (file_id)
-            JOIN ((SELECT * FROM old_runs EXCEPT SELECT * FROM lake.lost_runs)
-              UNION ALL (SELECT * FROM lake.lost_runs EXCEPT SELECT * FROM old_runs)) r
-            ON r.content_hash = f.content_hash AND (r.tile_id IS NULL OR r.tile_id = p.tile_id)
-              AND p.time BETWEEN r.t_start AND r.t_end""",
-            {},
-            "calibration",
-            was_settled,
-        )
+        dirty = cells.stale(con, CHANGED_RUN_TILES, {}, "calibration", was_settled)
         con.execute("DROP TABLE old_runs")
         # Until the calibration these runs were found under is recorded, they're stale.
         con.execute("DELETE FROM lake.store_meta WHERE key = 'stuck_runs'")
@@ -1247,7 +1321,9 @@ def publish(con, rows, stray=(), accept_losses=False, runs=()):
     # them stale, and `grid cells` waits for `grid calibrate`.
     stored = con.execute("SELECT * FROM lake.calibration").fetchall()
     con.execute("INSERT INTO lake.store_meta VALUES ('stuck_runs', ?)", [calibrated_by(stored)])
-    return dirty + assign(con, was_settled)
+    log.info("calibrate: %d tiles stale from stuck runs", dirty)
+    with step("assigning file offsets"):
+        return dirty + assign(con, was_settled)
 
 
 def calibrated_by(rows) -> str:
