@@ -34,7 +34,12 @@ with tiles.snapshot(run, "lake") as con:
         FROM lake.points p JOIN lake.files f USING (file_id) WHERE f.status = 'active'
         GROUP BY ALL"""
     )
-    days = [d for (d,) in con.execute("SELECT DISTINCT day FROM steps ORDER BY 1 DESC LIMIT 30")]
+    days = [
+        d
+        for (d,) in con.execute(
+            "SELECT DISTINCT day FROM steps ORDER BY 1 DESC LIMIT 30"
+        ).fetchall()
+    ]
     every = con.execute("SELECT tile_id, sr, sc, sum(n) AS n FROM steps GROUP BY ALL").fetchnumpy()
     arrivals = {
         d: con.execute("SELECT DISTINCT tile_id, sr, sc FROM steps WHERE day = ?", [d]).fetchnumpy()
@@ -65,10 +70,9 @@ for t in np.unique(every["tile_id"]):
     per_tile[t] = int(every["n"][at].sum())
 
 
-def within(t, s, n, w, e):
-    """Soundings of tile t in the steps a box in degrees touches."""
-    if t not in sat:
-        return 0
+def steps_of(t, s, n, w, e):
+    """The steps (first row, end row, first column, end column) of tile t a box in degrees
+    touches."""
     g = sat[t]
     lat0, lon0 = t // 360 - 90, t % 360 - 180
     k = leaves.k_for(lat0)
@@ -77,6 +81,15 @@ def within(t, s, n, w, e):
     r1 = min(max(math.ceil((n - lat0) * leaves.STEPS), 0), rows)
     c0 = min(max(math.floor((w - lon0) * leaves.BASE / k / leaves.STEP), 0), cols)
     c1 = min(max(math.ceil((e - lon0) * leaves.BASE / k / leaves.STEP), 0), cols)
+    return r0, r1, c0, c1
+
+
+def within(t, *box):
+    """Soundings of tile t in the steps a box in degrees touches."""
+    if t not in sat:
+        return 0
+    g = sat[t]
+    r0, r1, c0, c1 = steps_of(t, *box)
     return int(g[r1, c1] - g[r0, c1] - g[r1, c0] + g[r0, c0])
 
 
@@ -87,13 +100,25 @@ for d in days:
     day = {"day": str(d)}
     for stage in ("cells", "surface"):
         hit = leaves.dirty(boxes, changes, stage)
-        read = 0
+        read, union = 0, {}
         for t, keys in hit.items():
             for k in keys:
                 box = leaves.degrees(t, boxes[t][k], leaves.reach(t, stage))
                 around = [t] if stage == "cells" else tiles.neighbors(t)
-                read += sum(within(n, *box) for n in around)
-        day[stage] = {"leaves": sum(map(len, hit.values())), "share": read / total}
+                for n in around:
+                    if n in sat:
+                        read += within(n, *box)
+                        r0, r1, c0, c1 = steps_of(n, *box)
+                        union.setdefault(n, np.zeros(np.array(sat[n].shape) - 1, bool))[
+                            r0:r1, c0:c1
+                        ] = True
+        # Each sounding read once, however many jobs read it: what the design doc counted.
+        once = sum(int(np.diff(np.diff(sat[n], axis=0), axis=1)[m].sum()) for n, m in union.items())
+        day[stage] = {
+            "leaves": sum(map(len, hit.values())),
+            "share": read / total,
+            "union": once / total,
+        }
     touched = set(np.unique(a["tile_id"]).tolist())
     near = {n for t in touched for n in tiles.neighbors(t)} & set(per_tile)
     day["tile_cells"] = sum(per_tile[t] for t in touched) / total
@@ -104,6 +129,9 @@ for d in days:
 summary = {
     key: float(np.median([d[key]["share"] if isinstance(d[key], dict) else d[key] for d in out]))
     for key in ("cells", "surface", "tile_cells", "tile_surface")
+}
+summary["union"] = {
+    key: float(np.median([d[key]["union"] for d in out])) for key in ("cells", "surface")
 }
 summary["range"] = {
     key: [min(d[key]["share"] for d in out), max(d[key]["share"] for d in out)]

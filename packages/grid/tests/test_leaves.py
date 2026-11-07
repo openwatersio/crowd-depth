@@ -23,7 +23,8 @@ def test_a_sparse_tile_is_one_leaf():
     assert list(leaves.partition(SOUTH, small)) == [leaves.ROOT]
 
 
-def test_a_dense_tile_splits_until_each_leaf_holds_the_bound():
+def test_a_dense_tile_splits_until_each_leaf_holds_the_bound(monkeypatch):
+    monkeypatch.setattr(leaves, "MIN_STEPS", 1)
     counts = grid_with((10, 10, 600_000), (11, 10, 600_000), (500, 500, 100_000))
     cut = leaves.partition(SOUTH, counts)
     # Leaves tile the whole tile, on whole steps, and none holds more than the bound unless
@@ -34,10 +35,17 @@ def test_a_dense_tile_splits_until_each_leaf_holds_the_bound():
         n = counts[r0:r1, c0:c1].sum()
         assert n <= leaves.LEAF or (r1 - r0, c1 - c0) == (1, 1)
     assert (area == 1).all()
-    assert cut[min(cut, key=len)] == (0, STEPS, 0, STEPS) or len(cut) > 4
+    assert len(cut) > 4
 
 
-def test_leaves_merge_back_only_under_a_quarter_of_the_bound():
+def test_no_leaf_splits_below_the_least_size():
+    counts = grid_with((10, 10, 600_000), (11, 10, 600_000))
+    cut = leaves.partition(SOUTH, counts)
+    assert min(min(r1 - r0, c1 - c0) for r0, r1, c0, c1 in cut.values()) == leaves.MIN_STEPS
+
+
+def test_leaves_merge_back_only_under_a_quarter_of_the_bound(monkeypatch):
+    monkeypatch.setattr(leaves, "MIN_STEPS", 1)
     busy = grid_with((10, 10, 300_000), (400, 400, 900_000))
     cut = leaves.partition(SOUTH, busy)
     # A day's withdrawals take the tile under the split, but not under a quarter of it.
@@ -92,6 +100,8 @@ def test_leaves_build_what_whole_tiles_build(env, tmp_path, monkeypatch):  # noq
     split = tmp_path / "split"
     monkeypatch.setattr(leaves, "SPLIT", 60)
     monkeypatch.setattr(leaves, "LEAF", 25)
+    # Leaf edges down to a step, so the tracks cross them.
+    monkeypatch.setattr(leaves, "MIN_STEPS", 1)
     assert tiles.build(env.store, split, cores=2, memory_mb=8192) == 0
     cut = tiles.partitions(split)[SOUTH]
     assert len(cut) > 4

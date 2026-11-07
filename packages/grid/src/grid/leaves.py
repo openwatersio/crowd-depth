@@ -2,7 +2,7 @@
 new files rebuild the parts of a tile near them, not the whole tile (sub-tile-rebuild.md).
 
 A tile past SPLIT active soundings is split into quarters until each leaf holds at most
-LEAF; every other tile is one leaf, ROOT. Leaf edges fall on whole steps of STEP base rows
+LEAF or is MIN_STEPS a side; every other tile is one leaf, ROOT. Leaf edges fall on whole steps of STEP base rows
 and columns (6″): two consensus blocks and nine surface pixels, so no block, cell or pixel
 straddles two leaves. A leaf is a box of steps, (first row, end row, first column, end
 column), and a quadkey under ROOT. A node stays split until its soundings fall under a
@@ -25,8 +25,12 @@ STEPS = BASE // STEP
 SPLIT = 1_000_000
 LEAF = 250_000
 ROOT = "r"
-# Steps a side a leaf never splits below.
-MIN_STEPS = 1
+# Steps a side a leaf never splits below: 1/8°. A leaf's jobs read its reach around it again
+# for each leaf, so a small leaf in a busy harbour reads many times its own soundings. On the
+# Chesapeake's last 30 arrival days, a day's leaf jobs read a median 50% of all soundings
+# for cells and 56% for surfaces at 1/8°, against 52% and 63% at half that, 54% and 62% at
+# twice it, and 573% and 855% with no floor (sub-tile-rebuild.md).
+MIN_STEPS = 75
 # Base rows past a sounding its cell-level flags read: consensus's 3x3 blocks of 9 rows
 # (17), and the outvoted check's 3x3 pixels around it, whose soundings' own consensus reads
 # that far again (3 more).
