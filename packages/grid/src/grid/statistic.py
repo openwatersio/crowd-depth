@@ -226,7 +226,7 @@ def nearest(x, y, values, default=np.nan):
         tie = np.flatnonzero(np.isfinite(d) & (d > 0))
         if len(tie):
             dd, ii = tree.query(q[tie], k=TIES, distance_upper_bound=FALLBACK_PX)
-            assert not (np.isfinite(dd[:, -1]) & (dd[:, -1] == dd[:, :1])).any(), "ties past k"
+            assert not (np.isfinite(dd[:, -1]) & (dd[:, -1] == dd[:, 0])).any(), "ties past k"
             out[tie] = np.where(dd == dd[:, :1], taken[ii], -np.inf).max(axis=1)
         return out
 
