@@ -1,6 +1,6 @@
 # Live layer performance
 
-The "My soundings" layer ([live-layer.md](live-layer.md)) is slow to fill a view and heavy for a Raspberry Pi and the plotter that draws it. Most of the cost is two things. The plugin rebuilds each tile's depth surface from the cells every time the tile is asked for, and the zoom-13 to 15 tiles it sends carry far more geometry than a screen can show. This note measures both, reviews what upstream signalk-livedepth-plugin has done since we adapted it, and proposes a staged plan. The measurements describe the layer before stage 1; [Stage 1 results](#stage-1-results), [Stage 2 results](#stage-2-results) and [Stage 3 results](#stage-3-results) measure what each changed, and [Live and instant](#live-and-instant) designs what comes next.
+The "My soundings" layer ([live-layer.md](live-layer.md)) is slow to fill a view and heavy for a Raspberry Pi and the plotter that draws it. Most of the cost is two things. The plugin rebuilds each tile's depth surface from the cells every time the tile is asked for, and the zoom-13 to 15 tiles it sends carry far more geometry than a screen can show. This note measures both, reviews what upstream signalk-livedepth-plugin has done since we adapted it, and proposes a staged plan. The measurements describe the layer before stage 1; [Stage 1 results](#stage-1-results), [Stage 2 results](#stage-2-results) and [Stage 3 results](#stage-3-results) measure what each changed, [Live and instant](#live-and-instant) designs stages 4 and 5, and [Stage 4 and 5 results](#stage-4-and-5-results) measures them.
 
 ## How the layer worked before stage 1
 
@@ -450,15 +450,15 @@ What holds the surface back is the 30 s batch, which exists because Freeboard re
 
 ### Recommendation
 
-| Stage | Change                                                                               | Target                                                                    |
-| ----- | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------- |
-| 3     | The surface worked only where soundings reach; typed arrays                          | Done: a view 40 to 50% faster on the boat's Pi, byte-identical            |
-| 4     | Tiles built ahead in the background, nearest the boat first, at every zoom, and kept | Instant: pan and zoom read built tiles                                    |
-| 5     | The batch at 5 s; the pass drawn as a ribbon until its tiles land                    | Live: the colour under the boat within 2 s, the surface within about 10 s |
-| —     | Freeboard: `overlay.refresh` with tiles reloads those tiles alone                    | No freeze on dense stores at a 5 s batch                                  |
-| Later | Incremental zoom 14 surfaces (option D)                                              | Only if refresh builds on dense stores prove too slow                     |
+| Stage | Change                                                                               | Target                                                                     |
+| ----- | ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------- |
+| 3     | The surface worked only where soundings reach; typed arrays                          | Done: a view 40 to 50% faster on the boat's Pi, byte-identical             |
+| 4     | Tiles built ahead in the background, nearest the boat first, at every zoom, and kept | Done: pan and zoom read built tiles, 11 to 39 ms a tile on the boat's Pi   |
+| 5     | The batch at 5 s; the pass drawn as a ribbon until its tiles land                    | Done but for the surface: the ribbon within about 1 s, the surface in 30 s |
+| —     | Freeboard: `overlay.refresh` with tiles reloads those tiles alone                    | No freeze on dense stores at a 5 s batch                                   |
+| Later | Incremental zoom 14 surfaces (option D)                                              | Only if refresh builds on dense stores prove too slow                      |
 
-Stage 5's batch could go to 5 s at once on stores as light as the boat's. Whether to wait for the Freeboard change, or to choose the batch by how much a view holds, is a decision for the owner.
+Stage 5's batch could go to 5 s at once on stores as light as the boat's. The coordinator chose not to wait for the Freeboard change: the batch goes to 5 s where the view is light, and the plugin chooses it by how much the view holds, so a dense store isn't frozen for 0.6 s every 10 s until Freeboard can reload just the tiles it names.
 
 ### Freeboard-SK issue, drafted
 
@@ -469,3 +469,76 @@ Stage 5's batch could go to 5 s at once on stores as light as the boat's. Whethe
 > With a few hundred kilobytes of vector tiles in view, at a 6× CPU throttle standing in for a tablet, that's a 0.6 s freeze of the map per refresh. Our extension (the Crowd Depth plugin's "My soundings" layer) batches refreshes to one every 30 s because of it, while the boat's soundings change the tiles round it every 10 s.
 >
 > Could `overlay.refresh` with `tiles` reload only those tiles, and keep the source's key, re-keying the whole source only when `tiles` is left out? The fetcher's per-tile invalidation and revisions are already there; what's needed is to drop the named tiles from the OpenLayers source's tile cache and redraw, rather than changing the source's key. We're glad to test a build against our overlay, and can send a PR if that approach suits you.
+
+## Stage 4 and 5 results
+
+Stage 4 builds tiles ahead:
+
+- **What's built.** Every tile within the surface's margin of a cell, at zooms 4 to 15, found from the overview blocks of 16 cells: 26,838 tiles on the boat's store, of which 13,313 have a cell under them. A tile kept already isn't built again.
+- **Order.** Nearest the boat first, by the distance to a tile's edge; zoom 13 and out before 14 and 15; a zoom 15 tile beside its zoom 14 ancestor, on the thread that keeps that ancestor's surface. The queue is ordered when it's filled and when the boat has moved 500 m; tiles a change brings go to its front.
+- **Threads.** A tile is built ahead only on a tile thread with no request waiting, and a request below zoom 14 takes an idle thread first, so a plotter waits on one tile built ahead at most.
+- **Changes.** Besides the tiles a flush changes, the triggers drop kept tiles that didn't change: zoom 15 tiles cut from a changed ancestor's surface, and any within two overview blocks, about 4 km, of a changed cell. All of them are held off the disk for 10 minutes. While a plotter has polled `/live` in the last 30 s, those gone are built again into memory, so its refresh reads a built tile; with none looking, they wait. Each minute, tiles quiet for 10 minutes are built again and kept. A backfill pauses the builder, and its end queues everything again.
+- **Bound.** Built ahead, tiles fill the kept bound to three quarters, 48 MB, and the builder skips what's left: past it, each would only push out one kept before it. The rest is built when it's asked for.
+
+Stage 5 refreshes faster:
+
+- **The batch, by the view.** The runtime sends the host's `map.view`, with each poll of `/live`. The plugin weighs the tiles in view at the zoom a plotter draws, a zoom below the map's in 512-pixel tiles, in memory, kept, or as last built while they're rebuilt. It answers with a batch from 5 s to 30 s, 37.5 ms per KB: Freeboard's freeze, about 0.75 ms per KB of tiles in view at a 6× throttle, is then 2% of the time. Without a view, as on a host without `map`, the runtime keeps 30 s.
+- **The ribbon.** The provisional source carries a line between consecutive soundings, as wide as a cell, in the depth area a first pass would draw: the shoaler end less a first pass's safety margin, in the tiles' bands at their detail, and the chart's bands below zoom 13. It's drawn below the stored areas, so over water sounded before the stored area shows, which may be shoaler; over new water the ribbon shows until the tiles there refresh. A line is named for its first sounding, negated, and kept while that sounding is stored and not yet refreshed. None is drawn past 200 m, where the tiles draw no area.
+
+Tiles are byte-identical: 16,211 tiles kept by the builder on the boat's store match a fresh build, and 528 tiles, zooms 10 to 15 at both details over the boat's, the real and the synthetic stores, hash the same as `main`'s. `scripts/bench-view.mjs` gives the same bytes and vertices on each, and build times within run-to-run noise.
+
+### On the boat's Pi
+
+The boat's Raspberry Pi 5 with 8 GB, its own Signal K server running beside, a bench server on a copy of the boat's store, Freeboard-SK 3.4.1 in headless Chromium on the laptop at 1280 × 800 and a 6× CPU throttle, over the local network, as in [What the boat feels](#what-the-boat-feels). Two runs each but where noted.
+
+Building ahead from nothing kept took 1,073 s, about 18 minutes, for 26,838 tiles and 30 MB, at about 2.5 of the Pi's 4 cores. Resident memory held at 1.0 to 1.1 GB throughout, against about 500 MB after stage 2's walk of 1,080 tiles: with three tile threads kept busy, their V8 heaps grow to V8's own limit. Meanwhile a pan's tiles took 131 to 175 ms at the median, against 17 ms on `main`, as a request can wait behind a tile built ahead; the worst pan's last tile took 0.8 to 1.3 s, against 0.7 to 0.9 s.
+
+Once built, from a copy of the store with its tiles kept:
+
+| What                                                  | `main`                     | Stages 4 and 5           |
+| ----------------------------------------------------- | -------------------------- | ------------------------ |
+| Cold view at map zoom 13: median tile, last tile      | 550–720 ms; 1.9 s          | 29–39 ms; 1.3–1.4 s      |
+| Zoom 13 → 14                                          | 360–570 ms; 1.2–1.4 s      | 15–18 ms; 0.9–1.0 s      |
+| Zoom 14 → 15                                          | 420–510 ms; 1.4–1.6 s      | 12–15 ms; 0.66–0.68 s    |
+| 8 pans at map zoom 13: median, 90th pct, slowest tile | 17–18, 272–334, 368–411 ms | 12, 16–19, 24–30 ms      |
+| 8 pans at map zoom 15                                 | 17, 184–192, 243–286 ms    | 11–14, 23–33, 155–159 ms |
+| Frames over 50 ms, panning                            | none                       | none                     |
+
+The last tile's time includes Freeboard drawing under the throttle, and the cold view's its start. Panning, the slowest tiles on `main` are those with soundings, built cold; after, they're read from disk or memory.
+
+Sailing at 6 kn, a sounding a second, for 125 s at map zoom 13 (and once at 15, which matched):
+
+| What                                    | `main`                          | Stages 4 and 5                  |
+| --------------------------------------- | ------------------------------- | ------------------------------- |
+| Batch                                   | 30 s                            | 5 s, chosen for a 9 KB view     |
+| Tiles refetched                         | 4                               | 13                              |
+| A refetched tile's response, median     | 384–434 ms                      | 21–26 ms                        |
+| Sounding to the plotter, as provisional | 1.1–1.7 s median                | 0.9–1.2 s median, 1.9 s at most |
+| Sounding to the surface                 | 39–42 s median, 56–61 s at most | 30 s median, 40 s at most       |
+| Frames over 50 ms                       | none                            | none                            |
+| The Pi's server process, CPU            | 3% of a core                    | 35–37% of a core                |
+
+The surface isn't within 10 s, because most of the wait comes before a sounding is written to a cell at all: polling `/live`, a sounding is listed as stored 28 s after it's made at the median, 20 to 34 s. The writer holds it for QC's look ahead along the track, 11 soundings, until its pass in the cell closes, and to the next 10-second flush. From stored to the screen takes about 2 s, against about 13 s with the 30 s batch. The ribbon is what the boat sees meanwhile: it comes with the provisional soundings, within about a second.
+
+The CPU is the cost of building changed tiles ahead into memory while a plotter looks: the tiles round the boat at every zoom, and those within 4 km the triggers dropped, once each until they settle. With no plotter polling, those wait to settle.
+
+### The batch on a dense store
+
+The plugin's batch for a 1280 × 800 view, centred where each store has the most cells:
+
+| Map zoom | Boat's store | Real store    | Synthetic store |
+| -------- | ------------ | ------------- | --------------- |
+| 11       | 7 KB, 5 s    | 18 KB, 5 s    | 502 KB, 18.8 s  |
+| 13       | 9 KB, 5 s    | 63 KB, 5 s    | 328 KB, 12.3 s  |
+| 15       | 25 KB, 5 s   | 174 KB, 6.5 s | 408 KB, 15.3 s  |
+
+Sailing through the synthetic store's busiest water at map zoom 13 on the Pi, for 125 s, the plugin chose 12.3 s. Each refresh froze Freeboard for at most 233 ms, against 217 ms on `main` at 30 s; 17 frames went over 50 ms, against 6. So a refresh there is 1.9% of the time frozen, not 0.7%, and the 0.6 s freezes of stage 1 are gone with stage 1's smaller tiles.
+
+### Limits
+
+- **Memory.** Building ahead keeps the three tile threads busy for the first 18 minutes after an upgrade or a backfill, and the process's resident memory near 1 GB. On the boat's 8 GB Pi that's room enough; a 1 or 2 GB Pi isn't measured.
+- **The bound.** The kept tiles go oldest-built first, and those built ahead first are nearest where the boat was. On a store past 48 MB of tiles, as the synthetic one at 1,091 tiles, zoom 13 and out round the boat are built ahead and the rest is built when asked for; past 64 MB, plotters' requests push out the tiles round the boat's berth first.
+- **Under way.** About a third of a core on the Pi while a plotter watches. A flush walks about 170 tile ids per changed cell on the server's thread; after a long hold, a backfill's 3 hours of passes flush at once, a few hundred thousand ids, not measured.
+- **The ribbon.** It's a first pass's colour: where the boat's sounded before, the cell's average moves a fifth of the way, and unconfirmed shoals cap the depths. Drawn below the stored areas, it shows only over water the layer hasn't drawn, but over the edge of a stored area it can read deeper than the tile that replaces it. An untided sounding over a tided cell, as when signalk-tides stops, colours its raw depth.
+- **The view's zoom.** The plugin takes the host's zoom as OpenLayers', as Freeboard's is. A host reporting MapLibre's would be weighed a zoom coarser, and batched shorter.
+- **The surface.** The writer's QC hold, not the batch, is now what keeps the surface 30 s behind the boat.
