@@ -479,6 +479,61 @@ def test_a_one_pixel_interpolated_strip_stays_interpolated(tmp_path):
     assert between.contains(shapely.Point(-78 + 32.5 / 100, 34 - 50.5 / 100))
 
 
+@pytest.mark.parametrize("slit", [False, True])
+def test_a_lone_tracks_own_strip_stays_measured(tmp_path, monkeypatch, slit):
+    # A lone track in row 50 from the tile's west edge, and the band two pixels either
+    # side, west of interpolated water: the track's own strip, within a pixel of it, stays
+    # measured, and the band past that is interpolated, as is the water east of it. With
+    # `slit`, the band's tracing leaves a long gap under a pixel wide off the pixel centres,
+    # as Potrace can on a whole tile.
+    if slit:
+        traced = overlay.outline
+        gap = shapely.box(-78 + 10 / 100, 34 - 47.95 / 100, -78 + 50 / 100, 34 - 47.55 / 100)
+
+        def outline(mask, transform, tolerance=None):
+            got = traced(mask, transform, tolerance)
+
+            def px(r, c):
+                col, row = ~transform @ (-78 + (c + 0.5) / 100, 34 - (r + 0.5) / 100)
+                return mask[int(row), int(col)]
+
+            band = tolerance is None and px(47, 30) and not px(50, 30)
+            return overlay.polygonal(got.difference(gap)) if band else got
+
+        monkeypatch.setattr(overlay, "outline", outline)
+    depth = np.full((100, 100), surface.NODATA, dtype=np.float32)
+    depth[48:53, 0:60] = 12.0
+    depth[30:70, 60:90] = 12.0
+    count, near = np.zeros_like(depth), np.zeros_like(depth)
+    count[50, 0:60] = 1
+    near[48:53, 0:60] = 1
+    write_surface(tmp_path / "t.tif", -78, 33, depth, np.zeros_like(depth), count, near=near)
+    # A 3 m sounding in the next tile, beside the band where it meets the tile's edge,
+    # which caps it there, slit or not.
+    shoal = ([-78 - 0.5 / 100], [34 - 48.5 / 100], [3.0])
+    bands, footprint, surfaced, between, tvu = overlay.surface_bands(tmp_path / "t.tif", shoal)
+
+    def at(r, c):
+        return shapely.Point(-78 + (c + 0.5) / 100, 34 - (r + 0.5) / 100)
+
+    assert min(overlay.LEVELS[b] for b, a in bands.items() if a.contains(at(48, 0))) < 3
+    for r in (49, 50, 51):
+        assert not between.intersects(at(r, 30))
+    # Every pixel of the band past the strip, as the tracing may round a corner off.
+    for r in (48, 52):
+        for c in range(10, 60):
+            assert between.contains(at(r, c))
+    assert between.contains(shapely.Point(-78 + 75.5 / 100, 34 - 50.5 / 100))
+    # The strip is the only measured water: none slips between the band's edges and the
+    # interpolated water or the coverage's edge.
+    assert len(shapely.get_parts(overlay.polygonal(footprint.difference(between)))) == 1
+    got = by_layer(
+        overlay.tile_areas(([], [], []), PROPERTIES, bands, footprint, surfaced,
+                           (between, overlay.quality(None, None, 0, tvu)))
+    )  # fmt: skip
+    assert sorted(f["properties"]["kind"] for f in got["M_QUAL"]) == ["interpolated", "measured"]
+
+
 def test_nearby_soundings_reach_across_the_antimeridian(lake):
     # The tile at 179°E, 10°N and its neighbor across the antimeridian at 180°W.
     lake.execute("ALTER TABLE lake.cells ADD COLUMN cell_id SMALLINT")
@@ -856,16 +911,15 @@ def test_interpolated_pixels_widen_with_distance_and_are_marked(env, monkeypatch
     # The overlay marks where the surface is drawn between tracks.
     bands, footprint, surfaced, interpolated, tvu = overlay.surface_bands(path)
     assert interpolated.contains(shapely.Point(*test_grid.at(5006, 30)))
-    # The band beside the tracks is more than a pixel from them too, so with water drawn
-    # on both sides, each track's own strip is drawn as interpolated: interpolated water is
-    # never drawn as measured, and a strip a pixel wide between two of it isn't kept.
-    assert interpolated.contains(shapely.Point(*test_grid.at(5000, 30)))
+    # The band beside the tracks isn't grown into them, so each track's own strip stays
+    # measured.
+    assert not interpolated.intersects(shapely.Point(*test_grid.at(5000, 30)))
     assert tvu == pytest.approx(max(2 + 0.05 * float(depth[count == 0].min()), 1.96 * mid), abs=0.5)
     got = by_layer(
         overlay.tile_areas(([], [], []), PROPERTIES, bands, footprint, surfaced,
                            (interpolated, overlay.quality(None, None, 0, tvu)))
     )  # fmt: skip
-    assert [f["properties"]["kind"] for f in got["M_QUAL"]] == ["interpolated"]
+    assert [f["properties"]["kind"] for f in got["M_QUAL"]] == ["measured", "interpolated"]
 
 
 def test_soundings_skip_latitudes_web_mercator_cant_hold(lake):
