@@ -47,11 +47,11 @@ A daily run rebuilds cells in the touched tiles, and surfaces and web tiles in t
 | Full rebuild, empty space skipped                     |           37 |                    9.5 h |
 | …and the COG's overviews left out                     |           35 |                    8.5 h |
 | Daily at 1°, empty space skipped (30-day range)       |        23–27 |                    6–7 h |
-| Daily with empty space skipped and sub-tile dirtiness |    about 1–3 |                under 1 h |
+| Daily with empty space skipped and sub-tile dirtiness |     about 17 |                about 4 h |
 
-The last row is an estimate. It assumes dirty work follows each day's new tracks, a few percent of the dense tiles rather than all of them.
+The last row comes from [sub-tile-rebuild.md](sub-tile-rebuild.md): on the Chesapeake a day's new files dirty quadtree leaves holding 38–40% of all soundings, since the busiest harbours are crossed daily by the same vessels, and the overlay and web jobs stay per tile. Days whose tide levels or offsets move dirty more.
 
-The per-sounding cost decides the planet, not the fixed cost. Skipping empty space takes the fixed cost from 18 to 10 worker-hours of a full rebuild, and to about 8 without overviews, while the soundings cost 27. A day's touched tiles and their neighbors hold 79 to 88% of all soundings, so a 1° daily run costs about two thirds of a full rebuild whatever the fixed cost. Sub-tile dirtiness is the change that makes a daily run cheap, and the per-sounding cost of cells and surfaces is what decides a full rebuild.
+The per-sounding cost decides the planet, not the fixed cost. Skipping empty space takes the fixed cost from 18 to 10 worker-hours of a full rebuild, and to about 8 without overviews, while the soundings cost 27. A day's touched tiles and their neighbors hold 79 to 88% of all soundings, so a 1° daily run costs about two thirds of a full rebuild whatever the fixed cost. Sub-tile dirtiness takes about a quarter off a daily run; the per-sounding cost of cells and surfaces, in the harbours crossed daily, decides both what's left and a full rebuild.
 
 The densest tile is a critical path of its own. The Galveston and Houston tile (29°N 95°W) holds 67M soundings, more than twice Chesapeake's densest, and needs about 45 min of cells and surface on one M-series core at the linear rate.
 
