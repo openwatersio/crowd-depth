@@ -1,7 +1,8 @@
 // What the runtime asks the host to draw, poll by poll: tile refreshes batched to one per
-// interval, since Freeboard redraws the whole layer on each, and the soundings to draw
-// as provisional, kept until the refresh that brings in their tiles has landed. Once the
-// host holds the soundings, only the ones that came, changed or went are sent.
+// interval, the plugin's for the view or `refreshMs`, since Freeboard redraws the whole
+// layer on each, and the soundings to draw as provisional, kept until the refresh that
+// brings in their tiles has landed. Once the host holds the soundings, only the ones that
+// came, changed or went are sent.
 
 export type Tile = [number, number, number];
 export interface Feature {
@@ -11,6 +12,8 @@ export interface Live {
   rev: number;
   all?: boolean;
   tiles: Tile[];
+  /** How long to batch refreshes for the plotter's view, if the plugin knows it. */
+  refreshMs?: number;
   /** Ids of soundings just written to cells. */
   stored?: (string | number)[];
   provisional: { features: Feature[] };
@@ -70,7 +73,10 @@ export function createBatch(refreshMs: number, now = () => Date.now()) {
 
       lastAsked = undefined;
       let refresh: { tiles?: Tile[] } | undefined;
-      if ((pendingAll || pending.size) && now() - lastRefresh >= refreshMs) {
+      if (
+        (pendingAll || pending.size) &&
+        now() - lastRefresh >= (live.refreshMs ?? refreshMs)
+      ) {
         refresh = pendingAll ? {} : { tiles: [...pending.values()] };
         lastAsked = { tiles: [...pending.values()], all: pendingAll };
         pending.clear();

@@ -170,6 +170,7 @@ export function createCellStore(db: DatabaseSync) {
             excluded.first, excluded.last)
         OR overviews.t IS NOT excluded.t OR overviews.u IS NOT excluded.u`,
   );
+  const blockCells = db.prepare("SELECT py, px FROM overviews WHERE level = ?");
   const rowBlocks = db.prepare(
     `SELECT py, px, m, d, t, passes, first, last, u FROM overviews
      WHERE level = ? AND oy = ? AND ox BETWEEN ? AND ?`,
@@ -357,6 +358,11 @@ export function createCellStore(db: DatabaseSync) {
             )
           : rows(r.py0, r.py1, (py) => rowCells.all(py, r.px0, r.px1)),
       );
+    },
+
+    /** The cell each overview block at `level` holds, one per block with cells. */
+    blocks(level: number): { py: number; px: number }[] {
+      return blockCells.all(level) as { py: number; px: number }[];
     },
 
     shoals(west: number, south: number, east: number, north: number): Shoal[] {

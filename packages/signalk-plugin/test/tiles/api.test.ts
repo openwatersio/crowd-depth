@@ -11,8 +11,14 @@ import {
   createTileService,
   registerLayerRoutes,
 } from "../../src/tiles/index.js";
-import { thin } from "../../src/tiles/api.js";
+import {
+  parseView,
+  provisionalFeatures,
+  refreshMs,
+  thin,
+} from "../../src/tiles/api.js";
 import { DEFAULT_OWN_STYLE } from "../../src/tiles/style.js";
+import { FIRST_DEVIATION_M, cellDepth } from "../../src/tiles/cells.js";
 import { cellAt, cellCenter, tileFraction } from "../../src/tiles/geometry.js";
 
 interface Res {
@@ -180,4 +186,80 @@ test("a long held track is thinned, not cut, so all of it stays drawn", () => {
   expect(kept.slice(-1000)).toEqual(
     Array.from({ length: 1000 }, (_, i) => 9000 + i),
   );
+});
+
+test("the pass is drawn as a ribbon in a first pass's depth area, broken at gaps", () => {
+  const at = (s: number, lat: number, depth: number) => ({
+    time: s * 1e6,
+    lon: -76.2,
+    lat,
+    depth,
+  });
+  const features = provisionalFeatures([
+    at(0, 36.98, 4.37),
+    // 22 m on, a second later.
+    at(1, 36.9802, 4.9),
+    // 2 km on: a gap, not joined.
+    at(2, 37.0, 12.2),
+  ]);
+  // Named for its first sounding, so it stays while that one is stored and the next
+  // is still provisional.
+  expect(features.map((f) => f.id)).toEqual([0, 1e6, 2e6, -0]);
+  const ribbon = features[3];
+  expect(ribbon.geometry.type).toBe("LineString");
+  // The shoaler end, 4.37 m, less a first pass's untided margin of about 2 m: the 2 m
+  // band, finely drawn and in the chart's bands alike, so as shoal as the tile will be.
+  const margin = cellDepth({ m: 4.37, d: FIRST_DEVIATION_M });
+  expect(margin).toBeGreaterThan(2);
+  expect(margin).toBeLessThan(3);
+  expect(ribbon.properties).toMatchObject({ DRVAL1: 2, coarse: 2 });
+  // At 9 m, the 7 m band finely drawn, and the chart's 5 to 10 m.
+  const deeper = provisionalFeatures([at(0, 36.98, 9), at(1, 36.9802, 9.2)]);
+  expect(deeper[2].properties).toMatchObject({ DRVAL1: 6, coarse: 5 });
+  expect(
+    provisionalFeatures([at(0, 36.98, 9), at(1, 36.9802, 9.2)], "standard")[2]
+      .properties,
+  ).toMatchObject({ DRVAL1: 5, coarse: 5 });
+  // Past the deepest area the tiles draw: points, no ribbon.
+  expect(
+    provisionalFeatures([at(0, 36.98, 260), at(1, 36.9802, 260)]),
+  ).toHaveLength(2);
+  // A cell is about 4 pixels wide at style zoom 14 at 37° N.
+  const w0 = (ribbon.properties as { w0: number }).w0;
+  expect(w0 * 2 ** 14).toBeGreaterThan(4);
+  expect(w0 * 2 ** 14).toBeLessThan(6);
+});
+
+test("refreshes are batched by how much the plotter's view holds", async () => {
+  expect(refreshMs(25 * 1024)).toBe(5_000);
+  expect(refreshMs(400 * 1024)).toBe(15_000);
+  expect(refreshMs(2 * 1024 * 1024)).toBe(30_000);
+  // Plotters draw 512-pixel tiles, a zoom below the map's.
+  expect(parseView("13.4,-76.3,36.9,-76.1,37")).toEqual([
+    12, -76.3, 36.9, -76.1, 37,
+  ]);
+  expect(parseView("13,-76.3,36.9")).toBeUndefined();
+  // Out of range, or north below south: no view.
+  expect(parseView("13,-1e18,40,1e18,30")).toBeUndefined();
+  expect(parseView("13,-76.3,37,-76.1,36.9")).toBeUndefined();
+  expect(parseView("13,,,,")).toBeUndefined();
+  expect(parseView("13,-76.3,36.9,-76.1,90")).toBeUndefined();
+
+  const { store, get } = serve();
+  const { py, px } = cellAt(-76.2, 36.98);
+  store.addPasses([{ py, px, depth: 6, day: 20000 }]);
+  const f = tileFraction(-76.2, 36.98, 12);
+  const tile = await get(`${TILES_PATH}/:z/:x/:y.pbf`, {
+    params: { z: "12", x: `${Math.floor(f.x)}`, y: `${Math.floor(f.y)}` },
+  });
+  expect((tile.body as Buffer).length).toBeGreaterThan(0);
+  const live = async (view?: string) =>
+    (await get(LIVE_PATH, { query: { since: "-1", ...(view && { view }) } }))
+      .body as { refreshMs?: number; stored: unknown[] };
+  // The view's one built tile is light.
+  expect((await live("13,-76.25,36.95,-76.15,37")).refreshMs).toBe(5_000);
+  // No view, or a box too large for one: the runtime's own batch.
+  expect((await live()).refreshMs).toBeUndefined();
+  expect((await live("13,-80,30,-70,40")).refreshMs).toBeUndefined();
+  expect((await live("13,-1e18,40,1e18,30")).refreshMs).toBeUndefined();
 });

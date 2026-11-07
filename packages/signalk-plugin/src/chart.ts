@@ -143,6 +143,17 @@ export function startChart({
     file,
     detail,
     file ? keepTiles(db, detail, app) : undefined,
+    {
+      position: () => {
+        const p = app.getSelfPath("navigation.position.value") as
+          { latitude?: number; longitude?: number } | undefined;
+        return typeof p?.latitude === "number" &&
+          typeof p.longitude === "number"
+          ? { lon: p.longitude, lat: p.latitude }
+          : undefined;
+      },
+      log: (message) => app.debug(`Chart layer ${message}`),
+    },
   );
   // Off the main thread, given a database file to say the plugin is built and running.
   const qc = db.location() ? createQCThread() : undefined;
@@ -198,6 +209,7 @@ export function startChart({
     stored: writer.stored,
     safetyDepth: config.chart?.safetyDepth ?? DEFAULT_SAFETY_DEPTH_M,
     own: ownStyle(config),
+    detail,
   };
   current = started;
   // Only this start's own state: an older start can end after a newer one

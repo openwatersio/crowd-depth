@@ -4,13 +4,19 @@
 // them, draws the soundings not yet in a tile, and sets the user's depth unit.
 //
 // Freeboard redraws the whole layer on any refresh, however few tiles it names, so
-// refreshes are batched to one per REFRESH_MS. Soundings stay drawn as provisional until
-// the refresh that brings in their tiles has landed, so the track has no gap at zoom 10
-// and in, where tiles refresh as the boat goes. Further out they refresh every 5 minutes.
+// refreshes are batched: to one per 5 s where the view holds few tiles, and longer as it
+// holds more, as the plugin works out from the view the host reports; to one per
+// REFRESH_MS where the host reports none. Soundings, and the ribbon along them, stay
+// drawn as provisional until the refresh that brings in their tiles has landed, so the
+// track has no gap at zoom 10 and in, where tiles refresh as the boat goes. Further out
+// they refresh every 5 minutes.
 //
 // It polls only while the overlay is drawn and the plotter's tab is showing.
 import { connectExtension } from "signalk-plotterext-bus/extension";
-import type { OverlayStateEvent } from "signalk-plotterext-bus/extension";
+import type {
+  MapView,
+  OverlayStateEvent,
+} from "signalk-plotterext-bus/extension";
 import { createBatch, type Live } from "./batch.js";
 
 // The overlay and source ids in src/plotterext/manifest.ts and src/tiles/style.ts.
@@ -26,6 +32,8 @@ const M_PER_FT = 0.3048;
 const client = await connectExtension();
 
 let drawn = true;
+/** The host's view, for the plugin to batch refreshes by what it holds. */
+let view: MapView | undefined;
 let busy = false;
 let timer: ReturnType<typeof setInterval> | undefined;
 const batch = createBatch(REFRESH_MS);
@@ -37,7 +45,8 @@ async function poll(): Promise<void> {
   const abort = new AbortController();
   const timeout = setTimeout(() => abort.abort(), TIMEOUT_MS);
   try {
-    const res = await fetch(`${LIVE_URL}?since=${batch.rev}`, {
+    const at = view ? `&view=${[view.zoom, ...view.bounds].join(",")}` : "";
+    const res = await fetch(`${LIVE_URL}?since=${batch.rev}${at}`, {
       credentials: "include",
       signal: abort.signal,
     });
@@ -118,6 +127,20 @@ await client.subscribe(["overlay.state"], (_name, payload) => {
   schedule();
 });
 document.addEventListener("visibilitychange", schedule);
+
+if (client.hasCapability("map")) {
+  // Optional: without it, refreshes keep the runtime's own batch.
+  await client
+    .subscribe(["map.view"], (_name, payload) => {
+      view = payload as MapView;
+    })
+    .catch(() => {});
+  // Not awaited, nor over a view the host has sent since.
+  client.map
+    .getView()
+    .then((v) => (view ??= v))
+    .catch(() => {});
+}
 
 await loadUnits();
 schedule();

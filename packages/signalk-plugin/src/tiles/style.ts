@@ -6,7 +6,7 @@
 // runtime sets; the safety depth and the boat's own colours and tint are ones whose
 // defaults come from the plugin's settings.
 import { DEFINITIONS } from "./geometry.js";
-import { MAX_ZOOM, MIN_ZOOM } from "./surface.js";
+import { FINE_ZOOM, MAX_ZOOM, MIN_ZOOM } from "./surface.js";
 
 const P = DEFINITIONS.portrayal;
 
@@ -79,22 +79,25 @@ export function buildStyle({
 }) {
   // The chart's band colours at their lower edges, blended between, so metre bands
   // shade evenly and the chart's bands keep their colours.
-  const band: unknown[] = [
-    "interpolate",
-    ["linear"],
-    ["get", "DRVAL1"],
-    0,
-    DAY.bandColors[5],
-  ];
-  [...DAY.bandEdges].reverse().forEach((edge, i) => {
-    band.push(edge, DAY.bandColors[4 - i]);
-    // The chart's levels between these edges, as 30 m, keep their band's colour.
-    const next = [...DAY.bandEdges].reverse()[i + 1];
-    for (const l of P.isobaths_m) {
-      if (l > edge && next !== undefined && l < next)
-        band.push(l, DAY.bandColors[4 - i]);
-    }
-  });
+  const band = (lo: unknown) => {
+    const out: unknown[] = [
+      "interpolate",
+      ["linear"],
+      lo,
+      0,
+      DAY.bandColors[5],
+    ];
+    [...DAY.bandEdges].reverse().forEach((edge, i) => {
+      out.push(edge, DAY.bandColors[4 - i]);
+      // The chart's levels between these edges, as 30 m, keep their band's colour.
+      const next = [...DAY.bandEdges].reverse()[i + 1];
+      for (const l of P.isobaths_m) {
+        if (l > edge && next !== undefined && l < next)
+          out.push(l, DAY.bandColors[4 - i]);
+      }
+    });
+    return out;
+  };
   // A contour in the other unit than the user's isn't drawn; one of every five, or
   // the chart's isobaths, which have no unit, are drawn bold and always labelled.
   const otherUnit = [
@@ -103,11 +106,7 @@ export function buildStyle({
     ["!=", ["get", "unit"], ["global-state", "contourUnit"]],
   ];
   const major = ["any", ["!", ["has", "unit"]], ["has", "major"]];
-  const shallow = [
-    "<",
-    ["get", "DRVAL1"],
-    ["-", ["global-state", "safetyDepth"], EPS],
-  ];
+
   // Shoaler than the safety depth, or unconfirmed: drawn above the contour labels, so
   // within a tile a label never hides one.
   const shoalSounding = [
@@ -178,6 +177,19 @@ export function buildStyle({
       "text-halo-width": 1,
     },
   });
+  // Drying, shoaler than the safety depth, or the band's colour.
+  const areaColor = (property: string) => {
+    const lo = ["get", property];
+    return [
+      "case",
+      ["<", lo, 0],
+      DAY.drying,
+      ["<", lo, ["-", ["global-state", "safetyDepth"], EPS]],
+      DAY.hazard,
+      band(lo),
+    ];
+  };
+  const isPoint = ["==", ["geometry-type"], "Point"];
   return {
     version: 8,
     // Plotters that draw text in their own fonts ignore this, but the style spec wants a
@@ -208,20 +220,43 @@ export function buildStyle({
       },
     },
     layers: [
+      // The boat's latest pass in the colour of its depth area, as wide as the cells,
+      // until the tiles under it refresh: below the areas, so over water sounded before
+      // the stored area shows, which may be shoaler than this pass.
+      {
+        id: "ribbon",
+        type: "line",
+        source: "provisional",
+        filter: ["==", ["geometry-type"], "LineString"],
+        layout: { "line-cap": "round", "line-join": "round" },
+        paint: {
+          // In the bands the tiles under it draw: the chart's, zoomed out.
+          "line-color": [
+            "step",
+            ["zoom"],
+            areaColor("coarse"),
+            FINE_ZOOM,
+            areaColor("DRVAL1"),
+          ],
+          "line-opacity": 0.85,
+          "line-width": [
+            "interpolate",
+            ["exponential", 2],
+            ["zoom"],
+            0,
+            ["get", "w0"],
+            24,
+            ["*", ["get", "w0"], 2 ** 24],
+          ],
+        },
+      },
       {
         id: "depare",
         type: "fill",
         source: "cells",
         "source-layer": "DEPARE",
         paint: {
-          "fill-color": [
-            "case",
-            ["<", ["get", "DRVAL1"], 0],
-            DAY.drying,
-            shallow,
-            DAY.hazard,
-            band,
-          ],
+          "fill-color": areaColor("DRVAL1"),
           "fill-opacity": 0.85,
         },
       },
@@ -266,6 +301,7 @@ export function buildStyle({
         id: "provisional",
         type: "circle",
         source: "provisional",
+        filter: isPoint,
         paint: {
           "circle-radius": 2.5,
           "circle-color": DAY.provisional,
@@ -276,6 +312,7 @@ export function buildStyle({
         id: "provisional-label",
         type: "symbol",
         source: "provisional",
+        filter: isPoint,
         minzoom: 14,
         layout: {
           "text-field": ["to-string", ["get", ["global-state", "depthLabel"]]],

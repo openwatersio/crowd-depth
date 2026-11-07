@@ -318,3 +318,112 @@ test.skipIf(!existsSync(dist))(
   },
   60_000,
 );
+
+test.skipIf(!existsSync(dist))(
+  "tiles are built ahead and kept, and a change under way in a plotter's view is built again into memory",
+  async () => {
+    const { createDB } = await import("../../dist/storage.js");
+    const { createCellStore } = await import("../../dist/tiles/cells.js");
+    const { createKeptTiles } = await import("../../dist/tiles/kept.js");
+    const { createTileService, readTile, tilesNear } =
+      await import("../../dist/tiles/service.js");
+    const { cellAt, cellCenter, tileBounds, tileFraction } =
+      await import("../../dist/tiles/geometry.js");
+    const dir = mkdtempSync(join(tmpdir(), "crowd-depth-"));
+    const file = join(dir, "bathymetry.sqlite");
+    const db = createDB(file);
+    const store = createCellStore(db);
+    const pass = (depth: number) =>
+      Array.from({ length: 60 }, (_, i) => ({
+        ...cellAt(-76.2, 36.975 + i / 5400),
+        depth,
+        day: 20000,
+      }));
+    store.addPasses(pass(8));
+    // A second pass over the southern sixth of the first.
+    const again = pass(3).slice(0, 10);
+    const changed = again.map((c) => cellCenter(c.py, c.px));
+    const kept = createKeptTiles(db, "high");
+    let done!: () => void;
+    let built = new Promise<void>((r) => (done = r));
+    let log = "";
+    const tiles = createTileService(store, file, "high", kept, {
+      position: () => ({ lon: -76.2, lat: 36.98 }),
+      log: (m) => {
+        log = m;
+        done();
+      },
+    });
+    try {
+      await built;
+      const near = tilesNear(store);
+      expect(near.length).toBeGreaterThan(12);
+      for (const [z, x, y] of near) expect(kept.size(z, x, y)).toBeDefined();
+
+      const f = tileFraction(-76.2, 36.976, 15);
+      const at = [15, Math.floor(f.x), Math.floor(f.y)] as const;
+      built = new Promise<void>((r) => (done = r));
+      store.addPasses(again);
+      // A plotter showing that one zoom 15 tile; elsewhere, the changed tiles wait to
+      // settle, or to be asked for.
+      const e = 1e-9;
+      const b = tileBounds(...at);
+      tiles.watched([15, b.west + e, b.south + e, b.east - e, b.north - e]);
+      // Another plotter's poll, with no view and then one far off, leaves that view.
+      tiles.watched();
+      tiles.watched([15, 10, 10, 10.01, 10.01]);
+      tiles.changed(changed);
+      await built;
+      expect(log).toMatch(/^built 1 tiles ahead/);
+      // Changed within KEEP_QUIET_MS: built into memory, not onto the SD card.
+      expect(kept.size(...at)).toBeUndefined();
+      expect(await tiles.get(...at)).toEqual(
+        readTile(store, ...at, "high", false),
+      );
+      // Its zoom 14 ancestor changed too, out of view: not built until it's asked for.
+      const up = [14, at[1] >> 1, at[2] >> 1] as const;
+      expect(kept.size(...up)).toBeUndefined();
+      expect(await tiles.get(...up)).toEqual(
+        readTile(store, ...up, "high", false),
+      );
+    } finally {
+      tiles.close();
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+test.skipIf(!existsSync(dist))(
+  "kept tiles that can't be read stop building ahead, not the layer",
+  async () => {
+    const { createDB } = await import("../../dist/storage.js");
+    const { createCellStore } = await import("../../dist/tiles/cells.js");
+    const { createKeptTiles } = await import("../../dist/tiles/kept.js");
+    const { createTileService } = await import("../../dist/tiles/service.js");
+    const { cellAt } = await import("../../dist/tiles/geometry.js");
+    const dir = mkdtempSync(join(tmpdir(), "crowd-depth-"));
+    const file = join(dir, "bathymetry.sqlite");
+    const db = createDB(file);
+    const store = createCellStore(db);
+    store.addPasses([{ ...cellAt(-76.2, 36.98), depth: 6, day: 20000 }]);
+    const fail = () => {
+      throw new Error("disk I/O error");
+    };
+    const kept = {
+      ...createKeptTiles(db, "high"),
+      size: fail,
+      full: fail,
+    };
+    const tiles = createTileService(store, file, "high", kept, {
+      position: () => ({ lon: -76.2, lat: 36.98 }),
+    });
+    try {
+      expect(() => tiles.changed([{ lon: -76.2, lat: 36.98 }])).not.toThrow();
+    } finally {
+      tiles.close();
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
