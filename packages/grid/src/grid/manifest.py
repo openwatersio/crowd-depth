@@ -86,56 +86,49 @@ def ensure_file_tiles(con) -> int:
     return n
 
 
-# Each part sums hashes of rows per tile, as cells.inputs does for the whole store, so the
-# order rows come in doesn't matter.
-FINGERPRINT_PARTS = """
+# Each file's part of each tile's fingerprint, and each tide cell's: hashes summed over
+# rows, as cells.inputs does for the whole store, so the order rows come in doesn't matter.
+# A tile's fingerprint sums them, and a run diffs them to find what moved where.
+FILE_PARTS = """
 WITH ft AS (
   -- One row per file and tile, however many batches its soundings came in.
   SELECT t.tile_id, t.n, f.* FROM (
     SELECT tile_id, file_id, sum(n) AS n FROM lake.file_tiles GROUP BY ALL
   ) t JOIN lake.files f USING (file_id)
 ),
-files AS (
-  SELECT tile_id, sum(hash(file_id, key, version, status, content_hash, n)::HUGEINT) AS h,
-    sum(n) FILTER (WHERE status = 'active') AS active
-  FROM ft GROUP BY 1
-),
 qc AS (
-  SELECT t.tile_id, sum(hash(t.batch_id, b.qc_version)::HUGEINT) AS h
-  FROM (SELECT DISTINCT tile_id, batch_id FROM lake.file_tiles) t
-  LEFT JOIN lake.qc_batches b USING (batch_id) GROUP BY 1
+  SELECT t.tile_id, t.file_id, sum(hash(t.batch_id, b.qc_version)::HUGEINT) AS h
+  FROM (SELECT DISTINCT tile_id, file_id, batch_id FROM lake.file_tiles) t
+  LEFT JOIN lake.qc_batches b USING (batch_id) GROUP BY ALL
 ),
 offsets AS (
-  SELECT ft.tile_id, sum(hash(o.file_id, o.vessel, o.offset_m, o.se_m, o.excluded,
+  SELECT ft.tile_id, ft.file_id, sum(hash(o.file_id, o.vessel, o.offset_m, o.se_m, o.excluded,
     coalesce(o.lost_bottom, false))::HUGEINT) AS h
-  FROM ft JOIN lake.file_offsets o USING (file_id) GROUP BY 1
+  FROM ft JOIN lake.file_offsets o USING (file_id) GROUP BY ALL
 ),
 runs AS (
-  SELECT ft.tile_id, sum(hash(r.content_hash, r.vessel, r.tile_id, r.t_start, r.t_end)::HUGEINT)
-    AS h
+  SELECT ft.tile_id, ft.file_id,
+    sum(hash(r.content_hash, r.vessel, r.tile_id, r.t_start, r.t_end)::HUGEINT) AS h
   FROM ft JOIN lake.lost_runs r
     ON r.content_hash = ft.content_hash AND (r.tile_id IS NULL OR r.tile_id = ft.tile_id)
-  GROUP BY 1
+  GROUP BY ALL
 ),
 copies AS (
   -- Rule 5: an Open Waters file of a NOAA file's vessel, over its time, takes its soundings.
-  SELECT ft.tile_id, sum(hash(o.file_id, o.status, o.time_min, o.time_max)::HUGEINT) AS h
+  SELECT ft.tile_id, ft.file_id, sum(hash(o.file_id, o.status, o.time_min, o.time_max)::HUGEINT)
+    AS h
   FROM ft JOIN lake.files o ON o.source = 'openwaters' AND ft.source = 'noaa'
     AND o.vessel = ft.vessel
     -- Widened to whole seconds, as the dedupe widens them (catalog.ACTIVE).
     AND date_trunc('second', o.time_min) <= ft.time_max
     AND date_trunc('second', o.time_max) + INTERVAL 1 SECOND > ft.time_min
-  GROUP BY 1
-),
-stations AS (
-  SELECT tile_id, sum(hash(tide_cell, station_id, km)::HUGEINT) AS h FROM lake.tide_cells
-  GROUP BY 1
+  GROUP BY ALL
 ),
 days AS (
-  -- The days the tile's active files cover, by the stations its tide cells take levels from.
-  SELECT DISTINCT d.tile_id, s.station_id, d.day FROM (
-    SELECT tile_id, unnest(generate_series(time_min::DATE, time_max::DATE, INTERVAL 1 DAY))::DATE
-      AS day
+  -- The days each active file covers, by the stations its tile's tide cells take levels from.
+  SELECT DISTINCT d.tile_id, d.file_id, s.station_id, d.day FROM (
+    SELECT tile_id, file_id,
+      unnest(generate_series(time_min::DATE, time_max::DATE, INTERVAL 1 DAY))::DATE AS day
     FROM ft WHERE status = 'active' AND time_min IS NOT NULL AND time_max IS NOT NULL
   ) d JOIN (SELECT DISTINCT tile_id, station_id FROM lake.tide_cells WHERE station_id IS NOT NULL) s
     USING (tile_id)
@@ -146,18 +139,45 @@ levels AS (
   FROM lake.tide_levels GROUP BY ALL
 ),
 tide AS (
-  SELECT d.tile_id, sum(l.h) AS h FROM days d JOIN levels l USING (station_id, day) GROUP BY 1
+  SELECT d.tile_id, d.file_id, sum(l.h) AS h FROM days d JOIN levels l USING (station_id, day)
+  GROUP BY ALL
 )
-SELECT tile_id, coalesce(files.active, 0) AS active,
-  concat_ws(
-    '/', files.h, coalesce(qc.h, 0), coalesce(offsets.h, 0), coalesce(runs.h, 0),
-    coalesce(copies.h, 0), coalesce(stations.h, 0), coalesce(tide.h, 0)
-  ) AS parts
-FROM files
-LEFT JOIN qc USING (tile_id) LEFT JOIN offsets USING (tile_id) LEFT JOIN runs USING (tile_id)
-LEFT JOIN copies USING (tile_id) LEFT JOIN stations USING (tile_id) LEFT JOIN tide USING (tile_id)
+SELECT ft.tile_id, ft.file_id, CASE WHEN ft.status = 'active' THEN ft.n ELSE 0 END AS active,
+  hash(hash(ft.file_id, ft.key, ft.version, ft.status, ft.content_hash, ft.n),
+    coalesce(qc.h, 0), coalesce(offsets.h, 0), coalesce(runs.h, 0), coalesce(copies.h, 0),
+    coalesce(tide.h, 0)) AS h
+FROM ft
+LEFT JOIN qc USING (tile_id, file_id) LEFT JOIN offsets USING (tile_id, file_id)
+LEFT JOIN runs USING (tile_id, file_id) LEFT JOIN copies USING (tile_id, file_id)
+LEFT JOIN tide USING (tile_id, file_id)
+"""
+
+CELL_PARTS = """
+SELECT tile_id, tide_cell, hash(tide_cell, station_id, km) AS h FROM lake.tide_cells
+"""
+
+FINGERPRINT_PARTS = f"""
+WITH files AS (
+  SELECT tile_id, sum(h::HUGEINT) AS h, sum(active) AS active FROM ({FILE_PARTS}) GROUP BY 1
+),
+stations AS (SELECT tile_id, sum(h::HUGEINT) AS h FROM ({CELL_PARTS}) GROUP BY 1)
+SELECT tile_id, active, files.h || '/' || coalesce(stations.h, 0) AS parts
+FROM files LEFT JOIN stations USING (tile_id)
 ORDER BY tile_id
 """
+
+
+def constants() -> str:
+    """What every tile's cells are built with besides their files and tide cells."""
+    return f"{QC_VERSION}/{cells.GRID_VERSION}/{cells.CODE}"
+
+
+def check(con):
+    incomplete = [f for (f,) in con.execute(f"{INCOMPLETE} ORDER BY 1 LIMIT 5").fetchall()]
+    if incomplete:
+        raise RuntimeError(
+            f"file_tiles doesn't cover the points of files {incomplete}; run ensure_file_tiles"
+        )
 
 
 def fingerprints(con) -> dict[int, tuple[str, int]]:
@@ -167,13 +187,8 @@ def fingerprints(con) -> dict[int, tuple[str, int]]:
     The count is of active files' rows before dedupe, read from file_tiles rather than the
     points: a tile whose soundings rules 4 and 5 all set aside still counts them. Its
     fingerprint moves with the files that set them aside, so it is rebuilt, with no cells."""
-    incomplete = [f for (f,) in con.execute(f"{INCOMPLETE} ORDER BY 1 LIMIT 5").fetchall()]
-    if incomplete:
-        raise RuntimeError(
-            f"file_tiles doesn't cover the points of files {incomplete}; run ensure_file_tiles"
-        )
-    constants = f"{QC_VERSION}/{cells.GRID_VERSION}/{cells.CODE}"
+    check(con)
     return {
-        tile: (hashlib.sha256(f"{constants}/{parts}".encode()).hexdigest()[:16], active)
+        tile: (hashlib.sha256(f"{constants()}/{parts}".encode()).hexdigest()[:16], int(active))
         for tile, active, parts in con.execute(FINGERPRINT_PARTS).fetchall()
     }

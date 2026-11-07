@@ -298,7 +298,7 @@ def test_changing_a_grid_definition_bumps_the_grid_version():
     # and `tide` holds tide.py's and catalog.py's.
     grid = {k: DEFINITIONS[k] for k in ("cells", "statistic", "surface", "tide")}
     digest = hashlib.sha256(json.dumps(grid, sort_keys=True).encode()).hexdigest()[:16]
-    assert (cells.GRID_VERSION, digest) == (11, "e3e12f6160fca7bd")
+    assert (cells.GRID_VERSION, digest) == (12, "e3e12f6160fca7bd")
 
 
 def test_spike_chunks_give_the_same_flags(monkeypatch):

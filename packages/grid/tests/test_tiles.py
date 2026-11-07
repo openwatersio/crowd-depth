@@ -23,7 +23,7 @@ from pmtiles.tile import (
 from pmtiles.writer import Writer
 from test_ingest import env  # noqa: F401  (env is a fixture)
 
-from grid import cells, cli, manifest, overlay, tiles
+from grid import cells, cli, leaves, manifest, overlay, tiles
 from grid.catalog import open_store
 from grid.objects import LocalObjects
 
@@ -150,7 +150,7 @@ def test_a_cells_job_gives_duckdb_less_memory_than_the_others(env, tmp_path, mon
 
     seen = []
     monkeypatch.setattr(cells, "build", lambda con, _: seen.append(setting(con)))
-    tiles.do_cells(run, SOUTH, 1)
+    tiles.do_leaf_cells(run, f"{SOUTH}/{leaves.ROOT}", 1)
     with tiles.open_job(run, [SOUTH]) as con:
         seen.append(setting(con))
     want = []
@@ -218,8 +218,8 @@ def test_a_failed_job_reports_its_status_and_log(tmp_path):
             s.connect(str(sock))
         log = tmp_path / "job.log"
         done = subprocess.run(
-            [sys.executable, "-S", str(CLIENT), str(sock), str(log), "cells", str(tmp_path), "1"]
-            + ["123"],
+            [sys.executable, "-S", str(CLIENT), str(sock), str(log), "web", str(tmp_path), "1"]
+            + ["1_1"],
             cwd=tmp_path,
             check=False,
         )
@@ -228,13 +228,13 @@ def test_a_failed_job_reports_its_status_and_log(tmp_path):
 
 
 def blocking_job(sock, run):
-    """Start a cells job that blocks reading its run's data_url, a pipe. Returns its client
+    """Start a web job that blocks reading its run's data_url, a pipe. Returns its client
     and the pipe's write end, once the job holds the other end."""
     run.mkdir()
     os.mkfifo(run / "data_url")
     client = subprocess.Popen(
-        [sys.executable, "-S", str(CLIENT), str(sock), str(run / "log"), "cells", str(run)]
-        + ["1", "123"]
+        [sys.executable, "-S", str(CLIENT), str(sock), str(run / "log"), "web", str(run)]
+        + ["1", "1_1"]
     )
     for _ in range(400):
         try:
@@ -351,9 +351,12 @@ def jobs(run):
 
 
 def ran(run, since):
-    """{stage: sorted keys} of the jobs run after the first `since`."""
+    """{stage: sorted keys} of the jobs run after the first `since`, less those that found
+    their leaf unchanged."""
     got = {}
     for j in jobs(run)[since:]:
+        if j.get("unchanged"):
+            continue
         got.setdefault(j["stage"], []).extend(j["keys"])
     return {s: sorted(k) for s, k in got.items()}
 
@@ -427,7 +430,9 @@ def test_a_run_rebuilds_only_what_moved_and_matches_the_whole_region_build(
         m.setattr(tiles, "code", lambda: "changed")
         assert tiles.build(env.store, run, cores=2, memory_mb=8192, dry_run=True) == 0
     assert planned(capfd.readouterr().out) == {
+        "leaf_cells": 2,
         "cells": 2,
+        "leaf_surface": 2,
         "surface": 2,
         "overlay": 2,
         "web": len(tiles.web_keys([SOUTH, NORTH])),

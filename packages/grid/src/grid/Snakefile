@@ -1,7 +1,9 @@
-# The per-tile rebuild (tiles.py): cells → surface → overlay per 1° tile, web per z8 tile, then
-# the low zooms and one archive. Run it with `grid tiles`, which prepares the run directory
-# first: the frozen catalog, tiles.txt, and fp/{tile}.txt, rewritten only when a tile's
-# fingerprint moves, so a moved fingerprint is what reruns a tile.
+# The per-tile rebuild (tiles.py): cells → surface per leaf (leaves.py), each spliced into its
+# 1° tile, overlay per tile, web per z8 tile, then the low zooms and one archive. Run it with
+# `grid tiles`, which prepares the run directory first: the frozen catalog, tiles.txt, the
+# leaves (baseline/partitions.json), and each leaf's fingerprints, fp/{tile}/{leaf}.cells and
+# .surface, rewritten only when a change lands within their reach, so that is what reruns a
+# leaf.
 #
 # Config: memory_mb (the run's budget, which no job's estimate exceeds), code (tiles.code(),
 # so a code change reruns everything), and socket (the warm worker's; without it each job
@@ -19,6 +21,7 @@ from grid import tiles
 
 COUNTS = tiles.counts(Path.cwd())
 TILES = sorted(COUNTS)
+LEAVES = tiles.partitions(Path.cwd())
 WEB = tiles.web_keys(TILES)
 BUDGET = int(config.get("memory_mb", 8192))
 CODE = config.get("code") or tiles.code()
@@ -39,21 +42,33 @@ def around(tile, stage):
     return [f"done/{stage}/{n}" for n in tiles.neighbors(int(tile)) if n in COUNTS]
 
 
+def soundings(wc):
+    """A tile's active soundings, or those a leaf reads."""
+    if "leaf" in wc.keys():
+        return LEAVES[int(wc.tile)][wc.leaf][5]
+    return COUNTS[int(wc.tile)]
+
+
 def mem(stage):
-    return lambda wc: min(tiles.resources(stage, COUNTS[int(wc.tile)])[0], BUDGET)
+    return lambda wc: min(tiles.resources(stage, soundings(wc))[0], BUDGET)
 
 
 def threads(stage):
-    return lambda wc: tiles.resources(stage, COUNTS[int(wc.tile)])[1]
+    return lambda wc: tiles.resources(stage, soundings(wc))[1]
 
 
 def weight(wc):
     """Densest first: they set the critical path."""
-    return min(COUNTS[int(wc.tile)] // 100_000, 10_000)
+    return min(soundings(wc) // 100_000, 10_000)
+
+
+def leaves(tile, stage):
+    return [f"done/{stage}/{tile}/{leaf}" for leaf in sorted(LEAVES[int(tile)])]
 
 
 wildcard_constraints:
     tile=r"[0-9]+",
+    leaf=r"r[0-9]*",
     key=r"[0-9]+_[0-9]+",
 
 
@@ -64,11 +79,11 @@ rule all:
         expand("done/overlay/{tile}", tile=TILES),
 
 
-rule cells:
+rule leaf_cells:
     input:
-        "fp/{tile}.txt",
+        "fp/{tile}/{leaf}.cells",
     output:
-        "done/cells/{tile}",
+        "done/leaf_cells/{tile}/{leaf}",
     params:
         code=CODE,
     threads: threads("cells")
@@ -76,23 +91,62 @@ rule cells:
     resources:
         mem_mb=mem("cells"),
     log:
+        "logs/leaf_cells/{tile}/{leaf}.log",
+    shell:
+        run_job("leaf_cells", "{wildcards.tile}/{wildcards.leaf}") + " && touch {output}"
+
+
+rule cells:
+    input:
+        lambda wc: leaves(wc.tile, "leaf_cells"),
+    output:
+        "done/cells/{tile}",
+    params:
+        code=CODE,
+    threads: 1
+    priority: weight
+    resources:
+        mem_mb=min(tiles.SPLICE_MEMORY_MB, BUDGET),
+    log:
         "logs/cells/{tile}.log",
     shell:
         run_job("cells", "{wildcards.tile}") + " && touch {output}"
 
 
-# A surface reads its neighbors' points and cell-level flags, within the search radius.
-rule surface:
+# A leaf's surface reads its and its neighbors' points and cell-level flags within its reach.
+# It runs after their cells, but rebuilds only when a change lands within its reach, which
+# rewrites its fingerprint: a job whose fingerprint is the one it last built from does
+# nothing. (Taking the cells as ancient() inputs instead, Snakemake 9 never checks the
+# fingerprint of a job downstream of one that reruns.)
+rule leaf_surface:
     input:
+        "fp/{tile}/{leaf}.surface",
         lambda wc: around(wc.tile, "cells"),
     output:
-        "done/surface/{tile}",
+        "done/leaf_surface/{tile}/{leaf}",
     params:
         code=CODE,
     threads: threads("surface")
     priority: weight
     resources:
         mem_mb=mem("surface"),
+    log:
+        "logs/leaf_surface/{tile}/{leaf}.log",
+    shell:
+        run_job("leaf_surface", "{wildcards.tile}/{wildcards.leaf}") + " && touch {output}"
+
+
+rule surface:
+    input:
+        lambda wc: leaves(wc.tile, "leaf_surface"),
+    output:
+        "done/surface/{tile}",
+    params:
+        code=CODE,
+    threads: 1
+    priority: weight
+    resources:
+        mem_mb=min(tiles.SPLICE_MEMORY_MB, BUDGET),
     log:
         "logs/surface/{tile}.log",
     shell:
