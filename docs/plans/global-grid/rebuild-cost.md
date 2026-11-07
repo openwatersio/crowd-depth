@@ -53,13 +53,13 @@ The last row is an estimate. It assumes dirty work follows each day's new tracks
 
 The per-sounding cost decides the planet, not the fixed cost. Skipping empty space takes the fixed cost from 18 to 10 worker-hours of a full rebuild, and to about 8 without overviews, while the soundings cost 27. A day's touched tiles and their neighbors hold 79 to 88% of all soundings, so a 1° daily run costs about two thirds of a full rebuild whatever the fixed cost. Sub-tile dirtiness is the change that makes a daily run cheap, and the per-sounding cost of cells and surfaces is what decides a full rebuild.
 
-The densest tile is a critical path of its own. The Galveston and Houston tile (29°N 95°W) holds 67M soundings, more than twice Chesapeake's densest, and needs about 45 min of cells and surface on one M-series core at the linear rate.
+The densest tile is a critical path of its own. The Galveston Bay tile (29°N 95°W) holds 71.6M active soundings, up to 2.6 times Chesapeake's densest, and needs about 50 min of cells and surface on one M-series core at the linear rate. The store-level steps of its region, 252M soundings in 92 tiles, are longer: ingesting them from NOAA to R2 took 5.1 h and tide 2.9 h, and calibrate had not finished after 10.9 h ([planet-size.md](planet-size.md#the-galveston-region)).
 
 ## Not measured
 
-- Reading tiles out of DuckLake on R2 after compaction, and real R2 latency and throughput.
-- The planet's active soundings outside Chesapeake. [planet-size.md](planet-size.md) scales the archive's rows by Chesapeake's active ratio.
-- Memory and time for tiles denser than Chesapeake's densest. Three tiles hold more than twice as many soundings.
+- Reading tiles out of DuckLake on R2 after compaction, and real R2 latency and throughput. The Galveston store couldn't be compacted, so this is still open.
+- The active ratio beyond two regions. [planet-size.md](planet-size.md) scales the archive's rows by Chesapeake's 0.749; around Galveston it is 0.766.
+- Memory and time of the tile jobs for tiles denser than Chesapeake's densest. Galveston's store-level steps are measured: ingest peaked at 5.3 GB and tide at 4.2 GB, both at grid's default 4 GB DuckDB limit, and compact ran out of memory there.
 - Cheap x86 cores and a dedicated machine. Every timing here is from a shared M-series laptop.
 - Upload cost of a 15–30 GB daily archive, and how clients handle its ETag changing.
 - Open Waters GeoJSON input, and latitudes above 60°.
