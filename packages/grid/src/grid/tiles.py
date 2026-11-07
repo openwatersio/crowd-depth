@@ -702,7 +702,9 @@ def do_leaf_surface(run: Path, key: str, threads):
     near = None if leaf == leaves.ROOT else within(tile, box, "surface")
     with open_job(run, around, threads, box=near) as con:
         load(con, run, around, kinds=("flags",), box=near)
-        got = has_cells(con, run, tile) and surface.tile_entries(con, tile, partition(tile))
+        got = has_cells(con, run, tile) and surface.tile_entries(
+            con, tile, partition(tile), alone=near is None
+        )
     # Gridded with the job's DuckDB closed, so what it held is free for the rasters.
     if got:
         surface.grid_tile(tile, got, out).replace(path)

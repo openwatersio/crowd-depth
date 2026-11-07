@@ -71,12 +71,15 @@ def test_a_change_dirties_the_leaves_within_reach_alone():
 
 
 def crossing(env):  # noqa: F811
-    """Two tracks along rows and one across them in the south tile, one in the north."""
+    """Two tracks along rows and one across them in the south tile, two in the north."""
     test_grid.put(env, 1, track(5000, 12.0), "A")
     test_grid.put(env, 2, track(5012, 12.0), "B")
     rows = [(i, *test_grid.at(4970 + i, 30), 11.0 + (i % 3) * 0.2) for i in range(70)]
     test_grid.put(env, 3, rows, "C")
     test_grid.put(env, 4, track(200, 20.0, lat_shift=1), "D")
+    # Just across the north edge: the band beside it reaches leaves of the south tile that
+    # hold no soundings of their own.
+    test_grid.put(env, 6, track(1, 15.0, lat_shift=1), "F")
     env.run("noaa")
 
 
