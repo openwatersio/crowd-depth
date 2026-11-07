@@ -43,8 +43,12 @@ const RUN_MAX_US = 3600 * 1_000_000;
  * under way, so a sounding reaches its cell as soon as QC can judge it; more during a
  * backfill. QC reruns over the whole buffer each time, a few milliseconds on a Pi for
  * the thousand or so a boat under way at 1 Hz keeps, so past LIVE_ONE_BELOW soundings,
- * as at anchor, the batch grows with the buffer, keeping the cost per sounding bounded. */
+ * as at anchor, the batch grows with the buffer, keeping the cost per sounding bounded.
+ * Live, one is judged only LIVE_RUN_MS after QC last ran, so a faster sounder, or a
+ * burst of soundings, is judged LIVE_BURST at a time. */
 const LIVE_BATCH = 1;
+const LIVE_BURST = 10;
+const LIVE_RUN_MS = 500;
 const LIVE_ONE_BELOW = 2000;
 const BULK_BATCH = 200;
 const BATCH_PER_BUFFER = 0.01;
@@ -205,6 +209,8 @@ export function createCellWriter(
   /** QC running on its thread; nothing is judged or trimmed meanwhile. */
   let running: Promise<void> | undefined;
   let qcFailures = 0;
+  /** When QC last ran. */
+  let ranAt = -Infinity;
   const open = new Map<string, OpenPass>();
   let passes: Pass[] = [];
   let unwritten: Sounding[] = [];
@@ -360,7 +366,8 @@ export function createCellWriter(
     if (running || buffer.length === 0) return;
     const end = ready(all);
     if (end <= judged) return;
-    const arrival = Date.now() * 1000;
+    ranAt = Date.now();
+    const arrival = ranAt * 1000;
     const qc = Date.now() >= qcDownUntil ? runQC : undefined;
     if (!qc || all) {
       rule(trackQC(buffer, arrival, QC), end);
@@ -461,7 +468,11 @@ export function createCellWriter(
         buffer.push(s);
         latest = Math.max(latest, time);
         const batch = Math.max(
-          bulk ? BULK_BATCH : LIVE_BATCH,
+          bulk
+            ? BULK_BATCH
+            : Date.now() - ranAt >= LIVE_RUN_MS
+              ? LIVE_BATCH
+              : LIVE_BURST,
           bulk || buffer.length >= LIVE_ONE_BELOW
             ? buffer.length * BATCH_PER_BUFFER
             : 0,

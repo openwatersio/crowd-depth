@@ -385,6 +385,25 @@ test("a QC thread that keeps failing hands QC to this one, and says so", async (
   expect(failing.result).toEqual(here);
 });
 
+test("a burst of soundings is judged ten at a time, not one by one", async () => {
+  let runs = 0;
+  const writer = createCellWriter(createCellStore(createDB(":memory:")), {
+    flushIntervalMs: 100_000,
+    qc: (soundings, arrival) => {
+      runs++;
+      return Promise.resolve(trackQC(soundings, arrival, DEFINITIONS.qc));
+    },
+  });
+  // 2,000 soundings in well under a second, each run answered before the next arrives:
+  // about one run per 10, not one per sounding.
+  for (const d of spiky()) {
+    writer.write(d, () => {});
+    await new Promise((r) => setImmediate(r));
+  }
+  await end(writer);
+  expect(runs).toBeLessThan(300);
+});
+
 test("a writer stopped while QC runs ignores its findings", async () => {
   const store = createCellStore(createDB(":memory:"));
   let answer: (() => void) | undefined;
