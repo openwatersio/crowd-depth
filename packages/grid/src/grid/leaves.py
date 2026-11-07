@@ -25,6 +25,8 @@ STEPS = BASE // STEP
 SPLIT = 1_000_000
 LEAF = 250_000
 ROOT = "r"
+# Steps a side a leaf never splits below.
+MIN_STEPS = 1
 # Base rows past a sounding its cell-level flags read: consensus's 3x3 blocks of 9 rows
 # (17), and the outvoted check's 3x3 pixels around it, whose soundings' own consensus reads
 # that far again (3 more).
@@ -84,7 +86,8 @@ def partition(tile, counts, old=None):
         parts = [(a, b) for a in ((r0, rm), (rm, r1)) for b in ((c0, cm), (cm, c1))]
         parts = [(*a, *b) for a, b in parts if a[0] < a[1] and b[0] < b[1]]
         was = any(k.startswith(key) and k != key for k in old)
-        if len(parts) > 1 and (n(box) > bound or was and n(box) >= bound // 4):
+        small = min(r1 - r0, c1 - c0) < 2 * MIN_STEPS
+        if len(parts) > 1 and not small and (n(box) > bound or was and n(box) >= bound // 4):
             out = {}
             for i, part in enumerate(parts):
                 out |= node(f"{key}{i}", part, LEAF)

@@ -545,21 +545,30 @@ def open_job(run: Path, tiles: list[int], threads=1, memory_limit=JOB_MEMORY_LIM
         # Track QC's flags; cell-level ones are the cells jobs', read from their outputs.
         con.execute(
             f"""INSERT INTO lake.qc_flags SELECT * FROM store.qc_flags
-            WHERE {where} AND NOT list_contains({CELL_REASONS}, reason)"""
+            WHERE {where} AND NOT list_contains({CELL_REASONS}, reason){boxed(box)}"""
         )
         con.execute(ACTIVE_POINTS)
         yield con
 
 
-def load(con, run: Path, tiles, kinds):
-    """Insert the tiles' outputs of `kinds` (cells, shoals, flags) into `lake`."""
+def boxed(box) -> str:
+    """SQL keeping only the flags of points in `lake.points`, when a box limits them: a
+    leaf's job reads no other point's."""
+    return f" AND point_id IN (SELECT {POINT_ID} FROM lake.points p)" if box else ""
+
+
+def load(con, run: Path, tiles, kinds, box=None):
+    """Insert the tiles' outputs of `kinds` (cells, shoals, flags) into `lake`; with `box`,
+    only the flags of the points in it."""
     for t in tiles:
         for kind in kinds:
             f = run / TILE_FILES[kind].format(t)
             if f.exists():
                 table = "qc_flags" if kind == "flags" else kind
+                only = f" WHERE true{boxed(box)}" if kind == "flags" else ""
                 con.execute(
-                    f"INSERT INTO lake.{table} BY NAME SELECT * FROM read_parquet(?)", [str(f)]
+                    f"INSERT INTO lake.{table} BY NAME SELECT * FROM read_parquet(?){only}",
+                    [str(f)],
                 )
 
 
@@ -690,9 +699,9 @@ def do_leaf_surface(run: Path, key: str, threads):
     built.unlink(missing_ok=True)
     path.unlink(missing_ok=True)
     out.mkdir(parents=True, exist_ok=True)
-    whole = leaf == leaves.ROOT
-    with open_job(run, around, threads, box=None if whole else within(tile, box, "surface")) as con:
-        load(con, run, around, kinds=("flags",))
+    near = None if leaf == leaves.ROOT else within(tile, box, "surface")
+    with open_job(run, around, threads, box=near) as con:
+        load(con, run, around, kinds=("flags",), box=near)
         got = has_cells(con, run, tile) and surface.tile_entries(con, tile, partition(tile))
     # Gridded with the job's DuckDB closed, so what it held is free for the rasters.
     if got:
