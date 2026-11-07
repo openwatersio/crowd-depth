@@ -64,10 +64,55 @@ def test_a_change_dirties_the_leaves_within_reach_alone():
     far = leaves.step_boxes([SOUTH], [10], [300 + -(-cols // leaves.STEP) + 1])
     assert leaves.dirty(split, near, "cells") == {SOUTH: ["r0", "r1"]}
     assert leaves.dirty(split, far, "cells") == {SOUTH: ["r1"]}
-    # A change in a neighbor tile reaches the leaves by its edge.
+    # A change in a neighbor tile reaches the surfaces of the leaves by its edge, but not
+    # their cells, which read their own tile alone.
     below = leaves.step_boxes([SOUTH - 360], [STEPS - 1], [10])
-    assert leaves.dirty(split, below, "surface") == {SOUTH: ["r0"]}
+    assert leaves.dirty(split, below, "surface", [SOUTH - 360]) == {SOUTH: ["r0"]}
+    assert leaves.dirty(split, below, "cells", [SOUTH - 360]) == {}
     assert leaves.reach(SOUTH, "surface") > leaves.reach(SOUTH, "cells")
+
+
+def test_a_surface_reaches_as_far_as_a_wider_neighbors_flags():
+    # 47°N has columns of one base step and 48°N of two: a flag north of the line reads
+    # twice as far in degrees.
+    south, north = (47 + 90) * 360 + 180, (48 + 90) * 360 + 180
+    assert (
+        leaves.reach(south, "surface")[1] - leaves.reach(south, "cells")[1] > 2 * leaves.FLAGS_ROWS
+    )
+    assert leaves.reach(south, "surface")[0] == leaves.reach(north, "surface")[0]
+
+
+def test_a_change_across_the_antimeridian_reaches_the_leaves_beside_it():
+    west = (33 + 90) * 360  # 33°N, 180°W
+    east = west + 359  # 33°N, 179°E
+    split = {west: {"r0": (0, 600, 0, 300), "r1": (0, 600, 300, 600)}}
+    change = leaves.step_boxes([east], [300], [599])
+    assert leaves.dirty(split, change, "surface", [east]) == {west: ["r0"]}
+    # Its leaf's read takes the neighbor's points across the line, and no farther ones.
+    sql = tiles.within(west, (0, 600, 0, 300), "surface")
+    con = duckdb.connect()
+    con.execute(
+        "CREATE TABLE p AS SELECT 33.5 AS lat, unnest([179.995, 179.5, -179.995, -179.0])::DOUBLE AS lon"
+    )
+    assert sorted(x for (x,) in con.execute(f"SELECT lon FROM p WHERE {sql}").fetchall()) == [
+        -179.995,
+        179.995,
+    ]
+    # A tile at the east end reads the one across it the same way, and its own leaf.
+    sql = tiles.within(east, (0, 600, 300, 600), "surface")
+    assert sorted(x for (x,) in con.execute(f"SELECT lon FROM p WHERE {sql}").fetchall()) == [
+        -179.995,
+        179.5,
+        179.995,
+    ]
+
+
+def test_a_tile_that_doesnt_divide_into_steps_is_one_leaf_across_it():
+    polar = (86 + 90) * 360 + 180  # 86°N, 0°E, where k doesn't divide its columns
+    assert leaves.shape(polar)[1] is None
+    cut = leaves.partition(polar, None)
+    middle = leaves.step_boxes([polar], [300], [0]) + [0, 0, 0.5, 0.5]
+    assert leaves.dirty({polar: cut}, middle, "cells", [polar]) == {polar: [leaves.ROOT]}
 
 
 def crossing(env):  # noqa: F811
@@ -125,3 +170,12 @@ def test_leaves_build_what_whole_tiles_build(env, tmp_path, monkeypatch):  # noq
     monkeypatch.undo()
     assert tiles.build(env.store, whole, cores=2, memory_mb=8192) == 0
     same_outputs(whole, split, SOUTH)
+
+    # Leaves an older build left of a tile that is no longer live are removed.
+    for d in ("leaves/12345/r0", "fp/12345"):
+        (split / d).mkdir(parents=True)
+    monkeypatch.setattr(leaves, "SPLIT", 60)
+    monkeypatch.setattr(leaves, "LEAF", 25)
+    monkeypatch.setattr(leaves, "MIN_STEPS", 1)
+    tiles.prepare(env.store, split)
+    assert not (split / "leaves/12345").exists() and not (split / "fp/12345").exists()

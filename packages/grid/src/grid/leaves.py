@@ -58,14 +58,20 @@ def reach(tile, stage):
     """
     px = statistic.FALLBACK_PX + statistic.WINDOW + 1
     rows = cols = 2 * px
+    flags_cols = FLAGS_ROWS
     if stage == "surface":
+        # A neighbor's flags read 20 of its own columns, wider where its columns are.
+        lat0 = tile // 360 - 90
+        k = k_for(lat0)
+        widest = max(k_for(a) for a in (lat0 - 1, lat0, lat0 + 1) if -90 <= a <= 89)
+        flags_cols = -(-FLAGS_ROWS * widest // k)
         _, _, _, width, scale_x, scale_y = surface.geometry(tile)
         blur = math.ceil(4 * surface.SIGMA_PX)
         around = statistic.FALLBACK_PX + blur + 1
         rows = 2 * (around + math.ceil(surface.RADIUS_M / (scale_y / surface.ROWS)))
         cols = 2 * (around + math.ceil(surface.RADIUS_M / (scale_x / width)))
     # A pixel's two base rows: a sounding anywhere in it.
-    return rows + FLAGS_ROWS + 2, cols + FLAGS_ROWS + 2
+    return rows + FLAGS_ROWS + 2, cols + flags_cols + 2
 
 
 def partition(tile, counts, old=None):
@@ -74,7 +80,8 @@ def partition(tile, counts, old=None):
     (an iterable of quadkeys)."""
     old = set(old or ())
     rows, cols = shape(tile)
-    root = (0, rows, 0, cols or 0)
+    # A tile that doesn't divide into steps is one leaf, a step wider than it.
+    root = (0, rows, 0, cols or -(-BASE // k_for(tile // 360 - 90) // STEP))
     if counts is None or cols is None:
         return {ROOT: root}
     total = np.zeros((rows + 1, cols + 1), dtype=np.int64)
@@ -114,24 +121,35 @@ def degrees(tile, box, pad=(0, 0)):
     )
 
 
-def dirty(partitions, changes, stage):
+def dirty(partitions, changes, stage, tiles=None):
     """{tile: [quadkeys]} of the leaves whose `stage` a change lands within reach of.
 
     `changes` is an array of boxes in degrees, one row each (south, north, west, east),
-    in any tile. Only a tile's own and its neighbors' changes are compared with its leaves.
-
-    # ponytail: boxes don't wrap the antimeridian; a leaf by it misses changes across it
+    and `tiles` the tile each is in, by default the one holding its south-west corner. Cells
+    read only their own tile, so only its changes reach them; a surface reads its
+    neighbors' too, across the antimeridian as anywhere. A change reaches no farther than
+    the next tile, so each tile's leaves are compared with its neighborhood's changes.
     """
     changes = np.asarray(changes, dtype=np.float64).reshape(-1, 4)
+    if tiles is None:
+        tiles = tile_of(changes[:, 0], changes[:, 2])
+    tiles = np.asarray(tiles, dtype=np.int64)
+    # Each tile's changes, so a tile's leaves are compared with its neighborhood's alone.
+    order = np.argsort(tiles, kind="stable")
+    keys, starts = np.unique(tiles[order], return_index=True)
+    ends = np.append(starts[1:], len(order))
+    held = {int(k): order[a:b] for k, a, b in zip(keys, starts, ends)}
     out = {}
     for tile, leaves in partitions.items():
-        lat0, lon0 = tile // 360 - 90, tile % 360 - 180
-        near = changes[
-            (changes[:, 1] >= lat0 - 1) & (changes[:, 0] <= lat0 + 2)
-            & (changes[:, 3] >= lon0 - 1) & (changes[:, 2] <= lon0 + 2)
-        ]  # fmt: skip
-        if not len(near):
+        lon0 = tile % 360 - 180
+        around = [tile] if stage == "cells" else neighbors(tile)
+        at = [held[t] for t in around if t in held]
+        if not at:
             continue
+        near = changes[np.concatenate(at)]
+        # A neighbor across the antimeridian, a turn round.
+        near[:, 2:] += np.where(near[:, 2] - lon0 > 180, -360, 0)[:, None]
+        near[:, 2:] += np.where(lon0 - near[:, 2] > 180, 360, 0)[:, None]
         pad = reach(tile, stage)
         keys = list(leaves)
         boxes = np.array([degrees(tile, leaves[k], pad) for k in keys])
@@ -142,6 +160,23 @@ def dirty(partitions, changes, stage):
         if hit.any():
             out[tile] = [k for k, h in zip(keys, hit) if h]
     return out
+
+
+def tile_of(lat, lon):
+    """The 1° tile holding each (lat, lon)."""
+    lat, lon = np.asarray(lat), np.asarray(lon)
+    return ((np.floor(lat) + 90) * 360 + (np.floor(lon) + 180) % 360).astype(np.int64)
+
+
+def neighbors(tile):
+    """The tile and its eight neighbors, across the antimeridian, short of the poles."""
+    lat0, lon0 = tile // 360 - 90, tile % 360 - 180
+    return [
+        (lat0 + dy + 90) * 360 + (lon0 + dx + 180) % 360
+        for dy in (-1, 0, 1)
+        for dx in (-1, 0, 1)
+        if -90 <= lat0 + dy <= 89
+    ]
 
 
 def step_boxes(tiles, rows, cols):

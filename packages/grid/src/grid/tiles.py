@@ -1,12 +1,14 @@
-"""The per-tile rebuild: cells, surface and overlay per 1° tile, web tiles per z8 tile, then
-the low zooms and one archive, as a Snakemake workflow (the Snakefile beside this module).
+"""The per-tile rebuild: cells and surface per leaf (leaves.py), each spliced into its 1° tile,
+overlay per tile, web tiles per z8 tile, then the low zooms and one archive, as a Snakemake
+workflow (the Snakefile beside this module).
 
 `prepare` is the store-level step before it. It brings the store's QC, offsets and
 `file_tiles` up to date, freezes the catalog the pointer names into the run directory, and
-writes each tile's fingerprint to `fp/{tile}.txt`, rewriting a file only when its
-fingerprint moved. A moved fingerprint is what reruns a tile; a tile whose soundings are all
-withdrawn loses its fingerprint and its outputs, and the neighbors and web tiles that read
-it rerun because their inputs changed.
+writes each tile's fingerprint to `fp/{tile}.txt`, which says which tiles are live and is
+published with them. Then `plan` cuts the tiles into leaves and rewrites the fingerprints
+of the leaves a change reaches, `fp/{tile}/{leaf}.cells` and `.surface`: a rewritten one is
+what reruns a leaf. A tile whose soundings are all withdrawn loses its fingerprints and its
+outputs, and the neighbors and web tiles that read it rerun because their inputs changed.
 
 Each job reads the frozen catalog read-only and works in an in-memory `lake` holding only
 what it writes, so jobs run side by side and never write to the store. Jobs run in children
@@ -32,6 +34,7 @@ import tempfile
 import time
 from pathlib import Path
 
+import duckdb
 import numpy as np
 
 from . import calibrate, catalog, cells, leaves, manifest, overlay, qc, surface
@@ -128,16 +131,8 @@ def corner(tile):
     return tile // 360 - 90, tile % 360 - 180
 
 
-def neighbors(tile):
-    """The tile and its eight neighbors, across the antimeridian, short of the poles."""
-    lat0, lon0 = corner(tile)
-    out = []
-    for dy in (-1, 0, 1):
-        for dx in (-1, 0, 1):
-            lat, lon = lat0 + dy, (lon0 + dx + 180) % 360 - 180
-            if -90 <= lat <= 89:
-                out.append((lat + 90) * 360 + lon + 180)
-    return out
+# The tile and its eight neighbors, across the antimeridian, short of the poles.
+neighbors = leaves.neighbors
 
 
 def partition(tile):
@@ -259,7 +254,7 @@ def prepare(store, run: Path) -> dict:
     moved = [t for t, (fp, _) in sorted(live.items()) if write_if_changed(fp_path(run, t), fp)]
     gone = sorted(int(p.stem) for p in (run / "fp").glob("*.txt") if int(p.stem) not in live)
     with snapshot(run, "lake") as con:
-        planned = plan(con, run, {t: n for t, (_, n) in live.items()}, moved, key)
+        planned = plan(con, run, {t: n for t, (_, n) in live.items()}, key)
     before = web_keys(counts(run))
     write_if_changed(
         run / "tiles.txt", "".join(f"{t}\t{n}\n" for t, (_, n) in sorted(live.items()))
@@ -362,16 +357,18 @@ def step_counts(con, tiles) -> dict[int, np.ndarray]:
     return out
 
 
-def plan(con, run: Path, live: dict[int, int], moved, key) -> dict:
+def plan(con, run: Path, live: dict[int, int], key) -> dict:
     """Cut the live tiles (`{tile: active soundings}`) into leaves, and mark dirty the leaves
     a change since the last run lands within reach of, by rewriting their fingerprints,
     fp/{tile}/{leaf}.cells and .surface, with this run's catalog key and time.
 
     A change is a file whose part of a tile's fingerprint moved (manifest.FILE_PARTS),
     placed by the steps its soundings in that tile fall in, in any tile, or a tide cell that
-    came, went or changed station. A change to the constants every tile is built with, a
-    missing baseline, or a new leaf dirties every leaf it touches. The baseline is written
-    last, so a prepare that stops partway marks the same leaves again."""
+    came, went or changed station. A change to the constants every tile is built with or the
+    leaves' bounds, or a missing baseline, dirties every leaf, and a leaf not in the last
+    partition is dirty. A tile is cut again where its leaves' counts no longer add up to
+    its own. The baseline is written last, so a prepare that stops partway marks the same
+    leaves again."""
     base = run / BASELINE
     base.mkdir(exist_ok=True)
     files, cells_, consts = (
@@ -379,17 +376,25 @@ def plan(con, run: Path, live: dict[int, int], moved, key) -> dict:
         base / "tide_cells.parquet",
         base / "constants.txt",
     )
+    # The leaves' bounds too: a partition cut under others is cut again.
+    # And the parts' SQL and DuckDB's version, whose hash() may change: every part moved
+    # would place every file's soundings.
+    built_with = "/".join(
+        [manifest.constants(), *map(str, (leaves.SPLIT, leaves.LEAF, leaves.MIN_STEPS)),
+         hashlib.sha256((manifest.FILE_PARTS + manifest.CELL_PARTS).encode()).hexdigest()[:16],
+         duckdb.__version__]
+    )  # fmt: skip
     whole = not (files.exists() and cells_.exists() and consts.exists()) or (
-        consts.read_text() != manifest.constants()
+        consts.read_text() != built_with
     )
     old = partitions(run)
     con.execute(
         f"CREATE OR REPLACE TEMP TABLE file_parts AS SELECT tile_id, file_id, h FROM ({manifest.FILE_PARTS})"
     )
     con.execute(f"CREATE OR REPLACE TEMP TABLE cell_parts AS {manifest.CELL_PARTS}")
-    boxes = []
+    boxes, owners = [], []
     if not whole:
-        # Only the tiles still live: a gone tile's leaves are gone with it.
+        # Every tile's, gone ones too: a withdrawn neighbor's soundings reach a surface.
         con.execute(
             """CREATE OR REPLACE TEMP TABLE changed AS SELECT DISTINCT tile_id, file_id FROM (
               (FROM file_parts EXCEPT FROM read_parquet($path))
@@ -416,24 +421,31 @@ def plan(con, run: Path, live: dict[int, int], moved, key) -> dict:
                     np.ma.filled(got["sc"], 0)[placed],
                 )
             )
+            owners.append(t[placed])
             # A file whose soundings left the store: the whole tile it was in.
             gone_from = np.unique(t[~placed])
             s, w = gone_from // 360 - 90, gone_from % 360 - 180
             boxes.append(np.column_stack([s, s + 1, w, w + 1]).astype(np.float64))
+            owners.append(gone_from)
         moved_cells = con.execute(
-            """SELECT DISTINCT tide_cell FROM (
+            """SELECT DISTINCT tile_id, tide_cell FROM (
               (FROM cell_parts EXCEPT FROM read_parquet($path))
               UNION ALL (FROM read_parquet($path) EXCEPT FROM cell_parts))""",
             {"path": str(cells_)},
-        ).fetchnumpy()["tide_cell"]
+        ).fetchnumpy()
         # A tide cell is 1/50° (tide.TIDE_CELL).
-        s = (np.asarray(moved_cells) // 18000) / 50 - 90
-        w = (np.asarray(moved_cells) % 18000) / 50 - 180
+        s = (np.asarray(moved_cells["tide_cell"]) // 18000) / 50 - 90
+        w = (np.asarray(moved_cells["tide_cell"]) % 18000) / 50 - 180
         boxes.append(np.column_stack([s, s + 1 / 50, w, w + 1 / 50]))
+        owners.append(np.asarray(moved_cells["tile_id"]))
     dense = [
         t for t, n in live.items() if n > leaves.SPLIT or len(old.get(t, {leaves.ROOT: 0})) > 1
     ]
-    counts = step_counts(con, [t for t in dense if whole or t in moved or t not in old])
+    # Counted again where its leaves' counts no longer add up to the tile's.
+    counts = step_counts(
+        con,
+        [t for t in dense if whole or sum(v[4] for v in old.get(t, {}).values()) != live[t]],
+    )
     new = {}
     for t, n in sorted(live.items()):
         if t not in counts and t in old and t in dense:
@@ -453,18 +465,27 @@ def plan(con, run: Path, live: dict[int, int], moved, key) -> dict:
     for t in old.keys() & new.keys():
         for k in old[t].keys() - new[t].keys():
             forget_leaf(run, t, k)
+    # Leaves of a tile no longer live, which an older build may have left behind.
+    for d in ("leaves", "fp"):
+        for path in (run / d).glob("[0-9]*"):
+            if path.is_dir() and int(path.name) not in live:
+                forget(run, int(path.name))
     every = {t: list(ls) for t, ls in new.items()}
     boxed = {t: {k: v[:4] for k, v in ls.items()} for t, ls in new.items()}
     changes = np.concatenate(boxes) if boxes else np.empty((0, 4))
+    owned = np.concatenate(owners) if owners else np.empty(0, dtype=np.int64)
+    # Each step once, however many changed files sounded it.
+    both = np.unique(np.column_stack([changes, owned]), axis=0)
+    changes, owned = both[:, :4], both[:, 4].astype(np.int64)
     # Unique to this prepare, so every leaf it marks is rewritten, whatever the catalog key.
     stamp = f"{key} {time.time_ns()}\n"
     marked = {}
     for stage in ("cells", "surface"):
-        hit = every if whole else leaves.dirty(boxed, changes, stage)
+        hit = every if whole else leaves.dirty(boxed, changes, stage, owned)
         for t, keys in new.items():
             for k in keys:
                 path = run / "fp" / str(t) / f"{k}.{stage}"
-                if k in hit.get(t, ()) or not path.exists():
+                if k in hit.get(t, ()) or k not in old.get(t, {}) or not path.exists():
                     path.parent.mkdir(parents=True, exist_ok=True)
                     if write_if_changed(path, stamp):
                         marked[stage] = marked.get(stage, 0) + 1
@@ -473,7 +494,7 @@ def plan(con, run: Path, live: dict[int, int], moved, key) -> dict:
     tmp.replace(base / "partitions.json")
     for table, path in (("file_parts", files), ("cell_parts", cells_)):
         export(con, f"FROM {table}", path)
-    write_if_changed(consts, manifest.constants())
+    write_if_changed(consts, built_with)
     return {
         "leaves": sum(map(len, new.values())),
         "dirty_cells": marked.get("cells", 0),
@@ -603,7 +624,13 @@ def leaf_of(run: Path, key: str):
 def within(tile, box, stage):
     """SQL on lat and lon for the points within `stage`'s reach of a leaf's box."""
     s, n, w, e = leaves.degrees(tile, box, leaves.reach(tile, stage))
-    return f"lat >= {s!r} AND lat < {n!r} AND lon >= {w!r} AND lon < {e!r}"
+    # Past the antimeridian, a turn round: a neighbor's longitudes there are a turn away.
+    lon = f"lon >= {w!r} AND lon < {e!r}"
+    if w < -180:
+        lon = f"{lon} OR lon >= {w + 360!r}"
+    if e > 180:
+        lon = f"{lon} OR lon < {e - 360!r}"
+    return f"lat >= {s!r} AND lat < {n!r} AND ({lon})"
 
 
 # A leaf's cells, shoals and cell-level flags: what the leaf owns of them, its own rows and
@@ -691,8 +718,14 @@ def do_leaf_surface(run: Path, key: str, threads):
     around = neighbors(tile)
     out = leaf_dir(run, tile, leaf)
     path = out / "surface.tif"
-    # What it was last built from: its fingerprint, and the code, which Snakemake reruns on.
-    stamp = (run / "fp" / str(tile) / f"{leaf}.surface").read_text() + code()
+    # What it was last built from: its fingerprint, the code, which Snakemake reruns on, and
+    # whether its tile has cells, which a change out of its reach can turn.
+    cells_file = run / TILE_FILES["cells"].format(tile)
+    # A connection of its own: the module's default one may be the warm worker's, from before
+    # the fork, and hangs.
+    with duckdb.connect() as con:
+        has = cells_file.exists() and has_cells(con, run, tile)
+    stamp = f"{(run / 'fp' / str(tile) / f'{leaf}.surface').read_text()}{code()} {has}"
     built = out / "surface.fp"
     if built.exists() and built.read_text() == stamp:
         return "unchanged"

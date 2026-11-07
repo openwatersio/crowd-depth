@@ -221,12 +221,15 @@ def nearest(x, y, values, default=np.nan):
         q = np.stack([np.asarray(qx), np.asarray(qy)], axis=1)
         d, i = tree.query(q, distance_upper_bound=FALLBACK_PX)
         out = np.where(np.isfinite(d), taken[i], default)
-        # Points sit on a grid of whole pixels, one per pixel, so only a query that isn't
-        # on one can tie, and equal distances are exactly equal.
-        tie = np.flatnonzero(np.isfinite(d) & (d > 0))
+        # Points sit on a grid of whole pixels, one per pixel, and queries are whole pixels
+        # too, so equal distances are exactly equal; only a query whose two nearest are
+        # equally near has a tie to settle.
+        two, _ = tree.query(q, k=2, distance_upper_bound=FALLBACK_PX)
+        tie = np.flatnonzero(np.isfinite(two[:, 1]) & (two[:, 1] == two[:, 0]))
         if len(tie):
             dd, ii = tree.query(q[tie], k=TIES, distance_upper_bound=FALLBACK_PX)
-            assert not (np.isfinite(dd[:, -1]) & (dd[:, -1] == dd[:, 0])).any(), "ties past k"
+            if (np.isfinite(dd[:, -1]) & (dd[:, -1] == dd[:, 0])).any():
+                raise RuntimeError(f"more than {TIES} pixels equally near a query")
             out[tie] = np.where(dd == dd[:, :1], taken[ii], -np.inf).max(axis=1)
         return out
 
