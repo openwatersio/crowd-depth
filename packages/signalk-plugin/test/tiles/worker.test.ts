@@ -320,7 +320,7 @@ test.skipIf(!existsSync(dist))(
 );
 
 test.skipIf(!existsSync(dist))(
-  "tiles are built ahead and kept, and a change under way is built again into memory",
+  "tiles are built ahead and kept, and a change under way in a plotter's view is built again into memory",
   async () => {
     const { createDB } = await import("../../dist/storage.js");
     const { createCellStore } = await import("../../dist/tiles/cells.js");
@@ -346,9 +346,13 @@ test.skipIf(!existsSync(dist))(
     const kept = createKeptTiles(db, "high");
     let done!: () => void;
     let built = new Promise<void>((r) => (done = r));
+    let log = "";
     const tiles = createTileService(store, file, "high", kept, {
       position: () => ({ lon: -76.2, lat: 36.98 }),
-      log: () => done(),
+      log: (m) => {
+        log = m;
+        done();
+      },
     });
     try {
       await built;
@@ -360,26 +364,28 @@ test.skipIf(!existsSync(dist))(
       const at = [15, Math.floor(f.x), Math.floor(f.y)] as const;
       built = new Promise<void>((r) => (done = r));
       store.addPasses(again);
-      // With a plotter polling; with none, the changed tiles wait to settle.
+      // A plotter showing that one zoom 15 tile; elsewhere, the changed tiles wait to
+      // settle, or to be asked for.
+      const e = 1e-9;
+      const b = tileBounds(...at);
+      tiles.watched([15, b.west + e, b.south + e, b.east - e, b.north - e]);
+      // Another plotter's poll, with no view and then one far off, leaves that view.
       tiles.watched();
+      tiles.watched([15, 10, 10, 10.01, 10.01]);
       tiles.changed(changed);
       await built;
+      expect(log).toMatch(/^built 1 tiles ahead/);
       // Changed within KEEP_QUIET_MS: built into memory, not onto the SD card.
       expect(kept.size(...at)).toBeUndefined();
       expect(await tiles.get(...at)).toEqual(
         readTile(store, ...at, "high", false),
       );
-      // Every tile near the cells that draws something is built: kept, or, where the
-      // change dropped it, in memory, whether it changed or, as a zoom 15 tile cut from
-      // a changed ancestor, not.
-      const e = 1e-9;
-      for (const [z, x, y] of near) {
-        if (!readTile(store, z, x, y, "high", false)) continue;
-        const b = tileBounds(z, x, y);
-        expect(
-          tiles.held(z, b.west + e, b.south + e, b.east - e, b.north - e),
-        ).toBeGreaterThan(0);
-      }
+      // Its zoom 14 ancestor changed too, out of view: not built until it's asked for.
+      const up = [14, at[1] >> 1, at[2] >> 1] as const;
+      expect(kept.size(...up)).toBeUndefined();
+      expect(await tiles.get(...up)).toEqual(
+        readTile(store, ...up, "high", false),
+      );
     } finally {
       tiles.close();
       db.close();

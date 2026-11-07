@@ -255,8 +255,8 @@ export function registerLayerRoutes(
     guard((req, res, layer) => {
       const since = Number(req.query.since ?? -1);
       const provisional = layer.provisional();
-      layer.tiles.watched();
       const view = parseView(req.query.view);
+      layer.tiles.watched(view);
       const held = view && layer.tiles.held(...view);
       res.set("Cache-Control", "no-store").json({
         ...layer.tiles.since(Number.isInteger(since) ? since : -1),

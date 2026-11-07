@@ -63,13 +63,35 @@ const CELL_W = 1.5 * CELL_M;
 /** How far a written overview block's trigger drops kept tiles past a changed cell: the
  * block's cell may be a block away, and the trigger reaches a block past that. */
 const OVERVIEW_M = 2 * CELL_W * 2 ** Math.max(...OVERVIEW_LEVELS);
-/** Tiles changed under way are built ahead only while a plotter has polled for changes
- * this recently: with none looking, they're built when asked for, or once settled. */
+/** Tiles changed under way are built ahead only in the view of a plotter that polled for
+ * changes this recently: elsewhere they're built when asked for, or once settled. */
 const WATCHED_MS = 30_000;
 /** The most tiles a view is counted over: past it, it's not a plotter's view. */
 const VIEW_TILES = 64;
 
 export type TileId = [z: number, x: number, y: number];
+
+/** The tiles at zoom `z` over a box, as column and row ranges, or undefined over more
+ * than VIEW_TILES tiles: then it's not a plotter's view. Across the antimeridian, `x1`
+ * is past the last column, and wraps. */
+function viewTiles(
+  z: number,
+  west: number,
+  south: number,
+  east: number,
+  north: number,
+) {
+  const a = tileFraction(west, north, z);
+  const b = tileFraction(east, south, z);
+  const n = 2 ** z;
+  const x0 = Math.floor(a.x);
+  // Across the antimeridian, west is east of east.
+  const x1 = Math.floor(b.x) + (b.x < a.x ? n : 0);
+  const [y0, y1] = [Math.floor(a.y), Math.floor(b.y)];
+  const [w, h] = [x1 - x0 + 1, y1 - y0 + 1];
+  if (!(w >= 1 && h >= 1 && w * h <= VIEW_TILES)) return undefined;
+  return { z, n, x0, x1, y0, y1 };
+}
 
 /** The surfaces tiles past SHARED_ZOOM are cut from, by store, the last few built in
  * this thread; dropped when their cells change. */
@@ -270,8 +292,8 @@ export interface Ahead {
  * kept, so a plotter's pan or zoom reads tiles already built: nearest the boat first,
  * zoom 13 and out before 14 and 15, which plotters ask for only closer in, and only on a
  * thread with no tile asked for, so a plotter waits on one such tile at most. Tiles a
- * change drops are built again, those changed under way into memory, and onto disk once
- * they settle.
+ * change drops are built again: those changed under way into memory where a plotter's
+ * view shows them, and onto disk once they settle.
  */
 export function createTileService(
   store: CellStore,
@@ -388,8 +410,28 @@ export function createTileService(
   let ordered = false;
   let orderedAt: { lon: number; lat: number } | undefined;
   let closed = false;
-  /** When a plotter last polled for changes. */
-  let polled = -Infinity;
+  /** The tiles in view of plotters polling for changes, by view, and when each was last
+   * reported: polls don't say which plotter they're from, so each view lasts
+   * WATCHED_MS. */
+  const views = new Map<
+    string,
+    NonNullable<ReturnType<typeof viewTiles>> & { at: number }
+  >();
+  const inView = (z: number, x: number, y: number) => {
+    const at = Date.now();
+    for (const v of views.values()) {
+      if (
+        at - v.at <= WATCHED_MS &&
+        z === v.z &&
+        y >= v.y0 &&
+        y <= v.y1 &&
+        (x - v.x0 + v.n) % v.n <= v.x1 - v.x0
+      ) {
+        return true;
+      }
+    }
+    return false;
+  };
   let built = 0;
   let inFlight = 0;
   let since = 0;
@@ -463,12 +505,12 @@ export function createTileService(
       if (z >= SHARED_ZOOM && worker(z, x, y) !== w) continue;
       queue.delete(k);
       if (building.has(k)) continue;
-      // Kept on disk if it's settled, and there's room; in memory if not settled, and a
-      // plotter is looking.
+      // Kept on disk if it's settled, and there's room; in memory if not settled, and in
+      // a plotter's view, for the refresh it's about to ask for.
       if (quiet(k)) {
         room ??= !kept!.full(AHEAD_SHARE);
         if (!room) continue;
-      } else if (cache.has(k) || Date.now() - polled > WATCHED_MS) continue;
+      } else if (cache.has(k) || !inView(z, x, y)) continue;
       if (kept!.size(z, x, y) !== undefined) continue;
       return id;
     }
@@ -594,7 +636,8 @@ export function createTileService(
       // Every kept tile the write may have dropped: besides those that changed, zoom 15
       // tiles cut from a changed ancestor's surface, and any within an overview block of
       // a change, as far as the overviews' trigger reaches. Not kept while the boat is
-      // about, but built ahead into memory where they're gone, and kept once settled.
+      // about; built ahead into memory where they're gone and in a plotter's view, and
+      // kept once settled.
       const touched = new Map<string, TileId>();
       for (const { lon, lat } of positions) {
         for (let z = MIN_ZOOM; z <= MAX_ZOOM; z++) {
@@ -646,9 +689,18 @@ export function createTileService(
       scan();
     },
 
-    /** A plotter polled for changes: tiles changed under way are built ahead for it. */
-    watched() {
-      polled = Date.now();
+    /** A plotter polled for changes, showing `view` (zoom and box) where it said: tiles
+     * changed under way in any view reported within WATCHED_MS are built ahead. */
+    watched(
+      view?: readonly [z: number, w: number, s: number, e: number, n: number],
+    ) {
+      const tiles = view && viewTiles(...view);
+      if (!tiles) return;
+      const at = Date.now();
+      for (const [k, v] of views) if (at - v.at > WATCHED_MS) views.delete(k);
+      const k = `${tiles.z}/${tiles.x0}/${tiles.y0}/${tiles.x1}/${tiles.y1}`;
+      views.delete(k);
+      views.set(k, { ...tiles, at });
     },
 
     /** Bytes of the tiles at zoom `z` over a box that are built, in memory or kept, or
@@ -661,15 +713,9 @@ export function createTileService(
       east: number,
       north: number,
     ): number | undefined {
-      const a = tileFraction(west, north, z);
-      const b = tileFraction(east, south, z);
-      const n = 2 ** z;
-      const x0 = Math.floor(a.x);
-      // Across the antimeridian, west is east of east.
-      const x1 = Math.floor(b.x) + (b.x < a.x ? n : 0);
-      const [y0, y1] = [Math.floor(a.y), Math.floor(b.y)];
-      const [w, h] = [x1 - x0 + 1, y1 - y0 + 1];
-      if (!(w >= 1 && h >= 1 && w * h <= VIEW_TILES)) return undefined;
+      const v = viewTiles(z, west, south, east, north);
+      if (!v) return undefined;
+      const { n, x0, x1, y0, y1 } = v;
       let bytes = 0;
       for (let i = x0; i <= x1; i++) {
         for (let y = y0; y <= y1; y++) {

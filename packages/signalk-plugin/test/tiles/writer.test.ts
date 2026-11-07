@@ -403,3 +403,43 @@ test("a writer stopped while QC runs ignores its findings", async () => {
   expect(writer.provisional()).toHaveLength(200);
   expect(store.cells(-76.3, 36, -76.1, 37.1)).toEqual([]);
 });
+
+test("under way, a sounding is stored within about 25 s: QC's look-ahead, the pass leaving its cell, and the flush", () => {
+  vi.useFakeTimers({ now: Date.parse("2026-11-07T00:00:00Z") });
+  try {
+    const store = createCellStore(createDB(":memory:"));
+    const writer = createCellWriter(store);
+    // 6 kn, a sounding a second, on a gently turning course over a varying bottom.
+    let [lat, lon, h] = [23.50972, -75.74991, 0.6];
+    const held: number[] = [];
+    const made = new Map<number, number>();
+    for (let i = 0; i < 600; i++) {
+      vi.advanceTimersByTime(1000);
+      h += Math.sin(i / 50) * 0.02;
+      lat += (Math.cos(h) * 3.1) / 110540;
+      lon += (Math.sin(h) * 3.1) / (111320 * Math.cos((lat * Math.PI) / 180));
+      const now = Date.now();
+      writer.write(
+        {
+          latitude: lat,
+          longitude: lon,
+          depth: 8 + 5 * Math.sin(lon * 400) * Math.cos(lat * 300),
+          timestamp: Temporal.Instant.fromEpochMilliseconds(now),
+        },
+        () => {},
+      );
+      if (i >= 100) made.set(now * 1000, now);
+      for (const id of writer.stored()) {
+        const at = made.get(id);
+        if (at === undefined) continue;
+        held.push(now - at);
+        made.delete(id);
+      }
+    }
+    held.sort((a, b) => a - b);
+    expect(held.length).toBeGreaterThan(400);
+    expect(held[held.length >> 1]).toBeLessThanOrEqual(26_000);
+  } finally {
+    vi.useRealTimers();
+  }
+});

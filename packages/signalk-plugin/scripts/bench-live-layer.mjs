@@ -64,7 +64,7 @@ const count = () => db.prepare("SELECT count(*) AS n FROM cells").get().n;
 
 // Writer throughput on a first slice, as a live writer and as a backfill.
 for (const bulk of [false, true]) {
-  const writer = createCellWriter(store, { bulk, flushIntervalMs: 10_000 });
+  const writer = createCellWriter(store, { bulk });
   const t0 = performance.now();
   await lane(100_000, writer);
   await new Promise((r) => writer.end(r));

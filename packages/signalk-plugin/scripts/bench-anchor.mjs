@@ -24,7 +24,7 @@ for (const [name, depth, glitch] of [
   // answers long before the next one, and the soundings end now, as live.
   let runs = 0;
   let pending;
-  // It sails 100 minutes in about one, so the 10 s flush would let written passes pile
+  // It sails 100 minutes in about one, so the live flush would let written passes pile
   // up: it flushes every 5 ms instead, which overstates the cost of writes.
   const writer = createCellWriter(store, {
     flushIntervalMs: 5,
