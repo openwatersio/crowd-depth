@@ -132,3 +132,46 @@ test("after a pause, every sounding is sent again, even past a poll in flight", 
     data: [{ id: 1 }, { id: 2 }, { id: 3 }],
   });
 });
+
+test("the plugin's batch for the view replaces the runtime's own", () => {
+  let t = 0;
+  const batch = createBatch(30_000, () => t);
+  batch.next({ ...live(1, []), all: true });
+  batch.taken();
+  t = 6_000;
+  expect(
+    batch.next({ ...live(2, [], [[15, 1, 1]]), refreshMs: 5_000 }).refresh,
+  ).toEqual({
+    tiles: [[15, 1, 1]],
+  });
+  batch.taken();
+  t = 9_000;
+  expect(batch.next(live(3, [], [[15, 1, 2]])).refresh).toBeUndefined();
+  batch.taken();
+  // 6 s on, past the plugin's 5 s but, with no batch from the plugin, short of 30 s.
+  t = 12_000;
+  expect(batch.next(live(4, [])).refresh).toBeUndefined();
+  batch.taken();
+  expect(batch.next({ ...live(4, []), refreshMs: 5_000 }).refresh).toEqual({
+    tiles: [[15, 1, 2]],
+  });
+});
+
+test("a ribbon stays drawn after its first sounding is stored, until its tile lands", () => {
+  let t = 0;
+  const batch = createBatch(5_000, () => t);
+  // Soundings 1 and 2, and the ribbon from 1 to 2, id -1.
+  batch.next({ ...live(1, [1, 2, -1]), all: true });
+  batch.taken();
+  // 1 is written to a cell and leaves; so does the ribbon from it, stored as -1.
+  t = 1_000;
+  expect(
+    batch.next({ ...live(2, [2], [[15, 1, 1]]), stored: [1, -1] }),
+  ).toEqual({});
+  batch.taken();
+  t = 6_000;
+  expect(batch.next(live(2, [2])).refresh).toEqual({ tiles: [[15, 1, 1]] });
+  batch.taken();
+  t = 8_000;
+  expect(batch.next(live(2, [2]))).toEqual({ remove: [1, -1] });
+});

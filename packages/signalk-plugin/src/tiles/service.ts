@@ -5,6 +5,7 @@ import type { Prepared } from "./portray.js";
 import type { Changed } from "./writer.js";
 import {
   M_PER_DEG_LAT,
+  cellCenter,
   mPerDegLon,
   tileFraction,
   tileMetres,
@@ -47,6 +48,26 @@ export const SLOW_REFRESH_MS = 5 * 60_000;
 export const KEEP_QUIET_MS = 10 * 60_000;
 /** Revisions of changed tiles a client can catch up on before it refetches them all. */
 const HISTORY = 500;
+/** How often tiles changed under way are checked for having settled, to build and keep
+ * them on disk. */
+const SETTLE_CHECK_MS = 60_000;
+/** Tiles built ahead fill the kept bound to this share, leaving the rest for those a
+ * plotter asks for: past the bound each would only push out one kept before it. */
+const AHEAD_SHARE = 3 / 4;
+/** The overview level whose blocks, 16 cells or about 330 m, find the tiles to build. */
+const AHEAD_LEVEL = 4;
+/** How far the boat moves before the tiles to build are ordered again. */
+const REORDER_M = 500;
+/** The widest a cell gets: its columns are up to half as wide again as its rows. */
+const CELL_W = 1.5 * CELL_M;
+/** How far a written overview block's trigger drops kept tiles past a changed cell: the
+ * block's cell may be a block away, and the trigger reaches a block past that. */
+const OVERVIEW_M = 2 * CELL_W * 2 ** Math.max(...OVERVIEW_LEVELS);
+/** Tiles changed under way are built ahead only while a plotter has polled for changes
+ * this recently: with none looking, they're built when asked for, or once settled. */
+const WATCHED_MS = 30_000;
+/** The most tiles a view is counted over: past it, it's not a plotter's view. */
+const VIEW_TILES = 64;
 
 export type TileId = [z: number, x: number, y: number];
 
@@ -69,22 +90,64 @@ export function clearShared(store: CellStore, keys?: string[]) {
   else m.clear();
 }
 
+/** The tiles at zoom `z` within `m` metres of a position; across the antimeridian, the
+ * tiles on the other side. */
+function tilesWithin(lon: number, lat: number, m: number, z: number) {
+  const dLat = m / M_PER_DEG_LAT;
+  const dLon = m / mPerDegLon(Math.min(Math.abs(lat), 85));
+  const a = tileFraction(lon - dLon, lat + dLat, z);
+  const b = tileFraction(lon + dLon, lat - dLat, z);
+  const n = 2 ** z;
+  const out: TileId[] = [];
+  for (let x = Math.floor(a.x); x <= Math.floor(b.x); x++) {
+    for (
+      let y = Math.max(0, Math.floor(a.y));
+      y <= Math.min(n - 1, Math.floor(b.y));
+      y++
+    ) {
+      out.push([z, ((x % n) + n) % n, y]);
+    }
+  }
+  return out;
+}
+
 /** The ancestors at SHARED_ZOOM whose surfaces a change at `positions` reaches. */
 function sharedKeys(positions: Changed): string[] {
   const keys = new Set<string>();
   for (const { lon, lat } of positions) {
-    const dLat = MARGIN_M / M_PER_DEG_LAT;
-    const dLon = MARGIN_M / mPerDegLon(Math.min(Math.abs(lat), 85));
-    const a = tileFraction(lon - dLon, lat + dLat, SHARED_ZOOM);
-    const b = tileFraction(lon + dLon, lat - dLat, SHARED_ZOOM);
-    const n = 2 ** SHARED_ZOOM;
-    for (let x = Math.floor(a.x); x <= Math.floor(b.x); x++) {
-      for (let y = Math.floor(a.y); y <= Math.floor(b.y); y++) {
-        keys.add(`${SHARED_ZOOM}/${((x % n) + n) % n}/${y}`);
-      }
+    for (const t of tilesWithin(lon, lat, MARGIN_M, SHARED_ZOOM)) {
+      keys.add(t.join("/"));
     }
   }
   return [...keys];
+}
+
+/** Every tile, at every zoom, within the surface's margin of a cell: those that may draw
+ * something. Found from the overview blocks, a block's reach being its cell's plus its
+ * own size, so a few tiles past the margin come too. */
+export function tilesNear(store: CellStore): TileId[] {
+  const reach = CELL_W * 2 ** AHEAD_LEVEL + MARGIN_M;
+  const n = 2 ** MAX_ZOOM;
+  // Tiles at MAX_ZOOM, as y * n + x; those further out are their ancestors.
+  let level = new Set<number>();
+  for (const { py, px } of store.blocks(AHEAD_LEVEL)) {
+    const { lon, lat } = cellCenter(py, px);
+    for (const [, x, y] of tilesWithin(lon, lat, reach, MAX_ZOOM)) {
+      level.add(y * n + x);
+    }
+  }
+  const out: TileId[] = [];
+  for (let z = MAX_ZOOM, nz = n; z >= MIN_ZOOM; z--, nz /= 2) {
+    const up = new Set<number>();
+    for (const k of level) {
+      const x = k % nz;
+      const y = (k - x) / nz;
+      out.push([z, x, y]);
+      up.add((y >> 1) * (nz / 2) + (x >> 1));
+    }
+    level = up;
+  }
+  return out;
 }
 
 /** A tile built from the store: the cells under it, or under the ancestor it's cut from,
@@ -156,6 +219,10 @@ function createTileWorker(file: string, detail: Detail) {
     );
   };
   return {
+    /** Whether a tile is being built or waits to be. */
+    get busy() {
+      return waiting.size > 0;
+    },
     build(
       z: number,
       x: number,
@@ -183,6 +250,14 @@ function createTileWorker(file: string, detail: Detail) {
 }
 
 export type TileService = ReturnType<typeof createTileService>;
+type TileWorker = ReturnType<typeof createTileWorker>;
+
+/** What building tiles ahead needs. */
+export interface Ahead {
+  /** Where the boat is, to build the tiles nearest it first. */
+  position: () => { lon: number; lat: number } | undefined;
+  log?: (message: string) => void;
+}
 
 /**
  * Serves the live layer's tiles, built on request from the cells and cached, and keeps a
@@ -190,12 +265,20 @@ export type TileService = ReturnType<typeof createTileService>;
  * Given the database `file`, tiles are built on a worker thread; otherwise, as for an
  * in-memory database, in turn on this one. Given `kept`, built tiles are also kept on
  * disk, and read back from there before they're built.
+ *
+ * Given `ahead` too, every tile that may draw something is built in the background and
+ * kept, so a plotter's pan or zoom reads tiles already built: nearest the boat first,
+ * zoom 13 and out before 14 and 15, which plotters ask for only closer in, and only on a
+ * thread with no tile asked for, so a plotter waits on one such tile at most. Tiles a
+ * change drops are built again, those changed under way into memory, and onto disk once
+ * they settle.
  */
 export function createTileService(
   store: CellStore,
   file?: string,
   detail: Detail = "high",
   kept?: KeptTiles,
+  ahead?: Ahead,
 ) {
   const cache = new Map<string, Buffer | null>();
   let cached = 0;
@@ -205,7 +288,10 @@ export function createTileService(
     cached -= size(cache.get(k)!);
     cache.delete(k);
   };
+  /** Each tile's bytes when last built or read, for a view's weight while it's rebuilt. */
+  const sizes = new Map<string, number>();
   const toCache = (k: string, t: Buffer | null) => {
+    sizes.set(k, t?.length ?? 0);
     uncache(k);
     cache.set(k, t);
     cached += size(t);
@@ -247,15 +333,195 @@ export function createTileService(
   let turn = 0;
   // Tiles cut from one ancestor's surface go to one worker, which builds it once.
   const worker = (z: number, x: number, y: number) => {
-    if (z < SHARED_ZOOM) return workers[turn++ % workers.length];
+    // An idle thread first, rather than one building a tile ahead.
+    if (z < SHARED_ZOOM) {
+      return workers.find((w) => !w.busy) ?? workers[turn++ % workers.length];
+    }
     const a = sharedTile(z, x, y);
     return workers[(a.x * 31 + a.y) % workers.length];
   };
   let sharing = true;
-  const build = (z: number, x: number, y: number) =>
-    workers.length
-      ? worker(z, x, y).build(z, x, y, sharing)
+  const build = (z: number, x: number, y: number, w = worker(z, x, y)) =>
+    w
+      ? w.build(z, x, y, sharing)
       : Promise.resolve(readTile(store, z, x, y, detail, sharing));
+
+  /** Build a tile, on worker `w` when built ahead, and keep it on disk where it can be;
+   * in memory if it was asked for, or can't be kept on disk yet. */
+  const load = (k: string, z: number, x: number, y: number, w?: TileWorker) => {
+    const stamp = stamps.get(k);
+    // Before the build reads the cells, so a write after it drops the reservation.
+    const id = reserve(z, x, y);
+    const result: Promise<Buffer | undefined> = build(z, x, y, w)
+      .then((tile) => {
+        sizes.set(k, tile?.length ?? 0);
+        let onDisk = false;
+        // Not once a backfill has started meanwhile, whose write lock this would wait on.
+        if (id !== undefined && sharing) {
+          try {
+            onDisk = kept!.keep(id, tile);
+          } catch {
+            // Built again next time.
+          }
+        }
+        // Built ahead, a tile is held in memory only where it isn't kept on disk, as
+        // when a write dropped its reservation.
+        if (stamps.get(k) === stamp && (!w || !onDisk)) {
+          toCache(k, tile ?? null);
+        }
+        return tile;
+      })
+      .finally(() => {
+        if (building.get(k) === result) building.delete(k);
+        pump();
+      });
+    building.set(k, result);
+    return result;
+  };
+
+  // Building ahead: the tiles to build, by key, and in the order to build them.
+  const aheadOn = ahead && workers.length && kept ? ahead : undefined;
+  const queue = new Map<string, TileId>();
+  let order: string[] = [];
+  /** Keys in `order` before this one are built or dropped. */
+  let first = 0;
+  let ordered = false;
+  let orderedAt: { lon: number; lat: number } | undefined;
+  let closed = false;
+  /** When a plotter last polled for changes. */
+  let polled = -Infinity;
+  let built = 0;
+  let inFlight = 0;
+  let since = 0;
+
+  /** Queue tiles: those a change or a settle brings first, ahead of what's left of a
+   * scan, without ordering the whole queue again on every flush; `all`, from a scan, in
+   * order. */
+  const enqueue = (ids: Iterable<TileId>, all = false) => {
+    if (!aheadOn) return;
+    const fresh: string[] = [];
+    for (const id of ids) {
+      const k = id.join("/");
+      if (!queue.has(k)) fresh.push(k);
+      queue.set(k, id);
+    }
+    if (all) ordered = false;
+    else if (fresh.length) {
+      order = [...fresh, ...order.slice(first)];
+      first = 0;
+    }
+    pump();
+  };
+
+  /** Nearest the boat first, as the distance to a tile's edge; a zoom 14 and 15 tile by
+   * its zoom 14 ancestor's, so the tiles cut from one surface go together. */
+  const reorder = () => {
+    const at = aheadOn!.position();
+    const moved =
+      at !== undefined &&
+      (orderedAt === undefined ||
+        Math.hypot(
+          (at.lat - orderedAt.lat) * M_PER_DEG_LAT,
+          (at.lon - orderedAt.lon) * mPerDegLon(at.lat),
+        ) > REORDER_M);
+    if (ordered && !moved) return;
+    ordered = true;
+    if (at) orderedAt = at;
+    const rank = ([z, x, y]: TileId) => {
+      const a = z > SHARED_ZOOM ? sharedTile(z, x, y) : { z, x, y };
+      let d = 0;
+      if (orderedAt) {
+        const f = tileFraction(orderedAt.lon, orderedAt.lat, a.z);
+        const dx = Math.max(0, a.x - f.x, f.x - a.x - 1);
+        const dy = Math.max(0, a.y - f.y, f.y - a.y - 1);
+        d = Math.hypot(dx, dy) * tileMetres(a.z, orderedAt.lat);
+      }
+      return [z >= SHARED_ZOOM ? 1 : 0, d, a.y * 2 ** a.z + a.x, z];
+    };
+    const ranked = [...queue].map(([k, id]) => ({ k, r: rank(id) }));
+    ranked.sort((p, q) => {
+      for (let i = 0; i < p.r.length; i++) {
+        if (p.r[i] !== q.r[i]) return p.r[i] - q.r[i];
+      }
+      return 0;
+    });
+    order = ranked.map((e) => e.k);
+    first = 0;
+  };
+
+  /** The next tile to build ahead on worker `w`, if any. */
+  const next = (w: TileWorker): TileId | undefined => {
+    reorder();
+    while (first < order.length && !queue.has(order[first])) first++;
+    let room: boolean | undefined;
+    for (let i = first; i < order.length; i++) {
+      const k = order[i];
+      const id = queue.get(k);
+      if (!id) continue;
+      const [z, x, y] = id;
+      // Tiles cut from one surface are built on the thread that keeps it.
+      if (z >= SHARED_ZOOM && worker(z, x, y) !== w) continue;
+      queue.delete(k);
+      if (building.has(k)) continue;
+      // Kept on disk if it's settled, and there's room; in memory if not settled, and a
+      // plotter is looking.
+      if (quiet(k)) {
+        room ??= !kept!.full(AHEAD_SHARE);
+        if (!room) continue;
+      } else if (cache.has(k) || Date.now() - polled > WATCHED_MS) continue;
+      if (kept!.size(z, x, y) !== undefined) continue;
+      return id;
+    }
+    return undefined;
+  };
+
+  /** Give each idle thread a tile to build ahead. */
+  function pump() {
+    if (!aheadOn || closed || !sharing) return;
+    for (const w of workers) {
+      if (w.busy) continue;
+      let id: TileId | undefined;
+      try {
+        id = next(w);
+      } catch {
+        // The kept tiles can't be read: built ahead no further until they can, as a
+        // tile kept on disk is only ever a saving.
+        return;
+      }
+      if (!id) continue;
+      if (!inFlight && !built) since = Date.now();
+      inFlight++;
+      built++;
+      const [z, x, y] = id;
+      load(id.join("/"), z, x, y, w)
+        .catch(() => {
+          // Built again when it's asked for.
+        })
+        .finally(() => {
+          inFlight--;
+          if (!inFlight && !queue.size && built) {
+            aheadOn.log?.(
+              `built ${built} tiles ahead in ${((Date.now() - since) / 1000).toFixed(1)} s`,
+            );
+            built = 0;
+          }
+        });
+    }
+  }
+
+  /** Queue every tile that may draw something and isn't kept. */
+  const scan = () => {
+    if (!aheadOn) return;
+    try {
+      const have = kept!.keys();
+      enqueue(
+        tilesNear(store).filter((id) => !have.has(id.join("/"))),
+        true,
+      );
+    } catch {
+      // Nothing built ahead; tiles are built as they're asked for.
+    }
+  };
   // Revisions count from the time the service started, so a client holding one from
   // before a restart is behind every revision this one keeps, and refetches everything.
   let rev = Date.now();
@@ -273,6 +539,19 @@ export function createTileService(
     }
     changes.push({ rev: ++rev, tiles });
     if (changes.length > HISTORY) oldest = changes.shift()!.rev + 1;
+    enqueue(tiles);
+  };
+
+  /** Tiles quiet for KEEP_QUIET_MS since they changed, built again to be kept on disk. */
+  const settle = () => {
+    const at = Date.now();
+    const settled: TileId[] = [];
+    for (const [k, t] of changedAt) {
+      if (at - t < KEEP_QUIET_MS) continue;
+      changedAt.delete(k);
+      settled.push(k.split("/").map(Number) as TileId);
+    }
+    enqueue(settled);
   };
 
   const timer = setInterval(() => {
@@ -281,6 +560,9 @@ export function createTileService(
     slow.clear();
   }, SLOW_REFRESH_MS);
   timer.unref?.();
+  const settler = setInterval(settle, SETTLE_CHECK_MS);
+  settler.unref?.();
+  scan();
 
   return {
     /** A tile's encoded MVT, or undefined where the boat has no soundings. */
@@ -300,24 +582,7 @@ export function createTileService(
         toCache(k, disk);
         return disk ?? undefined;
       }
-      const stamp = stamps.get(k);
-      // Before the build reads the cells, so a write after it drops the reservation.
-      const id = reserve(z, x, y);
-      const result = build(z, x, y).finally(() => {
-        if (building.get(k) === result) building.delete(k);
-      });
-      building.set(k, result);
-      const tile = await result;
-      // Not once a backfill has started meanwhile, whose write lock this would wait on.
-      if (id !== undefined && sharing) {
-        try {
-          kept!.keep(id, tile);
-        } catch {
-          // Built again next time.
-        }
-      }
-      if (stamps.get(k) === stamp) toCache(k, tile ?? null);
-      return tile;
+      return load(k, z, x, y);
     },
 
     /** Mark the tiles within the surface's margin of changed cells as changed. */
@@ -326,29 +591,33 @@ export function createTileService(
       clearShared(store, keys);
       for (const w of workers) w.clear(keys);
       const now = new Map<string, TileId>();
-      const at = Date.now();
-      for (const [k, t] of changedAt) {
-        if (at - t >= KEEP_QUIET_MS) changedAt.delete(k);
-      }
+      // Every kept tile the write may have dropped: besides those that changed, zoom 15
+      // tiles cut from a changed ancestor's surface, and any within an overview block of
+      // a change, as far as the overviews' trigger reaches. Not kept while the boat is
+      // about, but built ahead into memory where they're gone, and kept once settled.
+      const touched = new Map<string, TileId>();
       for (const { lon, lat } of positions) {
-        const dLat = MARGIN_M / M_PER_DEG_LAT;
-        const dLon = MARGIN_M / mPerDegLon(Math.min(Math.abs(lat), 85));
         for (let z = MIN_ZOOM; z <= MAX_ZOOM; z++) {
-          const a = tileFraction(lon - dLon, lat + dLat, z);
-          const b = tileFraction(lon + dLon, lat - dLat, z);
-          const n = 2 ** z;
-          for (let x = Math.floor(a.x); x <= Math.floor(b.x); x++) {
-            for (let y = Math.floor(a.y); y <= Math.floor(b.y); y++) {
-              // Across the antimeridian, the tile on the other side.
-              const id: TileId = [z, ((x % n) + n) % n, y];
-              const k = id.join("/");
-              (z < SLOW_BELOW_ZOOM ? slow : now).set(k, id);
-              changedAt.set(k, at);
+          for (const id of tilesWithin(lon, lat, MARGIN_M, z)) {
+            (z < SLOW_BELOW_ZOOM ? slow : now).set(id.join("/"), id);
+          }
+          if (z === MAX_ZOOM) continue;
+          for (const id of tilesWithin(lon, lat, MARGIN_M + OVERVIEW_M, z)) {
+            touched.set(id.join("/"), id);
+            if (z !== SHARED_ZOOM) continue;
+            const [, x, y] = id;
+            for (const c of [0, 1, 2, 3]) {
+              const t: TileId = [z + 1, 2 * x + (c & 1), 2 * y + (c >> 1)];
+              touched.set(t.join("/"), t);
             }
           }
         }
       }
+      const at = Date.now();
+      for (const k of touched.keys()) changedAt.set(k, at);
+      settle();
       if (now.size) publish([...now.values()]);
+      enqueue(touched.values());
     },
 
     /** Share no surfaces between tiles while `on` is false, as while a backfill writes
@@ -358,6 +627,7 @@ export function createTileService(
       sharing = on;
       clearShared(store);
       for (const w of workers) w.clear();
+      pump();
     },
 
     /** Drop every tile, as after a backfill or a rebuild. */
@@ -369,9 +639,56 @@ export function createTileService(
       for (const k of building.keys()) stamps.set(k, (stamps.get(k) ?? 0) + 1);
       building.clear();
       slow.clear();
+      sizes.clear();
       rev++;
       oldest = rev + 1;
       changes.length = 0;
+      scan();
+    },
+
+    /** A plotter polled for changes: tiles changed under way are built ahead for it. */
+    watched() {
+      polled = Date.now();
+    },
+
+    /** Bytes of the tiles at zoom `z` over a box that are built, in memory or kept, or
+     * as last built while they're rebuilt: what a plotter showing it holds. Undefined
+     * over more than VIEW_TILES tiles. */
+    held(
+      z: number,
+      west: number,
+      south: number,
+      east: number,
+      north: number,
+    ): number | undefined {
+      const a = tileFraction(west, north, z);
+      const b = tileFraction(east, south, z);
+      const n = 2 ** z;
+      const x0 = Math.floor(a.x);
+      // Across the antimeridian, west is east of east.
+      const x1 = Math.floor(b.x) + (b.x < a.x ? n : 0);
+      const [y0, y1] = [Math.floor(a.y), Math.floor(b.y)];
+      const [w, h] = [x1 - x0 + 1, y1 - y0 + 1];
+      if (!(w >= 1 && h >= 1 && w * h <= VIEW_TILES)) return undefined;
+      let bytes = 0;
+      for (let i = x0; i <= x1; i++) {
+        for (let y = y0; y <= y1; y++) {
+          const x = i % n;
+          const k = `${z}/${x}/${y}`;
+          let size: number | undefined;
+          if (cache.has(k)) size = cache.get(k)?.length ?? 0;
+          else {
+            try {
+              size = kept?.size(z, x, y);
+            } catch {
+              // Counted as when last built.
+            }
+          }
+          // Being rebuilt, as the changed tiles a refresh is about to ask for are.
+          bytes += size ?? sizes.get(k) ?? 0;
+        }
+      }
+      return bytes;
     },
 
     /** The tiles changed after revision `since`, or `all` when the feed no longer goes
@@ -387,7 +704,9 @@ export function createTileService(
     },
 
     close() {
+      closed = true;
       clearInterval(timer);
+      clearInterval(settler);
       for (const w of workers) w.close();
     },
   };

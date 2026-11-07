@@ -10,6 +10,7 @@ import {
   KEEP_QUIET_MS,
   createTileService,
   readTile,
+  tilesNear,
 } from "../../src/tiles/service.js";
 
 const LON = -76.2;
@@ -123,7 +124,7 @@ test("a build that read the cells before a write isn't kept", () => {
   const id = kept.reserve(...at);
   const tile = readTile(store, ...at);
   store.addPasses(pass(20));
-  kept.keep(id, tile);
+  expect(kept.keep(id, tile)).toBe(false);
   expect(kept.get(...at)).toBeUndefined();
   db.close();
 });
@@ -341,5 +342,36 @@ test("dropping a kept tile finds its boxes by index, not by scanning them", () =
       "DELETE FROM kept_tile_boxes WHERE id IN (SELECT box FROM kept_tile_box_owners WHERE tile = 1)",
     ),
   ).toContain("SCAN kept_tile_boxes VIRTUAL TABLE INDEX 1:");
+  db.close();
+});
+
+test("the tiles to build ahead are those within the margin of a cell, at every zoom", () => {
+  const db = createDB(file);
+  const store = createCellStore(db);
+  store.addPasses(pass(8));
+  const near = new Set(tilesNear(store).map((t) => t.join("/")));
+  for (let z = 4; z <= 15; z++)
+    expect(near.has(tileAt(z).join("/"))).toBe(true);
+  // The pass runs north and south: the tile 350 m east is within the margin, the one
+  // 4 km east is not.
+  const east = (m: number) =>
+    tileAt(15, LON + m / (111320 * Math.cos((LAT * Math.PI) / 180))).join("/");
+  expect(near.has(east(350))).toBe(true);
+  expect(near.has(east(4000))).toBe(false);
+  db.close();
+});
+
+test("a view weighs a tile being rebuilt as it was last built", async () => {
+  const db = createDB(file);
+  const store = createCellStore(db);
+  store.addPasses(pass(8));
+  const tiles = createTileService(store, undefined, "high");
+  const at = tileAt(13);
+  const tile = await tiles.get(...at);
+  const box = [LON - 1e-4, LAT - 1e-4, LON + 1e-4, LAT + 1e-4] as const;
+  expect(tiles.held(13, ...box)).toBe(tile!.length);
+  // Changed: out of memory until it's asked for again.
+  tiles.changed([{ lon: LON, lat: LAT }]);
+  expect(tiles.held(13, ...box)).toBe(tile!.length);
   db.close();
 });

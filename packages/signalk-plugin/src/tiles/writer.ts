@@ -55,7 +55,7 @@ const QC_RETRY_MS = 10 * 60_000;
 const MAX_FLUSH_FAILURES = 3;
 
 /** How long a written sounding is listed as stored, which covers the chart's slowest
- * tile refresh, every 30 s. */
+ * batch of tile refreshes, 30 s. */
 const STORED_MS = 90_000;
 
 /** The longest the writer keeps passes back for a backfill that hasn't finished. */

@@ -44,7 +44,7 @@ const MAX_POINTS = 12;
 const MIN_POINTS = 3;
 /** Areas and contours stop here, as the grid's: deeper crowd soundings are mostly
  * sounders that lost the bottom. */
-const MAX_AREA_DEPTH_M = 200;
+export const MAX_AREA_DEPTH_M = 200;
 /** The deepest band's floor below chart datum, as the grid's drying band. */
 const DRYING_FLOOR_M = -30;
 /** How finely depths are drawn: contours every metre and every foot, or the chart's
@@ -166,6 +166,14 @@ export function depthLabels(d: number) {
     depth_ft: floor(d / P.m_per_ft),
     depth_fm: floor(d / P.m_per_fathom),
   };
+}
+
+/** The lower edge of the depth area a depth falls in, finely drawn or in the chart's
+ * bands. */
+export function areaBand(d: number, fine: boolean): number {
+  let lo = DRYING_FLOOR_M;
+  for (const e of fine ? FINE_EDGES : LEVELS) if (e - EDGE_M <= d) lo = e;
+  return lo;
 }
 
 /** Contour levels drawn at a zoom, as the grid's tiers. */

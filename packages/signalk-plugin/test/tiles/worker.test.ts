@@ -318,3 +318,106 @@ test.skipIf(!existsSync(dist))(
   },
   60_000,
 );
+
+test.skipIf(!existsSync(dist))(
+  "tiles are built ahead and kept, and a change under way is built again into memory",
+  async () => {
+    const { createDB } = await import("../../dist/storage.js");
+    const { createCellStore } = await import("../../dist/tiles/cells.js");
+    const { createKeptTiles } = await import("../../dist/tiles/kept.js");
+    const { createTileService, readTile, tilesNear } =
+      await import("../../dist/tiles/service.js");
+    const { cellAt, cellCenter, tileBounds, tileFraction } =
+      await import("../../dist/tiles/geometry.js");
+    const dir = mkdtempSync(join(tmpdir(), "crowd-depth-"));
+    const file = join(dir, "bathymetry.sqlite");
+    const db = createDB(file);
+    const store = createCellStore(db);
+    const pass = (depth: number) =>
+      Array.from({ length: 60 }, (_, i) => ({
+        ...cellAt(-76.2, 36.975 + i / 5400),
+        depth,
+        day: 20000,
+      }));
+    store.addPasses(pass(8));
+    // A second pass over the southern sixth of the first.
+    const again = pass(3).slice(0, 10);
+    const changed = again.map((c) => cellCenter(c.py, c.px));
+    const kept = createKeptTiles(db, "high");
+    let done!: () => void;
+    let built = new Promise<void>((r) => (done = r));
+    const tiles = createTileService(store, file, "high", kept, {
+      position: () => ({ lon: -76.2, lat: 36.98 }),
+      log: () => done(),
+    });
+    try {
+      await built;
+      const near = tilesNear(store);
+      expect(near.length).toBeGreaterThan(12);
+      for (const [z, x, y] of near) expect(kept.size(z, x, y)).toBeDefined();
+
+      const f = tileFraction(-76.2, 36.976, 15);
+      const at = [15, Math.floor(f.x), Math.floor(f.y)] as const;
+      built = new Promise<void>((r) => (done = r));
+      store.addPasses(again);
+      // With a plotter polling; with none, the changed tiles wait to settle.
+      tiles.watched();
+      tiles.changed(changed);
+      await built;
+      // Changed within KEEP_QUIET_MS: built into memory, not onto the SD card.
+      expect(kept.size(...at)).toBeUndefined();
+      expect(await tiles.get(...at)).toEqual(
+        readTile(store, ...at, "high", false),
+      );
+      // Every tile near the cells that draws something is built: kept, or, where the
+      // change dropped it, in memory, whether it changed or, as a zoom 15 tile cut from
+      // a changed ancestor, not.
+      const e = 1e-9;
+      for (const [z, x, y] of near) {
+        if (!readTile(store, z, x, y, "high", false)) continue;
+        const b = tileBounds(z, x, y);
+        expect(
+          tiles.held(z, b.west + e, b.south + e, b.east - e, b.north - e),
+        ).toBeGreaterThan(0);
+      }
+    } finally {
+      tiles.close();
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+test.skipIf(!existsSync(dist))(
+  "kept tiles that can't be read stop building ahead, not the layer",
+  async () => {
+    const { createDB } = await import("../../dist/storage.js");
+    const { createCellStore } = await import("../../dist/tiles/cells.js");
+    const { createKeptTiles } = await import("../../dist/tiles/kept.js");
+    const { createTileService } = await import("../../dist/tiles/service.js");
+    const { cellAt } = await import("../../dist/tiles/geometry.js");
+    const dir = mkdtempSync(join(tmpdir(), "crowd-depth-"));
+    const file = join(dir, "bathymetry.sqlite");
+    const db = createDB(file);
+    const store = createCellStore(db);
+    store.addPasses([{ ...cellAt(-76.2, 36.98), depth: 6, day: 20000 }]);
+    const fail = () => {
+      throw new Error("disk I/O error");
+    };
+    const kept = {
+      ...createKeptTiles(db, "high"),
+      size: fail,
+      full: fail,
+    };
+    const tiles = createTileService(store, file, "high", kept, {
+      position: () => ({ lon: -76.2, lat: 36.98 }),
+    });
+    try {
+      expect(() => tiles.changed([{ lon: -76.2, lat: 36.98 }])).not.toThrow();
+    } finally {
+      tiles.close();
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
