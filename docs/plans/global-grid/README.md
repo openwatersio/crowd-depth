@@ -98,7 +98,7 @@ Tables:
 
 Corrections are never written over `points`. Cells and the surface read each sounding with its tide level, interpolated at its own time, and its file's offset joined on, from the tables above.
 
-`points` is partitioned coarsely (10° cells) and sorted by tile within each, in files of about 256 MB with row groups of about 123k rows, so a tile reads a few row groups of its own ([store-layout.md](store-layout.md)). Each ingest batch is written sorted, and a run's small files merge into sorted ones when it publishes. `grid compact` rewrites each partition sorted once per store layout; on the Chesapeake, its 92M-row partition sorts in 96 s at a 1 GB limit in a 2 GB container. Finer directory partitions would produce hundreds of thousands of tiny files, and NOAA's folders are dated by processing, not observation, so partitioning by year would not bound a rebuild.
+`points` is partitioned coarsely (10° cells) and sorted by tile within each, in files of about 256 MB with row groups of about 123k rows, so a tile reads a few row groups of its own ([store-layout.md](store-layout.md)). Each ingest batch is written sorted, and a run's small files merge into sorted ones when it publishes. `grid compact` rewrites each partition sorted once per store layout, about 20M points at a time, so a 275M-point partition compacts on local disk in 161 s at a 1 GB limit in a 2 GB container. Finer directory partitions would produce hundreds of thousands of tiny files, and NOAA's folders are dated by processing, not observation, so partitioning by year would not bound a rebuild.
 
 #### Ingest
 

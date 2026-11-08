@@ -1408,6 +1408,55 @@ def test_lost_runs_set_aside_the_soundings_each_one_holds(env):  # noqa: F811
     assert len(got) == 432 and 10 < sum(lost for *_, lost in got) < 100 and got == want
 
 
+# Each sounding against every changed run of its file's content: the query the merged runs
+# replace, which finds the same tiles.
+PAIRWISE_RUN_TILES = """
+SELECT DISTINCT p.tile_id FROM lake.points p JOIN lake.files f USING (file_id)
+JOIN ((SELECT * FROM old_runs EXCEPT SELECT * FROM lake.lost_runs)
+  UNION ALL (SELECT * FROM lake.lost_runs EXCEPT SELECT * FROM old_runs)) r
+ON r.content_hash = f.content_hash AND (r.tile_id IS NULL OR r.tile_id = p.tile_id)
+  AND p.time BETWEEN r.t_start AND r.t_end
+"""
+
+
+@pytest.mark.parametrize(
+    "old, new, want",
+    [
+        ([], [0, 1, 2], {TILE}),  # overlapping and nested, all in the first tile
+        ([], [3], set()),  # in the next tile while the file sounds this one
+        ([], [4], {TILE + 1}),
+        ([], [5], {TILE, TILE + 1}),  # no tile: every tile it covers
+        ([0, 1, 4], [0, 1, 4], set()),  # nothing changed
+        ([0, 4], [1], {TILE, TILE + 1}),  # one gone, one come
+        ([2, 3], [2], set()),  # the one gone held no soundings
+    ],
+)
+def test_changed_runs_mark_the_tiles_whose_soundings_they_hold(env, old, new, want):  # noqa: F811
+    # A sounding every 20 minutes, three in one tile then three in the next.
+    rows = [(i * 1200, *at(5000, (i // 3 % 2) * cells.BASE + i % 3), 5.0) for i in range(72)]
+    put_dated(env, 1, rows, "AQM-A")
+    env.run("noaa")
+    h = timedelta(hours=1)
+    runs = [
+        (TILE, T0 + 0 * h, T0 + 2 * h),
+        (TILE, T0 + 1 * h, T0 + 3 * h),
+        (TILE, T0 + 1.5 * h, T0 + 1.6 * h),
+        (TILE + 1, T0, T0 + timedelta(minutes=40)),  # the first three soundings: this tile's
+        (TILE + 1, T0 + 5 * h, T0 + 6 * h),
+        (None, T0 + 10 * h, T0 + 12 * h),
+    ]
+    with open_store(env.store) as con:
+        [(content,)] = con.execute("SELECT content_hash FROM lake.files").fetchall()
+        con.execute("CREATE TEMP TABLE old_runs AS SELECT * FROM lake.lost_runs WITH NO DATA")
+        for table, picks in (("old_runs", old), ("lake.lost_runs", new)):
+            for i in picks:
+                con.execute(
+                    f"INSERT INTO {table} VALUES (?, 'AQM-A', ?, ?, ?)", [content, *runs[i]]
+                )
+        got = {t for (t,) in con.execute(calibrate.CHANGED_RUN_TILES).fetchall()}
+        assert got == {t for (t,) in con.execute(PAIRWISE_RUN_TILES).fetchall()} == want
+
+
 def test_a_sounding_under_a_tile_run_and_a_run_with_no_tile_comes_out_once(env):  # noqa: F811
     # A store not yet recalibrated keeps a run with no tile beside the tile's own runs that
     # cover the same soundings, both across midnight: each sounding still comes out once.
@@ -1604,7 +1653,26 @@ def test_a_stuck_run_holds_through_a_stray_reading(env, tmp_path, monkeypatch, s
     assert env.query("SELECT count(*) FROM lake.lost_runs") == [(1,)]
 
 
-def test_stuck_runs_are_searched_where_a_vessel_holds_only_held_depths(env):  # noqa: F811
+# One read of the tile for both vessels finds the runs a read per vessel does.
+@pytest.mark.parametrize("read", [calibrate.SEARCH_READ, 1])
+def test_vessels_searched_in_one_read_keep_their_own_runs(env, tmp_path, monkeypatch, read):  # noqa: F811
+    monkeypatch.setattr(calibrate, "SEARCH_READ", read)
+    monkeypatch.setattr(calibrate, "FLAT_RELIEF_M", 0)
+    fleet = [
+        *(transit(1 + i, "AQM-T", 5.4, (0, 240), i) for i in range(10)),
+        stuck(20, "AQM-T", 0.8, 20),
+        *(transit(40 + i, "AQM-U", 5.4, (0, 240), 40 + i) for i in range(10)),
+        stuck(50, "AQM-U", 0.8, 60),
+        *(transit(30 + i, "AQM-A", 9.5, (0, 240), 30 + i) for i in range(3)),
+    ]
+    calibrated(env, fleet, reference(tmp_path / "ref.tif", (0, 240)), monkeypatch)
+    runs = env.query("SELECT vessel, tile_id, t_start, t_end FROM lake.lost_runs ORDER BY ALL")
+    assert [(v, t) for v, t, *_ in runs] == [("AQM-T", TILE), ("AQM-U", TILE)]
+    # Each run in its own vessel's file's time.
+    assert all((v == "AQM-T") == (t0 < T0 + timedelta(seconds=40 * 1200)) for v, _, t0, _ in runs)
+
+
+def test_stuck_runs_are_searched_where_a_vessel_holds_only_held_depths(env, monkeypatch):  # noqa: F811
     # Two searched vessels over two tiles: B has medians only in the first, and A only in
     # the second, so each tile is searched for both.
     second = TILE + 1
@@ -1622,8 +1690,16 @@ def test_stuck_runs_are_searched_where_a_vessel_holds_only_held_depths(env):  # 
         con.execute(
             "CREATE TEMP TABLE stuck_vessels AS SELECT 'AQM-A' AS vessel UNION SELECT 'AQM-B'"
         )
-        got = {(t, v) for _, t, v, _ in calibrate.stuck_pairs(con)}
-    assert got == {(t, v) for t in (TILE, second) for v in ("AQM-A", "AQM-B")}
+        reads = [(t, [v for v, _ in vessels]) for _, t, vessels in calibrate.stuck_reads(con)]
+        # A tile is read once for both, unless they're too many soundings for one read.
+        assert reads == [(t, ["AQM-A", "AQM-B"]) for t in (TILE, second)]
+        monkeypatch.setattr(calibrate, "SEARCH_READ", 15)
+        reads = [(t, [v for v, _ in vessels]) for _, t, vessels in calibrate.stuck_reads(con)]
+        assert reads == [(t, [v]) for t in (TILE, second) for v in ("AQM-A", "AQM-B")]
+        monkeypatch.setattr(calibrate, "SEARCH_READ", 10**9)
+        monkeypatch.setattr(calibrate, "SEARCH_VESSELS", 1)
+        reads = [(t, [v for v, _ in vessels]) for _, t, vessels in calibrate.stuck_reads(con)]
+    assert reads == [(t, [v]) for t in (TILE, second) for v in ("AQM-A", "AQM-B")]
 
 
 def test_stuck_run_windows_order_soundings_the_same_every_time():

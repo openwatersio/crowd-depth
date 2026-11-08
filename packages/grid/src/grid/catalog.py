@@ -1,7 +1,9 @@
 """The DuckLake catalog: one writer at a time, a renewed lock, and a conditionally moved pointer."""
 
+import itertools
 import json
 import logging
+import math
 import os
 import socket
 import tempfile
@@ -549,6 +551,14 @@ STORE_SCHEME = f"{HASH_SCHEME}/{LAYOUT}"
 SORTED = {"points": "tile_id, lat, lon", "qc_flags": "tile_id, point_id"}
 TARGET_FILE_SIZE = "256MB"
 ROW_GROUP_ROWS = 122_880
+# Points `compact` sorts and writes in one statement, a range of a partition's tiles or a
+# band of latitude in one, and old points it deletes in one, on COMPACT_THREADS. DuckLake's
+# sorted insert holds each thread's share past DuckDB's limit, and a delete about 18 bytes a
+# row until it commits, then again each time it commits more deletes to the same file. On a
+# partition of 275M, rewritten whole, the sort on 18 threads ran out at 1 GB and peaked at
+# 4.6 GB at 4 GB, and its delete alone peaked at 5.4 GB at 1 GB.
+COMPACT_ROWS = 20_000_000
+COMPACT_THREADS = 4
 
 
 def migrate_layout(con, write=True):
@@ -603,10 +613,41 @@ def migrate_layout(con, write=True):
         raise
 
 
+def compact_ranges(con, cell):
+    """The partition's points in sort order as ranges (first tile, last tile, lowest lat,
+    lat below) of about COMPACT_ROWS: whole tiles, or bands of latitude in a tile with more."""
+    ranges, size = [], 0
+    for tile, n in con.execute(
+        "SELECT tile_id, count(*) FROM lake.points WHERE cell_id = ? GROUP BY 1 ORDER BY 1", [cell]
+    ).fetchall():
+        if n > COMPACT_ROWS:
+            k = math.ceil(n / COMPACT_ROWS)
+            [(cuts,)] = con.execute(
+                "SELECT approx_quantile(lat, ?::FLOAT[]) FROM lake.points WHERE cell_id = ? AND tile_id = ?",
+                [[i / k for i in range(1, k)], cell, tile],
+            ).fetchall()
+            bounds = [-math.inf, *sorted(set(cuts)), math.inf]
+            # shortcut: a latitude shared by more than COMPACT_ROWS can't be cut, so its band
+            # sorts at once (275M on COMPACT_THREADS took 1.43 GB at a 1 GB limit); cut on lon
+            # too if a stationary logger outgrows that
+            if len(bounds) < k + 1:
+                log.warning("tile %d: %d points in %d bands of latitude", tile, n, len(bounds) - 1)
+            ranges += [[tile, tile, lo, hi] for lo, hi in itertools.pairwise(bounds)]
+            size = math.inf
+        elif ranges and size + n <= COMPACT_ROWS:
+            ranges[-1][1] = tile
+            size += n
+        else:
+            ranges.append([tile, tile, -math.inf, math.inf])
+            size = n
+    return ranges
+
+
 def compact(con, publish=None) -> int:
-    """Rewrite each partition's points not yet compacted at LAYOUT into sorted files, one
-    partition per transaction, so a stopped run resumes at the next. Returns how many it
-    rewrote. The old files stay until snapshots expire, RETAIN after the run."""
+    """Rewrite each partition's points not yet compacted at LAYOUT into sorted files
+    (compact_partition), publishing after each. A stopped run resumes at the partition it
+    stopped in, which it rewrites from the start. Returns how many it rewrote. The old files
+    stay until snapshots expire, RETAIN after the run."""
     done = {
         v
         for (v,) in con.execute(
@@ -618,24 +659,64 @@ def compact(con, publish=None) -> int:
         for (c,) in con.execute("SELECT DISTINCT cell_id FROM lake.points ORDER BY 1").fetchall()
         if f"{LAYOUT}:{c}" not in done
     ]
-    for cell in cells:
-        # The rows written now get higher row ids, which tell them from the old ones.
-        [(last,)] = con.execute("SELECT max(rowid) FROM lake.points").fetchall()
-        con.execute("BEGIN")
-        try:
-            con.execute(
-                "INSERT INTO lake.points SELECT * FROM lake.points WHERE cell_id = ?", [cell]
-            )
-            con.execute("DELETE FROM lake.points WHERE cell_id = ? AND rowid <= ?", [cell, last])
-            con.execute("INSERT INTO lake.store_meta VALUES ('compacted', ?)", [f"{LAYOUT}:{cell}"])
-            con.execute("COMMIT")
-        except BaseException:
-            con.execute("ROLLBACK")
-            raise
-        log.info("compacted partition %s", cell)
-        if publish:
-            publish()
+    threads = con.execute("SELECT current_setting('threads')").fetchone()[0]
+    con.execute(f"SET threads = {min(threads, COMPACT_THREADS)}")
+    try:
+        for cell in cells:
+            compact_partition(con, cell)
+            if publish:
+                publish()
+    finally:
+        con.execute(f"SET threads = {threads}")
     return len(cells)
+
+
+def compact_partition(con, cell):
+    """Rewrite one partition's points sorted, a range at a time (compact_ranges), then
+    delete the old ones a batch of whole files at a time, by the span of their row ids; each
+    statement commits alone. Until the last delete the
+    partition holds its points twice, so nothing publishes in between: `compact` publishes
+    after each partition, and a run that stops partway leaves the catalog it last
+    published."""
+    # The rows written now get higher row ids, which tell them from the old ones.
+    [(last,)] = con.execute("SELECT max(rowid) FROM lake.points").fetchall()
+    for lo, hi, south, north in compact_ranges(con, cell):
+        con.execute(
+            """INSERT INTO lake.points SELECT * FROM lake.points WHERE cell_id = $cell
+            AND tile_id BETWEEN $lo AND $hi AND lat >= $south AND lat < $north
+            AND rowid <= $last""",
+            {"cell": cell, "lo": lo, "hi": hi, "south": south, "north": north, "last": last},
+        )
+        log.info("compacted partition %s tiles %d to %d, lat %s to %s", cell, lo, hi, south, north)
+    # Every old row rewritten, or none deleted: a row outside every range would be lost.
+    [(old, new)] = con.execute(
+        """SELECT count(*) FILTER (WHERE rowid <= $last), count(*) FILTER (WHERE rowid > $last)
+        FROM lake.points WHERE cell_id = $cell""",
+        {"cell": cell, "last": last},
+    ).fetchall()
+    if old != new:
+        raise RuntimeError(f"partition {cell}: rewrote {new} of {old} points")
+    # Whole files at a time: DuckLake merges a file's earlier deletes into each new one. Files
+    # whose row ids interleave, as a merged file's can, go in one delete.
+    batches, size = [], 0
+    for lo, hi, n in con.execute(
+        """SELECT min(rowid), max(rowid), count(*) FROM lake.points
+        WHERE cell_id = $cell AND rowid <= $last GROUP BY filename ORDER BY 1""",
+        {"cell": cell, "last": last},
+    ).fetchall():
+        if batches and (lo <= batches[-1][1] or size + n <= COMPACT_ROWS):
+            batches[-1][1] = max(batches[-1][1], hi)
+            size += n
+        else:
+            batches.append([lo, hi])
+            size = n
+    for lo, hi in batches:
+        [(n,)] = con.execute(
+            "DELETE FROM lake.points WHERE cell_id = ? AND rowid BETWEEN ? AND ?", [cell, lo, hi]
+        ).fetchall()
+        log.info("compacted partition %s: deleted %d old points", cell, n)
+    con.execute("INSERT INTO lake.store_meta VALUES ('compacted', ?)", [f"{LAYOUT}:{cell}"])
+    log.info("compacted partition %s", cell)
 
 
 class Session:

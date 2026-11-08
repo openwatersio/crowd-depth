@@ -1,3 +1,5 @@
+import itertools
+
 import pytest
 from test_ingest import ROWS, env, noaa_csv, noaa_key  # noqa: F401  (env is a fixture)
 
@@ -101,6 +103,67 @@ def test_a_store_in_ingest_order_moves_to_the_sorted_layout(env):  # noqa: F811
         env.query('SELECT file_id, "row", tile_id, depth_raw FROM lake.points ORDER BY ALL')
         == before
     )
+
+
+def test_compact_rewrites_a_partition_a_range_at_a_time(env, monkeypatch):  # noqa: F811
+    # Three tiles of 3,000 soundings, each heading north, and one more in the first tile;
+    # each band more than DuckLake inlines.
+    for n, lat in enumerate((34.1, 33.1, 32.1), 1):
+        rows = [(i // 60, -78.1 + i * 1e-5, lat + i * 1e-5, 5.0) for i in range(3000)]
+        env.noaa.put(noaa_key(n), noaa_csv(rows, unique_id=f"AQM-{n}"))
+    env.noaa.put(noaa_key(4), noaa_csv(track(32.2, n=200), unique_id="AQM-4"))
+    env.run("noaa")
+    before = env.query('SELECT file_id, "row", tile_id, depth_raw FROM lake.points ORDER BY ALL')
+    # A tile of more than COMPACT_ROWS is cut into bands of latitude, the others whole.
+    monkeypatch.setattr(catalog, "COMPACT_ROWS", 2000)
+    with open_store(env.store) as con:
+        con.execute("DELETE FROM lake.store_meta WHERE key = 'compacted'")
+        [(cell,)] = con.execute("SELECT DISTINCT cell_id FROM lake.points").fetchall()
+        ranges = catalog.compact_ranges(con, cell)
+        assert catalog.compact(con) == 1
+        assert catalog.compact(con) == 0
+        files = [
+            con.execute(f"SELECT tile_id, lat, lon FROM read_parquet('{f}')").fetchall()
+            for (f,) in con.execute(
+                "SELECT data_file FROM ducklake_list_files('lake', 'points')"
+            ).fetchall()
+        ]
+    assert len(ranges) == 6 and [len({t for t, *_ in f}) for f in files] == [1] * 6
+    # Each file in order, and no two overlap.
+    assert all(f == sorted(f) for f in files)
+    spans = sorted((f[0], f[-1]) for f in files)
+    assert all(a[1] < b[0] for a, b in itertools.pairwise(spans))
+    assert (
+        env.query('SELECT file_id, "row", tile_id, depth_raw FROM lake.points ORDER BY ALL')
+        == before
+    )
+
+
+def test_a_compact_stopped_partway_leaves_the_store_as_it_was(env, monkeypatch):  # noqa: F811
+    for n, lat in enumerate((34.1, 33.1), 1):
+        env.noaa.put(noaa_key(n), noaa_csv(track(lat), unique_id=f"AQM-{n}"))
+    env.run("noaa")
+    query = 'SELECT file_id, "row", tile_id, depth_raw FROM lake.points ORDER BY ALL'
+    before = env.query(query)
+    monkeypatch.setattr(catalog, "COMPACT_ROWS", 1)
+    with open_store(env.store) as con:
+        con.execute("DELETE FROM lake.store_meta WHERE key = 'compacted'")
+    real = catalog.log.info
+
+    def stop(msg, *args):
+        # After the first range is written and committed, before any old point is deleted.
+        if msg.startswith("compacted partition %s tiles"):
+            raise KeyboardInterrupt
+        real(msg, *args)
+
+    monkeypatch.setattr(catalog.log, "info", stop)
+    with pytest.raises(KeyboardInterrupt), open_store(env.store) as con:
+        catalog.compact(con, con.publish)
+    assert env.query(query) == before
+    monkeypatch.setattr(catalog.log, "info", real)
+    with open_store(env.store) as con:
+        assert catalog.compact(con, con.publish) == 1
+    assert env.query(query) == before
 
 
 def test_ingest_writes_points_sorted_by_tile_and_merges_runs_sorted(env):  # noqa: F811
