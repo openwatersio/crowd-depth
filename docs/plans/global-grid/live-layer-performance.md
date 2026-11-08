@@ -450,14 +450,14 @@ What holds the surface back is the 30 s batch, which exists because Freeboard re
 
 ### Recommendation
 
-| Stage | Change                                                                               | Target                                                                     |
-| ----- | ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------- |
-| 3     | The surface worked only where soundings reach; typed arrays                          | Done: a view 40 to 50% faster on the boat's Pi, byte-identical             |
-| 4     | Tiles built ahead in the background, nearest the boat first, at every zoom, and kept | Done: pan and zoom read built tiles, 11 to 39 ms a tile on the boat's Pi   |
-| 5     | The batch at 5 s; the pass drawn as a ribbon until its tiles land                    | Done but for the surface: the ribbon within about 1 s, the surface in 27 s |
-| 6     | A live preview of the surface round the boat, sent with each poll as GeoJSON         | Done: the surface within 1.1–1.4 s at the median, for 2–3% of a core       |
-| —     | Freeboard: `overlay.refresh` with tiles reloads those tiles alone                    | No freeze on dense stores at a 5 s batch                                   |
-| Later | Incremental zoom 14 surfaces (option D)                                              | Only if refresh builds on dense stores prove too slow                      |
+| Stage | Change                                                                               | Target                                                                   |
+| ----- | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------ |
+| 3     | The surface worked only where soundings reach; typed arrays                          | Done: a view 40 to 50% faster on the boat's Pi, byte-identical           |
+| 4     | Tiles built ahead in the background, nearest the boat first, at every zoom, and kept | Done: pan and zoom read built tiles, 11 to 39 ms a tile on the boat's Pi |
+| 5     | The batch at 5 s, chosen by the view                                                 | Done: the surface in 27 s                                                |
+| 6     | A live preview of the surface round the boat, sent with each poll as GeoJSON         | Done: the surface within 1.1–1.4 s at the median, for 2–3% of a core     |
+| —     | Freeboard: `overlay.refresh` with tiles reloads those tiles alone                    | No freeze on dense stores at a 5 s batch                                 |
+| Later | Incremental zoom 14 surfaces (option D)                                              | Only if refresh builds on dense stores prove too slow                    |
 
 Stage 5's batch could go to 5 s at once on stores as light as the boat's. The coordinator chose not to wait for the Freeboard change: the batch goes to 5 s where the view is light, and the plugin chooses it by how much the view holds, so a dense store isn't frozen for 0.6 s every 10 s until Freeboard can reload just the tiles it names.
 
@@ -484,7 +484,7 @@ Stage 4 builds tiles ahead:
 Stage 5 refreshes faster:
 
 - **The batch, by the view.** The runtime sends the host's `map.view`, with each poll of `/live`. The plugin weighs the tiles in view at the zoom a plotter draws, a zoom below the map's in 512-pixel tiles, in memory, kept, or as last built while they're rebuilt. It answers with a batch from 5 s to 30 s, 37.5 ms per KB: Freeboard's freeze, about 0.75 ms per KB of tiles in view at a 6× throttle, is then 2% of the time. Without a view, as on a host without `map`, the runtime keeps 30 s.
-- **The ribbon.** Stage 6's preview takes its place. The provisional source carries a line between consecutive soundings, as wide as a cell, in the depth area a first pass would draw: the shoaler end less a first pass's safety margin, in the tiles' bands at their detail, and the chart's bands below zoom 13. It's drawn below the stored areas, so over water sounded before the stored area shows, which may be shoaler; over new water the ribbon shows until the tiles there refresh. A line is named for its first sounding, negated, and kept while that sounding is stored and not yet refreshed. None is drawn past 200 m, where the tiles draw no area.
+- **The pass, drawn at once.** Stage 6's [live preview](#stage-6-results-the-live-preview) draws the surface along the pass within about 1.5 s, until its tiles land.
 
 Tiles are byte-identical: 16,211 tiles kept by the builder on the boat's store match a fresh build, and 528 tiles, zooms 10 to 15 at both details over the boat's, the real and the synthetic stores, hash the same as `main`'s. `scripts/bench-view.mjs` gives the same bytes and vertices on each, and build times within run-to-run noise.
 
@@ -522,7 +522,7 @@ Sailing at 6 kn, a sounding a second, for 125 s at map zoom 13 and 15, which mat
 
 #### Where a sounding waits
 
-The surface isn't within 10 s, because most of the wait comes before a sounding is written to a cell at all. From stored to the screen takes about 1 s; the ribbon covers the rest on screen, within about a second of the sounding. The writer, at 6 kn and a sounding a second:
+The surface isn't within 10 s, because most of the wait comes before a sounding is written to a cell at all. From stored to the screen takes about 1 s. Stage 6's preview shows the surface within about 1.5 s of the sounding, before it's stored. The writer, at 6 kn and a sounding a second:
 
 - **QC's look-ahead,** 11 soundings, 11 s: the spike and noise checks judge a sounding only once the soundings after it have come.
 - **The pass leaving the cell,** about 10 s: a cell's pass is the median of the soundings within a pixel of it, so it closes only when a judged sounding lands outside the cell's 3 × 3, about 1.5 cells, 30 m, along the track.
