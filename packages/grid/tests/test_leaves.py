@@ -187,7 +187,7 @@ def test_leaves_build_what_whole_tiles_build(env, tmp_path, monkeypatch):  # noq
     path = split / "baseline/partitions.json"
     cut = json.loads(path.read_text())
     good = cut[str(SOUTH)]
-    first, *rest = sorted(good)
+    first = min(good)
     cut[str(SOUTH)] = {
         k: [*v[:4], sum(w[4] for w in good.values()) if k == first else 0, v[5]]
         for k, v in good.items()
