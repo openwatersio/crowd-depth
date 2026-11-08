@@ -19,8 +19,8 @@ Soundings are active soundings, estimated as 0.749 of the archive's rows (the ra
 | total             | 7,295 |                |    1,964M |                    |
 
 - 42 tiles hold 50% of soundings, 180 hold 80%, 396 hold 90% and 2,687 hold 99%. The 10 densest hold 21%, the 100 densest 69%.
-- The densest tiles are Galveston and Houston (29°N 95°W, 67M), the Louisiana coast and Atchafalaya (30°N 92°W, 56M; 29°N 91°W, 52M), Freeport (29°N 96°W, 45M) and the lower Mississippi at Memphis (36°N 90°W, 37M). All of the top 10 are between 29°N and 36°N and 90°W and 96°W, and the US Gulf and Mississippi hold about 40% of the archive. The densest Chesapeake tile (36°N 77°W, 26M active) is not in the top 10.
-- Three tiles hold more than twice Chesapeake's densest. At the pipeline's linear rate, the densest needs about 45 min of cells and surface on one M-series core. Its memory is not measured; Chesapeake's densest tiles already peak at 4.5 GB.
+- The densest tiles are Galveston Bay (29°N 95°W, 67M; 71.6M measured), the Louisiana coast and Atchafalaya (30°N 92°W, 56M; 29°N 91°W, 52M), Houston (29°N 96°W, 45M; 48.3M measured) and the lower Mississippi at Memphis (36°N 90°W, 37M). All of the top 10 are between 29°N and 36°N and 90°W and 96°W, and the US Gulf and Mississippi hold about 40% of the archive. The densest Chesapeake tile (36°N 77°W, 26M) is not in the top 10. The Chesapeake set's 28.0M in it counts only files that touch the bay.
+- The densest holds up to 2.6 times as many as Chesapeake's densest. At the pipeline's linear rate, the densest, at 71.6M measured, needs about 50 min of cells and surface on one M-series core. Its tile jobs' memory is not measured yet ([The Galveston region](#the-galveston-region)).
 
 ## Daily arrivals
 
@@ -39,12 +39,34 @@ Over the last year, 357 folders held 567M active soundings, 1.6M a day on averag
 
 New data lands where the data already is. Every day touches most of the dense tiles, so rebuilding at 1° re-reads about two thirds of the planet for cells and about 84% for surfaces and web tiles, which rebuild the neighbors too. This matches Chesapeake (median 76% for touched tiles).
 
+## The Galveston region
+
+The densest tile and its eight neighbors, from 28°N to 31°N and 96°W to 93°W, ingested from NOAA's archive into a DuckLake store on R2 in November 2026 (main 9337d76). The keys are the 54,121 track-index entries whose lines cross the box. Their files carry 27M soundings outside it, along transits.
+
+| tile  | where                    | active soundings | estimated |
+| ----- | ------------------------ | ---------------: | --------: |
+| 42925 | 29°N 95°W, Galveston Bay |            71.6M |       67M |
+| 42924 | 29°N 96°W, Houston       |            48.3M |       45M |
+| 43286 | 30°N 94°W, Lake Charles  |            40.5M |           |
+| 42926 | 29°N 94°W, Port Arthur   |            32.3M |           |
+| 42564 | 28°N 96°W, Freeport      |            23.2M |           |
+| 42566 | 28°N 94°W                |             5.3M |           |
+| 43285 | 30°N 95°W, Beaumont      |             2.0M |           |
+| 42565 | 28°N 95°W                |             1.9M |           |
+| 43284 | 30°N 96°W                |                0 |           |
+
+- **Density.** Tile 42925 holds 71.6M active soundings, up to 2.6 times Chesapeake's densest (45463, 28.0M from files that touch the bay, so a lower bound for that tile), and 7% more than the track-index estimate. Houston's tile is 7% over its estimate too. Four of the nine tiles hold more than Chesapeake's densest.
+- **Active ratio.** Of the 54,113 files found, 40,866 are active, holding 252.1M of the 329.3M rows: 0.766, against Chesapeake's 0.749, counted the same way, as stored rows before the dedupe that tile jobs apply when they read. The other 13,247 files, 77.2M rows, are superseded: 13,233 copies of a stored file and 14 that later files cover. No file is invalid or withdrawn. The planet estimate's 0.749 is within 2.5% here.
+- **Ingest.** 40,880 new files and 252.1M soundings and 56.5 GB of CSVs downloaded in 5.1 h, at a 5.3 GB anon peak at grid's default 4 GB DuckDB limit (`GRID_MEMORY_LIMIT`), in a Linux cgroup on OrbStack's VM (18 threads). Of the step times in seconds: write to R2 6,789, QC 3,215, parse 2,904, download wait 1,283, dedupe 574, coverage 63, list 54. The steps overlap, and the last publish took most of the rest. Eight keys were not in the bucket. The store is 19.2 GB on R2, 17.3 GB of it points.
+- **Tide.** 2.9 h at a 4.2 GB anon peak, most of it fetching 2,824 CO-OPS gauge months; 52,064 station days in 67 tiles. CO-OPS answered 39 months of gauge 8761955 with HTTP 400; tide skips such a month with a warning, keeps what it had for it, and asks again on every run.
+- **Compact** ran out of memory, and **calibrate** stalled; both are in [backlog.md](backlog.md#3-make-the-daily-rebuild-fit). The tiles' cells, surface and overlay jobs have not run, so their memory is not measured.
+
 ## Method
 
 1. **Track index.** All 787,557 entries of the [track index](noaa-archive.md#layout) (`MapServer/1`), with `NAME`, `FILE_SIZE`, `PROVIDER` and the track line, simplified by the server to 0.002° (`maxAllowableOffset`). The index has no sounding counts. `FILE_SIZE` is the submitted `.tar.gz`.
 2. **Soundings per file.** `FILE_SIZE` times a rate per provider. The rates come from 443 CSVs sampled in proportion to the index by provider and year (at least 2 per provider and year), 2.0M rows in all. The overall rate is 0.029 rows per submitted byte. Rates are tight within a provider: Rosepoint, the largest, has 0.032–0.041 between the 10th and 90th percentile, and SeaKeepers 0.015–0.020. Every sampled entry had a CSV, which puts the share of index entries without one under 0.7% at 95% confidence.
 3. **Soundings per tile.** Each file's soundings are spread along its track line in proportion to the line's length in each tile.
-4. **Active soundings.** The archive's rows times 0.749, Chesapeake's ratio of active soundings to rows. Dedupe, missing-depth sentinels and QC remove the rest.
+4. **Active soundings.** The archive's rows times 0.749, Chesapeake's ratio of active files' stored rows to all rows. The rest are rows of files superseded by an identical or newer submission. The Galveston region's ratio is 0.766 ([below](#the-galveston-region)).
 
 Checks:
 
@@ -54,7 +76,7 @@ Checks:
 ## Not measured
 
 - **Index entries without a CSV.** Every index entry is counted, but some have no CSV in the bucket ([noaa-archive.md](noaa-archive.md#quirks)). The rate is 0 of the 443 sampled entries, 5 of Chesapeake's 24,418, and 0.5% in Fiji, but about 7% in the regions of [#127](https://github.com/openwatersio/crowd-depth/pull/127). The missing entries are mostly small fragments, so they hold a smaller share of soundings than of entries. Where the rate is near 7%, the estimate overstates soundings by up to that much and may add a few sparse tiles; the planet totals are likely high by about 1%.
-- **The active ratio outside Chesapeake.** 0.749 comes from one region. Identical resubmissions, sentinels and QC flags may differ by provider and region.
+- **The active ratio in other regions.** It is 0.749 in Chesapeake and 0.766 around Galveston. Resubmissions may differ by provider and region elsewhere.
 - **Tiles below one sounding.** A track clipping a tile corner credits it a fraction of a sounding. Tiles under one estimated sounding are left out, and none were. A track's simplified line can miss or add a tile at the edges, which matters only for the count of sparse tiles.
 - **Open Waters submissions.** Plugin data from non-IHO waters isn't in NOAA's archive.
 - **Arrivals by collection date.** Folder dates are processing dates, so a day's folder can hold older soundings. This changes which tiles are dirty only where old data arrives late.
