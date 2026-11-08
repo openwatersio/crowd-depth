@@ -20,11 +20,8 @@ test("contour labels sit above deeper soundings and below shoal ones", () => {
   expect(minor.minzoom).toBe(15);
 });
 
-test("the ribbon is drawn below the depth areas, and the soundings' circles only at points", () => {
+test("the soundings' circles are drawn only at points", () => {
   const style = buildStyle({ tiles: "t/{z}/{x}/{y}.pbf", safetyDepth: 3 });
-  const ids = style.layers.map((l) => l.id);
-  // Over water sounded before, the stored area shows, as shoal as it is.
-  expect(ids.indexOf("ribbon")).toBeLessThan(ids.indexOf("depare"));
   const layer = (id: string) =>
     style.layers.find((l) => l.id === id) as { filter?: unknown };
   expect(layer("provisional").filter).toEqual([
@@ -32,9 +29,22 @@ test("the ribbon is drawn below the depth areas, and the soundings' circles only
     ["geometry-type"],
     "Point",
   ]);
-  expect(layer("ribbon").filter).toEqual([
-    "==",
-    ["geometry-type"],
-    "LineString",
-  ]);
+});
+
+test("the preview lies under the tiles, its contours with theirs", () => {
+  const ids = (contours: boolean) =>
+    buildStyle({
+      tiles: "t",
+      safetyDepth: 2,
+      own: { accent: "#000000", shoal: "#000000", tint: "normal", contours },
+    }).layers.map((l) => l.id);
+  const on = ids(true);
+  // Over water sounded before, the stored area shows, as shoal as it is.
+  expect(on.indexOf("preview-depare")).toBeLessThan(on.indexOf("depare"));
+  expect(on.indexOf("depcnt-preview")).toBeGreaterThan(
+    on.indexOf("preview-depare"),
+  );
+  expect(on.indexOf("depcnt-preview")).toBeLessThan(on.indexOf("depare"));
+  expect(ids(false)).toContain("preview-depare");
+  expect(ids(false)).not.toContain("depcnt-preview");
 });

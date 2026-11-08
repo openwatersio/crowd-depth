@@ -20,7 +20,9 @@ import {
 import { EXTENT, Feature, Point, encodeTile } from "./mvt.js";
 import {
   Level,
+  PAD_PX,
   Prepared,
+  Traced,
   band,
   cut,
   isolines,
@@ -226,6 +228,10 @@ interface Source {
  * interpolated; then k × σ off, with σ from the nearest cell widened by its distance.
  * Every depth the blur carries past the interpolated pixels is capped at the shoalest of
  * the interpolated surface and `shoals` in its pixel or beside it.
+ *
+ * Over `span` tiles a side from the tile, as the preview's window is, at the tile's
+ * pixels; and given a `focus`, worked out only within its distance of its positions and
+ * as far again as the blur reaches, which past the distance it gets right.
  */
 export function surface(
   z: number,
@@ -233,18 +239,21 @@ export function surface(
   y: number,
   cells: Cell[],
   shoals: Shoal[] = [],
+  span = 1,
+  focus?: { m: number; at: { lon: number; lat: number }[] },
 ): Raster {
-  const b = tileBounds(z, x, y);
-  const lat = (b.north + b.south) / 2;
-  const n = rasterSize(z, lat);
-  const pm = tileMetres(z, lat) / n;
+  const lat =
+    (tileBounds(z, x, y).north + tileBounds(z, x, y + span - 1).south) / 2;
+  const perTile = rasterSize(z, lat);
+  const n = perTile * span;
+  const pm = tileMetres(z, lat) / perTile;
   // At least as far as a tile is traced past its edges, zoomed out where the margin is
   // less than a pixel or two.
   const halo = Math.max(Math.ceil(MARGIN_M / pm), HALO_MIN_PX);
   const size = n + 2 * halo;
   const at = (lon: number, la: number) => {
     const f = tileFraction(lon, la, z);
-    return { x: (f.x - x) * n + halo, y: (f.y - y) * n + halo };
+    return { x: (f.x - x) * perTile + halo, y: (f.y - y) * perTile + halo };
   };
 
   // One source per pixel: the shoalest cell in it.
@@ -280,6 +289,16 @@ export function surface(
   for (const s of sources)
     sourced[Math.floor(s.y) * size + Math.floor(s.x)] = 1;
   const candidates = dilate(sourced, size, reach);
+  if (focus) {
+    const near = new Uint8Array(size * size);
+    for (const { lon, lat: la } of focus.at) {
+      const p = at(lon, la);
+      if (p.x < 0 || p.y < 0 || p.x >= size || p.y >= size) continue;
+      near[Math.floor(p.y) * size + Math.floor(p.x)] = 1;
+    }
+    const wide = dilate(near, size, Math.ceil((focus.m + 4 * BLUR_M) / pm));
+    for (let i = 0; i < candidates.length; i++) candidates[i] &= wide[i];
+  }
   const search = nearestSearch(sources, size, pm, searchM, MAX_POINTS);
   const nearest = neighbours(MAX_POINTS);
   for (let py = 0; py < size; py++) {
@@ -341,8 +360,8 @@ export function surface(
   const byShoal = new Float32Array(size * size).fill(Infinity);
   for (const s of shoals) {
     const f = tileFraction(s.lon, s.lat, z);
-    const sx = Math.floor((f.x - x) * n + halo);
-    const sy = Math.floor((f.y - y) * n + halo);
+    const sx = Math.floor((f.x - x) * perTile + halo);
+    const sy = Math.floor((f.y - y) * perTile + halo);
     if (sx < 0 || sy < 0 || sx >= size || sy >= size) continue;
     byShoal[sy * size + sx] = Math.min(byShoal[sy * size + sx], s.depth);
   }
@@ -622,6 +641,63 @@ function blur(
   };
 }
 
+/** The depth areas and contours traced from a surface: finely drawn or in the chart's
+ * bands, at `levels`, simplified to within `tolerance` tile units, areas `areaTolerance`. */
+export function areasAndContours(
+  t: Traced,
+  fine: boolean,
+  levels: Level[],
+  tolerance: number,
+  areaTolerance: number,
+) {
+  let shoalest = Infinity;
+  let deepest = -Infinity;
+  t.extent.forEach((e, i) => {
+    if (e < 0) return;
+    shoalest = Math.min(shoalest, t.depth[i], t.wet[i]);
+    deepest = Math.max(deepest, t.depth[i], t.wet[i]);
+  });
+  const DEPARE: Feature[] = [];
+  const edges = fine ? FINE_EDGES : [DRYING_FLOOR_M, ...LEVELS];
+  for (let k = 0; k < edges.length - 1; k++) {
+    const [lo, hi] = [edges[k], edges[k + 1]];
+    // Each edge a few millimetres shoaler than the band's: water at exactly a band's
+    // depth, as water capped at a shoal's, is inside it, not on its edge.
+    if (hi - EDGE_M <= shoalest || lo - EDGE_M > deepest) continue;
+    const polys = polygons(t, band(t, lo - EDGE_M, hi - EDGE_M), areaTolerance);
+    if (polys.length) {
+      DEPARE.push({
+        type: "Polygon",
+        polygons: polys,
+        properties: { DRVAL1: lo, DRVAL2: hi },
+      });
+    }
+  }
+
+  const DEPCNT: Feature[] = [];
+  const traced = isolines(
+    t,
+    levels.filter((l) => l.m >= shoalest && l.m <= deepest).map((l) => l.m),
+    tolerance,
+  );
+  for (const level of levels) {
+    const lines = traced.get(level.m) ?? [];
+    if (lines.length) {
+      DEPCNT.push({
+        type: "LineString",
+        lines,
+        properties: {
+          VALDCO: level.m,
+          QUAPOS: 4,
+          ...(level.unit ? { unit: level.unit } : {}),
+          ...(level.major ? { major: 1 } : {}),
+        },
+      });
+    }
+  }
+  return { DEPARE, DEPCNT };
+}
+
 /** The S-57 layers of one tile: DEPARE, DEPCNT, SOUNDG and M_QUAL. */
 export function buildTile(
   z: number,
@@ -652,55 +728,13 @@ export function buildTile(
   const t = cut(prepared, (x - (a.x << a.k)) * n, (y - (a.y << a.k)) * n, n);
   const fine = detail === "high" && z >= FINE_ZOOM;
   const tolerance = z >= MAX_ZOOM ? SIMPLIFY_MAX_ZOOM_UNITS : SIMPLIFY_UNITS;
-  const areaTolerance = Math.max(1, tolerance * AREA_SHARE);
-  let shoalest = Infinity;
-  let deepest = -Infinity;
-  t.extent.forEach((e, i) => {
-    if (e < 0) return;
-    shoalest = Math.min(shoalest, t.depth[i], t.wet[i]);
-    deepest = Math.max(deepest, t.depth[i], t.wet[i]);
-  });
-  const DEPARE: Feature[] = [];
-  const edges = fine ? FINE_EDGES : [DRYING_FLOOR_M, ...LEVELS];
-  for (let k = 0; k < edges.length - 1; k++) {
-    const [lo, hi] = [edges[k], edges[k + 1]];
-    // Each edge a few millimetres shoaler than the band's: water at exactly a band's
-    // depth, as water capped at a shoal's, is inside it, not on its edge.
-    if (hi - EDGE_M <= shoalest || lo - EDGE_M > deepest) continue;
-    const polys = polygons(t, band(t, lo - EDGE_M, hi - EDGE_M), areaTolerance);
-    if (polys.length) {
-      DEPARE.push({
-        type: "Polygon",
-        polygons: polys,
-        properties: { DRVAL1: lo, DRVAL2: hi },
-      });
-    }
-  }
-
-  const DEPCNT: Feature[] = [];
-  const levels: Level[] = fine
-    ? FINE_CONTOURS
-    : contourLevels(z).map((m) => ({ m }));
-  const traced = isolines(
+  const { DEPARE, DEPCNT } = areasAndContours(
     t,
-    levels.filter((l) => l.m >= shoalest && l.m <= deepest).map((l) => l.m),
+    fine,
+    fine ? FINE_CONTOURS : contourLevels(z).map((m) => ({ m })),
     tolerance,
+    Math.max(1, tolerance * AREA_SHARE),
   );
-  for (const level of levels) {
-    const lines = traced.get(level.m) ?? [];
-    if (lines.length) {
-      DEPCNT.push({
-        type: "LineString",
-        lines,
-        properties: {
-          VALDCO: level.m,
-          QUAPOS: 4,
-          ...(level.unit ? { unit: level.unit } : {}),
-          ...(level.major ? { major: 1 } : {}),
-        },
-      });
-    }
-  }
 
   // The shoalest sounding in each lattice cell: a cell's depth at its centre, or an
   // unconfirmed shoal at its own position.
@@ -824,4 +858,65 @@ export function buildTile(
 
   if (!DEPARE.length && !SOUNDG.length && !M_QUAL.length) return undefined;
   return encodeTile({ DEPARE, DEPCNT, SOUNDG, M_QUAL });
+}
+
+/** The zoom whose tiles are each one of SHARED_ZOOM's pixels: the preview's windows
+ * are squares of them. */
+export const PIXEL_ZOOM = SHARED_ZOOM + Math.log2(rasterSize(SHARED_ZOOM));
+if (rasterSize(PIXEL_ZOOM) !== 1) {
+  throw new Error(
+    `zoom ${PIXEL_ZOOM} tiles aren't zoom ${SHARED_ZOOM}'s pixels`,
+  );
+}
+
+/** The depth areas and contours over `span` pixels a side from a PIXEL_ZOOM tile, in the
+ * window's tile units, as a MAX_ZOOM tile over the same water draws them: from the same
+ * pixels, sampled as finely, simplified as far. */
+export function previewLayers(
+  x: number,
+  y: number,
+  span: number,
+  cells: Cell[],
+  shoals: Shoal[],
+  focus: { m: number; at: { lon: number; lat: number }[] },
+  detail: Detail = "high",
+) {
+  const r = surface(PIXEL_ZOOM, x, y, cells, shoals, span, focus);
+  const top = rasterSize(MAX_ZOOM);
+  const t = cut(prepare(r), 0, 0, r.n, Math.max(1, Math.round(256 / top)));
+  // Only within the focus's distance of its positions, edged as the extent is: about
+  // the distance in samples.
+  const reach = (focus.m / r.pm) * t.u;
+  const near = new Float64Array(t.m * t.m).fill(-reach);
+  for (const { lon, lat } of focus.at) {
+    const f = tileFraction(lon, lat, PIXEL_ZOOM);
+    const cx = (f.x - x + PAD_PX) * t.u;
+    const cy = (f.y - y + PAD_PX) * t.u;
+    const [x0, x1] = [
+      Math.max(0, Math.ceil(cx - reach)),
+      Math.min(t.m - 1, Math.floor(cx + reach)),
+    ];
+    const [y0, y1] = [
+      Math.max(0, Math.ceil(cy - reach)),
+      Math.min(t.m - 1, Math.floor(cy + reach)),
+    ];
+    for (let sy = y0; sy <= y1; sy++) {
+      for (let sx = x0; sx <= x1; sx++) {
+        const i = sy * t.m + sx;
+        const v = reach - Math.hypot(sx + 0.5 - cx, sy + 0.5 - cy);
+        if (v > near[i]) near[i] = v;
+      }
+    }
+  }
+  t.extent = t.extent.map((e, i) => Math.min(e, near[i]));
+  // A MAX_ZOOM tile's tolerances, in its pixels, in the window's units.
+  const scale = top / r.n;
+  const fine = detail === "high";
+  return areasAndContours(
+    t,
+    fine,
+    fine ? FINE_CONTOURS : contourLevels(MAX_ZOOM).map((m) => ({ m })),
+    SIMPLIFY_MAX_ZOOM_UNITS * scale,
+    Math.max(1, SIMPLIFY_MAX_ZOOM_UNITS * AREA_SHARE) * scale,
+  );
 }

@@ -455,6 +455,7 @@ What holds the surface back is the 30 s batch, which exists because Freeboard re
 | 3     | The surface worked only where soundings reach; typed arrays                          | Done: a view 40 to 50% faster on the boat's Pi, byte-identical             |
 | 4     | Tiles built ahead in the background, nearest the boat first, at every zoom, and kept | Done: pan and zoom read built tiles, 11 to 39 ms a tile on the boat's Pi   |
 | 5     | The batch at 5 s; the pass drawn as a ribbon until its tiles land                    | Done but for the surface: the ribbon within about 1 s, the surface in 27 s |
+| 6     | A live preview of the surface round the boat, sent with each poll as GeoJSON         | Done: the surface within 1.1–1.4 s at the median, for 2–3% of a core       |
 | —     | Freeboard: `overlay.refresh` with tiles reloads those tiles alone                    | No freeze on dense stores at a 5 s batch                                   |
 | Later | Incremental zoom 14 surfaces (option D)                                              | Only if refresh builds on dense stores prove too slow                      |
 
@@ -483,7 +484,7 @@ Stage 4 builds tiles ahead:
 Stage 5 refreshes faster:
 
 - **The batch, by the view.** The runtime sends the host's `map.view`, with each poll of `/live`. The plugin weighs the tiles in view at the zoom a plotter draws, a zoom below the map's in 512-pixel tiles, in memory, kept, or as last built while they're rebuilt. It answers with a batch from 5 s to 30 s, 37.5 ms per KB: Freeboard's freeze, about 0.75 ms per KB of tiles in view at a 6× throttle, is then 2% of the time. Without a view, as on a host without `map`, the runtime keeps 30 s.
-- **The ribbon.** The provisional source carries a line between consecutive soundings, as wide as a cell, in the depth area a first pass would draw: the shoaler end less a first pass's safety margin, in the tiles' bands at their detail, and the chart's bands below zoom 13. It's drawn below the stored areas, so over water sounded before the stored area shows, which may be shoaler; over new water the ribbon shows until the tiles there refresh. A line is named for its first sounding, negated, and kept while that sounding is stored and not yet refreshed. None is drawn past 200 m, where the tiles draw no area.
+- **The ribbon.** Stage 6's preview takes its place. The provisional source carries a line between consecutive soundings, as wide as a cell, in the depth area a first pass would draw: the shoaler end less a first pass's safety margin, in the tiles' bands at their detail, and the chart's bands below zoom 13. It's drawn below the stored areas, so over water sounded before the stored area shows, which may be shoaler; over new water the ribbon shows until the tiles there refresh. A line is named for its first sounding, negated, and kept while that sounding is stored and not yet refreshed. None is drawn past 200 m, where the tiles draw no area.
 
 Tiles are byte-identical: 16,211 tiles kept by the builder on the boat's store match a fresh build, and 528 tiles, zooms 10 to 15 at both details over the boat's, the real and the synthetic stores, hash the same as `main`'s. `scripts/bench-view.mjs` gives the same bytes and vertices on each, and build times within run-to-run noise.
 
@@ -550,7 +551,47 @@ Sailing through the synthetic store's busiest water at map zoom 13 on the Pi, fo
 - **Memory.** Building ahead keeps the three tile threads busy for the first 18 minutes after an upgrade or a backfill, and the process's resident memory near 1 GB. On the boat's 8 GB Pi that's room enough; a 1 or 2 GB Pi isn't measured.
 - **The bound.** The kept tiles go oldest-built first, and those built ahead first are nearest where the boat was. On a store past 48 MB of tiles, as the synthetic one at 1,091 tiles, zoom 13 and out round the boat are built ahead and the rest is built when asked for; past 64 MB, plotters' requests push out the tiles round the boat's berth first.
 - **Under way.** 7–10% of a core on the Pi while a plotter watches, against the plan's 5%: a refresh's tiles every 5 s, built ahead, and QC once a sounding. A flush walks about 170 tile ids per changed cell on the server's thread; after a long hold, a backfill's 3 hours of passes flush at once, a few hundred thousand ids, not measured.
-- **The ribbon.** It's a first pass's colour: where the boat's sounded before, the cell's average moves a fifth of the way, and unconfirmed shoals cap the depths. Drawn below the stored areas, it shows only over water the layer hasn't drawn, but over the edge of a stored area it can read deeper than the tile that replaces it. An untided sounding over a tided cell, as when signalk-tides stops, colours its raw depth.
 - **The view's zoom.** The plugin takes the host's zoom as OpenLayers', as Freeboard's is. A host reporting MapLibre's would be weighed a zoom coarser, and batched shorter.
-- **The surface.** The writer's hold, QC's look-ahead and the pass leaving its cell, keeps the surface 27 s behind the boat at the median.
+- **The surface.** The writer's hold, QC's look-ahead and the pass leaving its cell, keeps the tiles' surface 27 s behind the boat at the median. The preview (stage 6) draws it within about 1.3 s meanwhile.
 - **No view.** A host that doesn't report its view gets no tiles built ahead under way, so its refresh builds them, at the 30 s batch. A plotter that pans or zooms out right after a refresh builds the changed tiles it hasn't been shown.
+
+## Stage 6 results: the live preview
+
+The tiles hold a sounding 27 s, by QC's look-ahead and the pass rule, which follow the grid's. The preview draws the surface those soundings will make before then, the way the tiles will draw it:
+
+- **What it draws.** The surface round the boat as the cells would hold it were every sounding held written now. The writer's `pending()` gives the passes held, the passes still open as if closed, and the soundings QC hasn't judged, run through the same pass rule on a copy, with what QC has already rejected left out. These are folded into the stored cells under the window with the cells' own moving average, so where the boat crosses old water the preview shows the average moving, not the pass alone. A test checks that the preview of pending passes equals the preview of the same passes once written.
+- **Where.** Within 100 m of a pending pass or of a cell written in the last 90 s, whose tile may not have refreshed: as far as the surface spreads a lone pass, and where new water meets stored. The window is the square of those positions plus 100 m, on the tiles' own pixel grid: a zoom 21 tile is exactly one of the zoom 14 surface's pixels, so `surface()` takes a window of any size in pixels. At most 56 pixels a side, about a kilometre, about the newest sounding. The surface is searched only within the 100 m and the blur's reach past it, and traced only within the 100 m, so the cost follows the track, not the stored water under it.
+- **How.** The same `surface()`, `prepare()`, `cut()` and tracing as a zoom 15 tile, at the same 4 samples a pixel and the same simplification, as depth areas and contours. Where the data agrees, the preview's contours lie within a metre of the zoom 15 tile's, in a test, and its surface's pixels within 0.05 mm of the tile's. Tiles are byte-identical: 194 tiles at zooms 10 to 15 at both details over the real and boat's stores hash the same as `main`'s.
+- **When.** On a tile thread, an idle one first, when a `/live` poll asks for it with `preview=<rev>`, once a sounding or QC verdict has come in since, at most once a second, and shared by every plotter polling. A poll waits for it up to 1 s, then sends the last. It isn't worked out where the plotter's view doesn't show the window, nor for a runtime that doesn't ask. One worked out across a write of its passes would count them twice, so it's dropped and worked out again. It's empty once nothing is pending and nothing was written in 90 s.
+- **What's sent.** GeoJSON depth areas and contours, with a revision, only when it's changed, and with contours in the unit the runtime asks for. The runtime sets it whole on a `preview` source, which Freeboard redraws without re-keying the tiles. It's drawn below the stored areas: over water sounded before the stored area shows, and over new water the preview shows until the tiles there refresh. Its contours are dashed, from zoom 13.
+- **No ribbon.** The preview reaches the plotter on the same poll as the soundings, for 255 of 255 soundings over the three runs below, so nothing else is drawn along the pass.
+
+### On the boat's Pi
+
+As in stage 4 and 5: the boat's Pi 5, a bench server on a copy of the boat's store, Freeboard-SK 3.4.1 in headless Chromium on the laptop at a 6× CPU throttle, through an SSH tunnel over the local network, since macOS keeps the test browser off the local network. Sailing at 6 kn, a sounding a second, two runs each of 125 s at map zoom 15 on the boat's water, and one of 95 s at map zoom 16 sailing onto new water, `main` and the preview in turn:
+
+| What                                         | `main`           | The preview                     |
+| -------------------------------------------- | ---------------- | ------------------------------- |
+| Sounding to the plotter, as provisional      | 1.1–1.6 s median | 1.2–1.4 s median, 1.6 s at most |
+| Sounding to the surface on screen, new water | 26–27 s median   | 1.2–1.4 s median, 1.6 s at most |
+| Sounding to the tiles' surface               | 26–27 s median   | 25–27 s median                  |
+| GeoJSON per poll that carries the preview    | none             | 18–19 KB median, 31 KB at most  |
+| On new water                                 | none             | 2 KB median, 3 KB at most       |
+| A poll's response                            | 10 ms median     | 41–60 ms median, 0.65 s at most |
+| Frames over 50 ms                            | none             | none                            |
+| The Pi's server process, CPU                 | 7–8% of a core   | 10% of a core                   |
+
+The time to the surface on screen is when the poll carrying it lands, on new water: over water already in a tile the stored areas draw over it, and the change shows when the tile refreshes. It's the same moment as the provisional sounding; Freeboard's drawing of it is in the frames, none over 50 ms, at most 17 ms at the 99th percentile. A poll's response includes waiting for the preview it worked out.
+
+Per thread, the preview takes 2.1–2.2% of a core on the tile thread it runs on, against 3.9–4.3% for the tile thread refreshing tiles. Timed alone on the Pi, `readPreview` for 90 s of track, the last 27 s pending, takes 61 ms at the median over the boat's water, 128 ms at most, and 28 ms over new water, single-threaded; at one a poll every 2 s that's 1.5 to 3% of a core.
+
+### Limits
+
+- **Under way, 10% of a core** with a plotter watching, against `main`'s 7–8%: the preview's 2%, and its garbage.
+- **A held track.** While a backfill holds the writer's passes, up to 3 hours, the preview draws only the kilometre about the boat; further back, the provisional points show the track, and the cells draw it once written.
+- **90 s.** The preview stops drawing a cell 90 s after it's written. At zoom 10 and in, tiles refresh within 30 s; further out they refresh every 5 minutes, so there, from 90 s to 5 minutes, newly written water shows as points, where the preview's window is a few pixels across anyway.
+- **Unjudged soundings.** The preview draws soundings QC hasn't judged yet, as the points do. A spike draws for the 11 s QC takes to judge it, and a wild position as the newest sounding moves the window there meanwhile. A run of one depth, which QC holds until it covers 1 km for the stuck-sounder check, is drawn only for its first 11 soundings, so a frozen sounder draws no further than a spike.
+- **At a berth,** with the sounder on, a sounding a second keeps the preview worked out once a second, about 28 ms on the Pi, 3% of a core; an unchanged one isn't sent again.
+- **First-pass colours.** Where the boat's sounded before, the preview's cell moves a fifth of the way, as the tile's will. An untided sounding over a tided cell, as when signalk-tides stops, is left out, as the tile leaves it.
+- **A host holding an older style,** with no `preview` source, can't take it, so it's sent again each poll until the style reloads, without redoing the tile refresh. An older runtime doesn't ask for it.
+- **Measured** on the boat's store and on new water at 6 kn. Over the synthetic store's busiest water a window took 42 ms at the median and 103 ms at most on the Pi; a faster boat's window reaches the 1 km cap sooner, and a sounder faster than 1 Hz isn't measured.
