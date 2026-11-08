@@ -47,9 +47,9 @@ A daily run rebuilds cells in the touched tiles, and surfaces and web tiles in t
 | Full rebuild, empty space skipped                     |           37 |                    9.5 h |
 | …and the COG's overviews left out                     |           35 |                    8.5 h |
 | Daily at 1°, empty space skipped (30-day range)       |        23–27 |                    6–7 h |
-| Daily with empty space skipped and sub-tile dirtiness |     about 17 |                about 4 h |
+| Daily with empty space skipped and sub-tile dirtiness |     about 18 |              about 4.5 h |
 
-The last row comes from [sub-tile-rebuild.md](sub-tile-rebuild.md): on the Chesapeake a day's new files dirty quadtree leaves holding 38–40% of all soundings, since the busiest harbours are crossed daily by the same vessels, and the overlay and web jobs stay per tile. Days whose tide levels or offsets move dirty more.
+The last row comes from [sub-tile-rebuild.md](sub-tile-rebuild.md): on the Chesapeake a day's leaf jobs read a median 50% of all soundings for cells and 56% for surfaces, since the busiest harbours are crossed daily by the same vessels and each leaf rereads the reach around it, and the overlay and web jobs stay per tile. Days whose tide levels or offsets move dirty more.
 
 The per-sounding cost decides the planet, not the fixed cost. Skipping empty space takes the fixed cost from 18 to 10 worker-hours of a full rebuild, and to about 8 without overviews, while the soundings cost 27. A day's touched tiles and their neighbors hold 79 to 88% of all soundings, so a 1° daily run costs about two thirds of a full rebuild whatever the fixed cost. Sub-tile dirtiness takes about a quarter off a daily run; the per-sounding cost of cells and surfaces, in the harbours crossed daily, decides both what's left and a full rebuild.
 

@@ -990,7 +990,7 @@ def test_interpolated_pixels_widen_with_distance_and_are_marked(env, monkeypatch
     # The corrections' σ, wider with each metre from the nearest track.
     assert CSIG < near < mid
     assert mid == pytest.approx(math.hypot(CSIG, 0.01 * at_pixel(distance, 5006, 30)), abs=1e-4)
-    assert at_pixel(count, 5006, 30) == 0 and at_pixel(distance, 5006, 30) > 40
+    assert at_pixel(count, 5006, 30) == surface.NODATA and at_pixel(distance, 5006, 30) > 40
     assert at_pixel(depth, 5006, 30) == pytest.approx(10.0 - statistic.K * mid, abs=0.05)
     # The overlay marks where the surface is drawn between tracks.
     bands, footprint, surfaced, interpolated, tvu = overlay.surface_bands(path)
@@ -998,7 +998,9 @@ def test_interpolated_pixels_widen_with_distance_and_are_marked(env, monkeypatch
     # The band beside the tracks isn't grown into them, so each track's own strip stays
     # measured.
     assert not interpolated.intersects(shapely.Point(*test_grid.at(5000, 30)))
-    assert tvu == pytest.approx(max(2 + 0.05 * float(depth[count == 0].min()), 1.96 * mid), abs=0.5)
+    assert tvu == pytest.approx(
+        max(2 + 0.05 * float(depth[count == surface.NODATA].min()), 1.96 * mid), abs=0.5
+    )
     got = by_layer(
         overlay.tile_areas(([], [], []), PROPERTIES, bands, footprint, surfaced,
                            (interpolated, overlay.quality(None, None, 0, tvu)))

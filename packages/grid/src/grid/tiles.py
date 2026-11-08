@@ -1,12 +1,14 @@
-"""The per-tile rebuild: cells, surface and overlay per 1° tile, web tiles per z8 tile, then
-the low zooms and one archive, as a Snakemake workflow (the Snakefile beside this module).
+"""The per-tile rebuild: cells and surface per leaf (leaves.py), each spliced into its 1° tile,
+overlay per tile, web tiles per z8 tile, then the low zooms and one archive, as a Snakemake
+workflow (the Snakefile beside this module).
 
 `prepare` is the store-level step before it. It brings the store's QC, offsets and
 `file_tiles` up to date, freezes the catalog the pointer names into the run directory, and
-writes each tile's fingerprint to `fp/{tile}.txt`, rewriting a file only when its
-fingerprint moved. A moved fingerprint is what reruns a tile; a tile whose soundings are all
-withdrawn loses its fingerprint and its outputs, and the neighbors and web tiles that read
-it rerun because their inputs changed.
+writes each tile's fingerprint to `fp/{tile}.txt`, which says which tiles are live and is
+published with them. Then `plan` cuts the tiles into leaves and rewrites the fingerprints
+of the leaves a change reaches, `fp/{tile}/{leaf}.cells` and `.surface`: a rewritten one is
+what reruns a leaf. A tile whose soundings are all withdrawn loses its fingerprints and its
+outputs, and the neighbors and web tiles that read it rerun because their inputs changed.
 
 Each job reads the frozen catalog read-only and works in an in-memory `lake` holding only
 what it writes, so jobs run side by side and never write to the store. Jobs run in children
@@ -32,9 +34,12 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import calibrate, catalog, cells, manifest, overlay, qc, surface
-from .catalog import ACTIVE_POINTS, MIGRATIONS, SCHEMA, open_store
-from .cells import CELL_REASONS
+import duckdb
+import numpy as np
+
+from . import calibrate, catalog, cells, leaves, manifest, overlay, qc, surface
+from .catalog import ACTIVE_POINTS, BASE_ROW, MIGRATIONS, POINT_ID, SCHEMA, open_store
+from .cells import BASE, CELL_REASONS, K_LIST
 from .sources import literal
 
 SNAKEFILE = Path(__file__).with_name("Snakefile")
@@ -66,6 +71,9 @@ MEMORY_MB = {
     "overlay": [(1_000_000, 1536), (None, 2304)],
 }
 WEB_MEMORY_MB = 2048
+# A splice's: it copies a tile's leaves' files into the tile's, DuckDB sorting the rows.
+SPLICE_MEMORY_MB = 1536
+SPLICE_MEMORY_LIMIT = "768MB"
 # GDAL's block cache in each job, in MB.
 GDAL_CACHE_MB = "64"
 # DuckDB threads by soundings: dense tiles set the run's critical path. A surface's
@@ -89,7 +97,10 @@ def code() -> str:
     code, the tools it runs and the libraries it draws with. A change reruns every job."""
     import rasterio
 
-    parts = [Path(f).read_bytes() for f in (__file__, surface.__file__, overlay.__file__)]
+    parts = [
+        Path(f).read_bytes()
+        for f in (__file__, surface.__file__, overlay.__file__, leaves.__file__)
+    ]
     parts.append(SNAKEFILE.read_bytes())
     for cmd in TOOLS:
         try:
@@ -120,16 +131,8 @@ def corner(tile):
     return tile // 360 - 90, tile % 360 - 180
 
 
-def neighbors(tile):
-    """The tile and its eight neighbors, across the antimeridian, short of the poles."""
-    lat0, lon0 = corner(tile)
-    out = []
-    for dy in (-1, 0, 1):
-        for dx in (-1, 0, 1):
-            lat, lon = lat0 + dy, (lon0 + dx + 180) % 360 - 180
-            if -90 <= lat <= 89:
-                out.append((lat + 90) * 360 + lon + 180)
-    return out
+# The tile and its eight neighbors, across the antimeridian, short of the poles.
+neighbors = leaves.neighbors
 
 
 def partition(tile):
@@ -250,6 +253,8 @@ def prepare(store, run: Path) -> dict:
     live = {t: (fp, n) for t, (fp, n) in prints.items() if n}
     moved = [t for t, (fp, _) in sorted(live.items()) if write_if_changed(fp_path(run, t), fp)]
     gone = sorted(int(p.stem) for p in (run / "fp").glob("*.txt") if int(p.stem) not in live)
+    with snapshot(run, "lake") as con:
+        planned = plan(con, run, {t: n for t, (_, n) in live.items()}, key)
     before = web_keys(counts(run))
     write_if_changed(
         run / "tiles.txt", "".join(f"{t}\t{n}\n" for t, (_, n) in sorted(live.items()))
@@ -271,7 +276,7 @@ def prepare(store, run: Path) -> dict:
     if gone or not live:
         for path in ("low.pmtiles", "overlay.pmtiles", "done/low", "done/assemble"):
             (run / path).unlink(missing_ok=True)
-    return {"tiles": len(live), "moved": moved, "gone": gone, "catalog": key}
+    return {"tiles": len(live), "moved": moved, "gone": gone, "catalog": key} | planned
 
 
 def fp_path(run, tile):
@@ -279,12 +284,228 @@ def fp_path(run, tile):
 
 
 def forget(run: Path, tile: int):
-    """Remove a tile's fingerprint and outputs, so nothing of it is read or published."""
+    """Remove a tile's fingerprint and outputs, its leaves' too, so nothing of it is read or
+    published."""
     fp_path(run, tile).unlink(missing_ok=True)
     for pattern in TILE_FILES.values():
         (run / pattern.format(tile)).unlink(missing_ok=True)
     for stage in STAGES:
         (run / "done" / stage / str(tile)).unlink(missing_ok=True)
+    for path in (run / "leaves" / str(tile), run / "fp" / str(tile),
+                 *(run / "done" / s / str(tile) for s in LEAF_STAGES)):  # fmt: skip
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def forget_leaf(run: Path, tile: int, leaf: str):
+    """Remove a leaf a split or merge did away with: its fingerprints and outputs."""
+    shutil.rmtree(leaf_dir(run, tile, leaf), ignore_errors=True)
+    for stage in LEAF_STAGES:
+        (run / "fp" / str(tile) / f"{leaf}.{stage.removeprefix('leaf_')}").unlink(missing_ok=True)
+        (run / "done" / stage / str(tile) / leaf).unlink(missing_ok=True)
+
+
+# Leaves ---------------------------------------------------------------------------------------
+
+
+LEAF_STAGES = ("leaf_cells", "leaf_surface")
+# What a run kept of the last one's inputs, to find what moved since.
+BASELINE = "baseline"
+
+
+def leaf_dir(run: Path, tile: int, leaf: str) -> Path:
+    return run / "leaves" / str(tile) / leaf
+
+
+def partitions(run: Path) -> dict[int, dict[str, list[int]]]:
+    """{tile: {quadkey: [first row, end row, first column, end column (in steps), active
+    soundings, soundings within its surface's reach]}} for the run's tiles."""
+    path = run / BASELINE / "partitions.json"
+    if not path.exists():
+        return {}
+    return {int(t): leaves_ for t, leaves_ in json.loads(path.read_text()).items()}
+
+
+# A point's base column in its tile, as cells number it.
+COLUMN = (
+    f"least(floor((p.lon - (p.tile_id % 360 - 180)) * {BASE} / {K_LIST}[p.tile_id // 360 - 90 + 91])"
+    f"::INTEGER, {BASE} // {K_LIST}[p.tile_id // 360 - 90 + 91] - 1)"
+)
+
+
+def step_counts(con, tiles) -> dict[int, np.ndarray]:
+    """{tile: active soundings per step} for `tiles`, before dedupe, as tiles.txt counts them."""
+    if not tiles:
+        return {}
+    parts = ",".join(map(str, sorted({partition(t) for t in tiles})))
+    got = con.execute(
+        f"""SELECT p.tile_id, {BASE_ROW} // {leaves.STEP} AS sr, {COLUMN} // {leaves.STEP} AS sc,
+          count(*) AS n
+        FROM lake.points p JOIN lake.files f USING (file_id)
+        WHERE f.status = 'active' AND p.cell_id IN ({parts}) AND list_contains($tiles, p.tile_id)
+        GROUP BY ALL""",
+        {"tiles": list(tiles)},
+    ).fetchnumpy()
+    out = {}
+    for t in tiles:
+        rows, cols = leaves.shape(t)
+        if cols is None:
+            continue
+        at = got["tile_id"] == t
+        grid = np.zeros((rows, cols), dtype=np.int64)
+        np.add.at(grid, (got["sr"][at], got["sc"][at]), got["n"][at])
+        out[t] = grid
+    return out
+
+
+def plan(con, run: Path, live: dict[int, int], key) -> dict:
+    """Cut the live tiles (`{tile: active soundings}`) into leaves, and mark dirty the leaves
+    a change since the last run lands within reach of, by rewriting their fingerprints,
+    fp/{tile}/{leaf}.cells and .surface, with this run's catalog key and time.
+
+    A change is a file whose part of a tile's fingerprint moved (manifest.FILE_PARTS),
+    placed by the steps its soundings in that tile fall in, in any tile, or a tide cell that
+    came, went or changed station. A change to the constants every tile is built with or the
+    leaves' bounds, or a missing baseline, dirties every leaf, and a leaf not in the last
+    partition is dirty. A tile is cut again where its own files changed or its leaves'
+    counts no longer add up to its own. The baseline is written last, so a prepare that stops partway marks the same
+    leaves again."""
+    base = run / BASELINE
+    base.mkdir(exist_ok=True)
+    files, cells_, consts = (
+        base / "files.parquet",
+        base / "tide_cells.parquet",
+        base / "constants.txt",
+    )
+    # The leaves' bounds too: a partition cut under others is cut again.
+    # And the parts' SQL and DuckDB's version, whose hash() may change: every part moved
+    # would place every file's soundings.
+    built_with = "/".join(
+        [manifest.constants(), *map(str, (leaves.SPLIT, leaves.LEAF, leaves.MIN_STEPS)),
+         hashlib.sha256((manifest.FILE_PARTS + manifest.CELL_PARTS).encode()).hexdigest()[:16],
+         duckdb.__version__]
+    )  # fmt: skip
+    whole = not (files.exists() and cells_.exists() and consts.exists()) or (
+        consts.read_text() != built_with
+    )
+    old = partitions(run)
+    con.execute(
+        f"CREATE OR REPLACE TEMP TABLE file_parts AS SELECT tile_id, file_id, h FROM ({manifest.FILE_PARTS})"
+    )
+    con.execute(f"CREATE OR REPLACE TEMP TABLE cell_parts AS {manifest.CELL_PARTS}")
+    boxes, owners, tiles_ = [], [], []
+    if not whole:
+        # Every tile's, gone ones too: a withdrawn neighbor's soundings reach a surface.
+        con.execute(
+            """CREATE OR REPLACE TEMP TABLE changed AS SELECT DISTINCT tile_id, file_id FROM (
+              (FROM file_parts EXCEPT FROM read_parquet($path))
+              UNION ALL (FROM read_parquet($path) EXCEPT FROM file_parts))""",
+            {"path": str(files)},
+        )
+        tiles_ = [t for (t,) in con.execute("SELECT DISTINCT tile_id FROM changed").fetchall()]
+        if tiles_:
+            parts = ",".join(map(str, sorted({partition(t) for t in tiles_})))
+            got = con.execute(
+                f"""SELECT c.tile_id, s.sr, s.sc FROM changed c LEFT JOIN (
+                  SELECT DISTINCT p.tile_id, p.file_id, {BASE_ROW} // {leaves.STEP} AS sr,
+                    {COLUMN} // {leaves.STEP} AS sc
+                  FROM lake.points p JOIN changed c USING (tile_id, file_id)
+                  WHERE p.cell_id IN ({parts})
+                ) s USING (tile_id, file_id)"""
+            ).fetchnumpy()
+            placed = ~np.ma.getmaskarray(np.ma.asarray(got["sr"]))
+            t = np.asarray(got["tile_id"], dtype=np.int64)
+            boxes.append(
+                leaves.step_boxes(
+                    t[placed],
+                    np.ma.filled(got["sr"], 0)[placed],
+                    np.ma.filled(got["sc"], 0)[placed],
+                )
+            )
+            owners.append(t[placed])
+            # A file whose soundings left the store: the whole tile it was in.
+            gone_from = np.unique(t[~placed])
+            s, w = gone_from // 360 - 90, gone_from % 360 - 180
+            boxes.append(np.column_stack([s, s + 1, w, w + 1]).astype(np.float64))
+            owners.append(gone_from)
+        moved_cells = con.execute(
+            """SELECT DISTINCT tile_id, tide_cell FROM (
+              (FROM cell_parts EXCEPT FROM read_parquet($path))
+              UNION ALL (FROM read_parquet($path) EXCEPT FROM cell_parts))""",
+            {"path": str(cells_)},
+        ).fetchnumpy()
+        # A tide cell is 1/50° (tide.TIDE_CELL).
+        s = (np.asarray(moved_cells["tide_cell"]) // 18000) / 50 - 90
+        w = (np.asarray(moved_cells["tide_cell"]) % 18000) / 50 - 180
+        boxes.append(np.column_stack([s, s + 1 / 50, w, w + 1 / 50]))
+        owners.append(np.asarray(moved_cells["tile_id"]))
+    dense = [
+        t for t, n in live.items() if n > leaves.SPLIT or len(old.get(t, {leaves.ROOT: 0})) > 1
+    ]
+    # Counted again where its own files changed, which can move soundings between its leaves
+    # and leave its total as it was, or where its leaves' counts no longer add up to it.
+    touched = set(tiles_)
+    counts = step_counts(
+        con,
+        [
+            t
+            for t in dense
+            if whole or t in touched or sum(v[4] for v in old.get(t, {}).values()) != live[t]
+        ],
+    )
+    new = {}
+    for t, n in sorted(live.items()):
+        if t not in counts and t in old and t in dense:
+            new[t] = old[t]
+            continue
+        cut = leaves.partition(t, counts.get(t), old.get(t))
+        if t not in counts:
+            new[t] = {k: [*box, n, n] for k, box in cut.items()}
+            continue
+        grid = counts[t]
+        pr, pc = (math.ceil(x / leaves.STEP) for x in leaves.reach(t, "surface"))
+        new[t] = {}
+        for k, (r0, r1, c0, c1) in cut.items():
+            ar, ac = max(r0 - pr, 0), max(c0 - pc, 0)
+            read = grid[ar : r1 + pr, ac : c1 + pc].sum()
+            new[t][k] = [r0, r1, c0, c1, int(grid[r0:r1, c0:c1].sum()), int(read)]
+    for t in old.keys() & new.keys():
+        for k in old[t].keys() - new[t].keys():
+            forget_leaf(run, t, k)
+    # Leaves of a tile no longer live, which an older build may have left behind.
+    for d in ("leaves", "fp"):
+        for path in (run / d).glob("[0-9]*"):
+            if path.is_dir() and int(path.name) not in live:
+                forget(run, int(path.name))
+    every = {t: list(ls) for t, ls in new.items()}
+    boxed = {t: {k: v[:4] for k, v in ls.items()} for t, ls in new.items()}
+    changes = np.concatenate(boxes) if boxes else np.empty((0, 4))
+    owned = np.concatenate(owners) if owners else np.empty(0, dtype=np.int64)
+    # Each step once, however many changed files sounded it.
+    both = np.unique(np.column_stack([changes, owned]), axis=0)
+    changes, owned = both[:, :4], both[:, 4].astype(np.int64)
+    # Unique to this prepare, so every leaf it marks is rewritten, whatever the catalog key.
+    stamp = f"{key} {time.time_ns()}\n"
+    marked = {}
+    for stage in ("cells", "surface"):
+        hit = every if whole else leaves.dirty(boxed, changes, stage, owned)
+        for t, keys in new.items():
+            for k in keys:
+                path = run / "fp" / str(t) / f"{k}.{stage}"
+                if k in hit.get(t, ()) or k not in old.get(t, {}) or not path.exists():
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    if write_if_changed(path, stamp):
+                        marked[stage] = marked.get(stage, 0) + 1
+    tmp = base / "partitions.json.tmp"
+    tmp.write_text(json.dumps({str(t): ls for t, ls in new.items()}))
+    tmp.replace(base / "partitions.json")
+    for table, path in (("file_parts", files), ("cell_parts", cells_)):
+        export(con, f"FROM {table}", path)
+    write_if_changed(consts, built_with)
+    return {
+        "leaves": sum(map(len, new.values())),
+        "dirty_cells": marked.get("cells", 0),
+        "dirty_surface": marked.get("surface", 0),
+    }
 
 
 # Jobs -----------------------------------------------------------------------------------------
@@ -327,10 +548,10 @@ def snapshot(run: Path, alias="store", threads=1, memory_limit=None):
 
 
 @contextlib.contextmanager
-def open_job(run: Path, tiles: list[int], threads=1, memory_limit=JOB_MEMORY_LIMIT):
+def open_job(run: Path, tiles: list[int], threads=1, memory_limit=JOB_MEMORY_LIMIT, box=None):
     """A connection whose `lake` holds the frozen catalog's tables as views, points limited
-    to `tiles`, track QC's flags for them copied in, and empty tables for what the job
-    writes."""
+    to `tiles`, and to `box` (SQL on lat and lon) if given, track QC's flags for them copied
+    in, and empty tables for what the job writes."""
     with snapshot(run, threads=threads, memory_limit=memory_limit) as con:
         tables = [
             t
@@ -345,27 +566,36 @@ def open_job(run: Path, tiles: list[int], threads=1, memory_limit=JOB_MEMORY_LIM
             if t in WRITTEN:
                 continue
             con.execute(f"DROP TABLE lake.{t}")
-            only = f" WHERE {where}" if t == "points" else ""
+            only = f" WHERE {where}" + (f" AND {box}" if box else "") if t == "points" else ""
             con.execute(f"CREATE VIEW lake.{t} AS SELECT * FROM store.{t}{only}")
         con.execute("INSERT INTO lake.store_meta SELECT * FROM store.store_meta")
         # Track QC's flags; cell-level ones are the cells jobs', read from their outputs.
         con.execute(
             f"""INSERT INTO lake.qc_flags SELECT * FROM store.qc_flags
-            WHERE {where} AND NOT list_contains({CELL_REASONS}, reason)"""
+            WHERE {where} AND NOT list_contains({CELL_REASONS}, reason){boxed(box)}"""
         )
         con.execute(ACTIVE_POINTS)
         yield con
 
 
-def load(con, run: Path, tiles, kinds):
-    """Insert the tiles' outputs of `kinds` (cells, shoals, flags) into `lake`."""
+def boxed(box) -> str:
+    """SQL keeping only the flags of points in `lake.points`, when a box limits them: a
+    leaf's job reads no other point's."""
+    return f" AND point_id IN (SELECT {POINT_ID} FROM lake.points p)" if box else ""
+
+
+def load(con, run: Path, tiles, kinds, box=None):
+    """Insert the tiles' outputs of `kinds` (cells, shoals, flags) into `lake`; with `box`,
+    only the flags of the points in it."""
     for t in tiles:
         for kind in kinds:
             f = run / TILE_FILES[kind].format(t)
             if f.exists():
                 table = "qc_flags" if kind == "flags" else kind
+                only = f" WHERE true{boxed(box)}" if kind == "flags" else ""
                 con.execute(
-                    f"INSERT INTO lake.{table} BY NAME SELECT * FROM read_parquet(?)", [str(f)]
+                    f"INSERT INTO lake.{table} BY NAME SELECT * FROM read_parquet(?){only}",
+                    [str(f)],
                 )
 
 
@@ -391,26 +621,91 @@ def export(con, query, path: Path):
     tmp.replace(path)
 
 
-def do_cells(run: Path, tile: int, threads):
-    with open_job(run, [tile], threads, CELLS_MEMORY_LIMIT) as con:
+def leaf_of(run: Path, key: str):
+    """(tile, quadkey, its box in steps) of a leaf job's key, TILE/QUADKEY."""
+    tile, leaf = key.split("/")
+    return int(tile), leaf, partitions(run)[int(tile)][leaf][:4]
+
+
+def within(tile, box, stage):
+    """SQL on lat and lon for the points within `stage`'s reach of a leaf's box."""
+    s, n, w, e = leaves.degrees(tile, box, leaves.reach(tile, stage))
+    # Past the antimeridian, a turn round: a neighbor's longitudes there are a turn away.
+    lon = f"lon >= {w!r} AND lon < {e!r}"
+    if w < -180:
+        lon = f"{lon} OR lon >= {w + 360!r}"
+    if e > 180:
+        lon = f"{lon} OR lon < {e - 360!r}"
+    return f"lat >= {s!r} AND lat < {n!r} AND ({lon})"
+
+
+# A leaf's cells, shoals and cell-level flags: what the leaf owns of them, its own rows and
+# columns, by each cell's corner, shoal's position and flagged sounding's.
+LEAF_KINDS = {
+    "cells": ('SELECT * FROM lake.cells WHERE tile_id = $tile AND "row" * level BETWEEN $r0 AND $r1'
+              ' AND col * level BETWEEN $c0 AND $c1 ORDER BY level, "row", col'),
+    "shoals": (f'SELECT * FROM lake.shoals p WHERE p.tile_id = $tile AND p."row" BETWEEN $r0 AND $r1'
+               f' AND {COLUMN} BETWEEN $c0 AND $c1 ORDER BY "row", lon, lat'),
+    "flags": (f"""SELECT * FROM lake.qc_flags WHERE tile_id = $tile
+              AND list_contains({CELL_REASONS}, reason) AND point_id IN (
+                SELECT {POINT_ID} FROM lake.points p WHERE p.tile_id = $tile
+                  AND {BASE_ROW} BETWEEN $r0 AND $r1 AND {COLUMN} BETWEEN $c0 AND $c1)
+              ORDER BY point_id, flag, reason"""),
+}  # fmt: skip
+
+
+def do_leaf_cells(run: Path, key: str, threads):
+    """A leaf's cells, shoals and cell-level flags, built from the points within the cells'
+    reach of it, into leaves/{tile}/{quadkey}/. A tile of one leaf is built whole."""
+    tile, leaf, box = leaf_of(run, key)
+    whole = leaf == leaves.ROOT
+    out = leaf_dir(run, tile, leaf)
+    with open_job(
+        run, [tile], threads, CELLS_MEMORY_LIMIT, box=None if whole else within(tile, box, "cells")
+    ) as con:
         if con.execute("SELECT count(*) FROM lake.points").fetchone()[0]:
             cells.build(con, [tile])
-        export(
-            con,
-            f'SELECT * FROM lake.cells WHERE tile_id = {tile} ORDER BY level, "row", col',
-            run / TILE_FILES["cells"].format(tile),
-        )
-        export(
-            con,
-            f'SELECT * FROM lake.shoals WHERE tile_id = {tile} ORDER BY "row", lon, lat',
-            run / TILE_FILES["shoals"].format(tile),
-        )
-        export(
-            con,
-            f"""SELECT * FROM lake.qc_flags WHERE tile_id = {tile}
-            AND list_contains({CELL_REASONS}, reason) ORDER BY point_id, flag, reason""",
-            run / TILE_FILES["flags"].format(tile),
-        )
+        # The leaf's base rows and columns, inclusive.
+        r0, r1, c0, c1 = (b * leaves.STEP - (i % 2) for i, b in enumerate(box))
+        if whole:
+            r0 = c0 = 0
+            r1 = c1 = 2**31 - 1
+        for kind, query in LEAF_KINDS.items():
+            params = {"tile": tile, "r0": r0, "r1": r1, "c0": c0, "c1": c1}
+            used = {k: v for k, v in params.items() if f"${k}" in query}
+            path = out / f"{kind}.parquet"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            con.execute(f"COPY ({query}) TO {literal(str(tmp))} (FORMAT parquet)", used)
+            tmp.replace(path)
+
+
+def splice_files(run: Path, tile: int, threads):
+    """The tile's cells, shoals and flags files, from its leaves': copied from a tile of
+    one leaf, which a whole-tile build writes the same."""
+    keys = sorted(partitions(run)[tile])
+    orders = {"cells": 'level, "row", col', "shoals": '"row", lon, lat',
+              "flags": "point_id, flag, reason"}  # fmt: skip
+    con = None
+    with contextlib.ExitStack() as stack:
+        for kind, order in orders.items():
+            path = run / TILE_FILES[kind].format(tile)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            parts = [leaf_dir(run, tile, k) / f"{kind}.parquet" for k in keys]
+            if len(parts) == 1:
+                tmp = path.with_name(path.name + ".tmp")
+                shutil.copyfile(parts[0], tmp)
+                tmp.replace(path)
+                continue
+            if con is None:
+                con = stack.enter_context(scratch(run, threads, SPLICE_MEMORY_LIMIT))
+            listed = ", ".join(literal(str(p)) for p in parts)
+            export(con, f"SELECT * FROM read_parquet([{listed}]) ORDER BY {order}", path)
+
+
+def do_cells(run: Path, tile: int, threads):
+    """A tile's cells, shoals and flags spliced from its leaves'."""
+    splice_files(run, tile, threads)
 
 
 def has_cells(con, run: Path, tile: int) -> bool:
@@ -421,19 +716,74 @@ def has_cells(con, run: Path, tile: int) -> bool:
     )
 
 
-def do_surface(run: Path, tile: int, threads):
-    """A tile's surface from its and its neighbors' points; none for a tile with no cells,
-    as `overlay.areas` builds none."""
+def do_leaf_surface(run: Path, key: str, threads):
+    """A leaf's surface from its and its neighbors' points within the surface's reach of it,
+    into leaves/{tile}/{quadkey}/surface.tif: a tile's raster, of which only the leaf's own
+    pixels are its; none for a tile with no cells, as `overlay.areas` builds none."""
+    tile, leaf, box = leaf_of(run, key)
     around = neighbors(tile)
-    path = run / TILE_FILES["surface"].format(tile)
+    out = leaf_dir(run, tile, leaf)
+    path = out / "surface.tif"
+    # What it was last built from: its fingerprint, the code, which Snakemake reruns on, and
+    # whether its tile has cells, which a change out of its reach can turn.
+    cells_file = run / TILE_FILES["cells"].format(tile)
+    # A connection of its own: the module's default one may be the warm worker's, from before
+    # the fork, and hangs.
+    with duckdb.connect() as con:
+        has = cells_file.exists() and has_cells(con, run, tile)
+    stamp = f"{(run / 'fp' / str(tile) / f'{leaf}.surface').read_text()}{code()} {has}"
+    built = out / "surface.fp"
+    if built.exists() and built.read_text() == stamp:
+        return "unchanged"
+    built.unlink(missing_ok=True)
     path.unlink(missing_ok=True)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open_job(run, around, threads) as con:
-        load(con, run, around, kinds=("flags",))
-        got = has_cells(con, run, tile) and surface.tile_entries(con, tile, partition(tile))
+    out.mkdir(parents=True, exist_ok=True)
+    near = None if leaf == leaves.ROOT else within(tile, box, "surface")
+    with open_job(run, around, threads, box=near) as con:
+        load(con, run, around, kinds=("flags",), box=near)
+        got = has_cells(con, run, tile) and surface.tile_entries(
+            con, tile, partition(tile), alone=near is None
+        )
     # Gridded with the job's DuckDB closed, so what it held is free for the rasters.
     if got:
-        surface.grid_tile(tile, got, path.parent)
+        surface.grid_tile(tile, got, out).replace(path)
+    built.write_text(stamp)
+
+
+def do_surface(run: Path, tile: int, threads):
+    """A tile's surface spliced from its leaves': each leaf's own pixels, copied into one
+    raster, whose blocks no leaf wrote into are left out. A tile of one leaf is copied."""
+    import rasterio
+    import rasterio.shutil
+    from rasterio.windows import Window
+
+    split = partitions(run)[tile]
+    path = run / TILE_FILES["surface"].format(tile)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    made = {k: f for k in sorted(split) if (f := leaf_dir(run, tile, k) / "surface.tif").exists()}
+    if not made:
+        path.unlink(missing_ok=True)
+        return
+    tmp = path.with_name(path.name + ".tmp")
+    if list(split) == [leaves.ROOT]:
+        shutil.copyfile(made[leaves.ROOT], tmp)
+        tmp.replace(path)
+        return
+    lat0, lon0, _, cols, *_ = surface.geometry(tile)
+    # Pixels a step.
+    px = leaves.STEP // surface.PIXEL_BASE
+    with tempfile.TemporaryDirectory(dir=os.environ.get("GRID_TEMP_DIR") or None) as scratch_:
+        sparse = Path(scratch_) / "sparse.tif"
+        with surface.open_sparse(sparse, lon0, lat0, (surface.ROWS, cols)) as dst:
+            for k, f in made.items():
+                r0, r1, c0, c1 = split[k][:4]
+                window = Window(c0 * px, surface.ROWS - r1 * px, (c1 - c0) * px, (r1 - r0) * px)
+                with rasterio.open(f) as src:
+                    data = src.read(window=window)
+                if (data != surface.NODATA).any():
+                    dst.write(data, window=window)
+        rasterio.shutil.copy(sparse, tmp, driver="COG", compress="deflate", sparse_ok=True)
+    tmp.replace(path)
 
 
 def do_overlay(run: Path, tile: int, threads):
@@ -748,7 +1098,14 @@ def do_assemble(run: Path, threads):
     tmp.replace(run / "overlay.pmtiles")
 
 
-PER_KEY = {"cells": do_cells, "surface": do_surface, "overlay": do_overlay, "web": do_web}
+PER_KEY = {
+    "leaf_cells": do_leaf_cells,
+    "cells": do_cells,
+    "leaf_surface": do_leaf_surface,
+    "surface": do_surface,
+    "overlay": do_overlay,
+    "web": do_web,
+}
 WHOLE = {"low": do_low, "assemble": do_assemble}
 
 
@@ -762,10 +1119,12 @@ def job(argv):
     os.environ["GDAL_CACHEMAX"] = os.environ.get("GDAL_CACHEMAX") or GDAL_CACHE_MB
     started = time.time()
     if stage in PER_KEY:
-        for k in keys:
-            PER_KEY[stage](run, k if stage == "web" else int(k), threads)
+        results = [
+            PER_KEY[stage](run, k if stage in ("web", *LEAF_STAGES) else int(k), threads)
+            for k in keys
+        ]
     else:
-        WHOLE[stage](run, threads)
+        results = [WHOLE[stage](run, threads)]
     # ru_maxrss is in bytes on macOS and in KB on Linux.
     unit = 2**20 if sys.platform == "darwin" else 2**10
     record = {
@@ -776,6 +1135,8 @@ def job(argv):
         # gdal_grid, potrace and tippecanoe.
         "tools_maxrss_mb": round(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / unit),
     }
+    if results and all(r == "unchanged" for r in results):
+        record["unchanged"] = True
     with open(run / "jobs.jsonl", "a") as f:
         f.write(json.dumps(record) + "\n")
 

@@ -24,7 +24,7 @@ from .qc import HAZARD_M, MAX_DEPTH_M, QC_VERSION, SHALLOW_M, TRACK_REASONS
 
 log = logging.getLogger(__name__)
 
-GRID_VERSION = 11
+GRID_VERSION = 12
 BATCH_POINTS = 5_000_000
 BASE = CELLS["rows_per_degree"]  # base rows per 1° tile
 MIN_VESSELS = 2

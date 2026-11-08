@@ -60,10 +60,12 @@ if a.nearest_px or a.ties:
     # Within 25 pixels a grid point has at most 24 others at one distance (at 325 px²).
     TIES = 32
 
-    def nearest(x, y, values, bound=a.nearest_px or np.inf, k=TIES if a.ties else 1):
+    def nearest(
+        x, y, values, default=np.nan, bound=a.nearest_px or np.inf, k=TIES if a.ties else 1
+    ):
         have = ~np.isnan(values)
         if not have.any():
-            return lambda qx, qy: np.full(len(qx), np.nan)
+            return lambda qx, qy: np.full(len(qx), default)
         tree = cKDTree(np.stack([x[have], y[have]], axis=1))
         taken = np.append(values[have], np.nan)
 

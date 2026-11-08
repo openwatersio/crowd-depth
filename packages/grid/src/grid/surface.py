@@ -224,19 +224,24 @@ def geometry(tile_id):
     return lat0, lon0, k, cols, scale_x, scale_y
 
 
-def tile_entries(con, tile_id: int, partition: int):
+def tile_entries(con, tile_id: int, partition: int, alone=True):
     """What gridding a tile reads from the store: its entries and per-pixel counts, and
-    its neighbors' entries within the search radius; None when it has no soundings. The
-    rest needs no connection, so a job can close its own first: what DuckDB holds then
-    goes back before the rasters are made."""
+    its neighbors' entries within the search radius; None when it has no soundings, or
+    with `alone` false, when its neighbors have none either: a leaf of a tile with
+    soundings draws the band beside a neighbor's track with none of its own. The rest
+    needs no connection, so a job can close its own first: what DuckDB holds then goes
+    back before the rasters are made."""
     lat0, lon0, k, cols, scale_x, scale_y = geometry(tile_id)
     params = {"partition": partition, "tile": tile_id, "lat0": lat0, "lon0": lon0, "k": k,
               "rlo": 0, "rhi": BASE, "pylo": -ROWS, "pyhi": 2 * ROWS, "pxlo": -cols,
               "pxhi": 2 * cols}  # fmt: skip
     own, counted = entries(con, params)
-    if not len(counted["py"]):
+    if alone and not len(counted["py"]):
         return None
-    return own, counted, margin(con, lat0, lon0, k, cols, scale_x, scale_y)
+    around = margin(con, lat0, lon0, k, cols, scale_x, scale_y)
+    if not len(counted["py"]) and not len(around[0]):
+        return None
+    return own, counted, around
 
 
 def grid_tile(tile_id: int, got, out: Path):
@@ -369,8 +374,11 @@ def grid_tile(tile_id: int, got, out: Path):
                 distance[depth == NODATA] = NODATA
                 sigma[depth == NODATA] = NODATA
                 near_px = np.where(depth == NODATA, NODATA, only_near.pop(key)).astype(np.float32)
+                # No soundings is no data, as a block left out reads: a leaf's splice writes
+                # only the blocks it has data in (tiles.do_surface).
+                counted = np.where(count[inner] > 0, count[inner], NODATA)
                 dst.write(
-                    np.stack([depth, distance, count[inner], sigma, near_px]),
+                    np.stack([depth, distance, counted, sigma, near_px]),
                     window=Window(c0, r0, c1 - c0, r1 - r0),
                 )
         rasterio.shutil.copy(sparse, path, driver="COG", compress="deflate", sparse_ok=True)

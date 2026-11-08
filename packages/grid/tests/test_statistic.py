@@ -130,3 +130,28 @@ def test_smoothing_in_bands_gives_the_same_entries(monkeypatch):
     whole = rows(statistic.smoothed(px, py, vessel, m, s))
     monkeypatch.setattr(statistic, "CHUNK", 90)
     assert rows(statistic.smoothed(px, py, vessel, m, s)) == whole
+
+
+def test_the_fallback_is_the_largest_of_the_nearest_within_reach():
+    rng = np.random.default_rng(5)
+    xy = np.unique(rng.integers(0, 80, (400, 2)), axis=0)
+    x, y = xy[:, 0], xy[:, 1]
+    v = rng.uniform(0, 5, len(x))
+    v[rng.random(len(x)) < 0.3] = np.nan
+    qx, qy = rng.integers(-40, 120, 2000), rng.integers(-40, 120, 2000)
+    got = statistic.nearest(x, y, v, default=-1.0)(qx, qy)
+    have = ~np.isnan(v)
+    want = []
+    for a, b in zip(qx, qy):
+        d = np.hypot(x[have] - a, y[have] - b)
+        want.append(v[have][d == d.min()].max() if d.min() < statistic.FALLBACK_PX else -1.0)
+    assert np.array_equal(got, want)
+    # Equally near on either side: the larger, whichever the tree meets first.
+    pick = statistic.nearest(np.array([0, 4]), np.array([0, 0]), np.array([0.3, 3.5]))
+    assert pick(np.array([2]), np.array([0]))[0] == 3.5
+
+
+def test_with_no_correction_sigma_in_reach_a_pixel_takes_an_uncorrected_soundings():
+    at = statistic.sigma_at(np.array([0]), np.array([0]), np.array([np.nan]), np.array([0.2]))
+    far = statistic.FALLBACK_PX + 1
+    assert np.isclose(at(np.array([far]), np.array([0]))[0], statistic.UNCORRECTED_SIGMA)
