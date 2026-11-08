@@ -2,7 +2,16 @@ import type { Request, Response } from "express";
 import type { ServerAPI } from "@signalk/server-api";
 import { ASSET_BASE } from "../plotterext/manifest.js";
 import { charted, type Sounding } from "./writer.js";
-import { MAX_ZOOM, MIN_ZOOM, depthLabels } from "./surface.js";
+import { FIRST_DEVIATION_M, cellDepth } from "./cells.js";
+import {
+  CELL_M,
+  MAX_AREA_DEPTH_M,
+  MAX_ZOOM,
+  MIN_ZOOM,
+  areaBand,
+  depthLabels,
+  type Detail,
+} from "./surface.js";
 import type { TileService } from "./service.js";
 import { buildStyle, type OwnStyle } from "./style.js";
 
@@ -14,6 +23,106 @@ export const LIVE_PATH = `${ASSET_BASE}/live`;
 /** Provisional soundings sent per poll: the newest in full, and older ones, held while a
  * backfill runs, thinned to as many again, so the whole track stays on the chart. */
 const NEWEST_PROVISIONAL = 1000;
+
+/** Soundings joined in the ribbon along the boat's pass, at most this far apart. */
+const RIBBON_GAP_US = 30_000_000;
+const RIBBON_GAP_M = 100;
+/** Ground metres per pixel at style zoom 0, 512-pixel tiles, on the equator. */
+const M_PER_PX_Z0 = 78271.517;
+
+/** Refreshes are batched to one per this long, at least and at most. */
+const REFRESH_MIN_MS = 5_000;
+const REFRESH_MAX_MS = 30_000;
+/** Freeboard redraws the whole layer on any refresh, which freezes a plotter about 0.75
+ * ms per KB of tiles in view at a 6× CPU throttle: batched so it's 2% of the time. */
+const REFRESH_MS_PER_KB = 37.5;
+
+/** How long to batch refreshes for a view holding `bytes` of tiles. */
+export function refreshMs(bytes: number): number {
+  return Math.round(
+    Math.min(
+      REFRESH_MAX_MS,
+      Math.max(REFRESH_MIN_MS, (bytes / 1024) * REFRESH_MS_PER_KB),
+    ),
+  );
+}
+
+/** A plotter's view from `zoom,west,south,east,north`: the tiles' zoom, a zoom below the
+ * map's as plotters draw 512-pixel tiles, and its box. */
+export function parseView(view: unknown) {
+  if (typeof view !== "string") return undefined;
+  const fields = view.split(",");
+  if (fields.some((f) => f.trim() === "")) return undefined;
+  const [zoom, west, south, east, north] = fields.map(Number);
+  const lon = (l: number) => l >= -180 && l <= 180;
+  const lat = (l: number) => l >= -85.06 && l <= 85.06;
+  if (
+    !(zoom >= 0 && zoom <= 30) ||
+    !lon(west) ||
+    !lon(east) ||
+    !lat(south) ||
+    !lat(north) ||
+    south > north
+  ) {
+    return undefined;
+  }
+  const z = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.floor(zoom) - 1));
+  return [z, west, south, east, north] as const;
+}
+
+/** A sounding's depth as its cell would publish it after its first pass, `m − kσ`. */
+const firstPassDepth = (s: Sounding) =>
+  cellDepth({ m: charted(s), d: FIRST_DEVIATION_M, t: s.tide?.sigma });
+
+/** The provisional soundings as points, and the pass they make as a ribbon, so the boat
+ * sees the surface's colour under it before the tiles do: a line from each to the next,
+ * as wide as a cell, in the depth area of the shoaler end as a first pass would draw it,
+ * in the tiles' bands at their `detail` and, zoomed out, the chart's. A line's id is its
+ * first sounding's, negated, so it's kept as long as that sounding is. */
+export function provisionalFeatures(
+  soundings: Sounding[],
+  detail: Detail = "high",
+) {
+  const points = soundings.map((s) => ({
+    type: "Feature",
+    // A sounding's id is its time, so the runtime can tell which have left.
+    id: s.time,
+    geometry: { type: "Point", coordinates: [s.lon, s.lat] },
+    properties: depthLabels(charted(s)),
+  }));
+  const ribbon = soundings.slice(1).flatMap((s, i) => {
+    const p = soundings[i];
+    const cos = Math.cos((s.lat * Math.PI) / 180);
+    const m = Math.hypot(
+      (s.lat - p.lat) * 110540,
+      (s.lon - p.lon) * 111320 * cos,
+    );
+    if (s.time - p.time > RIBBON_GAP_US || m > RIBBON_GAP_M) return [];
+    const d = Math.min(firstPassDepth(p), firstPassDepth(s));
+    // Past the deepest area the tiles draw.
+    if (d >= MAX_AREA_DEPTH_M) return [];
+    return [
+      {
+        type: "Feature",
+        id: -p.time,
+        geometry: {
+          type: "LineString",
+          coordinates: [
+            [p.lon, p.lat],
+            [s.lon, s.lat],
+          ],
+        },
+        // Its width in pixels at style zoom 0, doubling with each zoom.
+        properties: {
+          DRVAL1: areaBand(d, detail === "high"),
+          coarse: areaBand(d, false),
+          w0: CELL_M / (M_PER_PX_Z0 * cos),
+        },
+      },
+    ];
+  });
+  return [...points, ...ribbon];
+}
 
 /** Keep the newest soundings of `n`, in time order, and an even share of the rest. */
 export function thin(n: number) {
@@ -29,6 +138,7 @@ export interface Layer {
   stored: () => number[];
   safetyDepth: number;
   own: OwnStyle;
+  detail?: Detail;
 }
 
 /** The server API also carries Express's route methods, which the typed
@@ -59,8 +169,10 @@ function allowed(app: RouteApp, req: Request): boolean {
  *
  * - `style.json`: the MapLibre style the data overlay draws.
  * - `tiles/{z}/{x}/{y}.pbf`: S-57 vector tiles of the boat's cells.
- * - `live?since=<rev>`: the tiles changed since a revision, and the provisional
- *   soundings as GeoJSON, which the extension's runtime polls.
+ * - `live?since=<rev>&view=<zoom,west,south,east,north>`: the tiles changed since a
+ *   revision, how long to batch their refreshes for the plotter's view, and the
+ *   provisional soundings and their ribbon as GeoJSON, which the extension's runtime
+ *   polls.
  *
  * `getLayer` is read per request because the routes outlive a plugin restart.
  *
@@ -143,23 +255,24 @@ export function registerLayerRoutes(
     guard((req, res, layer) => {
       const since = Number(req.query.since ?? -1);
       const provisional = layer.provisional();
+      const view = parseView(req.query.view);
+      layer.tiles.watched(view);
+      const held = view && layer.tiles.held(...view);
       res.set("Cache-Control", "no-store").json({
         ...layer.tiles.since(Number.isInteger(since) ? since : -1),
-        // Ids of soundings just written to cells, which the runtime keeps drawing until
-        // their tiles are refreshed; any other sounding that leaves `provisional` is gone.
-        stored: layer.stored(),
+        ...(held !== undefined ? { refreshMs: refreshMs(held) } : {}),
+        // Ids of soundings just written to cells, and of the ribbon from each, which the
+        // runtime keeps drawing until their tiles are refreshed; any other feature that
+        // leaves `provisional` is gone.
+        stored: layer.stored().flatMap((id) => [id, -id]),
         provisional: {
           type: "FeatureCollection",
-          features: provisional
-            .sort((a, b) => a.time - b.time)
-            .filter(thin(provisional.length))
-            // A sounding's id is its time, so the runtime can tell which have left.
-            .map((s) => ({
-              type: "Feature",
-              id: s.time,
-              geometry: { type: "Point", coordinates: [s.lon, s.lat] },
-              properties: depthLabels(charted(s)),
-            })),
+          features: provisionalFeatures(
+            provisional
+              .sort((a, b) => a.time - b.time)
+              .filter(thin(provisional.length)),
+            layer.detail,
+          ),
         },
       });
     }),

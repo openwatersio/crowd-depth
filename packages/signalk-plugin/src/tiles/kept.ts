@@ -144,6 +144,13 @@ export function createKeptTiles(
     `SELECT id, ifnull(length(tile), 0) + ${ROW_BYTES} AS n FROM kept_tiles ORDER BY id`,
   );
   const dropThrough = db.prepare("DELETE FROM kept_tiles WHERE id <= ?");
+  const keptSize = db.prepare(
+    `SELECT length(tile) AS n FROM kept_tiles
+     WHERE z = ? AND x = ? AND y = ? AND detail = ? AND tile IS NOT NULL`,
+  );
+  const allKept = db.prepare(
+    "SELECT z, x, y FROM kept_tiles WHERE detail = ? AND tile IS NOT NULL",
+  );
 
   // Bytes kept, at most: rows the triggers drop aren't counted off.
   let bytes = (total.get() as { n: number }).n;
@@ -188,6 +195,26 @@ export function createKeptTiles(
       return row.tile.length ? Buffer.from(row.tile) : null;
     },
 
+    /** A kept tile's bytes, 0 for an empty one, or undefined where none is kept. */
+    size(z: number, x: number, y: number): number | undefined {
+      return (keptSize.get(z, x, y, detail) as { n: number } | undefined)?.n;
+    },
+
+    /** Every kept tile, as `z/x/y`. */
+    keys(): Set<string> {
+      const rows = allKept.all(detail) as { z: number; x: number; y: number }[];
+      return new Set(rows.map((r) => `${r.z}/${r.x}/${r.y}`));
+    },
+
+    /** Kept up to `share` of the bound, past which a tile built ahead would only push
+     * out an older one. */
+    full(share: number): boolean {
+      if (bytes < maxBytes * share) return false;
+      // Rows the triggers dropped aren't counted off: count again.
+      bytes = (total.get() as { n: number }).n;
+      return bytes >= maxBytes * share;
+    },
+
     /** Reserve a tile about to be built; returns the id to keep it by. */
     reserve(z: number, x: number, y: number): number {
       let id = 0;
@@ -203,14 +230,16 @@ export function createKeptTiles(
       return id;
     },
 
-    /** Keep a reserved tile, unless a write under it dropped its reservation. */
-    keep(id: number, tile: Buffer | undefined) {
+    /** Keep a reserved tile, unless a write under it dropped its reservation; returns
+     * whether it was kept. */
+    keep(id: number, tile: Buffer | undefined): boolean {
       const n = (tile?.length ?? 0) + ROW_BYTES;
       if (Number(fillTile.run(tile ?? new Uint8Array(0), id).changes) === 0) {
-        return;
+        return false;
       }
       bytes += n;
       if (bytes > maxBytes) evict();
+      return true;
     },
   };
 }

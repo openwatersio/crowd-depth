@@ -19,3 +19,22 @@ test("contour labels sit above deeper soundings and below shoal ones", () => {
   ) as { minzoom?: number };
   expect(minor.minzoom).toBe(15);
 });
+
+test("the ribbon is drawn below the depth areas, and the soundings' circles only at points", () => {
+  const style = buildStyle({ tiles: "t/{z}/{x}/{y}.pbf", safetyDepth: 3 });
+  const ids = style.layers.map((l) => l.id);
+  // Over water sounded before, the stored area shows, as shoal as it is.
+  expect(ids.indexOf("ribbon")).toBeLessThan(ids.indexOf("depare"));
+  const layer = (id: string) =>
+    style.layers.find((l) => l.id === id) as { filter?: unknown };
+  expect(layer("provisional").filter).toEqual([
+    "==",
+    ["geometry-type"],
+    "Point",
+  ]);
+  expect(layer("ribbon").filter).toEqual([
+    "==",
+    ["geometry-type"],
+    "LineString",
+  ]);
+});

@@ -51,7 +51,7 @@ export function buildManifest(version = pluginVersion()): PlotterExtManifest {
     version,
     apiVersion: "1",
     requires: ["overlays.data"],
-    optional: ["background.iframe", "units"],
+    optional: ["background.iframe", "units", "map"],
     buttons: [],
     panels: [],
     background: [
