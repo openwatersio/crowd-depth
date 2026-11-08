@@ -366,8 +366,8 @@ def plan(con, run: Path, live: dict[int, int], key) -> dict:
     placed by the steps its soundings in that tile fall in, in any tile, or a tide cell that
     came, went or changed station. A change to the constants every tile is built with or the
     leaves' bounds, or a missing baseline, dirties every leaf, and a leaf not in the last
-    partition is dirty. A tile is cut again where its leaves' counts no longer add up to
-    its own. The baseline is written last, so a prepare that stops partway marks the same
+    partition is dirty. A tile is cut again where its own files changed or its leaves'
+    counts no longer add up to its own. The baseline is written last, so a prepare that stops partway marks the same
     leaves again."""
     base = run / BASELINE
     base.mkdir(exist_ok=True)
@@ -392,7 +392,7 @@ def plan(con, run: Path, live: dict[int, int], key) -> dict:
         f"CREATE OR REPLACE TEMP TABLE file_parts AS SELECT tile_id, file_id, h FROM ({manifest.FILE_PARTS})"
     )
     con.execute(f"CREATE OR REPLACE TEMP TABLE cell_parts AS {manifest.CELL_PARTS}")
-    boxes, owners = [], []
+    boxes, owners, tiles_ = [], [], []
     if not whole:
         # Every tile's, gone ones too: a withdrawn neighbor's soundings reach a surface.
         con.execute(
@@ -441,10 +441,16 @@ def plan(con, run: Path, live: dict[int, int], key) -> dict:
     dense = [
         t for t, n in live.items() if n > leaves.SPLIT or len(old.get(t, {leaves.ROOT: 0})) > 1
     ]
-    # Counted again where its leaves' counts no longer add up to the tile's.
+    # Counted again where its own files changed, which can move soundings between its leaves
+    # and leave its total as it was, or where its leaves' counts no longer add up to it.
+    touched = set(tiles_)
     counts = step_counts(
         con,
-        [t for t in dense if whole or sum(v[4] for v in old.get(t, {}).values()) != live[t]],
+        [
+            t
+            for t in dense
+            if whole or t in touched or sum(v[4] for v in old.get(t, {}).values()) != live[t]
+        ],
     )
     new = {}
     for t, n in sorted(live.items()):

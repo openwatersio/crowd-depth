@@ -1,3 +1,5 @@
+import json
+
 import duckdb
 import numpy as np
 import rasterio
@@ -179,3 +181,24 @@ def test_leaves_build_what_whole_tiles_build(env, tmp_path, monkeypatch):  # noq
     monkeypatch.setattr(leaves, "MIN_STEPS", 1)
     tiles.prepare(env.store, split)
     assert not (split / "leaves/12345").exists() and not (split / "fp/12345").exists()
+
+    # A file of the tile changed but its total didn't, as when soundings move between its
+    # leaves: its leaves are counted again, not kept as they were.
+    path = split / "baseline/partitions.json"
+    cut = json.loads(path.read_text())
+    good = cut[str(SOUTH)]
+    first, *rest = sorted(good)
+    cut[str(SOUTH)] = {
+        k: [*v[:4], sum(w[4] for w in good.values()) if k == first else 0, v[5]]
+        for k, v in good.items()
+    }
+    path.write_text(json.dumps(cut))
+    files = split / "baseline/files.parquet"
+    duckdb.execute(
+        f"""COPY (SELECT tile_id, file_id, if(tile_id = {SOUTH} AND file_id = (
+            SELECT min(file_id) FROM read_parquet('{files}') WHERE tile_id = {SOUTH}), h + 1, h) AS h
+          FROM read_parquet('{files}')) TO '{files}.tmp' (FORMAT parquet)"""
+    )
+    (split / "baseline/files.parquet.tmp").replace(files)
+    tiles.prepare(env.store, split)
+    assert tiles.partitions(split)[SOUTH] == good
