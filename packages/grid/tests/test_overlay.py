@@ -419,6 +419,38 @@ def test_the_grown_edge_is_never_deeper_than_a_sounding_beside_it(tmp_path):
     # Away from the sounding, the grown edge takes the water's own depth.
     far = shapely.Point(-78 + 49.3 / 100, 34 - 10.5 / 100)
     assert [overlay.LEVELS[b] for b, a in bands.items() if a.contains(far)] == [10]
+    # Two soundings in that pixel: the shoaler caps, whichever comes first.
+    for shoals in ([3.0, 9.0], [9.0, 3.0]):
+        pair = ([-78 + 50.5 / 100] * 2, [34 - 50.5 / 100] * 2, shoals)
+        bands, *_ = overlay.surface_bands(tmp_path / "t.tif", pair)
+        [level] = [overlay.LEVELS[b] for b, a in bands.items() if a.contains(beside)]
+        assert level < 3
+
+
+@pytest.mark.parametrize("cap_chunk", [1, 2, 7])
+def test_soundings_placed_a_chunk_at_a_time_cap_as_all_at_once(tmp_path, monkeypatch, cap_chunk):
+    # Water ending at column 48 and gaps in it, with soundings past the edge, in the gaps,
+    # several to a pixel and some past the tile, at depths that vary sounding to sounding.
+    depth = np.full((100, 100), 12.0, dtype=np.float32)
+    depth[:, 49:] = surface.NODATA
+    depth[20:30, 10:20] = surface.NODATA
+    count = np.zeros_like(depth)
+    count[:, :49] = 1
+    write_surface(tmp_path / "t.tif", -78, 33, depth, np.zeros_like(depth), count)
+    rng = np.random.default_rng(0)
+    col = np.concatenate([rng.uniform(46, 53, 40), rng.uniform(9, 21, 20), [-0.5, 100.5]])
+    row = np.concatenate([rng.uniform(0, 100, 40), rng.uniform(19, 31, 20), [50.5, 60.5]])
+    col, row = np.repeat(col, 2), np.repeat(row, 2)
+    soundings = (-78 + col / 100, 34 - row / 100, rng.uniform(1, 11, len(col)))
+    whole = overlay.surface_bands(tmp_path / "t.tif", soundings)
+    uncapped = overlay.surface_bands(tmp_path / "t.tif")
+    assert any(not shapely.equals_exact(a, uncapped[0].get(b), 0) for b, a in whole[0].items())
+    monkeypatch.setattr(overlay, "CAP_CHUNK", cap_chunk)
+    chunked = overlay.surface_bands(tmp_path / "t.tif", soundings)
+    assert whole[0].keys() == chunked[0].keys()
+    for a, b in [*zip(whole[0].values(), chunked[0].values()), *zip(whole[1:4], chunked[1:4])]:
+        assert shapely.equals_exact(a, b, 0)
+    assert whole[4] == chunked[4]
 
 
 def ring_by_ring(band, monkeypatch):

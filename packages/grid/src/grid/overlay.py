@@ -427,15 +427,24 @@ def surface_bands(path, soundings=None):
         # reach past the outline, which cuts them.
         grown, near = carry(depth, valid)
         if soundings is not None and len(soundings[2]):
-            lon, lat, d = (np.asarray(a, dtype=float) for a in soundings)
-            row, col = (np.asarray(a) for a in rasterio.transform.rowcol(transform, lon, lat))
-            # One in the pixel beside the tile caps the edge pixels next to it; the window
-            # is the only part of the tile with pixels to cap.
-            row = np.clip(row + r0, 0, tile_shape[0] - 1) - r0
-            col = np.clip(col + c0, 0, tile_shape[1] - 1) - c0
-            inside = (row >= 0) & (row < depth.shape[0]) & (col >= 0) & (col < depth.shape[1])
-            row, col, d = row[inside], col[inside], d[inside].astype(np.float32)
-            # Each sounding's pixel and the eight around it, so only pixels beside one are
+            # A pixel's shoalest sounding caps as all of them do, so the soundings are
+            # placed a chunk at a time and the loop below works the pixels: placing all
+            # 20M beside Galveston Bay's tile at once took its overlay past 2 GB.
+            shoalest = np.full(depth.shape, np.inf, dtype=np.float32)
+            for i in range(0, len(soundings[2]), CAP_CHUNK):
+                lon, lat, d = (np.asarray(a[i : i + CAP_CHUNK], dtype=float) for a in soundings)
+                row, col = (np.asarray(a) for a in rasterio.transform.rowcol(transform, lon, lat))
+                # One in the pixel beside the tile caps the edge pixels next to it; the
+                # window is the only part of the tile with pixels to cap.
+                row = np.clip(row + r0, 0, tile_shape[0] - 1) - r0
+                col = np.clip(col + c0, 0, tile_shape[1] - 1) - c0
+                inside = (row >= 0) & (row < depth.shape[0]) & (col >= 0) & (col < depth.shape[1])
+                np.minimum.at(shoalest, (row[inside], col[inside]), d[inside].astype(np.float32))
+            del lon, lat, d, row, col, inside
+            row, col = np.nonzero(shoalest != np.inf)
+            d = shoalest[row, col]
+            del shoalest
+            # Each such pixel and the eight around it, so only pixels beside one are
             # touched: a sparse tile's window is most of the tile. Capped there: the carried
             # pixels, and those the surface took from the band beside a track. A cell's
             # sounding is its shoalest base cell, which can read shoaler than the medians
@@ -543,6 +552,8 @@ def carry(depth, valid):
 FILL_PX = 2
 # Rows of the window carried at once.
 CARRY_ROWS = 512
+# Soundings placed in the window's pixels at once.
+CAP_CHUNK = 1_000_000
 # Pixels past a tile's depths and soundings its bands are worked to: wider than the
 # furthest anything looks, coverage grown a pixel and then eroded three for its rim.
 WINDOW_PX = 16
