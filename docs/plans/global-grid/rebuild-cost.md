@@ -39,6 +39,8 @@ This assumes 8 cores and 32 GB, and the measured archive from [planet-size.md](p
 - **Surface:** 2.8 s per tile with empty space skipped, the median of the Chesapeake's tiles under 10k soundings, against 6.5 s for the whole raster. Of that 2.8 s, about 1.2 s builds the COG's overviews, which nothing in the pipeline reads yet; without them a tile takes about 1.6 s. Plus 19.4 s per million soundings, which skipping empty space doesn't change: dense tiles spend it in their soundings and depth areas.
 - **Web tiles:** 1.3 s per tile plus 7.8 s per million.
 
+Around Galveston a build of every tile took 9.6 worker-hours for 252M soundings, 137 s per million against these inputs' 50. Its jobs waited on spill I/O, eight at once on a USB SSD shared into the VM, beside an ingest: the slowest leaf surface took 264 s alone and 1,303 s in the build. So it bounds the per-sounding cost from above rather than replacing these inputs.
+
 A daily run rebuilds cells in the touched tiles, and surfaces and web tiles in those and their neighbors.
 
 |                                                       | Worker-hours | Wall time on cheap cores |
@@ -53,13 +55,13 @@ The last row comes from [sub-tile-rebuild.md](sub-tile-rebuild.md): on the Chesa
 
 The per-sounding cost decides the planet, not the fixed cost. Skipping empty space takes the fixed cost from 18 to 10 worker-hours of a full rebuild, and to about 8 without overviews, while the soundings cost 27. A day's touched tiles and their neighbors hold 79 to 88% of all soundings, so a 1° daily run costs about two thirds of a full rebuild whatever the fixed cost. Sub-tile dirtiness takes about a quarter off a daily run; the per-sounding cost of cells and surfaces, in the harbours crossed daily, decides both what's left and a full rebuild.
 
-The densest tile is a critical path of its own. The Galveston Bay tile (29°N 95°W) holds 71.6M active soundings, up to 2.6 times Chesapeake's densest, and needs about 50 min of cells and surface on one M-series core at the linear rate. The store-level steps of its region, 252M soundings in 92 tiles, are longer: ingesting them from NOAA to R2 took 5.1 h and tide 2.9 h, and calibrate had not finished after 10.9 h ([planet-size.md](planet-size.md#the-galveston-region)).
+The densest tile isn't a critical path of its own. The Galveston Bay tile (29°N 95°W) holds 71.6M active soundings, up to 2.6 times Chesapeake's densest; split into 49 leaves, its cells and surface take 1.8 worker-hours, and its slowest leaf job 264 s alone. Its region, 252M soundings in 92 tiles and 425 leaves, builds in 73 min with eight jobs at once, 9.6 worker-hours, and every job fits a 2 GB worker. The store-level steps are longer: ingesting the region from NOAA to R2 took 5.1 h and tide 2.9 h; compact takes 163 s and calibrate, reducing every file again, 34 min, both in 2 GB ([planet-size.md](planet-size.md#the-galveston-region)).
 
 ## Not measured
 
-- Reading tiles out of DuckLake on R2 after compaction, and real R2 latency and throughput. The Galveston store couldn't be compacted, so this is still open.
+- R2 throughput from a worker in the cloud. From the Mac Studio, Galveston Bay's compacted tile, 2.11 GB with every column, reads in 80 to 124 s, at the speed of its connection; pruned by row group, a dense tile reads 1.00 to 1.02 times its own rows ([planet-size.md](planet-size.md#the-galveston-region)).
 - The active ratio beyond two regions. [planet-size.md](planet-size.md) scales the archive's rows by Chesapeake's 0.749; around Galveston it is 0.766.
-- Memory and time of the tile jobs for tiles denser than Chesapeake's densest. Galveston's store-level steps are measured: ingest peaked at 5.3 GB and tide at 4.2 GB, both at grid's default 4 GB DuckDB limit, and compact ran out of memory there.
+- Ingest and tide in 2 GB. Around Galveston, ingest peaked at 5.3 GB and tide at 4.2 GB, both at grid's default 4 GB DuckDB limit.
 - Cheap x86 cores and a dedicated machine. Every timing here is from a shared M-series laptop.
 - Upload cost of a 15–30 GB daily archive, and how clients handle its ETag changing.
 - Open Waters GeoJSON input, and latitudes above 60°.
