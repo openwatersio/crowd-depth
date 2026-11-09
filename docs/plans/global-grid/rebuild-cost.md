@@ -55,14 +55,14 @@ The last row comes from [sub-tile-rebuild.md](sub-tile-rebuild.md): on the Chesa
 
 The per-sounding cost decides the planet, not the fixed cost. Skipping empty space takes the fixed cost from 18 to 10 worker-hours of a full rebuild, and to about 8 without overviews, while the soundings cost 27. A day's touched tiles and their neighbors hold 79 to 88% of all soundings, so a 1° daily run costs about two thirds of a full rebuild whatever the fixed cost. Sub-tile dirtiness takes about a quarter off a daily run; the per-sounding cost of cells and surfaces, in the harbours crossed daily, decides both what's left and a full rebuild.
 
-The densest tile isn't a critical path of its own. The Galveston Bay tile (29°N 95°W) holds 71.6M active soundings, up to 2.6 times Chesapeake's densest; split into 49 leaves, its cells and surface take 1.8 worker-hours, and its slowest leaf job 264 s alone. Its region, 252M soundings in 92 tiles and 425 leaves, builds in 73 min with eight jobs at once, 9.6 worker-hours, and every job fits a 2 GB worker. The store-level steps are longer: ingesting the region from NOAA to R2 took 5.1 h and tide 2.9 h; compact takes 163 s and calibrate, reducing every file again, 34 min, both in 2 GB ([planet-size.md](planet-size.md#the-galveston-region)).
+The densest tile isn't a critical path of its own. The Galveston Bay tile (29°N 95°W) holds 71.6M active soundings, up to 2.6 times Chesapeake's densest; split into 49 leaves, its cells and surface take 1.8 worker-hours, and its densest leaf's cells and surface take 76 s and 88 s alone. Its region, 252M soundings in 92 tiles and 425 leaves, builds in 73 min with eight jobs at once, 9.6 worker-hours; its slowest leaf job, a surface in Houston's tile, takes 264 s alone, and its densest jobs, measured alone, each finish in a 2 GB cgroup, the densest leaf cells within 47 MB of it. The store-level steps are longer: ingesting the region from NOAA to R2 took 5.1 h and tide 2.9 h; compact takes 163 s and calibrate, reducing every file again, 34 min, both in 2 GB ([planet-size.md](planet-size.md#the-galveston-region)).
 
 ## Not measured
 
-- R2 throughput from a worker in the cloud. From the Mac Studio, Galveston Bay's compacted tile, 2.11 GB with every column, reads in 80 to 124 s, at the speed of its connection; pruned by row group, a dense tile reads 1.00 to 1.02 times its own rows ([planet-size.md](planet-size.md#the-galveston-region)).
+- R2 throughput from a worker in the cloud. From the Mac Studio, Galveston Bay's compacted tile, 2.11 GB with every column, reads in 80 to 124 s, at the speed of its connection; pruned by row group, the five densest tiles each read 1.00 to 1.02 times their own rows ([planet-size.md](planet-size.md#the-galveston-region)).
 - The active ratio beyond two regions. [planet-size.md](planet-size.md) scales the archive's rows by Chesapeake's 0.749; around Galveston it is 0.766.
 - Ingest and tide in 2 GB. Around Galveston, ingest peaked at 5.3 GB and tide at 4.2 GB, both at grid's default 4 GB DuckDB limit.
-- Cheap x86 cores and a dedicated machine. Every timing here is from a shared M-series laptop.
+- Cheap x86 cores and a dedicated machine. Every timing here is from Apple silicon: a shared M-series laptop, and around Galveston a Mac Studio running other jobs beside it.
 - Upload cost of a 15–30 GB daily archive, and how clients handle its ETag changing.
 - Open Waters GeoJSON input, and latitudes above 60°.
 - The effect of each proposed change. Each needs measuring before the estimates above are relied on.

@@ -20,7 +20,7 @@ Soundings are active soundings, estimated as 0.749 of the archive's rows (the ra
 
 - 42 tiles hold 50% of soundings, 180 hold 80%, 396 hold 90% and 2,687 hold 99%. The 10 densest hold 21%, the 100 densest 69%.
 - The densest tiles are Galveston Bay (29°N 95°W, 67M; 71.6M measured), the Louisiana coast and Atchafalaya (30°N 92°W, 56M; 29°N 91°W, 52M), Houston (29°N 96°W, 45M; 48.3M measured) and the lower Mississippi at Memphis (36°N 90°W, 37M). All of the top 10 are between 29°N and 36°N and 90°W and 96°W, and the US Gulf and Mississippi hold about 40% of the archive. The densest Chesapeake tile (36°N 77°W, 26M) is not in the top 10. The Chesapeake set's 28.0M in it counts only files that touch the bay.
-- The densest holds up to 2.6 times as many as Chesapeake's densest. Split into 49 leaves, its cells and surface take 1.8 worker-hours, and every job of its region fits a 2 GB worker ([The Galveston region](#the-galveston-region)).
+- The densest holds up to 2.6 times as many as Chesapeake's densest. Split into 49 leaves, its cells and surface take 1.8 worker-hours, and its region's compact, calibrate and densest tile jobs each finish in a 2 GB cgroup, the densest leaf cells within 47 MB of it ([The Galveston region](#the-galveston-region)).
 
 ## Daily arrivals
 
@@ -65,7 +65,7 @@ The steps after tide were measured on a local copy of the store, downloaded from
 - **Compact** finishes in a 2 GB cgroup at a 1 GB limit, at 1.31 GB, in 163 s: six partitions in 48 ranges. The points go from 17.3 GB to 7.28 GB, in 21 files and row groups of 101k rows.
 - **Reads.** Pruned by its row groups' tiles, a tile's read touches 1.00 to 1.02 times its own rows in the five densest tiles, and 1.19 in 42565 (1.9M). Tile 42925 reads 721 row groups in 5 files, 2.11 GB with every column. From R2 over the Mac Studio's connection that read takes 124 s cold and 80 s warm on 4 threads, 17 to 26 MB/s, the speed the store downloaded at; from the local SSD 5.9 s and 2.4 s.
 - **Calibrate**, reducing every file again, finishes in a 2 GB cgroup at a 1 GB limit, at 1.79 GB, in 34 min: the reduce takes 7.5 min at 1.36 GB, the stuck-run search 474 s, publishing 52 s. With the files already reduced it takes 26 min at the same peak. At 768 MB it runs out of DuckDB memory after the lost-median passes, while judging transits: the temp tables of 45.6M file-pixel medians fill the pool, 709 MB of it with 5.9 GB spilled, and a statement can't pin the blocks it reads. At the 4 GB default it takes 21 min at 4.62 GB. Every run gives the same 114 segments, 3 steps, 2,251 stray transits, 90,018 lost runs and 39,830 file offsets.
-- **Tile jobs.** `grid tiles` builds the 92 tiles the region's files reach, in 425 leaves, in 73 min with eight jobs at once in 18 GB, 9.6 worker-hours: leaf cells 3.5 h, leaf surfaces 5.7 h, overlays 0.25 h, web tiles 0.06 h. The densest jobs, each alone in a 2 GB cgroup, all finish:
+- **Tile jobs.** `grid tiles` builds the 92 tiles the region's files reach, in 425 leaves, in 73 min with eight jobs at once in 18 GB, 9.6 worker-hours: leaf cells 3.5 h, leaf surfaces 5.7 h, overlays 0.25 h, web tiles 0.06 h. Tile 42925 splits into 49 leaves, whose cells and surfaces take 1.8 worker-hours. The densest jobs, each alone in a 2 GB cgroup, all finish, and so do all 92 overlays, at most 1.49 GB; the other leaf jobs were not run alone:
 
 | job                     | soundings in reach | peak anon |   s |
 | ----------------------- | -----------------: | --------: | --: |
@@ -75,6 +75,7 @@ The steps after tide were measured on a local copy of the store, downloaded from
 | leaf cells 42925/r023   |              11.7M |  1,800 MB |  76 |
 | leaf surface 42924/r331 |              25.8M |  1,544 MB | 264 |
 | leaf surface 43286/r101 |              15.8M |  1,505 MB | 117 |
+| leaf surface 42925/r023 |              11.7M |  1,305 MB |  88 |
 | cells splice 42925      |              71.6M |    918 MB |   5 |
 | overlay 42925           |              71.6M |  1,489 MB |  52 |
 | overlay 42924           |              48.3M |    947 MB |   9 |
