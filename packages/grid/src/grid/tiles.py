@@ -64,7 +64,10 @@ WRITTEN = ("cells", "qc_flags", "shoals", "cells_built", "store_meta", "tile_cha
 # back what it can, but 45463's reached 2.05 GB run alone. Overlay peaks follow the
 # tile's surface more than its soundings: past 1M soundings at most 1.9 GB (45464),
 # measured on OrbStack, so kept about 0.4 GB over it, near the gap cells allows for.
-# ponytail: measured on one region; refit once the planet's densest tiles have run
+# Galveston's densest leaves, past 10M soundings in reach, peak at up to 2.0 GB for
+# cells and 1.54 GB for surfaces, and its overlays at 1.49 GB: within these, though
+# cells at 2.0 GB keep less than that gap under 2,304 MB and none in a 2 GB worker.
+# ponytail: measured on two regions on Apple silicon; refit once x86 workers run them
 MEMORY_MB = {
     "cells": [(100_000, 512), (1_000_000, 1536), (10_000_000, 1792), (None, 2304)],
     "surface": [(1_000_000, 1792), (None, 2304)],
