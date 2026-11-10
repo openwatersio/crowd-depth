@@ -188,8 +188,9 @@ def test_lake_residuals_are_observed_in_mllw_minus_slackwater(lake, monkeypatch)
     [req] = asked
     assert req["station"] == "noaa/g1" and req["step"] == 360 and req["datum"] == "MLLW"
     assert req["end"] - req["start"] == 31 * 86400 - 360
-    # A gauge the lake has no MLLW for, or no station at all, has no residual.
-    assert tide.lake_residuals("nowhere", date(2024, 3, 1)) == []
+    # A gauge the lake doesn't list, or a month no year file covers, is one it can't give.
+    assert tide.lake_residuals("nowhere", date(2024, 3, 1)) is None
+    assert tide.lake_residuals("g1", date(2023, 3, 1)) is None
 
 
 def test_december_reads_only_its_own_year(lake):
@@ -212,7 +213,58 @@ def test_a_year_file_the_cache_cant_take_is_read_from_the_lake(lake, monkeypatch
     assert got == [(datetime(2024, 3, 1), pytest.approx(1.5))]
 
 
-def test_an_unknown_water_levels_source_is_refused(monkeypatch):
+def test_the_water_levels_source_defaults_to_the_stores(monkeypatch):
+    con = duckdb.connect()
+    con.execute("ATTACH ':memory:' AS lake")
+    con.execute("CREATE TABLE lake.store_meta (key VARCHAR, value VARCHAR)")
+    monkeypatch.delenv("GRID_WATER_LEVELS", raising=False)
+    assert tide.residual_source(con) is tide.coops_residuals
+    con.execute("INSERT INTO lake.store_meta VALUES ('residuals', 'lake v1')")
+    assert tide.residual_source(con) is tide.lake_residuals
+    monkeypatch.setenv("GRID_WATER_LEVELS", "coops")
+    assert tide.residual_source(con) is tide.coops_residuals
+    # A misspelling would otherwise switch the store.
     monkeypatch.setenv("GRID_WATER_LEVELS", "Lake")
     with pytest.raises(ValueError):
-        tide.residual_source()
+        tide.residual_source(con)
+
+
+def test_a_months_versions_change_with_its_year_files(lake):
+    start, end = datetime(2024, 6, 1), datetime(2024, 8, 1)
+    assert waterlevels.versions("coops", "g2", start, end) is None
+    assert waterlevels.observed("coops", "g2", start, end) is None
+    obs(lake, "g2/2024.parquet", [("2024-06-30 23:54:00", 2.0, 0)])
+    first = waterlevels.versions("coops", "g2", start, end)
+    # The later epoch's file appearing, as a backfill would bring it, changes them.
+    obs(lake, "g2/2/2024.parquet", [("2024-07-01 00:00:00", 1.4, 0)])
+    second = waterlevels.versions("coops", "g2", start, end)
+    assert first.startswith("1/2024=") and "2/2024=-" in first and "2/2024=-" not in second
+    obs(lake, "g2/2/2024.parquet", [("2024-07-01 00:00:00", 1.5, 0)])
+    assert waterlevels.versions("coops", "g2", start, end) != second
+
+
+def test_observations_slackwater_cant_predict_are_a_month_it_cant_give(lake, monkeypatch):
+    obs(lake, "g1/2024.parquet", [("2024-03-01 00:00:00", 1.5, 0)])
+    monkeypatch.setattr(tide, "slackwater_levels", lambda requests: [[] for _ in requests])
+    assert tide.lake_residuals("g1", date(2024, 3, 1)) is None
+
+
+def test_a_month_with_no_values_is_one_the_lake_cant_give(lake):
+    obs(lake, "g1/2024.parquet", [("2024-03-01 00:00:00", 1.5, 0), ("2024-03-01 00:06:00", 1.6, 4)])
+    # Values, all flagged: the lake's record is that there are none.
+    assert (
+        waterlevels.observed("coops", "g1", datetime(2024, 3, 1, 0, 6), datetime(2024, 4, 1)) == []
+    )
+    # No value at all, as before a gauge's record starts in its year file.
+    assert waterlevels.observed("coops", "g1", datetime(2024, 1, 1), datetime(2024, 2, 1)) is None
+
+
+def test_a_flagged_value_in_the_earlier_epoch_still_beats_a_rejected_one(lake, monkeypatch):
+    rows = waterlevels.stations("coops")
+    rows["g2"]["epochs"][1]["rejected"] = True
+    obs(lake, "g2/2024.parquet", [("2024-06-30 23:54:00", 2.0, 4)])
+    obs(lake, "g2/2/2024.parquet", [("2024-06-30 23:54:00", 9.0, 0)])
+    # The rejected epoch's file holds a value before its span, as after an epoch moves back.
+    rows["g2"]["epochs"][1]["since"] = datetime(2024, 6, 30)
+    got = waterlevels.observed("coops", "g2", datetime(2024, 6, 30), datetime(2024, 7, 1))
+    assert got == []

@@ -103,7 +103,8 @@ def main(argv=None):
         help="Rerun QC on every batch; `grid cells` QCs only batches not yet done at this version",
     )
     td = sub.add_parser(
-        "tide", help="Tide levels for the soundings' station days, from Slackwater and CO-OPS"
+        "tide",
+        help="Tide levels for the soundings' station days, from Slackwater and CO-OPS or the water-levels lake",
     )
     td.add_argument(
         "--accept-departures",

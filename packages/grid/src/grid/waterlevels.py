@@ -97,18 +97,23 @@ def _etag(href: str) -> str | None:
         raise
 
 
+def version(source: str, station: str, epoch: int, year: int) -> str | None:
+    """A year file's version from the years listing, or its ETag; None where it has no
+    file, and "" where it has neither."""
+    listed = years(source)
+    if listed is not None and station in listed:
+        return listed[station].get((epoch, year))
+    return _etag(url(source, station, epoch, year))
+
+
 def year_file(source: str, station: str, epoch: int, year: int) -> Path | str | None:
     """A local copy of one year file, current with the lake, or its URL where it can't be
     cached; None where it has no file."""
     href = url(source, station, epoch, year)
-    listed = years(source)
-    if listed is not None and station in listed:
-        version = listed[station].get((epoch, year))
-    else:
-        version = _etag(href)
-    if version is None:
+    ver = version(source, station, epoch, year)
+    if ver is None:
         return None
-    tag = re.sub(r"[^A-Za-z0-9]", "", version)
+    tag = re.sub(r"[^A-Za-z0-9]", "", ver)
     if not tag:
         return href
     folder = cache.path("water-levels", "obs", source, urllib.parse.quote(station, safe=""), epoch)
@@ -127,10 +132,38 @@ def year_file(source: str, station: str, epoch: int, year: int) -> Path | str | 
     return dest
 
 
-def observed(source: str, station: str, start: datetime, end: datetime) -> list[tuple]:
+def spans(source: str, station: str, start: datetime, end: datetime) -> list[tuple]:
+    """The (epoch, year) year files that could hold a station's levels from `start` to
+    before `end`, in epochs that convert to the current datum."""
+    row = stations(source).get(station)
+    if row is None:
+        return []
+    last = (end - timedelta(microseconds=1)).year
+    return [
+        (e, year)
+        for e in row["epochs"]
+        if e["to_current"] is not None
+        and not ((e["since"] and e["since"] >= end) or (e["until"] and e["until"] <= start))
+        for year in range(start.year, last + 1)
+    ]
+
+
+def versions(source, station, start, end, version=version) -> str | None:
+    """What `observed` would read, as each year file's version, so a change to any of
+    them shows; None where no file covers the span."""
+    found = [
+        (e["id"], y, version(source, station, e["id"], y))
+        for e, y in spans(source, station, start, end)
+    ]
+    if all(v is None for *_, v in found):
+        return None
+    return ";".join(f"{e}/{y}={'-' if v is None else v}" for e, y, v in found)
+
+
+def observed(source: str, station: str, start: datetime, end: datetime) -> list[tuple] | None:
     """A station's levels from `start` to before `end` (naive UTC), in its current datum,
     as (time, level_m), leaving out values flagged suspect or bad and epochs that can't be
-    converted to the current one."""
+    converted to the current one; None where no year file holds a value in the span."""
     try:
         return _observed(source, station, start, end)
     except duckdb.IOException:
@@ -139,38 +172,34 @@ def observed(source: str, station: str, start: datetime, end: datetime) -> list[
 
 
 def _observed(source, station, start, end):
-    row = stations(source).get(station)
-    if row is None:
-        return []
     parts = []
-    for e in row["epochs"]:
-        if e["to_current"] is None:
-            continue
-        if (e["since"] and e["since"] >= end) or (e["until"] and e["until"] <= start):
-            continue
-        for year in range(start.year, (end - timedelta(microseconds=1)).year + 1):
-            path = year_file(source, station, e["id"], year)
-            if path is not None:
-                parts.append((path, e))
+    for e, year in spans(source, station, start, end):
+        path = year_file(source, station, e["id"], year)
+        if path is not None:
+            parts.append((path, e))
     if not parts:
-        return []
+        return None
 
     def quoted(path):
         return str(path).replace("'", "''")
 
     union = " UNION ALL ".join(
-        f"""SELECT time, level_m::DOUBLE + {float(e["to_current"])} AS level, {int(e["rejected"])} AS rejected
-        FROM read_parquet('{quoted(p)}') WHERE flag <= {MAX_FLAG}
+        f"""SELECT time, level_m::DOUBLE + {float(e["to_current"])} AS level, flag,
+          {int(e["rejected"])} AS rejected
+        FROM read_parquet('{quoted(p)}') WHERE true
           {f"AND time >= TIMESTAMPTZ '{e['since']}+00'" if e["since"] else ""}
           {f"AND time < TIMESTAMPTZ '{e['until']}+00'" if e["until"] else ""}"""
         for p, e in parts
     )
     # After a rejected epoch, its files and the epoch before it can share a time; the
-    # latter wins.
-    return _sql(
-        f"""SELECT timezone('UTC', time) AS t, level FROM ({union})
+    # latter wins, flagged or not.
+    rows = _sql(
+        f"""SELECT timezone('UTC', time) AS t, level, flag FROM ({union})
         WHERE time >= $1::TIMESTAMP AT TIME ZONE 'UTC' AND time < $2::TIMESTAMP AT TIME ZONE 'UTC'
-        QUALIFY row_number() OVER (PARTITION BY time ORDER BY rejected) = 1
+        QUALIFY row_number() OVER (PARTITION BY time ORDER BY rejected, flag, level) = 1
         ORDER BY t""",
         [start, end],
     )
+    if not rows:
+        return None
+    return [(t, level) for t, level, flag in rows if flag <= MAX_FLAG]
