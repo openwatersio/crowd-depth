@@ -7,7 +7,10 @@ cell takes the nearest station within STATION_KM whose license allows commercial
 and whose harmonics Slackwater accepts; NOAA's subordinate stations carry the time
 and height corrections to their control station that discrete tide zones would. Where
 a CO-OPS water level gauge is within GAUGE_KM of the station, its observed minus
-predicted level, the weather's part of the water level, is added to the prediction.
+predicted level, the weather's part of the water level, is added to the prediction. The
+observed and predicted levels come from CO-OPS' API, or, with GRID_WATER_LEVELS=lake,
+the observed from the Open Waters water-levels lake and the predicted from Slackwater at
+the gauge's own station, so at a station that is the gauge the level is what it observed.
 Levels are relative to each station's chart datum: MLLW in US waters, LAT in most
 others.
 
@@ -17,6 +20,7 @@ when depths are read (catalog's `corrected_points_in`). Raw depths are never cha
 """
 
 import contextlib
+import http.client
 import json
 import logging
 import math
@@ -30,10 +34,11 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import duckdb
 import numpy as np
 from scipy.spatial import cKDTree
 
-from . import cache, cells
+from . import cache, cells, waterlevels
 from .catalog import TIDE_CELL, checkpoint
 from .definitions import TIDE
 from .qc import EARLIEST
@@ -56,6 +61,9 @@ PREDICT = Path(
 )
 COOPS = "https://api.tidesandcurrents.noaa.gov"
 FETCHERS = 1
+# The lake takes parallel downloads; each fetch also runs the Slackwater helper, about
+# 0.25 GB apiece.
+LAKE_FETCHERS = 4
 # CO-OPS errors that mean a gauge has no residual to give, rather than a failed request.
 NO_RESIDUAL = ("no data", "data was found", "no mllw", "don't have predictions")
 # CO-OPS lists about 300 water level gauges.
@@ -171,6 +179,41 @@ def coops_residuals(gauge: str, month: date) -> list[tuple[datetime, float]]:
         for t in sorted(observed.keys() & predicted.keys())
         if abs(observed[t] - predicted[t]) <= MAX_RESIDUAL_M
     ]
+
+
+def lake_residuals(gauge: str, month: date) -> list[tuple[datetime, float]]:
+    """A CO-OPS gauge's observed level from the water-levels lake, in MLLW, minus
+    Slackwater's prediction for its station, 6-minute, through one month."""
+    mllw = waterlevels.stations("coops").get(gauge, {}).get("datums", {}).get("MLLW")
+    if mllw is None:
+        return []
+    start = datetime.combine(month, datetime.min.time())
+    end = datetime.combine(month_end(month) + timedelta(days=1), datetime.min.time())
+    observed = waterlevels.observed("coops", gauge, start, end)
+    if not observed:
+        return []
+    t0 = int(start.replace(tzinfo=UTC).timestamp())
+    t1 = int(end.replace(tzinfo=UTC).timestamp())
+    [series] = slackwater_levels(
+        [{"station": f"noaa/{gauge}", "start": t0, "end": t1 - 360, "step": 360, "datum": "MLLW"}]
+    )
+    predicted = {int(t): h for t, h in series if h is not None and math.isfinite(h)}
+    # CO-OPS publishes levels in millimeters; the lake keeps them as 32-bit floats.
+    rows = []
+    for t, level in observed:
+        p = predicted.get(int(t.replace(tzinfo=UTC).timestamp()))
+        if p is not None and abs(r := round(level + mllw, 3) - p) <= MAX_RESIDUAL_M:
+            rows.append((t, r))
+    return rows
+
+
+def residual_source():
+    """CO-OPS' API, or the water-levels lake with GRID_WATER_LEVELS=lake."""
+    source = os.environ.get("GRID_WATER_LEVELS") or "coops"
+    # A misspelling would otherwise switch the store back to CO-OPS and take every month again.
+    if source not in ("coops", "lake"):
+        raise ValueError(f"GRID_WATER_LEVELS is {source!r}; use coops or lake")
+    return lake_residuals if source == "lake" else coops_residuals
 
 
 def _xyz(lon, lat):
@@ -393,14 +436,17 @@ def cached_month(gauge, month):
 
 def fetch_residuals(con, months, today, residuals=coops_residuals):
     """Fetch gauge `months` (gauge, first day), replacing what is kept for each. A month
-    CO-OPS can't give now keeps what it had, or is recorded open if it had nothing, so its
-    days take predictions alone until a later run gets it. A month some store has made
-    final comes from the shared cache. Returns the months fetched."""
+    `residuals` can't give now keeps what it had, or is recorded open if it had nothing, so its
+    days take predictions alone until a later run gets it. A CO-OPS month some store has
+    made final comes from the shared cache. Returns the months fetched."""
 
     served = set()
 
+    lake = residuals is lake_residuals
+
     def fetch(m):
-        kept = cache.read_json(cached_month(*m))
+        # The lake's year files are cached instead, and its residuals change with Slackwater.
+        kept = None if lake else cache.read_json(cached_month(*m))
         if kept:
             # An entry of another shape, or with a value CO-OPS' answer would have dropped,
             # is a miss: CO-OPS answers, and replaces it.
@@ -411,14 +457,18 @@ def fetch_residuals(con, months, today, residuals=coops_residuals):
                     return rows
         try:
             return residuals(*m)
-        except (OSError, ValueError, RuntimeError) as e:
+        except (OSError, ValueError, RuntimeError, duckdb.Error, http.client.HTTPException) as e:
             log.warning("tide: gauge %s %s not fetched (%s); kept as it was", *m, e)
             return None
 
     fetched = []
-    # One at a time: CO-OPS refuses bursts.
-    with ThreadPoolExecutor(FETCHERS) as pool:
-        for (gauge, month), rows in zip(months, pool.map(fetch, months)):
+    # One at a time from CO-OPS, which refuses bursts.
+    with ThreadPoolExecutor(LAKE_FETCHERS if lake else FETCHERS) as pool:
+        # A window at a time, so fetched months don't pile up ahead of their writes.
+        answers = (
+            rows for i in range(0, len(months), 64) for rows in pool.map(fetch, months[i : i + 64])
+        )
+        for (gauge, month), rows in zip(months, answers):
             key = {"gauge": gauge, "month": month}
             stored = con.execute(
                 """SELECT count(*) FROM lake.tide_residuals
@@ -482,7 +532,7 @@ def fetch_residuals(con, months, today, residuals=coops_residuals):
             # Final here is final for every store. An empty month isn't kept: an outage's
             # empty answer could pass for one.
             final = today >= month_end(month) + timedelta(days=RECENT_DAYS)
-            if rows and final and (gauge, month) not in served:
+            if rows and final and not lake and (gauge, month) not in served:
                 cache.write_json(cached_month(gauge, month), [(t.isoformat(), v) for t, v in rows])
             fetched.append((gauge, month))
             checkpoint(con)
@@ -495,7 +545,7 @@ def build(
     con,
     stations=slackwater_stations,
     gauges=coops_gauges,
-    residuals=coops_residuals,
+    residuals=None,
     levels=slackwater_levels,
     version=None,
     batch_days=2000,
@@ -513,6 +563,7 @@ def build(
     # ponytail: scans every point for new cells and days; read only new batches at planet scale
     today = today or datetime.now(UTC).date()
     version = version or slackwater_version()
+    residuals = residuals or residual_source()
     # Before anything changes: new cells change the cells' inputs too.
     was_settled = cells.settled(con)
     con.execute("CREATE OR REPLACE TEMP TABLE old_levels AS SELECT * FROM lake.tide_levels LIMIT 0")
@@ -528,6 +579,18 @@ def build(
         con.execute("INSERT INTO old_levels SELECT * FROM lake.tide_levels")
     load_stations(con, stations, gauges, version, accept_departures)
     assign_cells(con)
+    # Residuals taken another way, or against another engine's predictions, are all taken
+    # again: every month reopens, and is fetched with the open ones below. One the new way
+    # can't give, such as a gauge the lake hasn't backfilled, keeps what it had and stays
+    # open, so it is asked for again on each run.
+    basis = f"lake {version}" if residuals is lake_residuals else "coops"
+    kept = con.execute("SELECT value FROM lake.store_meta WHERE key = 'residuals'").fetchone()
+    if (kept[0] if kept else "coops") != basis:
+        con.execute("BEGIN")
+        con.execute("UPDATE lake.tide_residual_months SET fetched = DATE '1900-01-01'")
+        con.execute("DELETE FROM lake.store_meta WHERE key = 'residuals'")
+        con.execute("INSERT INTO lake.store_meta VALUES ('residuals', ?)", [basis])
+        con.execute("COMMIT")
     # Gauge months that aren't final are fetched again, and the levels of those that came
     # back are done again; one CO-OPS can't give now keeps its levels.
     open_ = con.execute(

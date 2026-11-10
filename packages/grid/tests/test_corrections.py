@@ -17,6 +17,7 @@ from test_ingest import env  # noqa: F401  (a fixture)
 from grid import calibrate, catalog, cells, cli, ingest, overlay, tide
 from grid import reference as reference_mod
 from grid.catalog import open_store
+from grid.objects import LocalObjects
 
 TILE = (LAT0 + 90) * 360 + LON0 + 180
 
@@ -148,6 +149,60 @@ def test_recent_days_take_a_gauges_late_data_and_mark_their_tiles(env):  # noqa:
     built = env.query("SELECT value FROM lake.store_meta WHERE key = 'cells'")
     with open_store(env.store) as con:
         assert built == [(cells.inputs(con),)]
+
+
+def test_switching_to_the_lake_takes_every_months_residuals_again(env, monkeypatch):  # noqa: F811
+    lon, lat = at(5000, 0)
+    put(env, 1, [(0, lon, lat, 5.0)])
+    env.run("noaa")
+    gauges = [{"id": "g1", "lon": lon + 0.2, "lat": lat + 0.1}]
+    later = date(2027, 1, 1)
+
+    def lake(gauge, month):
+        return [(t, r + 0.2) for t, r in residuals(gauge, month)]
+
+    monkeypatch.setattr(tide, "lake_residuals", lake)
+    with open_store(env.store) as con:
+        cells.build(con)
+        tide.build(con, stations, lambda: gauges, residuals, levels, version="v1", today=later)
+        cells.build(con)
+        # Final months aren't fetched again, but a new way to take them is.
+        monkeypatch.setenv("GRID_WATER_LEVELS", "lake")
+        tide.build(con, stations, lambda: gauges, None, levels, version="v1", today=later)
+        assert cells.changed(con) == [TILE]
+    [(_, _, _, h, _, _)] = corrected(env)
+    assert h == pytest.approx(1.75 + 0.3, abs=1e-6)
+
+
+def test_a_month_the_lake_cant_give_keeps_its_residuals_and_stays_open(
+    env,  # noqa: F811
+    monkeypatch,
+):
+    lon, lat = at(5000, 0)
+    put(env, 1, [(0, lon, lat, 5.0)])
+    env.run("noaa")
+    gauges = [{"id": "g1", "lon": lon + 0.2, "lat": lat + 0.1}]
+    later = date(2027, 1, 1)
+    monkeypatch.setattr(tide, "lake_residuals", lambda g, m: [])
+    with open_store(env.store) as con:
+        tide.build(con, stations, lambda: gauges, residuals, levels, version="v1", today=later)
+        monkeypatch.setenv("GRID_WATER_LEVELS", "lake")
+        for _ in range(2):
+            tide.build(con, stations, lambda: gauges, None, levels, version="v1", today=later)
+        months = "SELECT fetched FROM lake.tide_residual_months"
+        assert con.execute(months).fetchall() == [(date(1900, 1, 1),)]
+    [(_, _, _, h, _, _)] = corrected(env)
+    assert h == pytest.approx(1.75 + 0.1, abs=1e-6)
+
+
+def test_a_lake_error_keeps_the_month_as_it_was(tmp_path, monkeypatch):
+    def broken(gauge, month):
+        raise duckdb.HTTPException("HTTP 503")
+
+    monkeypatch.setattr(tide, "lake_residuals", broken)
+    with open_store(LocalObjects(tmp_path / "s")) as con:
+        con.execute("CREATE TEMP TABLE old_levels AS SELECT * FROM lake.tide_levels LIMIT 0")
+        assert tide.fetch_residuals(con, [("g1", date(2026, 1, 1))], date(2026, 6, 1), broken) == []
 
 
 def test_old_days_that_gain_levels_mark_their_tiles(env):  # noqa: F811
