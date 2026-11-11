@@ -184,6 +184,8 @@ Downloads go to one cache that every store and worktree on the machine shares, a
 
 Each entry is written to a `.part` file beside it and renamed into place, so concurrent runs only ever read whole entries. A run that can't write to the cache, or remove from it, goes on without it; on Linux, entries a `./docker.sh` run wrote belong to root, so a host run can read them but not trim them, and they don't count against its cap, so the disk may hold more. A source file whose entry a run can't read is downloaded instead. `grid cache --prune` removes rasters the newest cached tile scheme no longer lists, older tile schemes, source files past the cap, and `.part` files a dead write left over a day ago. Prune while no run is going.
 
+Code that decides from the store's file list (`ducklake_list_files` and its file counts, sizes or delete files) has to flush inlined rows first, with `catalog.flush_inlined`. DuckLake keeps an insert of up to 1,000 rows in the catalog itself (`DATA_INLINING_ROW_LIMIT`), where no file list shows it, until a publish writes it out. A decision made before that flush lags by a run, as `grid compact`'s small-file count did. The file list also keeps a file whose rows were all deleted, with a delete file, until the publish's `ducklake_rewrite_data_files` drops it.
+
 ## Testing
 
 Tests live in each package's `test/` directory, mirroring `src/` (e.g.
