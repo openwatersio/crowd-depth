@@ -167,7 +167,7 @@ uv run grid --store /tmp/grid cells --bbox=-77.5,36.8,-75.5,39.7      # only the
 ./docker.sh uv run grid --store .preview/store overlay --out .preview/out   # overlay layers and PMTiles, in the image; it mounts only packages/grid, so the store must be in it
 uv run grid --store /tmp/grid tiles --out /tmp/run   # rebuild only the tiles whose inputs moved since the last run into /tmp/run, through Snakemake; see docs/plans/global-grid/per-tile-pipeline.md
 uv run grid --store .preview/store benchmark --surface .preview/out/surface --out .preview/bench   # score a render against S-102 and BlueTopo; see Validation in docs/plans/global-grid
-uv run grid --store /tmp/grid compact  # QC any unchecked batches, then rewrite each partition's points sorted by tile, once per store layout; run it first after upgrading an older store
+uv run grid --store /tmp/grid compact  # QC any unchecked batches, then rewrite each partition's points and flags sorted by tile, once per store layout and again once either collects small files; run it after each ingest, QC or cells build, and first after upgrading an older store
 uv run grid --store /tmp/grid stats
 uv run grid cache                      # the shared download cache's size by kind; --prune drops old releases and files past the cap
 ```

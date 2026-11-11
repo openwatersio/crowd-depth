@@ -186,7 +186,8 @@ def main(argv=None):
         help="The QC flags that pick accepted soundings and confirmed shoals; default: this code's",
     )
     sub.add_parser(
-        "compact", help="Rewrite each partition's points sorted by tile, once per store layout"
+        "compact",
+        help="Rewrite each partition's points and flags sorted by tile, once per layout or small-file backlog",
     )
     sub.add_parser("stats", help="Count files by source and status")
     k = sub.add_parser("cache", help="Show the download cache's size by kind")

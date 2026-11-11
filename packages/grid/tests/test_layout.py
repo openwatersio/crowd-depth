@@ -152,7 +152,7 @@ def test_a_compact_stopped_partway_leaves_the_store_as_it_was(env, monkeypatch):
 
     def stop(msg, *args):
         # After the first range is written and committed, before any old point is deleted.
-        if msg.startswith("compacted partition %s tiles"):
+        if msg.startswith("compacted partition %s %s tiles"):
             raise KeyboardInterrupt
         real(msg, *args)
 
@@ -166,15 +166,60 @@ def test_a_compact_stopped_partway_leaves_the_store_as_it_was(env, monkeypatch):
     assert env.query(query) == before
 
 
-def test_ingest_writes_points_sorted_by_tile_and_merges_runs_sorted(env):  # noqa: F811
-    env.noaa.put(noaa_key(1), noaa_csv(track(34.1)))
-    env.run("noaa")
-    # A later run's file, in a tile south of the first's: the publish merges the two.
-    env.noaa.put(noaa_key(2), noaa_csv(track(33.1), unique_id="AQM-2"))
-    env.run("noaa")
-    with open_store(env.store, write=False) as con:
+def test_runs_write_sorted_files_that_compact_merges_once_crowded(env, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(catalog, "COMPACT_FILES", 2)
+    for n, lat in enumerate((34.1, 33.1), 1):
+        env.noaa.put(noaa_key(n), noaa_csv(track(lat), unique_id=f"AQM-{n}"))
+        env.run("noaa")
+    query = 'SELECT file_id, "row", tile_id, depth_raw FROM lake.points ORDER BY ALL'
+    flags = "SELECT * FROM lake.qc_flags ORDER BY ALL"
+    before = env.query(query)
+
+    def listed(con, table):
+        return con.execute(
+            f"SELECT data_file, delete_file FROM ducklake_list_files('lake', '{table}')"
+        ).fetchall()
+
+    with open_store(env.store) as con:
+        # Each run's points stay in a sorted file of their own until compact.
         files = point_files(con)
-    assert len(files) == 1 and files[0] == sorted(files[0]) and len(files[0]) == 3000
+        assert len(files) == 2 and all(f == sorted(f) for f in files)
+        assert catalog.compact(con, con.publish) == 1
+        points = listed(con, "points")
+        # A file of flags for each file's points: one small file, then two, which crowd the
+        # flags alone, so their points stay as they are.
+        for (file_id,) in con.execute("SELECT file_id FROM lake.files").fetchall():
+            assert catalog.compact(con, con.publish) == 0
+            con.execute(
+                f"""INSERT INTO lake.qc_flags SELECT {catalog.POINT_ID}, 'reject', 'spike', 99,
+                cell_id, tile_id FROM lake.points p WHERE file_id = ?""",
+                [file_id],
+            )
+        assert catalog.compact(con, con.publish) == 1
+        assert listed(con, "points") == points and len(listed(con, "qc_flags")) == 1
+        # A delete leaves a file with deletes, which counts toward a rewrite too; a tile of
+        # more flags than COMPACT_ROWS is cut into bands of point_id.
+        monkeypatch.setattr(catalog, "COMPACT_FILES", 1)
+        monkeypatch.setattr(catalog, "COMPACT_ROWS", 1000)
+        con.execute(
+            "DELETE FROM lake.qc_flags WHERE tile_id = (SELECT min(tile_id) FROM lake.qc_flags)"
+        )
+        assert listed(con, "qc_flags")[0][1]
+        flagged = con.execute(flags).fetchall()
+        [(cell,)] = con.execute("SELECT DISTINCT cell_id FROM lake.qc_flags").fetchall()
+        bands = catalog.compact_ranges(con, cell, "qc_flags")
+        assert len(bands) > len({lo for lo, *_ in bands})
+        assert catalog.compact(con, con.publish) == 1
+        # At full-size ranges, what compact writes doesn't crowd a partition again.
+        monkeypatch.setattr(catalog, "COMPACT_FILES", 2)
+        monkeypatch.setattr(catalog, "COMPACT_ROWS", 20_000_000)
+        catalog.compact(con, con.publish)
+        assert catalog.compact(con, con.publish) == 0
+        [(_, deletes)] = listed(con, "qc_flags")
+        files = point_files(con)
+    assert deletes is None and 0 < len(flagged) < 3000
+    assert all(f == sorted(f) for f in files) and sum(map(len, files)) == 3000
+    assert env.query(query) == before and env.query(flags) == flagged
 
 
 def test_a_store_at_a_later_layout_is_refused(env):  # noqa: F811
