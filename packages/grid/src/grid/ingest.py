@@ -41,7 +41,8 @@ WITHDRAWAL_LIMIT = 0.01
 # one into DuckDB, whose memory is capped; points wait in a DuckDB table until a flush.
 FETCH_BYTES = 512 * 2**20
 FLUSH_POINTS = 500_000
-# Rule 4 checks files for coverage in groups holding at most this many points.
+# Rule 4 checks files for coverage in groups that read at most this many points: each
+# file's once, plus the older file's again for every pair it's in.
 COVER_POINTS = 5_000_000
 FETCHERS = 16
 # NOAA's response, newest layout first. `.failed.json` marks a retry the API still owes.
@@ -511,19 +512,23 @@ class Ingest:
 
         Counting matters: loggers faster than 1 Hz repeat a time and position with
         different depths, and a newer file holding fewer of them doesn't hold them all.
-        Pairs are checked in groups whose files hold at most COVER_POINTS points, so
-        memory stays bounded however many files overlap.
+        Pairs are checked in groups that read at most COVER_POINTS points, counting the
+        older file again for each pair it's in, so memory stays bounded however many files
+        overlap: one vessel's thousands of overlapping files make millions of pairs. A pair
+        over that runs alone, so an older file of more than half of it is one query a pair.
         """
         held, group, files, size = set(), [], set(), 0
         for pair in sorted(pairs):
             new = set(pair) - files
-            if group and size + sum(sizes[f] for f in new) > COVER_POINTS:
+            cost = sum(sizes[f] for f in new) + sizes[pair[1]]
+            if group and size + cost > COVER_POINTS:
                 held |= self.holding_group(group, files)
                 group, files, size = [], set(), 0
+                cost = sum(sizes[f] for f in pair) + sizes[pair[1]]
                 new = set(pair)
             group.append(pair)
             files |= new
-            size += sum(sizes[f] for f in new)
+            size += cost
         if group:
             held |= self.holding_group(group, files)
         return held
@@ -531,8 +536,8 @@ class Ingest:
     def holding_group(self, group, files) -> set:
         newer, older = zip(*group)
         ids = sorted(files)
-        # ponytail: points are sorted by tile, so the id range prunes row groups only among a
-        # run's own files, before they merge; elsewhere it reads every row group's file_id.
+        # ponytail: points are sorted by tile, so the id range prunes row groups only among
+        # files not yet compacted; elsewhere it reads every row group's file_id.
         # Judge cover against the run's new files and per-file summaries if that grows slow
         return set(
             self.sql(

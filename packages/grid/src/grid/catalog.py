@@ -559,6 +559,13 @@ ROW_GROUP_ROWS = 122_880
 # 4.6 GB at 4 GB, and its delete alone peaked at 5.4 GB at 1 GB.
 COMPACT_ROWS = 20_000_000
 COMPACT_THREADS = 4
+# `compact` rewrites a partition's points, or its flags, again once that table holds this
+# many files there under SMALL_FILE_BYTES or with deletes: a day's ingest or rebuild adds a
+# few, a compact leaves a few, and ingest of the planet left thousands in its densest.
+COMPACT_FILES = 64
+SMALL_FILE_BYTES = 16 * 2**20
+# The column a tile with more than COMPACT_ROWS is cut on, in each table `compact` rewrites.
+BANDS = {"points": "lat", "qc_flags": "point_id"}
 
 
 def migrate_layout(con, write=True):
@@ -613,17 +620,21 @@ def migrate_layout(con, write=True):
         raise
 
 
-def compact_ranges(con, cell):
-    """The partition's points in sort order as ranges (first tile, last tile, lowest lat,
-    lat below) of about COMPACT_ROWS: whole tiles, or bands of latitude in a tile with more."""
+def compact_ranges(con, cell, table="points"):
+    """The partition's rows in sort order as ranges (first tile, last tile, lowest band,
+    band below) of about COMPACT_ROWS: whole tiles, or bands of a tile with more, cut on its
+    BANDS column."""
+    band = BANDS[table]
     ranges, size = [], 0
     for tile, n in con.execute(
-        "SELECT tile_id, count(*) FROM lake.points WHERE cell_id = ? GROUP BY 1 ORDER BY 1", [cell]
+        f"SELECT tile_id, count(*) FROM lake.{table} WHERE cell_id = ? GROUP BY 1 ORDER BY 1",
+        [cell],
     ).fetchall():
         if n > COMPACT_ROWS:
             k = math.ceil(n / COMPACT_ROWS)
             [(cuts,)] = con.execute(
-                "SELECT approx_quantile(lat, ?::FLOAT[]) FROM lake.points WHERE cell_id = ? AND tile_id = ?",
+                f"""SELECT approx_quantile({band}, ?::FLOAT[]) FROM lake.{table}
+                WHERE cell_id = ? AND tile_id = ?""",
                 [[i / k for i in range(1, k)], cell, tile],
             ).fetchall()
             bounds = [-math.inf, *sorted(set(cuts)), math.inf]
@@ -631,7 +642,7 @@ def compact_ranges(con, cell):
             # sorts at once (275M on COMPACT_THREADS took 1.43 GB at a 1 GB limit); cut on lon
             # too if a stationary logger outgrows that
             if len(bounds) < k + 1:
-                log.warning("tile %d: %d points in %d bands of latitude", tile, n, len(bounds) - 1)
+                log.warning("tile %d: %d %s in %d bands", tile, n, table, len(bounds) - 1)
             ranges += [[tile, tile, lo, hi] for lo, hi in itertools.pairwise(bounds)]
             size = math.inf
         elif ranges and size + n <= COMPACT_ROWS:
@@ -644,26 +655,45 @@ def compact_ranges(con, cell):
 
 
 def compact(con, publish=None) -> int:
-    """Rewrite each partition's points not yet compacted at LAYOUT into sorted files
-    (compact_partition), publishing after each. A stopped run resumes at the partition it
-    stopped in, which it rewrites from the start. Returns how many it rewrote. The old files
-    stay until snapshots expire, RETAIN after the run."""
+    """Rewrite into sorted files (compact_partition) each partition not yet compacted at
+    LAYOUT, and the points or flags of each partition where that table holds COMPACT_FILES
+    small files or files with deletes, publishing after each partition. A stopped run
+    resumes at the partition it stopped in, which it rewrites from the start. Returns how
+    many partitions it rewrote. The old files stay until snapshots expire, RETAIN after the
+    run."""
+    # Rows still inlined in the catalog become files at the publish, so count them as files.
+    flush_inlined(con)
     done = {
         v
         for (v,) in con.execute(
             "SELECT value FROM lake.store_meta WHERE key = 'compacted'"
         ).fetchall()
     }
-    cells = [
-        c
+    # The catalog lists each file with its partition in its path, so no data is read.
+    crowded = {}
+    for table in BANDS:
+        for (c,) in con.execute(
+            f"""SELECT TRY_CAST(regexp_extract(data_file, 'cell_id=(-?[0-9]+)/', 1) AS SMALLINT)
+            FROM ducklake_list_files('lake', '{table}')
+            WHERE data_file_size_bytes < $small OR delete_file IS NOT NULL
+            GROUP BY 1 HAVING count(*) >= $files""",
+            {"small": SMALL_FILE_BYTES, "files": COMPACT_FILES},
+        ).fetchall():
+            if c is None:
+                log.warning(
+                    "%s: %d or more small files outside any partition", table, COMPACT_FILES
+                )
+            crowded.setdefault(c, []).append(table)
+    cells = {
+        c: list(BANDS) if f"{LAYOUT}:{c}" not in done else crowded.get(c)
         for (c,) in con.execute("SELECT DISTINCT cell_id FROM lake.points ORDER BY 1").fetchall()
-        if f"{LAYOUT}:{c}" not in done
-    ]
+    }
+    cells = {c: tables for c, tables in cells.items() if tables}
     threads = con.execute("SELECT current_setting('threads')").fetchone()[0]
     con.execute(f"SET threads = {min(threads, COMPACT_THREADS)}")
     try:
-        for cell in cells:
-            compact_partition(con, cell)
+        for cell, tables in cells.items():
+            compact_partition(con, cell, tables)
             if publish:
                 publish()
     finally:
@@ -671,36 +701,53 @@ def compact(con, publish=None) -> int:
     return len(cells)
 
 
-def compact_partition(con, cell):
-    """Rewrite one partition's points sorted, a range at a time (compact_ranges), then
-    delete the old ones a batch of whole files at a time, by the span of their row ids; each
-    statement commits alone. Until the last delete the
-    partition holds its points twice, so nothing publishes in between: `compact` publishes
-    after each partition, and a run that stops partway leaves the catalog it last
-    published."""
+def compact_partition(con, cell, tables=tuple(BANDS)):
+    """Rewrite one partition's `tables`, its points then its flags, sorted, a range at a
+    time (compact_ranges), deleting each table's old rows a batch of whole files at a time,
+    by the span of their row ids; each statement commits alone. Until the last delete the partition
+    holds its rows twice, so nothing publishes in between: `compact` publishes after each
+    partition, and a run that stops partway leaves the catalog it last published."""
+    for table in tables:
+        rewrite(con, table, cell)
+    marker = f"{LAYOUT}:{cell}"
+    con.execute(
+        """INSERT INTO lake.store_meta SELECT 'compacted', $m WHERE NOT EXISTS
+        (SELECT 1 FROM lake.store_meta WHERE key = 'compacted' AND value = $m)""",
+        {"m": marker},
+    )
+    log.info("compacted partition %s", cell)
+
+
+def rewrite(con, table, cell):
+    band = BANDS[table]
     # The rows written now get higher row ids, which tell them from the old ones.
-    [(last,)] = con.execute("SELECT max(rowid) FROM lake.points").fetchall()
-    for lo, hi, south, north in compact_ranges(con, cell):
+    [(last,)] = con.execute(f"SELECT max(rowid) FROM lake.{table}").fetchall()
+    if last is None:
+        return
+    for lo, hi, south, north in compact_ranges(con, cell, table):
         con.execute(
-            """INSERT INTO lake.points SELECT * FROM lake.points WHERE cell_id = $cell
-            AND tile_id BETWEEN $lo AND $hi AND lat >= $south AND lat < $north
+            f"""INSERT INTO lake.{table} SELECT * FROM lake.{table} WHERE cell_id = $cell
+            AND tile_id BETWEEN $lo AND $hi AND {band} >= $south AND {band} < $north
             AND rowid <= $last""",
             {"cell": cell, "lo": lo, "hi": hi, "south": south, "north": north, "last": last},
         )
-        log.info("compacted partition %s tiles %d to %d, lat %s to %s", cell, lo, hi, south, north)
+        log.info(
+            "compacted partition %s %s tiles %d to %d, %s %s to %s",
+            *(cell, table, lo, hi, band, south, north),
+        )
     # Every old row rewritten, or none deleted: a row outside every range would be lost.
     [(old, new)] = con.execute(
-        """SELECT count(*) FILTER (WHERE rowid <= $last), count(*) FILTER (WHERE rowid > $last)
-        FROM lake.points WHERE cell_id = $cell""",
+        f"""SELECT count(*) FILTER (WHERE rowid <= $last), count(*) FILTER (WHERE rowid > $last)
+        FROM lake.{table} WHERE cell_id = $cell""",
         {"cell": cell, "last": last},
     ).fetchall()
     if old != new:
-        raise RuntimeError(f"partition {cell}: rewrote {new} of {old} points")
+        raise RuntimeError(f"partition {cell}: rewrote {new} of {old} {table}")
     # Whole files at a time: DuckLake merges a file's earlier deletes into each new one. Files
     # whose row ids interleave, as a merged file's can, go in one delete.
     batches, size = [], 0
     for lo, hi, n in con.execute(
-        """SELECT min(rowid), max(rowid), count(*) FROM lake.points
+        f"""SELECT min(rowid), max(rowid), count(*) FROM lake.{table}
         WHERE cell_id = $cell AND rowid <= $last GROUP BY filename ORDER BY 1""",
         {"cell": cell, "last": last},
     ).fetchall():
@@ -712,11 +759,9 @@ def compact_partition(con, cell):
             size = n
     for lo, hi in batches:
         [(n,)] = con.execute(
-            "DELETE FROM lake.points WHERE cell_id = ? AND rowid BETWEEN ? AND ?", [cell, lo, hi]
+            f"DELETE FROM lake.{table} WHERE cell_id = ? AND rowid BETWEEN ? AND ?", [cell, lo, hi]
         ).fetchall()
-        log.info("compacted partition %s: deleted %d old points", cell, n)
-    con.execute("INSERT INTO lake.store_meta VALUES ('compacted', ?)", [f"{LAYOUT}:{cell}"])
-    log.info("compacted partition %s", cell)
+        log.info("compacted partition %s: deleted %d old %s", cell, n, table)
 
 
 class Session:
@@ -802,10 +847,13 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
                 if final:
                     # Rebuilds delete and reinsert cells, their flags and shoals, the
                     # calibration and the cells' marker, and DuckLake deletes by writing
-                    # delete files, so the replaced files stay live until rewritten.
-                    # Small files, a run's inserts, merge into sorted ones, and calibration's
-                    # medians, added a few files at a time each day, into larger ones.
-                    for table in (*SORTED, "file_medians", "file_median_inputs", "file_tide_cells"):
+                    # delete files, so the replaced files stay live until rewritten, and so
+                    # do the files `compact` empties. Calibration's medians, added a few
+                    # files at a time each day, merge into larger ones. Points and flags
+                    # merge only in `compact`: DuckLake merges a table's files sorted in one
+                    # statement, which ran out of memory at 1 GB on a planet's 34k flag
+                    # files. Rewriting them is cheap: 7,600 emptied files in 9 s at 0.5 GB.
+                    for table in ("file_medians", "file_median_inputs", "file_tide_cells"):
                         con.execute(f"CALL ducklake_merge_adjacent_files('lake', '{table}')")
                     for table in (
                         "points",

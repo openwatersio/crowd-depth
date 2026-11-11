@@ -20,7 +20,7 @@ Soundings are active soundings, estimated as 0.749 of the archive's rows (the ra
 
 - 42 tiles hold 50% of soundings, 180 hold 80%, 396 hold 90% and 2,687 hold 99%. The 10 densest hold 21%, the 100 densest 69%.
 - The densest tiles are Galveston Bay (29°N 95°W, 67M; 71.6M measured), the Louisiana coast and Atchafalaya (30°N 92°W, 56M; 29°N 91°W, 52M), Houston (29°N 96°W, 45M; 48.3M measured) and the lower Mississippi at Memphis (36°N 90°W, 37M). All of the top 10 are between 29°N and 36°N and 90°W and 96°W, and the US Gulf and Mississippi hold about 40% of the archive. The densest Chesapeake tile (36°N 77°W, 26M) is not in the top 10. The Chesapeake set's 28.0M in it counts only files that touch the bay.
-- The densest holds up to 2.6 times as many as Chesapeake's densest. At the pipeline's linear rate, the densest, at 71.6M measured, needs about 50 min of cells and surface on one M-series core. Its tile jobs' memory is not measured yet ([The Galveston region](#the-galveston-region)).
+- The densest holds up to 2.6 times as many as Chesapeake's densest. Split into 49 leaves, its cells and surface take 1.8 worker-hours, and its region's compact, calibrate and densest tile jobs each finish in a 2 GB cgroup, the densest leaf cells within 47 MB of it ([The Galveston region](#the-galveston-region)).
 
 ## Daily arrivals
 
@@ -59,7 +59,29 @@ The densest tile and its eight neighbors, from 28°N to 31°N and 96°W to 93°W
 - **Active ratio.** Of the 54,113 files found, 40,866 are active, holding 252.1M of the 329.3M rows: 0.766, against Chesapeake's 0.749, counted the same way, as stored rows before the dedupe that tile jobs apply when they read. The other 13,247 files, 77.2M rows, are superseded: 13,233 copies of a stored file and 14 that later files cover. No file is invalid or withdrawn. The planet estimate's 0.749 is within 2.5% here.
 - **Ingest.** 40,880 new files and 252.1M soundings and 56.5 GB of CSVs downloaded in 5.1 h, at a 5.3 GB anon peak at grid's default 4 GB DuckDB limit (`GRID_MEMORY_LIMIT`), in a Linux cgroup on OrbStack's VM (18 threads). Of the step times in seconds: write to R2 6,789, QC 3,215, parse 2,904, download wait 1,283, dedupe 574, coverage 63, list 54. The steps overlap, and the last publish took most of the rest. Eight keys were not in the bucket. The store is 19.2 GB on R2, 17.3 GB of it points.
 - **Tide.** 2.9 h at a 4.2 GB anon peak, most of it fetching 2,824 CO-OPS gauge months; 52,064 station days in 67 tiles. CO-OPS answered 39 months of gauge 8761955 with HTTP 400; tide skips such a month with a warning, keeps what it had for it, and asks again on every run.
-- **Compact** ran out of memory, and **calibrate** stalled; both are in [backlog.md](backlog.md#3-make-the-daily-rebuild-fit). The tiles' cells, surface and overlay jobs have not run, so their memory is not measured.
+
+The steps after tide were measured on a local copy of the store, downloaded from R2 in 19 min, in the grid image on OrbStack's Linux VM (18 threads, aarch64), each in a Linux cgroup of its own, with anon memory sampled every 50 ms. Calibrate at 1 GB and the tile jobs ran while the planet's NOAA ingest ran in the same VM, so their times are upper bounds; their memory is their cgroup's own. Spill and data were on a USB SSD shared into the VM, and with eight jobs at once the leaf surfaces waited on its I/O: run alone, the slowest took 264 s against 1,303 s in the build.
+
+- **Compact** finishes in a 2 GB cgroup at a 1 GB limit, at 1.31 GB, in 163 s: six partitions in 48 ranges. The points go from 17.3 GB to 7.28 GB, in 21 files and row groups of 101k rows.
+- **Reads.** Pruned by its row groups' tiles, a tile's read touches 1.00 to 1.02 times its own rows in the five densest tiles, and 1.19 in 42565 (1.9M). Tile 42925 reads 721 row groups in 5 files, 2.11 GB with every column. From R2 over the Mac Studio's connection that read takes 124 s cold and 80 s warm on 4 threads, 17 to 26 MB/s, the speed the store downloaded at; from the local SSD 5.9 s and 2.4 s.
+- **Calibrate**, reducing every file again, finishes in a 2 GB cgroup at a 1 GB limit, at 1.79 GB, in 34 min: the reduce takes 7.5 min at 1.36 GB, the stuck-run search 474 s, publishing 52 s. With the files already reduced it takes 26 min at the same peak. At 768 MB it runs out of DuckDB memory after the lost-median passes, while judging transits: the temp tables of 45.6M file-pixel medians fill the pool, 709 MB of it with 5.9 GB spilled, and a statement can't pin the blocks it reads. At the 4 GB default it takes 21 min at 4.62 GB. Every run gives the same 114 segments, 3 steps, 2,251 stray transits, 90,018 lost runs and 39,830 file offsets.
+- **Tile jobs.** `grid tiles` builds the 92 tiles the region's files reach, in 425 leaves, in 73 min with eight jobs at once in 18 GB, 9.6 worker-hours: leaf cells 3.5 h, leaf surfaces 5.7 h, overlays 0.25 h, web tiles 0.06 h. Tile 42925 splits into 49 leaves, whose cells and surfaces take 1.8 worker-hours. The densest jobs, each alone in a 2 GB cgroup, all finish, and so do all 92 overlays, at most 1.49 GB; the other leaf jobs were not run alone:
+
+| job                     | soundings in reach | peak anon |   s |
+| ----------------------- | -----------------: | --------: | --: |
+| leaf cells 42924/r331   |              25.8M |  1,956 MB | 154 |
+| leaf cells 42924/r313   |              17.3M |  2,001 MB |  99 |
+| leaf cells 43286/r101   |              15.8M |  1,658 MB | 140 |
+| leaf cells 42925/r023   |              11.7M |  1,800 MB |  76 |
+| leaf surface 42924/r331 |              25.8M |  1,544 MB | 264 |
+| leaf surface 43286/r101 |              15.8M |  1,505 MB | 117 |
+| leaf surface 42925/r023 |              11.7M |  1,305 MB |  88 |
+| cells splice 42925      |              71.6M |    918 MB |   5 |
+| overlay 42925           |              71.6M |  1,489 MB |  52 |
+| overlay 42924           |              48.3M |    947 MB |   9 |
+| overlay 42926           |              32.3M |  1,374 MB |  33 |
+
+Overlay 42925 places the 20M published soundings in and beside its tile in its pixels a million at a time: all at once, they took it to 2.74 GB, with the same output on all 92 tiles, byte for byte. Leaf cells 42924/r313 runs within 47 MB of its cgroup's 2,048 MB, with the kernel reclaiming.
 
 ## Method
 

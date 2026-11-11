@@ -511,6 +511,25 @@ def test_rule4_matches_judging_each_pair_in_turn(tmp_path, monkeypatch, seed):
     assert any(r[2] == "covered" for r in results[0])
 
 
+def test_rule4_groups_count_the_older_file_once_per_pair(monkeypatch):
+    # The check reads the older file's points again for each pair it's in: one file
+    # overlapped by many newer ones splits across groups though their files are few.
+    monkeypatch.setattr(ingest, "COVER_POINTS", 12)
+    groups = []
+
+    class Groups:
+        def holding_group(self, group, files):
+            groups.append((list(group), set(files)))
+            return set()
+
+    sizes = {0: 4, **{n: 1 for n in range(1, 7)}}
+    pairs = {(n, 0) for n in range(1, 7)}
+    Ingest.holding(Groups(), pairs, sizes)
+    assert sorted(p for group, _ in groups for p in group) == sorted(pairs)
+    for group, files in groups:
+        assert sum(sizes[f] for f in files) + sum(sizes[older] for _, older in group) <= 12
+
+
 def test_rule4_covered_file_returns_when_newer_withdrawn(env, monkeypatch):
     monkeypatch.setattr(ingest, "WITHDRAWAL_LIMIT", 1)
     env.ow.put(ow_key(1), geojson(ROWS[:2]))
