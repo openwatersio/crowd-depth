@@ -25,10 +25,10 @@ Each stage is a `grid` command run in a container. A stage starts only when the 
 
 | #   | Stage     | Command                                                | Runs as                                                                           | Lock |
 | --- | --------- | ------------------------------------------------------ | --------------------------------------------------------------------------------- | ---- |
-| 1   | Ingest    | `grid ingest --source noaa`                            | one process, `GRID_MEMORY_LIMIT=768MB`, downloading as it goes                    | yes  |
-| 2   | Compact   | `grid compact`                                         | one process, a partition at a time                                                | yes  |
+| 1   | Ingest    | `grid ingest --source noaa`                            | one process, `GRID_MEMORY_LIMIT=8GB` in 12 GB, downloading as it goes             | no   |
+| 2   | Compact   | `grid compact`                                         | one process, a partition at a time, `GRID_MEMORY_LIMIT=768MB` in 3 GB             | yes  |
 | 3   | Tide      | `grid tide`                                            | one process                                                                       | yes  |
-| 4   | Calibrate | `grid calibrate --reference s102 --reference bluetopo` | one process, `GRID_MEMORY_LIMIT=768MB`                                            | yes  |
+| 4   | Calibrate | `grid calibrate --reference s102 --reference bluetopo` | one process, `GRID_MEMORY_LIMIT=1GB` in 4 GB                                      | yes  |
 | 5   | Tiles     | `grid tiles --out run --memory-gb 20`                  | Snakemake: leaf cells, leaf surfaces, splices, overlays, web, low zooms, assembly | yes  |
 | 6   | Publish   | `grid tiles --out run --publish s3://…`                | uploads only; no job reruns                                                       | no   |
 
@@ -57,7 +57,7 @@ Rows come from Galveston's 4.5M rows per GB of CSV, times 471 GB. Disk: the stor
 A stopped run picks up where it stopped, stage by stage:
 
 - **Ingest** publishes its catalog every 15 minutes (`catalog.CHECKPOINT_SECONDS`), so a rerun skips the files it committed.
-- **Compact** rewrites each partition once per store layout and skips the ones already done.
+- **Compact** publishes after each partition, and a rerun skips the partitions already done, unless their points or flags have crowded again.
 - **Tide** fetches only station days it lacks, and calibrate reduces only files whose fingerprint moved (`lake.file_medians`).
 - **Tiles**: Snakemake reruns only unfinished jobs; a job's outputs are its checkpoint.
 - **Publish** names tile files by content, so a rerun uploads only what isn't there, and writes the manifest last.
@@ -70,16 +70,20 @@ The same keys as the Chesapeake preview ([per-tile-pipeline.md](per-tile-pipelin
 
 ## Measured
 
-_To be filled in as each stage finishes: wall time, worker-hours, peak memory, bytes read and written._
+On the Mac Studio under OrbStack, with the store on a USB SSD. Each stage is one process, so its worker-hours are its wall time. Peak memory is the container's anonymous memory, sampled each second; the cgroup's read and write counts miss most of the bind mount's traffic, so they're left out.
 
-| Stage     | Wall | Worker-hours | Peak memory | Read | Written |
-| --------- | ---: | -----------: | ----------: | ---: | ------: |
-| Ingest    |      |              |             |      |         |
-| Compact   |      |              |             |      |         |
-| Tide      |      |              |             |      |         |
-| Calibrate |      |              |             |      |         |
-| Tiles     |      |              |             |      |         |
-| Publish   |      |              |             |      |         |
+| Stage     |                Wall | CPU-hours | Peak memory |
+| --------- | ------------------: | --------: | ----------: |
+| Ingest    | 24.3 h, in six runs |      34.5 |     10.5 GB |
+| Compact   | 53 min, in two runs |       2.6 |      2.0 GB |
+| Tide      |                     |           |             |
+| Calibrate |                     |           |             |
+| Tiles     |                     |           |             |
+| Publish   |                     |           |             |
+
+**Ingest** read all 1,045,268 CSVs into 1.90B points and 171M flags. It ran at a 2 GB limit in 6 GB at first, then at 8 GB in 12 GB; the lock was waived so it ran beside the Galveston probes, and its times include their load. Two runs stopped about 7.8 h in when a download in `tmp/` vanished from OrbStack's bind mount, and the driver now reruns ingest after that error, up to three times; each rerun resumes from the last checkpoint. One run was killed at 6 GB while rule 4 judged one vessel's 1.49M overlapping pairs, and two failed in the final publish's merge of 34,168 flag files, one at 10.5 GB. The fixes for both are in [#237](https://github.com/openwatersio/crowd-depth/pull/237), and with them the last run took 520 s at 2.3 GB.
+
+**Compact** rewrote all 285 partitions, the points from 42,753 files to 389 (132 GB on disk, old files included until snapshots expire) and the flags from 34,168 to 277. Its memory grows over a run, in DuckDB's file and object caches and about 1 GB outside them: the first run was killed at 2 GB after 197 partitions, and the second finished the other 88 in 3 GB.
 
 ## Hetzner
 
