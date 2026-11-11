@@ -167,7 +167,7 @@ uv run grid --store /tmp/grid cells --bbox=-77.5,36.8,-75.5,39.7      # only the
 ./docker.sh uv run grid --store .preview/store overlay --out .preview/out   # overlay layers and PMTiles, in the image; it mounts only packages/grid, so the store must be in it
 uv run grid --store /tmp/grid tiles --out /tmp/run   # rebuild only the tiles whose inputs moved since the last run into /tmp/run, through Snakemake; see docs/plans/global-grid/per-tile-pipeline.md
 uv run grid --store .preview/store benchmark --surface .preview/out/surface --out .preview/bench   # score a render against S-102 and BlueTopo; see Validation in docs/plans/global-grid
-uv run grid --store /tmp/grid compact  # QC any unchecked batches, then rewrite each partition's points sorted by tile, once per store layout; run it first after upgrading an older store
+uv run grid --store /tmp/grid compact  # QC any unchecked batches, then rewrite each partition's points and flags sorted by tile, once per store layout and again once either collects small files; run it after each ingest, QC or cells build, and first after upgrading an older store
 uv run grid --store /tmp/grid stats
 uv run grid cache                      # the shared download cache's size by kind; --prune drops old releases and files past the cap
 ```
@@ -183,6 +183,8 @@ Downloads go to one cache that every store and worktree on the machine shares, a
 - `coops`: CO-OPS gauge months with data, once a store has made them final, 45 days after they end. A recent month, and a month CO-OPS has no data for, is fetched again by each store.
 
 Each entry is written to a `.part` file beside it and renamed into place, so concurrent runs only ever read whole entries. A run that can't write to the cache, or remove from it, goes on without it; on Linux, entries a `./docker.sh` run wrote belong to root, so a host run can read them but not trim them, and they don't count against its cap, so the disk may hold more. A source file whose entry a run can't read is downloaded instead. `grid cache --prune` removes rasters the newest cached tile scheme no longer lists, older tile schemes, source files past the cap, and `.part` files a dead write left over a day ago. Prune while no run is going.
+
+Code that decides from the store's file list (`ducklake_list_files` and its file counts, sizes or delete files) has to flush inlined rows first, with `catalog.flush_inlined`. DuckLake keeps an insert of up to 1,000 rows in the catalog itself (`DATA_INLINING_ROW_LIMIT`), where no file list shows it, until a publish writes it out. A decision made before that flush lags by a run, as `grid compact`'s small-file count did. The file list also keeps a file whose rows were all deleted, with a delete file, until the publish's `ducklake_rewrite_data_files` drops it.
 
 ## Testing
 
