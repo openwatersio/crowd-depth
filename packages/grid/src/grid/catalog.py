@@ -661,6 +661,8 @@ def compact(con, publish=None) -> int:
     resumes at the partition it stopped in, which it rewrites from the start. Returns how
     many partitions it rewrote. The old files stay until snapshots expire, RETAIN after the
     run."""
+    # Rows still inlined in the catalog become files at the publish, so count them as files.
+    flush_inlined(con)
     done = {
         v
         for (v,) in con.execute(

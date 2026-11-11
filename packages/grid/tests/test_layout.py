@@ -222,6 +222,20 @@ def test_runs_write_sorted_files_that_compact_merges_once_crowded(env, monkeypat
     assert env.query(query) == before and env.query(flags) == flagged
 
 
+def test_compact_counts_flags_still_inlined(env, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(catalog, "COMPACT_FILES", 2)
+    env.noaa.put(noaa_key(1), noaa_csv(track(34.1)))
+    env.run("noaa")
+    insert = f"""INSERT INTO lake.qc_flags SELECT {catalog.POINT_ID}, 'reject', 'spike', 99,
+        cell_id, tile_id FROM lake.points p WHERE "row" BETWEEN ? AND ?"""
+    with open_store(env.store) as con:
+        assert catalog.compact(con, con.publish) == 1
+        # A file of flags, then a QC batch too small to leave the catalog until a flush.
+        con.execute(insert, [0, 1489])
+        con.execute(insert, [1490, 1499])
+        assert catalog.compact(con, con.publish) == 1
+
+
 def test_a_store_at_a_later_layout_is_refused(env):  # noqa: F811
     env.noaa.put(noaa_key(1), noaa_csv(ROWS))
     env.run("noaa")
