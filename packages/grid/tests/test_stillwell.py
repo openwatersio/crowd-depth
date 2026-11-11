@@ -8,11 +8,11 @@ from typing import ClassVar
 import duckdb
 import pytest
 
-from grid import tide, waterlevels
+from grid import stillwell, tide
 
 
 class Handler(SimpleHTTPRequestHandler):
-    """Serves the lake's files with an ETag, as its bucket does, and counts the GETs."""
+    """Serves Stillwell's files with an ETag, as its bucket does, and counts the GETs."""
 
     gets: ClassVar[list[str]] = []
 
@@ -34,20 +34,20 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 @pytest.fixture
-def lake(tmp_path, monkeypatch):
-    root = tmp_path / "lake"
+def bucket(tmp_path, monkeypatch):
+    root = tmp_path / "bucket"
     root.mkdir()
     server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, directory=str(root)))
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    monkeypatch.setattr(waterlevels, "LAKE", f"http://127.0.0.1:{server.server_port}")
-    waterlevels.stations.cache_clear()
-    waterlevels.years.cache_clear()
+    monkeypatch.setattr(stillwell, "HOST", f"http://127.0.0.1:{server.server_port}")
+    stillwell.stations.cache_clear()
+    stillwell.years.cache_clear()
     Handler.gets = []
     stations(root)
     yield root
     server.shutdown()
-    waterlevels.stations.cache_clear()
-    waterlevels.years.cache_clear()
+    stillwell.stations.cache_clear()
+    stillwell.years.cache_clear()
 
 
 def sql(query):
@@ -96,9 +96,9 @@ def years(root, rows):
     )
 
 
-def test_levels_leave_out_suspect_and_bad_values(lake):
+def test_levels_leave_out_suspect_and_bad_values(bucket):
     obs(
-        lake,
+        bucket,
         "g1/2024.parquet",
         [
             ("2024-03-01 00:00:00", 1.5, 0),
@@ -108,17 +108,21 @@ def test_levels_leave_out_suspect_and_bad_values(lake):
             ("2024-04-01 00:00:00", 1.7, 0),
         ],
     )
-    got = waterlevels.observed("coops", "g1", datetime(2024, 3, 1), datetime(2024, 4, 1))
+    got = stillwell.observed("coops", "g1", datetime(2024, 3, 1), datetime(2024, 4, 1))
     assert got == [
         (datetime(2024, 3, 1, 0, 0), pytest.approx(1.5)),
         (datetime(2024, 3, 1, 0, 6), pytest.approx(1.6)),
     ]
 
 
-def test_an_earlier_epochs_levels_are_put_in_the_current_datum(lake):
-    obs(lake, "g2/2024.parquet", [("2024-06-30 23:54:00", 2.0, 0), ("2024-07-01 00:00:00", 9.0, 0)])
-    obs(lake, "g2/2/2024.parquet", [("2024-07-01 00:00:00", 1.4, 0)])
-    got = waterlevels.observed("coops", "g2", datetime(2024, 6, 30), datetime(2024, 7, 2))
+def test_an_earlier_epochs_levels_are_put_in_the_current_datum(bucket):
+    obs(
+        bucket,
+        "g2/2024.parquet",
+        [("2024-06-30 23:54:00", 2.0, 0), ("2024-07-01 00:00:00", 9.0, 0)],
+    )
+    obs(bucket, "g2/2/2024.parquet", [("2024-07-01 00:00:00", 1.4, 0)])
+    got = stillwell.observed("coops", "g2", datetime(2024, 6, 30), datetime(2024, 7, 2))
     # Epoch 1's row past its `until` isn't part of the series.
     assert got == [
         (datetime(2024, 6, 30, 23, 54), pytest.approx(1.5)),
@@ -126,46 +130,46 @@ def test_an_earlier_epochs_levels_are_put_in_the_current_datum(lake):
     ]
 
 
-def test_a_year_file_is_downloaded_again_only_when_its_version_changes(lake):
-    obs(lake, "g1/2024.parquet", [("2024-03-01 00:00:00", 1.5, 0)])
-    years(lake, [("coops/g1", 1, 2024, "aaa")])
-    first = waterlevels.year_file("coops", "g1", 1, 2024)
-    assert waterlevels.year_file("coops", "g1", 1, 2024) == first
+def test_a_year_file_is_downloaded_again_only_when_its_version_changes(bucket):
+    obs(bucket, "g1/2024.parquet", [("2024-03-01 00:00:00", 1.5, 0)])
+    years(bucket, [("coops/g1", 1, 2024, "aaa")])
+    first = stillwell.year_file("coops", "g1", 1, 2024)
+    assert stillwell.year_file("coops", "g1", 1, 2024) == first
     # Listed as missing: no request at all.
-    assert waterlevels.year_file("coops", "g1", 1, 2023) is None
+    assert stillwell.year_file("coops", "g1", 1, 2023) is None
     assert Handler.gets.count("/obs/coops/g1/2024.parquet") == 1
-    years(lake, [("coops/g1", 1, 2024, "bbb")])
-    waterlevels.years.cache_clear()
-    second = waterlevels.year_file("coops", "g1", 1, 2024)
+    years(bucket, [("coops/g1", 1, 2024, "bbb")])
+    stillwell.years.cache_clear()
+    second = stillwell.year_file("coops", "g1", 1, 2024)
     assert second != first and second.exists() and not first.exists()
     assert Handler.gets.count("/obs/coops/g1/2024.parquet") == 2
 
 
-def test_without_a_years_listing_the_etag_versions_a_year_file(lake):
-    obs(lake, "g1/2024.parquet", [("2024-03-01 00:00:00", 1.5, 0)])
-    first = waterlevels.year_file("coops", "g1", 1, 2024)
-    assert waterlevels.year_file("coops", "g1", 1, 2024) == first
-    assert waterlevels.year_file("coops", "g1", 1, 2023) is None
-    obs(lake, "g1/2024.parquet", [("2024-03-01 00:00:00", 1.6, 0)])
-    assert waterlevels.year_file("coops", "g1", 1, 2024) != first
+def test_without_a_years_listing_the_etag_versions_a_year_file(bucket):
+    obs(bucket, "g1/2024.parquet", [("2024-03-01 00:00:00", 1.5, 0)])
+    first = stillwell.year_file("coops", "g1", 1, 2024)
+    assert stillwell.year_file("coops", "g1", 1, 2024) == first
+    assert stillwell.year_file("coops", "g1", 1, 2023) is None
+    obs(bucket, "g1/2024.parquet", [("2024-03-01 00:00:00", 1.6, 0)])
+    assert stillwell.year_file("coops", "g1", 1, 2024) != first
     assert Handler.gets.count("/obs/coops/g1/2024.parquet") == 2
 
 
-def test_a_station_the_listing_marks_is_checked_by_its_etag(lake):
-    obs(lake, "g1/2024.parquet", [("2024-03-01 00:00:00", 1.5, 0)])
-    (lake / "stations" / "years").mkdir(parents=True)
+def test_a_station_the_listing_marks_is_checked_by_its_etag(bucket):
+    obs(bucket, "g1/2024.parquet", [("2024-03-01 00:00:00", 1.5, 0)])
+    (bucket / "stations" / "years").mkdir(parents=True)
     years_rows = "('coops/g1', 1, 2023, 'aaa'), ('coops/g1', NULL, NULL, NULL)"
     sql(
         f"""COPY (SELECT * FROM (VALUES {years_rows}) t(id, epoch, year, version))
-        TO '{lake}/stations/years/coops.parquet'"""
+        TO '{bucket}/stations/years/coops.parquet'"""
     )
     # The listing has no 2024 row, but a marked station's rows may be out of date.
-    assert waterlevels.year_file("coops", "g1", 1, 2024) is not None
+    assert stillwell.year_file("coops", "g1", 1, 2024) is not None
 
 
-def test_lake_residuals_are_observed_in_mllw_minus_slackwater(lake, monkeypatch):
+def test_stillwell_residuals_are_observed_in_mllw_minus_slackwater(bucket, monkeypatch):
     obs(
-        lake,
+        bucket,
         "g1/2024.parquet",
         [
             ("2024-03-01 00:00:00", 1.5, 0),
@@ -180,7 +184,7 @@ def test_lake_residuals_are_observed_in_mllw_minus_slackwater(lake, monkeypatch)
         return [[[t, 0.3] for t in range(r["start"], r["end"] + 1, r["step"])] for r in requests]
 
     monkeypatch.setattr(tide, "slackwater_levels", levels)
-    got = tide.lake_residuals("g1", date(2024, 3, 1))
+    got = tide.stillwell_residuals("g1", date(2024, 3, 1))
     assert got == [
         (datetime(2024, 3, 1, 0, 0), pytest.approx(0.2)),
         (datetime(2024, 3, 1, 0, 6), pytest.approx(0.3)),
@@ -188,28 +192,28 @@ def test_lake_residuals_are_observed_in_mllw_minus_slackwater(lake, monkeypatch)
     [req] = asked
     assert req["station"] == "noaa/g1" and req["step"] == 360 and req["datum"] == "MLLW"
     assert req["end"] - req["start"] == 31 * 86400 - 360
-    # A gauge the lake doesn't list, or a month no year file covers, is one it can't give.
-    assert tide.lake_residuals("nowhere", date(2024, 3, 1)) is None
-    assert tide.lake_residuals("g1", date(2023, 3, 1)) is None
+    # A gauge Stillwell doesn't list, or a month no year file covers, is one it can't give.
+    assert tide.stillwell_residuals("nowhere", date(2024, 3, 1)) is None
+    assert tide.stillwell_residuals("g1", date(2023, 3, 1)) is None
 
 
-def test_december_reads_only_its_own_year(lake):
-    obs(lake, "g1/2024.parquet", [("2024-12-31 23:54:00", 1.5, 0)])
-    obs(lake, "g1/2025.parquet", [("2025-01-01 00:00:00", 1.6, 0)])
-    got = waterlevels.observed("coops", "g1", datetime(2024, 12, 1), datetime(2025, 1, 1))
+def test_december_reads_only_its_own_year(bucket):
+    obs(bucket, "g1/2024.parquet", [("2024-12-31 23:54:00", 1.5, 0)])
+    obs(bucket, "g1/2025.parquet", [("2025-01-01 00:00:00", 1.6, 0)])
+    got = stillwell.observed("coops", "g1", datetime(2024, 12, 1), datetime(2025, 1, 1))
     assert len(got) == 1
     assert "/obs/coops/g1/2025.parquet" not in Handler.gets
 
 
-def test_a_year_file_the_cache_cant_take_is_read_from_the_lake(lake, monkeypatch):
-    obs(lake, "g1/2024.parquet", [("2024-03-01 00:00:00", 1.5, 0)])
+def test_a_year_file_the_cache_cant_take_is_read_from_stillwell(bucket, monkeypatch):
+    obs(bucket, "g1/2024.parquet", [("2024-03-01 00:00:00", 1.5, 0)])
 
     def unwritable(dest):
         raise PermissionError(dest)
 
-    monkeypatch.setattr(waterlevels.cache, "writing", unwritable)
-    assert waterlevels.year_file("coops", "g1", 1, 2024) == waterlevels.url("coops", "g1", 1, 2024)
-    got = waterlevels.observed("coops", "g1", datetime(2024, 3, 1), datetime(2024, 4, 1))
+    monkeypatch.setattr(stillwell.cache, "writing", unwritable)
+    assert stillwell.year_file("coops", "g1", 1, 2024) == stillwell.url("coops", "g1", 1, 2024)
+    got = stillwell.observed("coops", "g1", datetime(2024, 3, 1), datetime(2024, 4, 1))
     assert got == [(datetime(2024, 3, 1), pytest.approx(1.5))]
 
 
@@ -219,52 +223,69 @@ def test_the_water_levels_source_defaults_to_the_stores(monkeypatch):
     con.execute("CREATE TABLE lake.store_meta (key VARCHAR, value VARCHAR)")
     monkeypatch.delenv("GRID_WATER_LEVELS", raising=False)
     assert tide.residual_source(con) is tide.coops_residuals
-    con.execute("INSERT INTO lake.store_meta VALUES ('residuals', 'lake v1')")
-    assert tide.residual_source(con) is tide.lake_residuals
+    con.execute("INSERT INTO lake.store_meta VALUES ('residuals', 'stillwell v1')")
+    assert tide.residual_source(con) is tide.stillwell_residuals
     monkeypatch.setenv("GRID_WATER_LEVELS", "coops")
     assert tide.residual_source(con) is tide.coops_residuals
     # A misspelling would otherwise switch the store.
-    monkeypatch.setenv("GRID_WATER_LEVELS", "Lake")
+    monkeypatch.setenv("GRID_WATER_LEVELS", "Stillwell")
     with pytest.raises(ValueError):
         tide.residual_source(con)
 
 
-def test_a_months_versions_change_with_its_year_files(lake):
+def test_a_months_versions_change_with_its_year_files(bucket):
     start, end = datetime(2024, 6, 1), datetime(2024, 8, 1)
-    assert waterlevels.versions("coops", "g2", start, end) is None
-    assert waterlevels.observed("coops", "g2", start, end) is None
-    obs(lake, "g2/2024.parquet", [("2024-06-30 23:54:00", 2.0, 0)])
-    first = waterlevels.versions("coops", "g2", start, end)
+    assert stillwell.versions("coops", "g2", start, end) is None
+    assert stillwell.observed("coops", "g2", start, end) is None
+    obs(bucket, "g2/2024.parquet", [("2024-06-30 23:54:00", 2.0, 0)])
+    first = stillwell.versions("coops", "g2", start, end)
     # The later epoch's file appearing, as a backfill would bring it, changes them.
-    obs(lake, "g2/2/2024.parquet", [("2024-07-01 00:00:00", 1.4, 0)])
-    second = waterlevels.versions("coops", "g2", start, end)
+    obs(bucket, "g2/2/2024.parquet", [("2024-07-01 00:00:00", 1.4, 0)])
+    second = stillwell.versions("coops", "g2", start, end)
     assert first.startswith("1/2024=") and "2/2024=-" in first and "2/2024=-" not in second
-    obs(lake, "g2/2/2024.parquet", [("2024-07-01 00:00:00", 1.5, 0)])
-    assert waterlevels.versions("coops", "g2", start, end) != second
+    obs(bucket, "g2/2/2024.parquet", [("2024-07-01 00:00:00", 1.5, 0)])
+    assert stillwell.versions("coops", "g2", start, end) != second
 
 
-def test_observations_slackwater_cant_predict_are_a_month_it_cant_give(lake, monkeypatch):
-    obs(lake, "g1/2024.parquet", [("2024-03-01 00:00:00", 1.5, 0)])
+def test_observations_slackwater_cant_predict_are_a_month_it_cant_give(bucket, monkeypatch):
+    obs(bucket, "g1/2024.parquet", [("2024-03-01 00:00:00", 1.5, 0)])
     monkeypatch.setattr(tide, "slackwater_levels", lambda requests: [[] for _ in requests])
-    assert tide.lake_residuals("g1", date(2024, 3, 1)) is None
+    assert tide.stillwell_residuals("g1", date(2024, 3, 1)) is None
+    # Predictions at other times, or residuals past the limit, aren't Stillwell's record either.
+    monkeypatch.setattr(tide, "slackwater_levels", lambda requests: [[[0, 0.3]] for _ in requests])
+    assert tide.stillwell_residuals("g1", date(2024, 3, 1)) is None
 
 
-def test_a_month_with_no_values_is_one_the_lake_cant_give(lake):
-    obs(lake, "g1/2024.parquet", [("2024-03-01 00:00:00", 1.5, 0), ("2024-03-01 00:06:00", 1.6, 4)])
-    # Values, all flagged: the lake's record is that there are none.
-    assert (
-        waterlevels.observed("coops", "g1", datetime(2024, 3, 1, 0, 6), datetime(2024, 4, 1)) == []
+def test_the_coops_gauge_listing_asks_for_water_level_stations(monkeypatch):
+    asked = []
+
+    def get(url, params):
+        asked.append(params)
+        return {"stations": [{"id": str(i), "lng": 0, "lat": 0} for i in range(tide.MIN_GAUGES)]}
+
+    monkeypatch.setattr(tide, "_get", get)
+    assert len(tide.coops_gauges()) == tide.MIN_GAUGES
+    assert asked == [{"type": "waterlevels"}]
+
+
+def test_a_month_with_no_values_is_one_stillwell_cant_give(bucket):
+    obs(
+        bucket,
+        "g1/2024.parquet",
+        [("2024-03-01 00:00:00", 1.5, 0), ("2024-03-01 00:06:00", 1.6, 4)],
     )
+    # Values, all flagged: Stillwell's record is that there are none.
+    assert stillwell.observed("coops", "g1", datetime(2024, 3, 1, 0, 6), datetime(2024, 4, 1)) == []
     # No value at all, as before a gauge's record starts in its year file.
-    assert waterlevels.observed("coops", "g1", datetime(2024, 1, 1), datetime(2024, 2, 1)) is None
+    assert stillwell.observed("coops", "g1", datetime(2024, 1, 1), datetime(2024, 2, 1)) is None
 
 
-def test_a_flagged_value_in_the_earlier_epoch_still_beats_a_rejected_one(lake, monkeypatch):
-    rows = waterlevels.stations("coops")
+def test_a_flagged_value_in_the_earlier_epoch_still_beats_a_rejected_one(bucket, monkeypatch):
+    rows = stillwell.stations("coops")
     rows["g2"]["epochs"][1]["rejected"] = True
-    obs(lake, "g2/2024.parquet", [("2024-06-30 23:54:00", 2.0, 4)])
-    obs(lake, "g2/2/2024.parquet", [("2024-06-30 23:54:00", 9.0, 0)])
+    obs(bucket, "g2/2024.parquet", [("2024-06-30 23:54:00", 2.0, 4)])
+    obs(bucket, "g2/2/2024.parquet", [("2024-06-30 23:54:00", 9.0, 0)])
     # The rejected epoch's file holds a value before its span, as after an epoch moves back.
     rows["g2"]["epochs"][1]["since"] = datetime(2024, 6, 30)
-    got = waterlevels.observed("coops", "g2", datetime(2024, 6, 30), datetime(2024, 7, 1))
+    got = stillwell.observed("coops", "g2", datetime(2024, 6, 30), datetime(2024, 7, 1))
     assert got == []

@@ -104,7 +104,7 @@ def main(argv=None):
     )
     td = sub.add_parser(
         "tide",
-        help="Tide levels for the soundings' station days, from Slackwater and CO-OPS or the water-levels lake",
+        help="Tide levels for the soundings' station days, from Slackwater and CO-OPS or Stillwell",
     )
     td.add_argument(
         "--accept-departures",

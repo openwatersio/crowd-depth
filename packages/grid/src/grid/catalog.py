@@ -99,8 +99,8 @@ CREATE TABLE IF NOT EXISTS lake.tide_levels (
 -- fetched: a month is final once fetched well after its end.
 CREATE TABLE IF NOT EXISTS lake.tide_residuals (gauge VARCHAR, time TIMESTAMP, residual FLOAT);
 CREATE TABLE IF NOT EXISTS lake.tide_residual_months (gauge VARCHAR, month DATE, fetched DATE);
--- For each gauge month fetched from the water-levels lake: when, what it was read from
--- (tide.lake_version), and a digest of its residuals.
+-- For each gauge month fetched from Stillwell: when, what it was read from
+-- (tide.stillwell_version), and a digest of its levels in MLLW.
 CREATE TABLE IF NOT EXISTS lake.tide_residual_versions (
   gauge VARCHAR, month DATE, fetched DATE, version VARCHAR, digest VARCHAR
 );

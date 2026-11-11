@@ -8,7 +8,7 @@ It lives at GRID_CACHE_DIR, or $XDG_CACHE_HOME/crowd-depth-grid, or
 - `files`: NOAA's CSVs, keyed by bucket, key and ETag, trimmed to GRID_CACHE_FILES_GB,
   least recently used first. Open Waters uploads aren't kept: a withdrawn one must leave.
 - `coops`: CO-OPS gauge months, once final.
-- `water-levels`: the water-levels lake's year files, keyed by their version or ETag.
+- `stillwell`: Stillwell's year files, keyed by their version or ETag.
 
 An entry is written to a temporary file beside it and renamed into place, so another
 process sees a whole entry or none, and an interrupted write leaves only a `.part` file.

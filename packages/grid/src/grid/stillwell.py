@@ -1,12 +1,12 @@
-"""Observed water levels from the Open Waters water-levels lake.
+"""Observed water levels from Open Waters' Stillwell.
 
-The lake (https://water-levels.openwaters.io, documented in openwatersio/water-levels
+Stillwell (https://stillwell.openwaters.io, documented in openwatersio/stillwell
 `docs/data.md`) keeps each station's observations as one Parquet file per year, in the
 station's own datum, with each datum epoch's files apart. A year file is downloaded once
-into the shared cache and kept under the `version` the lake's years listing gives it, so
+into the shared cache and kept under the `version` Stillwell's years listing gives it, so
 it is downloaded again only when its rows change. Where a source has no years listing yet,
 or lists a station as being rewritten, the file's ETag stands in for its version. A file
-with neither, or one the cache can't take, is read from the lake instead.
+with neither, or one the cache can't take, is read from Stillwell instead.
 """
 
 import contextlib
@@ -22,7 +22,7 @@ import duckdb
 
 from . import cache
 
-LAKE = "https://water-levels.openwaters.io"
+HOST = "https://stillwell.openwaters.io"
 # The flags kept: good, interpolated and preliminary; suspect and bad are left out.
 MAX_FLAG = 2
 # Each read is a few year files; several run at once beside the Slackwater helper.
@@ -48,7 +48,7 @@ def stations(source: str) -> dict[str, dict]:
           [{{'id': e.id, 'since': timezone('UTC', e.since), 'until': timezone('UTC', e.until),
             'to_current': e.to_current, 'rejected': coalesce(e.state = 'rejected', false)}}
            for e in epochs] AS epochs
-        FROM '{LAKE}/stations.parquet' WHERE source = $1""",
+        FROM '{HOST}/stations.parquet' WHERE source = $1""",
         [source],
     )
     return {sid: {"datums": datums or {}, "epochs": epochs or []} for sid, datums, epochs in rows}
@@ -62,7 +62,7 @@ def years(source: str) -> dict[str, dict[tuple[int, int], str]] | None:
     try:
         rows = _sql(
             f"""SELECT id, epoch, year, version
-            FROM '{LAKE}/stations/years/{source}.parquet'"""
+            FROM '{HOST}/stations/years/{source}.parquet'"""
         )
     except duckdb.HTTPException as e:
         if "404" in str(e):
@@ -82,7 +82,7 @@ def years(source: str) -> dict[str, dict[tuple[int, int], str]] | None:
 
 def url(source: str, station: str, epoch: int, year: int) -> str:
     part = "" if epoch == 1 else f"/{epoch}"
-    return f"{LAKE}/obs/{source}/{urllib.parse.quote(station, safe='')}{part}/{year}.parquet"
+    return f"{HOST}/obs/{source}/{urllib.parse.quote(station, safe='')}{part}/{year}.parquet"
 
 
 def _etag(href: str) -> str | None:
@@ -107,7 +107,7 @@ def version(source: str, station: str, epoch: int, year: int) -> str | None:
 
 
 def year_file(source: str, station: str, epoch: int, year: int) -> Path | str | None:
-    """A local copy of one year file, current with the lake, or its URL where it can't be
+    """A local copy of one year file, current with Stillwell, or its URL where it can't be
     cached; None where it has no file."""
     href = url(source, station, epoch, year)
     ver = version(source, station, epoch, year)
@@ -116,7 +116,7 @@ def year_file(source: str, station: str, epoch: int, year: int) -> Path | str | 
     tag = re.sub(r"[^A-Za-z0-9]", "", ver)
     if not tag:
         return href
-    folder = cache.path("water-levels", "obs", source, urllib.parse.quote(station, safe=""), epoch)
+    folder = cache.path("stillwell", "obs", source, urllib.parse.quote(station, safe=""), epoch)
     dest = folder / f"{year}.{tag}.parquet"
     if dest.exists():
         return dest

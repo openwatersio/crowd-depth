@@ -8,8 +8,8 @@ and whose harmonics Slackwater accepts; NOAA's subordinate stations carry the ti
 and height corrections to their control station that discrete tide zones would. Where
 a CO-OPS water level gauge is within GAUGE_KM of the station, its observed minus
 predicted level, the weather's part of the water level, is added to the prediction. The
-observed and predicted levels come from CO-OPS' API, or, with GRID_WATER_LEVELS=lake,
-the observed from the Open Waters water-levels lake and the predicted from Slackwater at
+observed and predicted levels come from CO-OPS' API, or, with GRID_WATER_LEVELS=stillwell,
+the observed from Open Waters' Stillwell and the predicted from Slackwater at
 the gauge's own station, so at a station that is the gauge the level is what it observed.
 Levels are relative to each station's chart datum: MLLW in US waters, LAT in most
 others.
@@ -40,7 +40,7 @@ import duckdb
 import numpy as np
 from scipy.spatial import cKDTree
 
-from . import cache, cells, waterlevels
+from . import cache, cells, stillwell
 from .catalog import TIDE_CELL, checkpoint
 from .definitions import TIDE
 from .qc import EARLIEST
@@ -63,12 +63,12 @@ PREDICT = Path(
 )
 COOPS = "https://api.tidesandcurrents.noaa.gov"
 FETCHERS = 1
-# The lake takes parallel downloads; each fetch also runs the Slackwater helper, about
+# Stillwell takes parallel downloads; each fetch also runs the Slackwater helper, about
 # 0.25 GB apiece.
-LAKE_FETCHERS = 4
+STILLWELL_FETCHERS = 4
 # CO-OPS errors that mean a gauge has no residual to give, rather than a failed request.
 NO_RESIDUAL = ("no data", "data was found", "no mllw", "don't have predictions")
-# What a failed fetch of a gauge month can raise, from CO-OPS, the lake or the helper.
+# What a failed fetch of a gauge month can raise, from CO-OPS, Stillwell or the helper.
 FETCH_ERRORS = (
     OSError,
     ValueError,
@@ -198,13 +198,13 @@ def month_span(month: date) -> tuple[datetime, datetime]:
     return start, datetime.combine(month_end(month) + timedelta(days=1), datetime.min.time())
 
 
-def lake_residuals(gauge: str, month: date) -> list[tuple[datetime, float]] | None:
-    """A CO-OPS gauge's observed level from the water-levels lake, in MLLW, minus
-    Slackwater's prediction for its station, 6-minute, through one month; [] where the lake
+def stillwell_residuals(gauge: str, month: date) -> list[tuple[datetime, float]] | None:
+    """A CO-OPS gauge's observed level from Stillwell, in MLLW, minus
+    Slackwater's prediction for its station, 6-minute, through one month; [] where Stillwell
     flags every value. None where it can't give the month: no MLLW, no value in its year
     files that month (such as at a gauge it hasn't backfilled), or no prediction from
-    Slackwater for the values it has."""
-    got = lake_observed(gauge, month)
+    Slackwater that matches the values it has."""
+    got = stillwell_observed(gauge, month)
     if got is None:
         return None
     mllw, observed = got
@@ -219,43 +219,44 @@ def lake_residuals(gauge: str, month: date) -> list[tuple[datetime, float]] | No
     predicted = {int(t): h for t, h in series if h is not None and math.isfinite(h)}
     if not predicted:
         return None
-    # CO-OPS publishes levels in millimeters; the lake keeps them as 32-bit floats.
+    # CO-OPS publishes levels in millimeters; Stillwell keeps them as 32-bit floats.
     rows = []
     for t, level in observed:
         p = predicted.get(int(t.replace(tzinfo=UTC).timestamp()))
         if p is not None and abs(r := round(level + mllw, 3) - p) <= MAX_RESIDUAL_M:
             rows.append((t, r))
-    return rows
+    # Values with no residual are a mismatch, such as a wrong MLLW, not Stillwell's record.
+    return rows or None
 
 
-def lake_observed(gauge: str, month: date):
-    """A gauge's MLLW offset and its unflagged levels through one month, or None where the
-    lake can't give them."""
-    station = waterlevels.stations("coops").get(gauge)
+def stillwell_observed(gauge: str, month: date):
+    """A gauge's MLLW offset and its unflagged levels through one month, or None where
+    Stillwell can't give them."""
+    station = stillwell.stations("coops").get(gauge)
     mllw = station and station["datums"].get("MLLW")
     if mllw is None:
         return None
-    observed = waterlevels.observed("coops", gauge, *month_span(month))
+    observed = stillwell.observed("coops", gauge, *month_span(month))
     return None if observed is None else (mllw, observed)
 
 
-def lake_digest(gauge: str, month: date) -> str | None:
-    """A digest of what a gauge month's lake residuals are made from, short of Slackwater's
+def stillwell_digest(gauge: str, month: date) -> str | None:
+    """A digest of what a gauge month's Stillwell residuals are made from, short of Slackwater's
     prediction, which the store's basis covers."""
-    got = lake_observed(gauge, month)
+    got = stillwell_observed(gauge, month)
     if got is None:
         return None
     mllw, observed = got
     return digest([(t, round(level + mllw, 3)) for t, level in observed])
 
 
-def lake_version(gauge: str, month: date, version=waterlevels.version) -> str | None:
-    """What a gauge month's lake residuals are read from: its year files' versions, and the
+def stillwell_version(gauge: str, month: date, version=stillwell.version) -> str | None:
+    """What a gauge month's Stillwell residuals are read from: its year files' versions, and the
     station's MLLW and epochs. None where no year file covers the month."""
-    files = waterlevels.versions("coops", gauge, *month_span(month), version)
+    files = stillwell.versions("coops", gauge, *month_span(month), version)
     if files is None:
         return None
-    station = waterlevels.stations("coops")[gauge]
+    station = stillwell.stations("coops")[gauge]
     return f"{files};MLLW={station['datums'].get('MLLW')};{station['epochs']}"
 
 
@@ -264,9 +265,9 @@ def digest(rows) -> str:
 
 
 def reopen_changed(con):
-    """Reopen each final month a lake-mode store holds whose residuals would now differ: one
-    whose year files or station changed and now hold other values for it, as a backfill or the
-    lake's quality control can, and one another build fetched since, such as an older
+    """Reopen each final month a Stillwell-mode store holds whose residuals would now differ: one
+    whose year files or station changed and now hold other values for it, as a backfill or
+    Stillwell's quality control can, and one another build fetched since, such as an older
     release after a rollback. A year file rewritten without changing the month, as the
     current year's is each day, only has its version brought up to date."""
     final = con.execute(
@@ -276,26 +277,30 @@ def reopen_changed(con):
         WHERE m.fetched >= last_day(m.month) + INTERVAL {RECENT_DAYS} DAY"""
     ).fetchall()
     # One look per year file, however many months it holds.
-    version = functools.cache(waterlevels.version)
+    version = functools.cache(stillwell.version)
 
     def check(row):
         gauge, month, kept, kept_digest, ours = row
         if not ours:
             return "reopen", None
         try:
-            now = lake_version(gauge, month, version)
+            now = stillwell_version(gauge, month, version)
             if now == kept:
                 return None, None
-            sums = lake_digest(gauge, month)
+            sums = stillwell_digest(gauge, month)
         except FETCH_ERRORS as e:
             log.warning("tide: gauge %s %s not checked (%s)", gauge, month, e)
             return None, None
-        if sums is None or sums != kept_digest:
+        # A month Stillwell can't give now, such as during a partial read of its stations,
+        # keeps what it has, as a fetch would.
+        if sums is None:
+            return None, None
+        if sums != kept_digest:
             return "reopen", None
         return "update", now
 
     reopened = 0
-    with ThreadPoolExecutor(LAKE_FETCHERS) as pool:
+    with ThreadPoolExecutor(STILLWELL_FETCHERS) as pool:
         checked = list(pool.map(check, final))
     con.execute("BEGIN")
     for (gauge, month, *_), (action, now) in zip(final, checked):
@@ -319,14 +324,14 @@ def reopen_changed(con):
 
 
 def residual_source(con):
-    """CO-OPS' API, or the water-levels lake, as GRID_WATER_LEVELS says; unset, the way the
+    """CO-OPS' API, or Stillwell, as GRID_WATER_LEVELS says; unset, the way the
     store's residuals were taken, so a run without it doesn't switch a store back."""
     kept = con.execute("SELECT value FROM lake.store_meta WHERE key = 'residuals'").fetchone()
     source = os.environ.get("GRID_WATER_LEVELS") or (kept and kept[0].split()[0]) or "coops"
     # A misspelling would otherwise switch the store back to CO-OPS and take every month again.
-    if source not in ("coops", "lake"):
-        raise ValueError(f"GRID_WATER_LEVELS is {source!r}; use coops or lake")
-    return lake_residuals if source == "lake" else coops_residuals
+    if source not in ("coops", "stillwell"):
+        raise ValueError(f"GRID_WATER_LEVELS is {source!r}; use coops or stillwell")
+    return stillwell_residuals if source == "stillwell" else coops_residuals
 
 
 def _xyz(lon, lat):
@@ -555,14 +560,14 @@ def fetch_residuals(con, months, today, residuals=coops_residuals):
 
     served = set()
 
-    lake = residuals is lake_residuals
+    from_stillwell = residuals is stillwell_residuals
 
     def fetch(m):
         # Taken before the residuals, so a file that changes between them is read again on
         # the next run rather than kept under its new version.
-        if lake:
+        if from_stillwell:
             try:
-                version, sums = lake_version(*m), lake_digest(*m)
+                version, sums = stillwell_version(*m), stillwell_digest(*m)
                 return (version, sums), residuals(*m)
             except FETCH_ERRORS as e:
                 log.warning("tide: gauge %s %s not fetched (%s); kept as it was", *m, e)
@@ -587,7 +592,7 @@ def fetch_residuals(con, months, today, residuals=coops_residuals):
 
     fetched = []
     # One at a time from CO-OPS, which refuses bursts.
-    with ThreadPoolExecutor(LAKE_FETCHERS if lake else FETCHERS) as pool:
+    with ThreadPoolExecutor(STILLWELL_FETCHERS if from_stillwell else FETCHERS) as pool:
         # A window at a time, so fetched months don't pile up ahead of their writes.
         answers = (
             got for i in range(0, len(months), 64) for got in pool.map(fetch, months[i : i + 64])
@@ -605,9 +610,9 @@ def fetch_residuals(con, months, today, residuals=coops_residuals):
             ).fetchone()
             # An empty answer from CO-OPS where data was kept is an outage, not the gauge's
             # record; a first empty answer is taken as final only once a second agrees. An
-            # outage of the lake raises instead, so its empty answer is the record: every value
+            # outage of Stillwell raises instead, so its empty answer is the record: every value
             # that month flagged.
-            if rows is None or (not rows and not lake and (stored or prior is None)):
+            if rows is None or (not rows and not from_stillwell and (stored or prior is None)):
                 con.execute(
                     """INSERT INTO lake.tide_residual_months SELECT $gauge, $month, DATE '1900-01-01'
                     WHERE NOT EXISTS (SELECT 1 FROM lake.tide_residual_months
@@ -658,7 +663,7 @@ def fetch_residuals(con, months, today, residuals=coops_residuals):
                 "DELETE FROM lake.tide_residual_versions WHERE gauge = $gauge AND month = $month",
                 key,
             )
-            if lake:
+            if from_stillwell:
                 con.execute(
                     "INSERT INTO lake.tide_residual_versions VALUES (?, ?, ?, ?, ?)",
                     [gauge, month, today, version, sums],
@@ -667,7 +672,7 @@ def fetch_residuals(con, months, today, residuals=coops_residuals):
             # Final here is final for every store. An empty month isn't kept: an outage's
             # empty answer could pass for one.
             final = today >= month_end(month) + timedelta(days=RECENT_DAYS)
-            if rows and final and not lake and (gauge, month) not in served:
+            if rows and final and not from_stillwell and (gauge, month) not in served:
                 cache.write_json(cached_month(gauge, month), [(t.isoformat(), v) for t, v in rows])
             fetched.append((gauge, month))
             checkpoint(con)
@@ -716,9 +721,9 @@ def build(
     assign_cells(con)
     # Residuals taken another way, or against another engine's predictions, are all taken
     # again: every month reopens, and is fetched with the open ones below. One the new way
-    # can't give, such as a gauge the lake hasn't backfilled, keeps what it had and stays
+    # can't give, such as a gauge Stillwell hasn't backfilled, keeps what it had and stays
     # open, so it is asked for again on each run.
-    basis = f"lake {version}" if residuals is lake_residuals else "coops"
+    basis = f"stillwell {version}" if residuals is stillwell_residuals else "coops"
     kept = con.execute("SELECT value FROM lake.store_meta WHERE key = 'residuals'").fetchone()
     if (kept[0] if kept else "coops") != basis:
         con.execute("BEGIN")
@@ -726,7 +731,7 @@ def build(
         con.execute("DELETE FROM lake.store_meta WHERE key = 'residuals'")
         con.execute("INSERT INTO lake.store_meta VALUES ('residuals', ?)", [basis])
         con.execute("COMMIT")
-    if residuals is lake_residuals:
+    if residuals is stillwell_residuals:
         reopen_changed(con)
     # Gauge months that aren't final are fetched again, and the levels of those that came
     # back are done again; one CO-OPS can't give now keeps its levels.
