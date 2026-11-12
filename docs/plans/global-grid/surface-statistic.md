@@ -1,8 +1,8 @@
 # Surface statistic
 
-With tide reduced and each vessel's offset corrected, draw `median − 1.75σ`, where σ combines each sounding's correction uncertainty with the spread of vessels around a local plane. In Thimble Shoal Channel it draws 0.1% of pixels more than 1 m deeper than the shoalest BlueTopo cell under them, and 0.3% of channel pixels, with a channel bias of −1.2 m. The current statistic, a 10th percentile with a guard on the shoalest sounding, draws none too deep but puts the channel 1.9 m too shallow and 45% of channel pixels more than 2 m too shallow.
+With tide reduced and each vessel's offset corrected, the grid draws `median − 1.75σ`, where σ combines each sounding's correction uncertainty with the spread of vessels around a local plane. In Thimble Shoal Channel it draws 0.1% of pixels more than 1 m deeper than the shoalest BlueTopo cell under them, and 0.3% of channel pixels, with a channel bias of −1.2 m. A 10th percentile with a guard on the shoalest sounding draws none too deep but puts the channel 1.9 m too shallow and 45% of channel pixels more than 2 m too shallow.
 
-Drop the guard on the shoalest sounding: it doubles false shoals in the channel and helps little anywhere else. In sparse water the statistic matters less than QC. In Tangier Sound, one sounder stuck at 2.6 m in 9 to 22 m of water and two vessels without an offset drew false shoals over a fifth of the area under every statistic, and no QC rule caught the stuck sounder.
+The grid has no guard on the shoalest sounding: it doubles false shoals in the channel and helps little anywhere else. In sparse water the statistic matters less than QC. In Tangier Sound, one sounder stuck at 2.6 m in 9 to 22 m of water and two vessels without an offset drew false shoals over a fifth of the area under every statistic, and no QC rule caught the stuck sounder.
 
 Measured in October 2026 on the Chesapeake NOAA CSB set. The comparison's code isn't checked in. The speckle in the same channel is in [channel-speckle.md](channel-speckle.md).
 
@@ -54,34 +54,34 @@ Bias is the estimate minus BlueTopo's median, so negative means shoaler. "Too de
 
 ### Thimble Shoal Channel
 
-| Statistic                          |  Bias | Channel bias | Too deep | On slopes | In channel | False shoals | In channel | Left out: too deep | Left out: false shoals |
-| ---------------------------------- | ----: | -----------: | -------: | --------: | ---------: | -----------: | ---------: | -----------------: | ---------------------: |
-| Current: 10th pct., shoalest guard | −0.25 |        −1.87 |     0.0% |      0.1% |       0.0% |         6.7% |        45% |               0.2% |                  10.0% |
-| 10th percentile, no guard          | −0.18 |        −0.92 |     0.4% |      7.0% |       2.2% |         2.9% |        14% |                    |                        |
-| Median of vessel medians           | −0.07 |        −0.41 |     1.3% |       23% |       7.0% |         1.3% |       5.6% |               2.3% |                   0.8% |
-| Median − 1.0σ_a                    | −0.45 |        −1.02 |     0.0% |      0.1% |       0.0% |         5.5% |        27% |               0.4% |                   5.9% |
-| Median − 1.5σ_a                    | −0.63 |        −1.30 |     0.0% |      0.0% |       0.0% |         7.5% |        34% |               0.2% |                   9.1% |
-| Median − 1.0σ_b                    | −0.32 |        −0.86 |     0.4% |      7.1% |       2.2% |         3.7% |        17% |               0.8% |                   2.5% |
-| Median − 1.5σ_b                    | −0.42 |        −1.09 |     0.1% |      2.3% |       0.7% |         5.3% |        24% |               0.4% |                   4.1% |
-| **Median − 1.75σ_b**               | −0.47 |        −1.20 |     0.1% |      1.1% |       0.3% |         6.4% |        28% |                    |                        |
-| Median − 2.0σ_b                    | −0.53 |        −1.31 |     0.0% |      0.5% |       0.2% |         9.4% |        31% |               0.3% |                   6.8% |
-| Median − 1.5σ_c                    | −0.41 |        −0.78 |     0.3% |      4.9% |       1.6% |         5.3% |        20% |               0.8% |                   3.5% |
-| Median − 1.5σ_b, shoalest guard    | −0.47 |        −1.86 |     0.0% |      0.0% |       0.0% |         9.0% |        45% |                    |                        |
+| Statistic                       |  Bias | Channel bias | Too deep | On slopes | In channel | False shoals | In channel | Left out: too deep | Left out: false shoals |
+| ------------------------------- | ----: | -----------: | -------: | --------: | ---------: | -----------: | ---------: | -----------------: | ---------------------: |
+| 10th pct., shoalest guard       | −0.25 |        −1.87 |     0.0% |      0.1% |       0.0% |         6.7% |        45% |               0.2% |                  10.0% |
+| 10th percentile, no guard       | −0.18 |        −0.92 |     0.4% |      7.0% |       2.2% |         2.9% |        14% |                    |                        |
+| Median of vessel medians        | −0.07 |        −0.41 |     1.3% |       23% |       7.0% |         1.3% |       5.6% |               2.3% |                   0.8% |
+| Median − 1.0σ_a                 | −0.45 |        −1.02 |     0.0% |      0.1% |       0.0% |         5.5% |        27% |               0.4% |                   5.9% |
+| Median − 1.5σ_a                 | −0.63 |        −1.30 |     0.0% |      0.0% |       0.0% |         7.5% |        34% |               0.2% |                   9.1% |
+| Median − 1.0σ_b                 | −0.32 |        −0.86 |     0.4% |      7.1% |       2.2% |         3.7% |        17% |               0.8% |                   2.5% |
+| Median − 1.5σ_b                 | −0.42 |        −1.09 |     0.1% |      2.3% |       0.7% |         5.3% |        24% |               0.4% |                   4.1% |
+| **Median − 1.75σ_b**            | −0.47 |        −1.20 |     0.1% |      1.1% |       0.3% |         6.4% |        28% |                    |                        |
+| Median − 2.0σ_b                 | −0.53 |        −1.31 |     0.0% |      0.5% |       0.2% |         9.4% |        31% |               0.3% |                   6.8% |
+| Median − 1.5σ_c                 | −0.41 |        −0.78 |     0.3% |      4.9% |       1.6% |         5.3% |        20% |               0.8% |                   3.5% |
+| Median − 1.5σ_b, shoalest guard | −0.47 |        −1.86 |     0.0% |      0.0% |       0.0% |         9.0% |        45% |                    |                        |
 
 A guard on confirmed shoals changed no row by more than 0.3 points: these areas have few.
 
 ### Tangier Sound
 
-| Statistic                          |  Bias | Too deep | On slopes | Deeper than 12 m | False shoals | Left out: too deep | Left out: false shoals |
-| ---------------------------------- | ----: | -------: | --------: | ---------------: | -----------: | -----------------: | ---------------------: |
-| Current: 10th pct., shoalest guard | −0.18 |     4.0% |       18% |             4.2% |         1.9% |               2.1% |                   1.5% |
-| Median of vessel medians           | −0.05 |     6.1% |       31% |             6.5% |         0.9% |               2.9% |                   0.8% |
-| Median − 1.0σ_a                    | −0.44 |     2.5% |       11% |             2.5% |         2.9% |               0.8% |                   2.7% |
-| Median − 1.5σ_a                    | −0.63 |     1.8% |      7.0% |             1.8% |         5.0% |               0.5% |                   5.1% |
-| Median − 1.5σ_b                    | −0.32 |     3.1% |       15% |             3.1% |         2.5% |               0.9% |                   2.1% |
-| **Median − 1.75σ_b**               | −0.37 |     2.8% |       13% |             2.8% |         2.8% |                    |                        |
-| Median − 2.0σ_b                    | −0.41 |     2.5% |       12% |             2.5% |         3.1% |               0.7% |                   2.6% |
-| Median − 1.5σ_b, shoalest guard    | −0.34 |     2.7% |       13% |             2.7% |         3.0% |                    |                        |
+| Statistic                       |  Bias | Too deep | On slopes | Deeper than 12 m | False shoals | Left out: too deep | Left out: false shoals |
+| ------------------------------- | ----: | -------: | --------: | ---------------: | -----------: | -----------------: | ---------------------: |
+| 10th pct., shoalest guard       | −0.18 |     4.0% |       18% |             4.2% |         1.9% |               2.1% |                   1.5% |
+| Median of vessel medians        | −0.05 |     6.1% |       31% |             6.5% |         0.9% |               2.9% |                   0.8% |
+| Median − 1.0σ_a                 | −0.44 |     2.5% |       11% |             2.5% |         2.9% |               0.8% |                   2.7% |
+| Median − 1.5σ_a                 | −0.63 |     1.8% |      7.0% |             1.8% |         5.0% |               0.5% |                   5.1% |
+| Median − 1.5σ_b                 | −0.32 |     3.1% |       15% |             3.1% |         2.5% |               0.9% |                   2.1% |
+| **Median − 1.75σ_b**            | −0.37 |     2.8% |       13% |             2.8% |         2.8% |                    |                        |
+| Median − 2.0σ_b                 | −0.41 |     2.5% |       12% |             2.5% |         3.1% |               0.7% |                   2.6% |
+| Median − 1.5σ_b, shoalest guard | −0.34 |     2.7% |       13% |             2.7% |         3.0% |                    |                        |
 
 Left out, every σ statistic draws under 1% of a vessel's own pixels more than 1 m deeper than it read them. Against BlueTopo, 2 to 3% of pixels stay too deep at any k. The vessels agree with each other there and not with the survey, which points at the survey's vintage on a moving bottom or its 4 m shoalest cell, not at the statistic.
 
@@ -92,9 +92,9 @@ The result here is inconclusive. Only 2,000 pixels can be scored, and 4 to 9% of
 ## Findings
 
 - **σ_b beats σ_a.** At the same safety, σ_a over-shoals: its spread counts relief as noise, so on Thimble's slopes it draws 86% of pixels as false shoals at k = 1.5, against 61% for σ_b. σ_a is the only σ that keeps every slope pixel safe, though. σ_c shrinks with the number of vessels and lets 1.6% of channel pixels through at k = 1.5, so it's not a safety margin.
-- **k = 1.75 with σ_b** is the smallest k that keeps Thimble's channel under 0.5% too deep (0.3%), and in Tangier it draws fewer pixels too deep than the current statistic, overall and on slopes, at the cost of 0.2 m more shoal bias. k = 2 buys 0.1 point of channel safety for 3 points more false shoals.
+- **k = 1.75 with σ_b** is the smallest k that keeps Thimble's channel under 0.5% too deep (0.3%), and in Tangier it draws fewer pixels too deep than the 10th percentile with the guard, overall and on slopes, at the cost of 0.2 m more shoal bias. k = 2 buys 0.1 point of channel safety for 3 points more false shoals.
 - **The guard on the shoalest sounding can go.** On Thimble it takes slopes from 2.3% to 0% too deep and doubles channel false shoals (24% to 45%). In Tangier it changes too-deep pixels by 0.4 points. Confirmed shoals, which publish as soundings anyway, are the hazard path.
-- **Slopes are the remaining risk.** σ_b at k = 1.75 leaves 1.1% of Thimble's slope pixels and 13% of Tangier's more than 1 m too deep, against 0.1% and 18% for the current statistic. The 200 m interpolation radius blends the deep side of a slope over its shoal side. A pixel's own shoalest sounding as a floor only where σ_a is much larger than σ_b, that is on slopes, is the next thing to measure.
+- **Slopes are the remaining risk.** σ_b at k = 1.75 leaves 1.1% of Thimble's slope pixels and 13% of Tangier's more than 1 m too deep, against 0.1% and 18% for the 10th percentile with the guard. The 200 m interpolation radius blends the deep side of a slope over its shoal side. A pixel's own shoalest sounding as a floor only where σ_a is much larger than σ_b, that is on slopes, is the next thing to measure.
 - **Corrections close most of the gap.** Uncorrected, every statistic put the channel 3 to 5 m too shallow. With tide and calibration, the median of vessels is within 0.1 m of BlueTopo outside the channel in both dense and sparse water.
 
 ## Sparse water
@@ -105,13 +105,13 @@ In Tangier Sound, before cleaning, every statistic drew 19 to 30% of pixels as f
 - **Uncalibrated vessels.** Two vessels without an offset read 2 m and 17 m shallow; one logged a raw median of 0.4 m in 17 m of water. Leaving uncalibrated vessels out of the statistic where calibrated ones sounded took the median's false shoals from 19.6% to 9.6%. Readings under 0.5 m, which version 5 QC keeps for review, account for 0.7 points of that.
 - **Datum seams.** The nearest-gauge separation jumps 0.42 m across Pocomoke Sound, from −0.37 m at its northwest corner to Onancock's −0.79 m. Calibration anchors on the same rule, so a vessel anchored on either side of the seam carries it.
 
-## Recommendation
+## What's built
 
-1. **Draw `median − 1.75σ_b`** of per-vessel medians, and publish σ_b. It feeds M_QUAL and CATZOC.
-2. **Drop the guard on the shoalest sounding.** Keep confirmed shoals as the hazard path.
-3. **Catch shallow lost-bottom readings in QC.** A shoal-side reference check, a near-constant reading far shoaler than Seascape over a whole file, would have caught Tangier's stuck sounder. Measure its false-alarm rate on real shoals first.
-4. **Leave uncalibrated vessels out of the median** where calibrated vessels sounded the pixel, and keep them where they're the only data, marked uncalibrated.
-5. **Measure a slope floor next:** the shoalest accepted sounding as a floor only on pixels where σ_a is well above σ_b.
+1. **`median − 1.75σ_b`** of per-vessel medians, with σ_b published per pixel for `M_QUAL` and CATZOC ([statistic.py](../../../packages/grid/src/grid/statistic.py)).
+2. **No guard on the shoalest sounding.** Confirmed shoals are the hazard path, and cap the surface only within 2 m + 5% of the other vessels' median ([Legibility](#legibility)).
+3. **Shallow lost-bottom readings** are caught by calibration rather than QC: a vessel month in a tile that reads lost against its segment, stuck runs, and stretches over flat, well-surveyed water are set aside ([Vessel calibration](README.md#vessel-calibration)).
+
+Still open, in [backlog.md](backlog.md): leaving uncalibrated vessels out of the median where calibrated vessels sounded the pixel, a file-level check for a sounder stuck reading shallow, and a slope floor, the shoalest accepted sounding only on pixels where σ_a is well above σ_b.
 
 ## In the pipeline
 
@@ -119,11 +119,11 @@ In Tangier Sound, before cleaning, every statistic drew 19 to 30% of pixels as f
 
 Interpolated pixels widen σ by 0.005 m per metre from the nearest sounding. That takes Tangier Sound from 2.7% to 2.1% too deep and changes nothing in Thimble, where every pixel is within 100 m of a track.
 
-`grid cells` on Thimble's tile, the densest (28M soundings), takes 14 minutes and peaks at 3.2 GB resident with DuckDB at 4 GB; its surface takes 3.5 minutes. Vessel smoothing and σ are worked about 2 million window entries at a time.
+In `grid tiles`, the cells job for Thimble's tile, the densest (28M soundings), finishes in a 2 GB Linux cgroup at 1.74 GB in 202 s, and its surface on one thread at 2.05 GB in 430–540 s ([per-tile-pipeline.md](per-tile-pipeline.md#measured-with-snakemake)). Vessel smoothing and σ are worked about 2 million window entries at a time.
 
 ### Legibility
 
-The surface also smooths each vessel along its own coverage, adds 40 m of smoothing to `gdal_grid` and blurs over 2 pixels. Unconfirmed shoals QC judged improbable don't affect it, and a confirmed shoal caps it only within 2 m + 5% of the other vessels' median. Rebuilt on Thimble's tile, which holds Norfolk, and the tile north of it, and scored against `reference_pixels` (BlueTopo and S-102 at MLLW) on every pixel a vessel sounded, from the published render to now:
+The surface also smooths each vessel along its own coverage, adds 40 m of smoothing to `gdal_grid` and blurs over 2 pixels. Unconfirmed shoals QC judged improbable don't affect it, and a confirmed shoal caps it only within 2 m + 5% of the other vessels' median. Rebuilt on Thimble's tile, which holds Norfolk, and the tile north of it, and scored against `reference_pixels` (BlueTopo and S-102 at MLLW) on every pixel a vessel sounded. Each cell gives a render without these rules, with every unconfirmed shoal leaving its pixel empty and every confirmed shoal capping it, then the surface with them:
 
 | Vessels in the pixel |         Empty | Roughness, m | More than 1 m too deep | False shoals over 2 m | Under 1 m where the survey is 2 m or more |
 | -------------------- | ------------: | -----------: | ---------------------: | --------------------: | ----------------------------------------: |
@@ -133,7 +133,7 @@ The surface also smooths each vessel along its own coverage, adds 40 m of smooth
 | 10 or more           |  77.2% → 2.9% |  0.10 → 0.08 |          23.2% → 13.0% |         32.7% → 54.7% |                               5.0% → 0.0% |
 | All                  |  16.8% → 9.8% |  0.08 → 0.05 |            4.2% → 4.2% |           6.6% → 8.1% |                               1.5% → 0.9% |
 
-Holes fall as traffic rises. Among pixels mostly surrounded by drawn surface on Thimble's tile, by soundings within about 5 pixels, the share left empty goes from 5.1% to 0.0% over 1,000 soundings, 2.1% to 0.2% at 200 to 1,000, 1.1% to 0.7% at 50 to 200, and 1.0% to 0.9% under 50. Before, every pixel holding an unconfirmed shoal stayed empty, and in busy water some vessel almost always logs one.
+Holes fall as traffic rises. Among pixels mostly surrounded by drawn surface on Thimble's tile, by soundings within about 5 pixels, the share left empty goes from 5.1% to 0.0% over 1,000 soundings, 2.1% to 0.2% at 200 to 1,000, 1.1% to 0.7% at 50 to 200, and 1.0% to 0.9% under 50. Left empty over every unconfirmed shoal, a busy pixel almost always stays empty, since in busy water some vessel almost always logs one.
 
 In Norfolk's harbour (−76.36 to −76.30, 36.83 to 36.97), echoes off piers and moored hulls that many vessels read are confirmed as shoals. Capping the surface at all of them drew 10.1% of the harbour's surface as drying and 9.7% at 0 to 2 m, in a channel dredged to about 15 m. Capping only near the other vessels' median draws 0.1% drying and 2.9% at 0 to 2 m. It outvotes 339,522 of Thimble's tile's 780,149 confirmed-shoal soundings, 264,690 of them in the harbour, and 28,098 of 128,259 on the tile north. Of those outvoted, 5.6% and 2.0% sit where the survey also reads within 1 m as shallow, so some may be real; they publish as unconfirmed soundings, not as capping shoals. Busy water's false shoals stay high: echoes within the tolerance and channel edges.
 

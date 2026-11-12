@@ -1,35 +1,27 @@
 # Rebuild cost
 
-Can the planet be rebuilt daily on cheap hardware? Not with the pipeline as it stands, but probably with four targeted changes to a per-tile design. Three spikes on the Chesapeake set (98.5M active soundings, 18,434 files, 212 1° tiles) show where the time goes. The store layout and QC are not the bottleneck. Two costs are: new data landing in the same dense harbor tiles every day, so rebuilding at 1° granularity re-processes most of the data daily, and a full-size raster for every 1° tile however empty it is. Across the whole NOAA archive the first is the larger: it covers 7,295 tiles, and a day's arrivals touch tiles holding two thirds of its soundings ([planet-size.md](planet-size.md)).
+Can the planet be rebuilt daily on cheap hardware? Three spikes on the Chesapeake set (98.5M active soundings, 18,434 files, 212 1° tiles) showed where the time went: not the store layout or QC, but new data landing in the same dense harbor tiles every day, so rebuilding at 1° granularity re-processes most of the data daily, and a full-size raster for every 1° tile however empty it is. Across the whole NOAA archive the first is the larger: a day's arrivals touch tiles holding two thirds of its soundings ([planet-size.md](planet-size.md)). The pipeline sorts the store by tile, skips empty raster blocks, rebuilds only the leaves of a dense tile that new data reaches, and fits every job in a 2 GB worker. What a planet day costs with them is below.
 
-Details are in [store-layout.md](store-layout.md), [qc-functions.md](qc-functions.md), [per-tile-pipeline.md](per-tile-pipeline.md) and [planet-size.md](planet-size.md). The work that follows from them is in [backlog.md](backlog.md).
+Details are in [store-layout.md](store-layout.md), [qc-functions.md](qc-functions.md), [per-tile-pipeline.md](per-tile-pipeline.md), [sub-tile-rebuild.md](sub-tile-rebuild.md) and [planet-size.md](planet-size.md). The work that follows from them is in [backlog.md](backlog.md).
 
-## Summary of the spikes
+## What the spikes found
 
-**Store layout.** One table sorted by 10° cell and then tile, with row groups of about 123k rows, reads about as efficiently as physically separate per-tile files: 1.26× read amplification over a full rebuild, against 1.0×. In ingest order, row groups cross a median of 6 tiles, so a full rebuild reads the store 6.8 times over. `grid cells` can query one store per cell, as long as the store is compacted in tile order and daily appends are sorted. Dropping the stored `point_id` saves 47% of bytes, and putting `tile_id` on `qc_flags` lets flag reads prune by tile.
+**Store layout.** One table sorted by 10° cell and then tile, with row groups of about 123k rows, reads about as efficiently as physically separate per-tile files: 1.26× read amplification over a full rebuild, against 1.0×. In ingest order, row groups cross a median of 6 tiles, so a full rebuild reads the store 6.8 times over. Dropping a stored `point_id` saves 47% of bytes, and putting `tile_id` on `qc_flags` lets flag reads prune by tile. The store is built this way ([store-layout.md](store-layout.md#in-the-store)).
 
-**QC as pure functions.** Track QC runs as numpy ([qc.py](../../../packages/grid/src/grid/qc.py)), with flags matching the day-split SQL's on the whole Chesapeake store (98.5M soundings) apart from stuck runs across UTC midnight. QC of that store takes 53 s against 204 s for the SQL, about 4 times faster on this laptop's cores; on NOAA's largest Chesapeake file (3.5M soundings) ingest's QC takes 0.9 s against 5.0 s, with about 420 MB more memory. Its TypeScript port shares thresholds and test vectors as JSON.
+**QC as pure functions.** Track QC runs as numpy ([qc.py](../../../packages/grid/src/grid/qc.py)), with flags matching the day-split SQL's on the whole Chesapeake store (98.5M soundings) apart from stuck runs across UTC midnight. QC of that store takes 53 s against 204 s for the SQL. Its TypeScript port in the plugin shares thresholds and test vectors as JSON ([qc-functions.md](qc-functions.md)).
 
-**Per-tile pipeline.** It works end to end and matches a single global run, apart from tie-breaking noise in `placed`:
+**Per-tile pipeline.** `grid tiles` rebuilds cells, surfaces and depth areas per 1° tile, cut into leaves where a tile is dense, web tiles per z8 tile, one low-zoom run for z0–7, and assembles one PMTiles archive by copying tile bytes ([per-tile-pipeline.md](per-tile-pipeline.md)). A tile or leaf reruns only when its inputs move. Its limits:
 
-- cells per 1° tile;
-- the surface per 1° tile, plus a 450 m strip from each neighbor;
-- web tiles per z8 tile, whose z8–z15 subtree is disjoint from every other;
-- one low-zoom run for z0–7;
-- assembly by copying tile bytes into one PMTiles archive, in 1.3 s.
+- **A daily run at 1° cost about 75% of a full rebuild.** Over the last 30 arrival days, the 3–15 tiles touched each day held 47–86% of all soundings (median 76%). Leaves of at least 1/8° take a day's reads to a median 50% for cells and 56% for surfaces ([sub-tile-rebuild.md](sub-tile-rebuild.md)).
+- **Memory.** Every job fits a 2 GB Linux cgroup: a surface works only the blocks with data, and the densest cells, surfaces and overlays were each brought under it ([backlog.md](backlog.md#3-make-the-daily-rebuild-fit)).
+- **Seams.** Coverage and depth bands can disagree across a tile edge, since consensus and the surface's blur stop there. A single global run draws the same seams, so they come from the per-tile surface, not from the split ([per-tile-pipeline.md](per-tile-pipeline.md#seams-between-tiles)).
 
-Chesapeake takes 1 h 53 m serially and 81 min with 4 workers on a shared laptop. Its limits:
+## The store's own steps
 
-- **A daily run costs about 75% of a full rebuild.** Over the last 30 arrival days, the 3–15 tiles touched each day held 47–86% of all soundings (median 76%).
-- **Memory.** Surfaces peaked at 3–4.5 GB in that measurement, past the 2 GB budget per work unit, full-tile rasters alone about 1.7 GB. A surface now works only the blocks with data and runs in a 2 GB cgroup ([per-tile-pipeline.md](per-tile-pipeline.md#measured-with-snakemake)).
-- **Seams.** Coverage stops at a tile edge on one side in 28% of samples, and depth bands disagree across an edge in 9.4%. A single global run draws the same seams, so they come from the per-tile surface, not from the split.
-
-## Current design
-
-- **Ingest.** The Chesapeake import to R2 loaded 97.2M points from 18,066 new files in 5 h 19 min, with a peak of 1.65 GB. Seconds per step: list 45, download wait 536, parse 2,644, dedupe 574, write 2,507, QC 630, coverage 9,724. Coverage, a per-file query against every other file's time range, is half the wall time. The run is one transaction, so one late R2 error discards everything; two attempts were lost that way after the machine slept.
-- **`grid cells`.** A full rebuild at about 46 min per 100M soundings, which puts a planet rebuild at about 16–20 h with no incremental path. With the corroboration join fixed, the bay's build on R2 (8.0M measured cells and 2.8M filled, 20 units) takes 2 h 59 min, with DuckDB at 3.5 GB of a 4 GB limit and a peak RSS of 5.0 GB. The largest costs are hole filling (3,412 s), rereading each unit's active points (3,081 s) and deleting the old `qc_flags` (2,583 s); consensus takes 692 s.
-
-The per-tile cells stage costs about the same (36 min serially for Chesapeake). Splitting by tile doesn't make the work cheaper. It makes the work partitionable, and so incremental and parallel.
+- **Ingest** commits per batch and publishes its catalog every 15 minutes, so a failure loses only the work since, and a rerun skips files already published. Rule 4's coverage finds every candidate pair in one query and checks containment in groups, 136 s on the Chesapeake's 18,055 files. Around Galveston, ingest from NOAA to R2 took 5.1 h for 252M soundings ([planet-size.md](planet-size.md#the-galveston-region)).
+- **Compact** rewrites a partition a range of tiles at a time: 163 s around Galveston, 53 min for the planet's 285 partitions.
+- **Tide** fetches gauge months and predicts station levels: 2.9 h around Galveston, most of it CO-OPS.
+- **Calibrate** reduces only files whose inputs moved and solves every segment: 34 min around Galveston reducing every file again, within a 2 GB cgroup.
 
 ## A planet day
 

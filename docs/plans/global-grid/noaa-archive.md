@@ -17,13 +17,13 @@ A submission's name in the track index maps to its CSV: the first eight digits o
 
 ## Size
 
-Checked through the track index's statistics query:
+The bucket held 1,045,268 CSVs and 471.1 GB in a listing on 2026-11-08, which is what ingest reads; the planet ingest stored 1.90 billion soundings from them. The track index has one entry per submission and fewer entries than the bucket has CSVs. Checked through the track index's statistics query on 2026-10-15:
 
 - 784,429 submissions from 2017-04-25 on, totaling 80 GB as submitted (compressed). The CSVs are roughly three times larger.
 - 275,726 submissions and 25 GB arrived in the last year.
 - One day's folder (2026-10-14) held 1,631 CSVs and 751 MB.
 
-A build of Fiji read 28.4 million soundings from 1.15 GB of submissions, which puts the whole archive at roughly 2 billion soundings.
+A build of Fiji read 28.4 million soundings from 1.15 GB of submissions, which put the whole archive at roughly 2 billion soundings before the planet ingest counted 1.90 billion.
 
 ## CSV format
 

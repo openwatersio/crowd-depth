@@ -2,11 +2,11 @@
 
 Each vessel's vertical offset can be calibrated, both against BlueTopo and from crossings with other vessels, and the two methods agree. Across the Chesapeake, 234 of 303 vessels calibrate against BlueTopo, with offsets from −3.4 m to 0.0 m (10th to 90th percentile). A crossover solve anchored to the other vessels recovers a held-out vessel's BlueTopo offset to within 0.09 m (median) and 0.31 m (90th percentile).
 
-Offsets are not constant for a quarter of the vessels. 36 of the 146 vessels with enough calibrated transits show a step, a median of 0.74 m and up to 5.2 m, which looks like a sounder being moved, replaced or reconfigured. Calibrating per vessel and step segment, rather than per vessel, is what makes the corrected surface right. In Thimble Shoal Channel, with offsets learned everywhere except the scored area, `median − 1.645σ` is never drawn more than 1 m deeper than the shoalest BlueTopo cell under it, against 2.1% of pixels with one constant offset per vessel.
+Offsets are not constant for a quarter of the vessels. 36 of the 146 vessels with enough calibrated transits show a step, a median of 0.74 m and up to 5.2 m, which looks like a sounder being moved, replaced or reconfigured. Calibrating per vessel and step segment, rather than per vessel, is what makes the corrected surface right. In Thimble Shoal Channel, with offsets learned everywhere except the scored area, the spike's `median − 1.645σ` is never drawn more than 1 m deeper than the shoalest BlueTopo cell under it, against 2.1% of pixels with one constant offset per vessel.
 
 Planet-scale cost is small. The crossover work runs per 1° tile, and the densest Chesapeake tile takes 4.7 s and 1.3 GB. The global solve is a sparse system with one unknown per vessel segment, which takes under a second at 100,000 segments.
 
-Measured in October 2026 on the Chesapeake set. The comparison's code isn't checked in.
+Measured in October 2026 on the Chesapeake set, before tide reduction and before `grid calibrate`. The comparison's code isn't checked in. It scored surfaces with `median − 1.645σ`; the grid draws `median − 1.75σ_b` ([surface-statistic.md](surface-statistic.md)). How `grid calibrate` builds on it is under [In the pipeline](#in-the-pipeline).
 
 ## Method
 
@@ -115,14 +115,17 @@ The work splits into a per-tile part, which carries all the soundings, and a glo
 
 At the 2B soundings assumed in [rebuild-cost.md](rebuild-cost.md), crossover detection and terms are about 25 times the bay, a few minutes per pass, and ten passes stay well under an hour of worker time. That is small next to the grid rebuild. A calibration change dirties every tile a segment touched, so a daily run should re-solve and republish only offsets that moved by more than their standard error.
 
-## Recommendation
+## In the pipeline
 
-1. **Key offsets by vessel and step segment.** Run step detection on per-transit offsets against BlueTopo or crossings, and give each segment its own offset and standard error. One constant per vessel leaves 2.1% of channel pixels drawn more than 1 m too deep; per segment leaves none.
-2. **Solve BlueTopo and crossings together.** Use BlueTopo and S-102 as anchors where a segment has at least 50 flat-seabed pixels across 2 transits, and solve every segment's offset at shared pixels. Weight anchors by their standard error rather than fixing them, so one bad anchor can't pull its neighbors. Seascape's other surveyed sources can anchor once Seascape carries a quality layer per pixel (uncertainty, source and survey date), which the calibration filter needs.
-3. **Require five crossing transits** before treating a crossover offset as calibrated, about ±0.4 m. Below that, publish the offset with its uncertainty and weight the segment low, as the plan does for uncalibrated vessels.
-4. **Reduce tide before calibrating.** It is most of the remaining per-transit spread, and it would tighten both the offsets and the step detection.
-5. **Offset only, no scale factor,** until deeper water is in the set. Scale fits barely help at 2–20 m.
-6. **Feed calibration residuals into σ.** Each segment's standard error and spread are the per-vessel uncertainty the backlog's "Better σ" item needs.
+`grid calibrate` follows this spike ([Vessel calibration](README.md#vessel-calibration)):
+
+1. **Offsets by vessel and step segment.** Steps come from binary segmentation of each vessel's per-transit offsets, and each segment has its own offset and standard error in `lake.calibration`.
+2. **BlueTopo, S-102 and crossings solved together.** A segment with at least 50 flat-seabed pixels across 2 transits is anchored, weighted by its standard error rather than fixed, and every segment is solved at shared 2/3″ pixels by robust least squares, with the pixel depths eliminated.
+3. **Five crossing transits** before a crossover offset counts as calibrated.
+4. **Tide reduced first.** Calibration reads only tide-reduced soundings, or ones `grid tide` found no station for.
+5. **Offset only, no scale factor.**
+
+Not built: calibration residuals in σ (the backlog's "Better σ"), and anchors from Seascape's other surveyed sources, which wait on a quality layer per pixel there.
 
 ## Not measured
 

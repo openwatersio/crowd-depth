@@ -199,6 +199,9 @@ Do A, B's small parts, and E's small parts first. They're local changes that nee
 | 2     | Contours of one unit per tile, once Freeboard's fetching of hidden sources is checked | Not done: Freeboard fetches tiles for a source whose layers are all hidden                                                                       |
 | 2     | Latitude-sized rasters, if seams can be held                                          | Done below zoom 14: a zoom 13 view builds 35 to 44% faster. Zooms 14 and 15 are unchanged                                                        |
 | 3     | Typed arrays in `surface()`; the surface worked only where soundings reach            | Done, byte-identical: the boat's view on its Pi 8.0 → 4.6 s for the zoom 13 to 15 walk. What follows is in [Live and instant](#live-and-instant) |
+| 4     | Tiles built ahead in the background, nearest the boat first, at every zoom, and kept  | Done: pan and zoom read built tiles, 11 to 39 ms a tile on the boat's Pi ([Stage 4 and 5 results](#stage-4-and-5-results))                       |
+| 5     | The batch chosen by the view, 5 s where it's light; the pass drawn as a ribbon        | Done: the surface 27 s behind the boat at the median, held by QC's look-ahead and the pass rule, not the batch                                   |
+| 6     | A preview of the surface the held soundings will make, sent with each poll            | Under way in [#233](https://github.com/openwatersio/crowd-depth/pull/233): the surface on screen within about 1.5 s of a sounding                |
 
 Rendering changes in stage 1 and 2 come with before-and-after screenshots on real data, as any change to how tiles render does.
 
