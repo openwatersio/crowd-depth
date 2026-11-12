@@ -27,7 +27,7 @@ Each stage is a `grid` command run in a container. A stage starts only when the 
 | --- | --------- | ------------------------------------------------------ | --------------------------------------------------------------------------------- | ---- |
 | 1   | Ingest    | `grid ingest --source noaa`                            | one process, `GRID_MEMORY_LIMIT=8GB` in 12 GB, downloading as it goes             | no   |
 | 2   | Compact   | `grid compact`                                         | one process, a partition at a time, `GRID_MEMORY_LIMIT=768MB` in 3 GB             | yes  |
-| 3   | Tide      | `grid tide`                                            | one process                                                                       | yes  |
+| 3   | Tide      | `grid tide` with `GRID_WATER_LEVELS=stillwell`         | one process, `GRID_MEMORY_LIMIT=768MB` in 3 GB                                    | yes  |
 | 4   | Calibrate | `grid calibrate --reference s102 --reference bluetopo` | one process, `GRID_MEMORY_LIMIT=1GB` in 4 GB                                      | yes  |
 | 5   | Tiles     | `grid tiles --out run --memory-gb 20`                  | Snakemake: leaf cells, leaf surfaces, splices, overlays, web, low zooms, assembly | yes  |
 | 6   | Publish   | `grid tiles --out run --publish s3://…`                | uploads only; no job reruns                                                       | no   |
@@ -76,7 +76,7 @@ On the Mac Studio under OrbStack, with the store on a USB SSD. Each stage is one
 | --------- | ------------------: | --------: | ----------: |
 | Ingest    | 24.3 h, in six runs |      34.5 |     10.5 GB |
 | Compact   | 53 min, in two runs |       2.6 |      2.0 GB |
-| Tide      |                     |           |             |
+| Tide      |              61 min |       3.3 |      1.8 GB |
 | Calibrate |                     |           |             |
 | Tiles     |                     |           |             |
 | Publish   |                     |           |             |
@@ -84,6 +84,8 @@ On the Mac Studio under OrbStack, with the store on a USB SSD. Each stage is one
 **Ingest** read all 1,045,268 CSVs into 1.90B points and 171M flags. It ran at a 2 GB limit in 6 GB at first, then at 8 GB in 12 GB; the lock was waived so it ran beside the Galveston probes, and its times include their load. Two runs stopped about 7.8 h in when a download in `tmp/` vanished from OrbStack's bind mount, and the driver now reruns ingest after that error, up to three times; each rerun resumes from the last checkpoint. One run was killed at 6 GB while rule 4 judged one vessel's 1.49M overlapping pairs, and two failed in the final publish's merge of 34,168 flag files, one at 10.5 GB. The fixes for both are in [#237](https://github.com/openwatersio/crowd-depth/pull/237), and with them the last run took 520 s at 2.3 GB.
 
 **Compact** rewrote all 285 partitions, the points from 42,753 files to 389 (132 GB on disk, old files included until snapshots expire) and the flags from 34,168 to 277. Its memory grows over a run, in DuckDB's file and object caches and about 1 GB outside them: the first run was killed at 2 GB after 197 partitions, and the second finished the other 88 in 3 GB.
+
+**Tide** read gauge observations from Stillwell. A first run against CO-OPS' API spent 9 h fetching gauge months at about 8 s each and stopped unfinished when the Studio rebooted; from Stillwell the whole stage took 61 min. It wrote 382,510 station days. Of the 14,522 gauge months the soundings need, Stillwell couldn't give 4,268: 2,801 at 132 gauges it hasn't backfilled, 1,189 at 57 gauges with no MLLW in its station list, 278 at 49 gauges whose year file has nothing usable that month, and 5 that returned HTTP 500. Those months keep CO-OPS residuals from the stopped run (597) or none, so their soundings get Slackwater's prediction alone (3,671). Each later tide run asks for them again. Six more months failed when two of tide's fetchers downloaded the same year file at once and one read it mid-rename on OrbStack's bind mount; they're asked for again too.
 
 ## Hetzner
 
