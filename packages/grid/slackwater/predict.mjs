@@ -3,9 +3,10 @@
 //
 //   node predict.mjs stations   one JSON line per tide station
 //   node predict.mjs version    the engine and station database versions, as one JSON line
-//   node predict.mjs levels     for each JSON line {station, start, end, step} on stdin
-//                               (epoch seconds), a line [station, [[time, level], ...]]
-//                               above the station's chart datum, start and end included
+//   node predict.mjs levels     for each JSON line {station, start, end, step[, datum]} on
+//                               stdin (epoch seconds), a line [station, [[time, level], ...]]
+//                               above `datum`, or the station's chart datum, start and end
+//                               included
 import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { loadStations } from "@slackwater/database";
@@ -47,7 +48,7 @@ if (process.argv[2] === "stations") {
     return predictors.get(id);
   };
   for await (const line of createInterface({ input: process.stdin })) {
-    const { station, start, end, step } = JSON.parse(line);
+    const { station, start, end, step, datum } = JSON.parse(line);
     // A station the engine can't predict gives an empty series: that day goes without.
     let series = [];
     try {
@@ -55,6 +56,7 @@ if (process.argv[2] === "stations") {
         start: new Date(start * 1000),
         end: new Date(end * 1000),
         timeFidelity: step,
+        datum,
       });
       series = timeline.map((p) => [p.time.getTime() / 1000, p.level]);
     } catch (error) {

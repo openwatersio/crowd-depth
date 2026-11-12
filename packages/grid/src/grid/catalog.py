@@ -97,10 +97,15 @@ CREATE TABLE IF NOT EXISTS lake.tide_cells (tide_cell BIGINT, tile_id INTEGER, s
 CREATE TABLE IF NOT EXISTS lake.tide_levels (
   station_id INTEGER, slot TIMESTAMP, level FLOAT, slope FLOAT, sigma FLOAT, method VARCHAR
 );
--- CO-OPS observed minus predicted water level per gauge, and when each gauge month was
+-- Observed minus predicted water level per CO-OPS gauge, and when each gauge month was
 -- fetched: a month is final once fetched well after its end.
 CREATE TABLE IF NOT EXISTS lake.tide_residuals (gauge VARCHAR, time TIMESTAMP, residual FLOAT);
 CREATE TABLE IF NOT EXISTS lake.tide_residual_months (gauge VARCHAR, month DATE, fetched DATE);
+-- For each gauge month fetched from Stillwell: when, what it was read from
+-- (tide.stillwell_version), and a digest of its levels in MLLW.
+CREATE TABLE IF NOT EXISTS lake.tide_residual_versions (
+  gauge VARCHAR, month DATE, fetched DATE, version VARCHAR, digest VARCHAR
+);
 -- A surveyed reference sampled at a calibration pixel (two base rows by two base
 -- columns of a tile): depth below chart datum, relief within about 20 m, uncertainty.
 CREATE TABLE IF NOT EXISTS lake.reference_pixels (
@@ -876,6 +881,7 @@ def open_store(store, write=True, ttl=timedelta(minutes=10)):
                         "tide_levels",
                         "tide_residuals",
                         "tide_residual_months",
+                        "tide_residual_versions",
                     ):
                         con.execute(f"CALL ducklake_rewrite_data_files('lake', '{table}')")
                     # A reader may still hold a catalog up to RETAIN old, so snapshots, the

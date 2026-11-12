@@ -17,6 +17,7 @@ from test_ingest import env  # noqa: F401  (a fixture)
 from grid import calibrate, catalog, cells, cli, ingest, overlay, tide
 from grid import reference as reference_mod
 from grid.catalog import open_store
+from grid.objects import LocalObjects
 
 TILE = (LAT0 + 90) * 360 + LON0 + 180
 
@@ -148,6 +149,140 @@ def test_recent_days_take_a_gauges_late_data_and_mark_their_tiles(env):  # noqa:
     built = env.query("SELECT value FROM lake.store_meta WHERE key = 'cells'")
     with open_store(env.store) as con:
         assert built == [(cells.inputs(con),)]
+
+
+def test_switching_to_stillwell_takes_every_months_residuals_again(env, monkeypatch):  # noqa: F811
+    lon, lat = at(5000, 0)
+    put(env, 1, [(0, lon, lat, 5.0)])
+    env.run("noaa")
+    gauges = [{"id": "g1", "lon": lon + 0.2, "lat": lat + 0.1}]
+    later = date(2027, 1, 1)
+
+    def from_stillwell(gauge, month):
+        return [(t, r + 0.2) for t, r in residuals(gauge, month)]
+
+    monkeypatch.setattr(tide, "stillwell_residuals", from_stillwell)
+    monkeypatch.setattr(tide, "stillwell_version", lambda *a: "v")
+    monkeypatch.setattr(tide, "stillwell_digest", lambda *a: "d")
+    with open_store(env.store) as con:
+        cells.build(con)
+        tide.build(con, stations, lambda: gauges, residuals, levels, version="v1", today=later)
+        cells.build(con)
+        # Final months aren't fetched again, but a new way to take them is.
+        monkeypatch.setenv("GRID_WATER_LEVELS", "stillwell")
+        tide.build(con, stations, lambda: gauges, None, levels, version="v1", today=later)
+        assert cells.changed(con) == [TILE]
+    [(_, _, _, h, _, _)] = corrected(env)
+    assert h == pytest.approx(1.75 + 0.3, abs=1e-6)
+
+
+def test_a_month_stillwell_cant_give_keeps_its_residuals_and_stays_open(
+    env,  # noqa: F811
+    monkeypatch,
+):
+    lon, lat = at(5000, 0)
+    put(env, 1, [(0, lon, lat, 5.0)])
+    env.run("noaa")
+    gauges = [{"id": "g1", "lon": lon + 0.2, "lat": lat + 0.1}]
+    later = date(2027, 1, 1)
+    # No year file covers the month, as at a gauge Stillwell hasn't backfilled.
+    monkeypatch.setattr(tide, "stillwell_residuals", lambda g, m: None)
+    monkeypatch.setattr(tide, "stillwell_version", lambda *a: None)
+    monkeypatch.setattr(tide, "stillwell_digest", lambda *a: None)
+    with open_store(env.store) as con:
+        tide.build(con, stations, lambda: gauges, residuals, levels, version="v1", today=later)
+        monkeypatch.setenv("GRID_WATER_LEVELS", "stillwell")
+        for _ in range(2):
+            tide.build(con, stations, lambda: gauges, None, levels, version="v1", today=later)
+        months = "SELECT fetched FROM lake.tide_residual_months"
+        assert con.execute(months).fetchall() == [(date(1900, 1, 1),)]
+    [(_, _, _, h, _, _)] = corrected(env)
+    assert h == pytest.approx(1.75 + 0.1, abs=1e-6)
+
+
+def test_a_new_month_stillwell_has_no_file_for_stays_open(env, monkeypatch):  # noqa: F811
+    lon, lat = at(5000, 0)
+    put(env, 1, [(0, lon, lat, 5.0)])
+    env.run("noaa")
+    gauges = [{"id": "g1", "lon": lon + 0.2, "lat": lat + 0.1}]
+    later = date(2027, 1, 1)
+    monkeypatch.setattr(tide, "stillwell_residuals", lambda g, m: None)
+    monkeypatch.setattr(tide, "stillwell_version", lambda *a: None)
+    monkeypatch.setattr(tide, "stillwell_digest", lambda *a: None)
+    monkeypatch.setenv("GRID_WATER_LEVELS", "stillwell")
+    with open_store(env.store) as con:
+        for _ in range(3):
+            tide.build(con, stations, lambda: gauges, None, levels, version="v1", today=later)
+        months = "SELECT fetched FROM lake.tide_residual_months"
+        assert con.execute(months).fetchall() == [(date(1900, 1, 1),)]
+
+
+def test_a_final_stillwell_month_is_fetched_again_when_its_residuals_would_change(
+    env,  # noqa: F811
+    monkeypatch,
+):
+    lon, lat = at(5000, 0)
+    put(env, 1, [(0, lon, lat, 5.0)])
+    env.run("noaa")
+    gauges = [{"id": "g1", "lon": lon + 0.2, "lat": lat + 0.1}]
+    later = date(2027, 1, 1)
+    files = {"version": "aaa", "residual": 0.1, "rows": True}
+
+    def answer(gauge, month):
+        if not files["rows"]:
+            return []
+        return [(t, files["residual"]) for t, _ in residuals(gauge, month)]
+
+    monkeypatch.setattr(tide, "stillwell_residuals", answer)
+    monkeypatch.setattr(tide, "stillwell_version", lambda g, m, version=None: files["version"])
+    monkeypatch.setattr(
+        tide, "stillwell_digest", lambda g, m: repr((files["residual"], files["rows"]))
+    )
+    monkeypatch.setenv("GRID_WATER_LEVELS", "stillwell")
+
+    def run():
+        tide.build(con, stations, lambda: gauges, None, levels, version="v1", today=later)
+        [(h,)] = con.execute(
+            """SELECT tide FROM corrected_points_in(
+              (SELECT any_value(cell_id) FROM lake.points), [], 0, 10800)"""
+        ).fetchall()
+        return h
+
+    with open_store(env.store) as con:
+        assert run() == pytest.approx(1.75 + 0.1, abs=1e-6)
+        kept = "SELECT version FROM lake.tide_residual_versions"
+        # The year file rewritten, as the current year's is daily, but this month unchanged:
+        # only its version is brought up to date.
+        files["version"] = "bbb"
+        cells.build(con)
+        assert run() == pytest.approx(1.75 + 0.1, abs=1e-6)
+        assert cells.changed(con) == []
+        assert con.execute(kept).fetchall() == [("bbb",)]
+        # Its file unchanged: not fetched again, whatever it would give.
+        files["residual"] = 0.3
+        assert run() == pytest.approx(1.75 + 0.1, abs=1e-6)
+        # Its file changed, and with it the month.
+        files["version"] = "ccc"
+        assert run() == pytest.approx(1.75 + 0.3, abs=1e-6)
+        # Written since by another build, as an older release would after a rollback.
+        con.execute("UPDATE lake.tide_residual_months SET fetched = DATE '2026-12-31'")
+        files["residual"] = 0.5
+        assert run() == pytest.approx(1.75 + 0.5, abs=1e-6)
+        # Stillwell's quality control takes back every value that month.
+        files["version"], files["rows"] = "ddd", False
+        assert run() == pytest.approx(1.75, abs=1e-6)
+
+
+def test_a_stillwell_error_keeps_the_month_as_it_was(tmp_path, monkeypatch):
+    def broken(gauge, month):
+        raise duckdb.HTTPException("HTTP 503")
+
+    monkeypatch.setattr(tide, "stillwell_residuals", broken)
+    monkeypatch.setattr(tide, "stillwell_version", lambda *a: "v")
+    monkeypatch.setattr(tide, "stillwell_digest", lambda *a: "d")
+    with open_store(LocalObjects(tmp_path / "s")) as con:
+        con.execute("CREATE TEMP TABLE old_levels AS SELECT * FROM lake.tide_levels LIMIT 0")
+        assert tide.fetch_residuals(con, [("g1", date(2026, 1, 1))], date(2026, 6, 1), broken) == []
 
 
 def test_old_days_that_gain_levels_mark_their_tiles(env):  # noqa: F811
