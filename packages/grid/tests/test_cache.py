@@ -553,3 +553,27 @@ def test_an_interrupted_prefetch_stops_its_downloads(monkeypatch):
     with pytest.raises(reference.Stopped):
         reference.download(LINK, cache.path("reference", "x", "y"))
     assert len(chunks) == 2 and not list(cache.path("reference", "x").glob("*"))
+
+
+def test_a_batch_takes_no_tile_that_would_pass_its_raster_bound(monkeypatch):
+    # Four rasters a batch: tiles of three each go one at a time, and a tile of nine alone.
+    rasters = {1: ["a", "b", "c"], 2: ["c", "d", "e"], 3: list("fghijklmn")}
+    looked, fetched, sampled = [], [], []
+
+    def tile_links(con, tile, name, catalogs):
+        looked.append(tile)
+        return tile, (None, [0.0], [0.0]), [(link, None) for link in rasters[tile]]
+
+    def sample_tile(con, tile, name, catalogs, shift_at, pixels):
+        sampled.append(tile)
+        return 1, 1
+
+    monkeypatch.setattr(reference, "FETCH_WORKERS", 1)
+    monkeypatch.setattr(reference, "unsampled_tiles", lambda con, name: list(rasters))
+    monkeypatch.setattr(reference, "tile_links", tile_links)
+    monkeypatch.setattr(reference, "prefetch", lambda name, want: fetched.append(sorted(want)))
+    monkeypatch.setattr(reference, "sample_tile", sample_tile)
+    monkeypatch.setattr(reference, "checkpoint", lambda con: None)
+    assert reference.sample(None, ["bluetopo"]) == 3
+    assert fetched == [rasters[1], rasters[2], rasters[3]]
+    assert sampled == looked == [1, 2, 3]

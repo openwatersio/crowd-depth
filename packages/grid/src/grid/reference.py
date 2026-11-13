@@ -15,6 +15,7 @@ scheme gives, and checked against it, several at once for a batch of tiles befor
 they're sampled.
 """
 
+import collections
 import contextlib
 import functools
 import hashlib
@@ -163,7 +164,8 @@ def download(url, entry, sha=None):
     digest, size = hashlib.sha256(), 0
     with cache.writing(entry) as tmp, urllib.request.urlopen(url, timeout=300) as r:
         with open(tmp, "wb") as f:
-            # Small reads, so an interrupted run stops a slow download within seconds.
+            # Small reads, so an interrupted run stops a flowing download within one; a
+            # stalled one stops at its next read, up to the 300 s timeout.
             while chunk := r.read(2**16):
                 if stopping.is_set():
                     raise Stopped(url)
@@ -391,7 +393,7 @@ def kind(src):
 def sample(con, sources, separation=None):
     """Sample each source at the calibration pixels (temp table `cal_obs`) it hasn't been
     sampled at, in batches of tiles whose rasters are downloaded together, so memory
-    follows a batch's pixels: about PREFETCH_PIXELS, plus the last tile's."""
+    follows a batch's pixels: about PREFETCH_PIXELS, plus the last tile's and the next's."""
 
     def shift_at(lon, lat):
         # MLLW above NAVD88, from CO-OPS only once a NAVD88 raster needs it.
@@ -404,24 +406,24 @@ def sample(con, sources, separation=None):
     http = {"GDAL_HTTP_TIMEOUT": 60, "GDAL_HTTP_MAX_RETRY": 3, "GDAL_HTTP_RETRY_DELAY": 5}
     with rasterio.Env(**http):
         for name in sources:
-            tiles = unsampled_tiles(con, name)
+            tiles = collections.deque(unsampled_tiles(con, name))
+            ahead = None  # the tile, pixels and links that didn't fit the last batch
             while tiles:
                 # A batch at a time, so downloads overlap yet sampled tiles are checkpointed
                 # as they go, and memory holds only a batch's pixels.
                 batch, want, held = {}, {}, 0
-                while (
-                    tiles
-                    and len(batch) < PREFETCH_TILES
-                    and len(want) < 4 * FETCH_WORKERS
-                    and held < PREFETCH_PIXELS
-                ):
-                    tile = tiles.pop(0)
-                    batch[tile] = _, lon, lat = unsampled(con, tile, name)
-                    held += len(lat)
-                    if name in CATALOGS:
-                        lat0, lon0 = tile // 360 - 90, tile % 360 - 180
-                        box = (lon0, lat0, lon0 + 1, lat0 + 1)
-                        want.update(links(name, box, catalogs, lon, lat)[0])
+                while tiles and len(batch) < PREFETCH_TILES and held < PREFETCH_PIXELS:
+                    tile, pixels, fetch = ahead or tile_links(con, tiles[0], name, catalogs)
+                    ahead = None
+                    # A tile whose rasters would take the batch past its bound waits for
+                    # the next; one past it alone is a batch of its own.
+                    if batch and len(want.keys() | dict(fetch).keys()) > 4 * FETCH_WORKERS:
+                        ahead = tile, pixels, fetch
+                        break
+                    tiles.popleft()
+                    batch[tile] = pixels
+                    held += len(pixels[2])
+                    want.update(fetch)
                 prefetch(name, want)
                 for tile, pixels in batch.items():
                     n, got = sample_tile(con, tile, name, catalogs, shift_at, pixels)
@@ -429,6 +431,16 @@ def sample(con, sources, separation=None):
                     checkpoint(con)
     log.info("reference: %d pixel samples, %d with a depth", total, found)
     return total
+
+
+def tile_links(con, tile, name, catalogs):
+    """A 1° tile, its `unsampled` pixels, and the (link, checksum) of a catalog source's
+    rasters there."""
+    pixels = _, lon, lat = unsampled(con, tile, name)
+    if name not in CATALOGS:
+        return tile, pixels, []
+    lat0, lon0 = tile // 360 - 90, tile % 360 - 180
+    return tile, pixels, links(name, (lon0, lat0, lon0 + 1, lat0 + 1), catalogs, lon, lat)[0]
 
 
 def unsampled_tiles(con, name):
