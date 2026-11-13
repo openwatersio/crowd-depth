@@ -54,7 +54,7 @@ from scipy.sparse import coo_matrix, csc_matrix, csr_matrix, diags
 from scipy.sparse.csgraph import connected_components
 from scipy.sparse.linalg import splu
 
-from . import catalog, cells, manifest, reference
+from . import catalog, cells, manifest, ranges, reference
 from . import release as release_memory
 from .cells import BASE, K_LIST
 from .qc import QC_VERSION, TRACK_REASONS
@@ -214,6 +214,9 @@ SEARCH_VESSELS = 64
 SEARCH_THREADS = 4
 # Rows per batch of files whose per-transit medians are taken at once (transit_offsets).
 TRANSIT_ROWS = 2_000_000
+# Rows of `cal_obs` per run of tiles read at once by a statement over every tile: whole, the
+# planet's joins and medians spilled past 25 GB. Every row of a pixel is in its tile.
+TILE_ROWS = 2_000_000
 # A vessel's calendar month in a 1° tile with MONTH_SHARE or more of its pixels there
 # reading lost (from MONTH_PIXELS judged) is set aside in that tile, so a sounder that lost
 # the bottom in one bay keeps its soundings in the next: with stuck runs and stretches, 2.54M
@@ -367,12 +370,13 @@ CODE = hashlib.sha256(
     ).encode()
 ).hexdigest()[:16]
 
-# Rows at anchor-quality reference pixels (`anchor_px`), with the difference from the
-# reference and whether the row reads lost.
+# Rows at anchor-quality reference pixels (`anchor_px`) in the tiles `$lo` to `$hi`, with the
+# difference from the reference and whether the row reads lost.
 ANCHOR_ROWS = f"""
 SELECT o.vessel, o.file_id, o.t, o.tile_id, o.py, o.px, o.m - r.depth AS e, r.depth AS z, o.lost
 FROM cal_obs o JOIN anchor_px r USING (tile_id, py, px)
-WHERE abs(o.m - r.depth) < {ANCHOR_DIFF_M}
+WHERE abs(o.m - r.depth) < {ANCHOR_DIFF_M} AND o.tile_id BETWEEN $lo AND $hi
+  AND r.tile_id BETWEEN $lo AND $hi
 """
 
 # The working table `search_soundings`: one tile's soundings of the vessels in `$vessels`; then
@@ -670,14 +674,19 @@ def stuck_runs(con, offset, status):
     # Each vessel's calendar months in each tile: how many of its file-pixel medians were
     # judged, and how many read lost.
     lost = f"o.m < {LOST_BOTTOM} * (s.z + u.o) AND o.m < s.z + u.o - {LOST_MARGIN_M}"
-    con.execute(
-        f"""CREATE OR REPLACE TABLE vessel_months AS
-        SELECT o.vessel, date_trunc('month', o.t) AS month, o.tile_id, count(*) AS judged,
+    # Grouped by tile, so a run of tiles at a time gives the same rows, and the joins' memory
+    # follows a run.
+    months = f"""SELECT o.vessel, date_trunc('month', o.t) AS month, o.tile_id, count(*) AS judged,
           count(*) FILTER (WHERE {lost}) AS lost
         FROM cal_obs o JOIN unit_offsets u USING (vessel, file_id)
         JOIN seabed_px s USING (tile_id, py, px)
+        WHERE o.tile_id BETWEEN $lo AND $hi AND s.tile_id BETWEEN $lo AND $hi
         GROUP BY ALL"""
-    )
+    tiles = tile_ranges(con)
+    con.execute(f"CREATE OR REPLACE TABLE vessel_months AS {months}", {"lo": 0, "hi": -1})
+    for lo, hi in tiles:
+        con.execute(f"INSERT INTO vessel_months {months}", {"lo": lo, "hi": hi})
+        release()
     # Searched by the month across its tiles, as the search finds runs in any of them.
     con.execute(
         f"""CREATE OR REPLACE TABLE stuck_vessels AS
@@ -686,8 +695,7 @@ def stuck_runs(con, offset, status):
     )
     # A month set aside in a tile: each of its files' soundings there, to the end of the
     # last month its lost medians reach, as a median holds every visit to its pixel.
-    runs = con.execute(
-        f"""WITH months AS (
+    set_aside = f"""WITH months AS (
           SELECT vessel, month, sum(judged) AS judged, sum(lost) AS lost
           FROM vessel_months GROUP BY ALL
         )
@@ -696,15 +704,19 @@ def stuck_runs(con, offset, status):
             a.month) + INTERVAL 1 MONTH - INTERVAL 1 MICROSECOND)
         FROM cal_obs o JOIN unit_offsets u USING (vessel, file_id) JOIN months a
           ON a.vessel = o.vessel AND a.month = date_trunc('month', o.t)
-        LEFT JOIN seabed_px s USING (tile_id, py, px)
+        LEFT JOIN (FROM seabed_px WHERE tile_id BETWEEN $lo AND $hi) s USING (tile_id, py, px)
         LEFT JOIN vessel_months m
           ON m.vessel = a.vessel AND m.month = a.month AND m.tile_id = o.tile_id
         JOIN lake.files f ON f.file_id = o.file_id
-        WHERE f.status = 'active' AND CASE WHEN m.judged >= {MONTH_PIXELS}
+        WHERE f.status = 'active' AND o.tile_id BETWEEN $lo AND $hi
+          AND CASE WHEN m.judged >= {MONTH_PIXELS}
           THEN m.lost >= {MONTH_SHARE} * m.judged
           ELSE a.judged >= {MONTH_PIXELS} AND a.lost >= {MONTH_SHARE} * a.judged END
         GROUP BY f.content_hash, f.vessel, o.tile_id, f.time_min, f.time_max, a.month"""
-    ).fetchall()
+    runs = []
+    for lo, hi in tiles:
+        runs += con.execute(set_aside, {"lo": lo, "hi": hi}).fetchall()
+        release()
     # ponytail: a file's run is found and applied per tile, so one that crosses a tile edge
     # is two; judge across tiles if the seams show
     # A tile's soundings for a group of its vessels at a time (SEARCH_READ), then one vessel's
@@ -757,7 +769,7 @@ def stuck_reads(con):
     rows = con.execute(
         """SELECT cell_id, tile_id, unique_id, file_id, count(*) FROM lake.points
         WHERE unique_id IN (SELECT vessel FROM stuck_vessels)
-          AND tile_id IN (SELECT tile_id FROM cal_obs
+          AND tile_id IN (SELECT DISTINCT tile_id FROM cal_obs
             WHERE vessel IN (SELECT vessel FROM stuck_vessels))
         GROUP BY ALL ORDER BY ALL"""
     ).fetchall()
@@ -861,22 +873,59 @@ def crossings(con):
     con.execute("DROP TABLE xweights")
 
 
+def tile_ranges(con):
+    """Runs of tiles (first, last) holding about TILE_ROWS of `cal_obs` rows each."""
+    return ranges(
+        con.execute("SELECT tile_id, count(*) FROM cal_obs GROUP BY 1 ORDER BY 1").fetchall(),
+        TILE_ROWS,
+    )
+
+
+def file_ranges(con, table):
+    """Runs of file ids (first, last) holding about TRANSIT_ROWS of `table`'s rows each:
+    their medians can't spill, so a batch of files at a time, as each is a file's alone."""
+    return ranges(
+        con.execute(f"SELECT file_id, count(*) FROM {table} GROUP BY 1 ORDER BY 1").fetchall(),
+        TRANSIT_ROWS,
+    )
+
+
 def anchors(con, n_units):
     """Each unit's anchor offset and standard error, NaN where it has no anchor, and its
     anchor pixels and transits. The offset and transits are from rows not read lost, the
     pixels from all of them: leaving out a vessel's lost rows mustn't take its anchor, or
-    with it what says those rows are lost."""
+    with it what says those rows are lost. Rows and pixels a run of tiles at a time, and the
+    transits' medians a batch of files at a time, so memory follows a batch."""
+    obs = f"SELECT a.*, u.unit FROM ({ANCHOR_ROWS}) a JOIN file_units u USING (vessel, file_id)"
+    # No tile: the table's columns alone.
+    con.execute(f"CREATE OR REPLACE TABLE anchor_rows AS {obs}", {"lo": 0, "hi": -1})
+    con.execute("CREATE OR REPLACE TABLE anchor_pixels (unit INTEGER, pixels BIGINT)")
+    for lo, hi in tile_ranges(con):
+        con.execute(f"INSERT INTO anchor_rows {obs}", {"lo": lo, "hi": hi})
+        # A pixel is in one tile, so each run's are its own.
+        con.execute(
+            """INSERT INTO anchor_pixels SELECT unit, count(DISTINCT (tile_id, py, px))
+            FROM anchor_rows WHERE tile_id BETWEEN $lo AND $hi GROUP BY unit""",
+            {"lo": lo, "hi": hi},
+        )
+        release()
+    con.execute("CREATE OR REPLACE TABLE anchor_files (unit INTEGER, file_id BIGINT, e FLOAT)")
+    for lo, hi in file_ranges(con, "anchor_rows"):
+        con.execute(
+            """INSERT INTO anchor_files SELECT unit, file_id, median(e) FROM anchor_rows
+            WHERE NOT lost AND file_id BETWEEN $lo AND $hi GROUP BY ALL""",
+            {"lo": lo, "hi": hi},
+        )
+        release()
     rows = con.execute(
-        f"""WITH a AS (
-          SELECT a.*, u.unit FROM ({ANCHOR_ROWS}) a JOIN file_units u USING (vessel, file_id)
-        ),
-        f AS (SELECT unit, file_id, median(e) AS e FROM a WHERE NOT lost GROUP BY ALL),
-        g AS (SELECT unit, count(DISTINCT (tile_id, py, px)) AS pixels FROM a GROUP BY unit)
+        """WITH g AS (SELECT unit, sum(pixels) AS pixels FROM anchor_pixels GROUP BY unit)
         -- The median of the transits' medians: one long transit counts once.
         SELECT unit, median(f.e) AS offset, count(*) AS transits, g.pixels,
           list(f.e) AS per_transit
-        FROM g JOIN f USING (unit) GROUP BY ALL"""
+        FROM g JOIN anchor_files f USING (unit) GROUP BY ALL"""
     ).fetchall()
+    for table in ("anchor_rows", "anchor_pixels", "anchor_files"):
+        con.execute(f"DROP TABLE {table}")
     offset = np.full(n_units, np.nan)
     se = np.full(n_units, np.nan)
     pixels = np.zeros(n_units, int)
@@ -999,9 +1048,13 @@ def transit_offsets(con, offset, lost=False):
     show as a step. A transit that lost the bottom shows it the same way."""
     whole = f"{bool(lost)} OR count(*) FILTER (WHERE NOT e.lost) < {STEP_PIXELS}"
     con.register("offsets_np", {"unit": np.arange(len(offset)), "o": offset})
-    con.execute(
-        f"""CREATE OR REPLACE TABLE transit_e AS
-        WITH x AS (SELECT x.*, o.o FROM xrows x JOIN offsets_np o USING (unit)),
+    # A run of tiles at a time: every row of a pixel is in its tile, and the planet's in one
+    # statement spilled past 15 GB.
+    transits = f"""
+        WITH x AS (
+          SELECT x.*, o.o FROM xrows x JOIN offsets_np o USING (unit)
+          WHERE x.tile_id BETWEEN $lo AND $hi
+        ),
         px AS (
           SELECT tile_id, py, px, sum(b * (m - o)) AS t, sum(b) AS w FROM x GROUP BY ALL
         ),
@@ -1010,29 +1063,21 @@ def transit_offsets(con, offset, lost=False):
           -- whose rows there all read lost, which has none in `xrows`.
           SELECT tile_id, py, px, unit,
             (px.t - coalesce(x.b * (x.m - x.o), 0)) / (px.w - coalesce(x.b, 0)) AS z
-          FROM (SELECT DISTINCT tile_id, py, px, unit FROM xobs)
+          FROM (SELECT DISTINCT tile_id, py, px, unit FROM xobs WHERE tile_id BETWEEN $lo AND $hi)
           JOIN px USING (tile_id, py, px) LEFT JOIN x USING (tile_id, py, px, unit)
           WHERE px.w > coalesce(x.b, 0)
         )
         SELECT o.vessel, o.file_id, o.t, o.m - z.z AS e, z.z AS z, o.lost
-        FROM xobs o JOIN others z USING (tile_id, py, px, unit)
+        FROM (FROM xobs WHERE tile_id BETWEEN $lo AND $hi) o
+        JOIN others z USING (tile_id, py, px, unit)
         UNION ALL BY NAME {ANCHOR_ROWS}"""
-    )
+    con.execute(f"CREATE OR REPLACE TABLE transit_e AS {transits}", {"lo": 0, "hi": -1})
+    for lo, hi in tile_ranges(con):
+        con.execute(f"INSERT INTO transit_e BY NAME {transits}", {"lo": lo, "hi": hi})
+        release()
     con.unregister("offsets_np")
-    # The medians can't spill: a batch of files at a time, as each is a file's alone. A
-    # batch is a run of file ids in order, so it's read as their range.
-    sizes = con.execute("SELECT file_id, count(*) FROM transit_e GROUP BY 1 ORDER BY 1").fetchall()
-    batches, batch, size = [], [], 0
-    for file_id, n in sizes:
-        if batch and size + n > TRANSIT_ROWS:
-            batches.append(batch)
-            batch, size = [], 0
-        batch.append(file_id)
-        size += n
-    if batch:
-        batches.append(batch)
     rows = []
-    for files in batches:
+    for lo, hi in file_ranges(con, "transit_e"):
         rows += con.execute(
             f"""SELECT e.vessel, e.file_id, f.time_min AS t,
               CASE WHEN {whole} THEN median(e.e) ELSE median(e.e) FILTER (WHERE NOT e.lost) END,
@@ -1040,7 +1085,7 @@ def transit_offsets(con, offset, lost=False):
             FROM transit_e e JOIN lake.files f USING (file_id)
             WHERE e.file_id BETWEEN $lo AND $hi GROUP BY e.vessel, e.file_id, f.time_min
             HAVING count(*) >= {STEP_PIXELS}""",
-            {"lo": files[0], "hi": files[-1]},
+            {"lo": lo, "hi": hi},
         ).fetchall()
         release()
     con.execute("DROP TABLE transit_e")
@@ -1116,15 +1161,25 @@ def without_lost_steps(con, segments):
     if not segments:
         return segments
     names = units_for(con, segments)
+    # The rows a run of tiles at a time, so the join's memory follows a run.
+    con.execute("CREATE OR REPLACE TABLE step_rows (unit INTEGER, m FLOAT, depth FLOAT)")
+    for lo, hi in tile_ranges(con):
+        con.execute(
+            """INSERT INTO step_rows SELECT u.unit, o.m, s.depth
+            FROM cal_obs o JOIN file_units u USING (vessel, file_id)
+            JOIN anchor_px s USING (tile_id, py, px)
+            WHERE list_contains($vessels, o.vessel)
+              AND o.tile_id BETWEEN $lo AND $hi AND s.tile_id BETWEEN $lo AND $hi""",
+            {"vessels": list(segments), "lo": lo, "hi": hi},
+        )
+        release()
     lost = con.execute(
         f"""SELECT unit FROM (
-          SELECT u.unit, regr_slope(o.m, s.depth) AS slope, stddev(s.depth) AS spread
-          FROM cal_obs o JOIN file_units u USING (vessel, file_id)
-          JOIN anchor_px s USING (tile_id, py, px)
-          WHERE list_contains(?, o.vessel) GROUP BY u.unit
-        ) WHERE spread >= {SEABED_SPREAD_M} AND slope < {FOLLOWS_SEABED}""",
-        [list(segments)],
+          SELECT unit, regr_slope(m, depth) AS slope, stddev(depth) AS spread
+          FROM step_rows GROUP BY unit
+        ) WHERE spread >= {SEABED_SPREAD_M} AND slope < {FOLLOWS_SEABED}"""
     ).fetchall()
+    con.execute("DROP TABLE step_rows")
     dropped = set()
     for (unit,) in lost:
         vessel, seg = names[unit]
@@ -1233,8 +1288,11 @@ def run(con, references=(), accept_losses=False) -> dict:
     if not con.execute("SELECT count(*) FROM lake.tide_stations").fetchone()[0]:
         raise RuntimeError("calibration reads tide-reduced depths; run `grid tide` first")
     tiles, reduced = reduce(con)
-    if references:
-        reference.sample(con, references)
+    sampled = reference.sample(con, references) if references else 0
+    # Kept now, not at the next checkpoint: a run that fails in the solve would otherwise
+    # reduce and sample the same files and pixels again.
+    if (reduced or sampled) and getattr(con, "published", None) is not None:
+        con.publish()
     # Pass 1: a unit per vessel, for pixel depths to find steps against.
     names = units_for(con, {})
     if not names:
@@ -1245,10 +1303,13 @@ def run(con, references=(), accept_losses=False) -> dict:
     segments = without_lost_steps(con, segments_from(series(transit_offsets(con, first))))
     # Pass 2: a unit per segment. A vessel with steps was judged by one offset across them.
     if segments:
-        con.execute(
-            "UPDATE cal_obs SET lost = false WHERE lost AND list_contains(?, vessel)",
-            [list(segments)],
-        )
+        for lo, hi in tile_ranges(con):
+            con.execute(
+                """UPDATE cal_obs SET lost = false WHERE lost AND list_contains($vessels, vessel)
+                AND tile_id BETWEEN $lo AND $hi""",
+                {"vessels": list(segments), "lo": lo, "hi": hi},
+            )
+            release()
     names = units_for(con, segments)
     offset, se, anchored, anchor, pixels, transits = solve_without_lost(con, len(names))
     with step("judging transits"):
