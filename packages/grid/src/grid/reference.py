@@ -391,7 +391,7 @@ def kind(src):
 
 
 def sample(con, sources, separation=None):
-    """Sample each source at the calibration pixels (temp table `cal_obs`) it hasn't been
+    """Sample each source at the calibration pixels (working table `cal_obs`) it hasn't been
     sampled at, in batches of tiles whose rasters are downloaded together, so memory
     follows a batch's pixels: about PREFETCH_PIXELS, plus the last tile's and the next's."""
 
