@@ -342,7 +342,7 @@ def kind(src):
 
 
 def sample(con, sources, separation=None):
-    """Sample each source at the calibration pixels (temp table `cal_obs`) it hasn't been
+    """Sample each source at the calibration pixels (working table `cal_obs`) it hasn't been
     sampled at, a tile at a time, so memory follows a tile's pixels."""
 
     def shift_at(lon, lat):
