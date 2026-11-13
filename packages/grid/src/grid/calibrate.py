@@ -212,10 +212,12 @@ SEARCH_VESSELS = 64
 # DuckDB threads for the stuck-run search: each holds its own share of a pair's soundings,
 # and on 4 a vessel's 5.0M in one tile took under 512 MB, against more than 640 MB on 18.
 SEARCH_THREADS = 4
-# Rows per batch of files whose per-transit medians are taken at once (transit_offsets).
+# Rows per batch of files whose per-transit medians are taken at once (transit_offsets,
+# anchors).
 TRANSIT_ROWS = 2_000_000
-# Rows of `cal_obs` per run of tiles read at once by a statement over every tile: whole, the
-# planet's joins and medians spilled past 25 GB. Every row of a pixel is in its tile.
+# Rows of `cal_obs` per run of tiles read at once by a statement over every tile: the
+# planet's `transit_offsets` in one statement spilled past 15 GB. Every row of a pixel is in
+# its tile.
 TILE_ROWS = 2_000_000
 # A vessel's calendar month in a 1° tile with MONTH_SHARE or more of its pixels there
 # reading lost (from MONTH_PIXELS judged) is set aside in that tile, so a sounder that lost
@@ -475,7 +477,8 @@ WHERE reach >= {FLAT_REACH_M} AND reach >= {FLAT_SPEED_MS} * epoch(t_end - t_sta
 # in at most one and is matched to the last that starts before it, by ASOF join: on a first
 # calibrate every run is new, and checking each sounding against all of its file's runs is
 # its soundings times its runs (9.1 billion pairs on the Chesapeake, up to 3,130 runs a file).
-CHANGED_RUN_TILES = """
+# First the merged runs, as rows (file_id, tile_id, t_start, t_end), as many as the runs.
+CHANGED_RUNS = """
 WITH c AS (
   (SELECT * FROM old_runs EXCEPT SELECT * FROM lake.lost_runs)
   UNION ALL (SELECT * FROM lake.lost_runs EXCEPT SELECT * FROM old_runs)
@@ -491,18 +494,27 @@ s AS (
         PARTITION BY content_hash, tile_id ORDER BY t_start, t_end) AS island
     FROM r
   ) GROUP BY content_hash, tile_id, island
-),
-d AS (SELECT f.file_id, s.tile_id, s.t_start, s.t_end FROM s JOIN lake.files f USING (content_hash)),
-p AS (SELECT file_id, tile_id, time FROM lake.points WHERE file_id IN (SELECT file_id FROM d))
-SELECT p.tile_id FROM p ASOF JOIN (FROM d WHERE tile_id IS NOT NULL) d
+)
+SELECT f.file_id, s.tile_id, s.t_start, s.t_end FROM s JOIN lake.files f USING (content_hash)
+"""
+# Then the tiles `$lo` to `$hi` of soundings under them (`changed_runs`): the join sorts its
+# soundings, which on a first planet calibrate are every searched vessel's.
+CHANGED_RUN_TILES = """
+WITH p AS (
+  SELECT file_id, tile_id, time FROM lake.points
+  WHERE file_id IN (SELECT file_id FROM changed_runs) AND tile_id BETWEEN $lo AND $hi
+)
+SELECT p.tile_id FROM p ASOF JOIN (FROM changed_runs WHERE tile_id BETWEEN $lo AND $hi) d
   ON d.file_id = p.file_id AND d.tile_id = p.tile_id AND p.time >= d.t_start
 WHERE p.time <= d.t_end
-UNION ALL
+UNION
 -- A run with no tile, from a store not yet recalibrated, holds in every tile.
-SELECT p.tile_id FROM p ASOF JOIN (FROM d WHERE tile_id IS NULL) d
+SELECT p.tile_id FROM p ASOF JOIN (FROM changed_runs WHERE tile_id IS NULL) d
   ON d.file_id = p.file_id AND p.time >= d.t_start
 WHERE p.time <= d.t_end
 """
+# Soundings per run of tiles whose changed runs are found at once.
+RUN_POINTS = 5_000_000
 
 
 def fill_tide_cells(con):
@@ -695,14 +707,17 @@ def stuck_runs(con, offset, status):
     )
     # A month set aside in a tile: each of its files' soundings there, to the end of the
     # last month its lost medians reach, as a median holds every visit to its pixel.
-    set_aside = f"""WITH months AS (
-          SELECT vessel, month, sum(judged) AS judged, sum(lost) AS lost
-          FROM vessel_months GROUP BY ALL
-        )
+    # Each vessel's months across its tiles, once rather than for each run.
+    con.execute(
+        """CREATE OR REPLACE TABLE vessel_month_totals AS
+        SELECT vessel, month, sum(judged) AS judged, sum(lost) AS lost
+        FROM vessel_months GROUP BY ALL"""
+    )
+    set_aside = f"""
         SELECT f.content_hash, f.vessel, o.tile_id, greatest(f.time_min, a.month),
           least(f.time_max, coalesce(max(date_trunc('month', o.t_last)) FILTER (WHERE {lost}),
             a.month) + INTERVAL 1 MONTH - INTERVAL 1 MICROSECOND)
-        FROM cal_obs o JOIN unit_offsets u USING (vessel, file_id) JOIN months a
+        FROM cal_obs o JOIN unit_offsets u USING (vessel, file_id) JOIN vessel_month_totals a
           ON a.vessel = o.vessel AND a.month = date_trunc('month', o.t)
         LEFT JOIN (FROM seabed_px WHERE tile_id BETWEEN $lo AND $hi) s USING (tile_id, py, px)
         LEFT JOIN vessel_months m
@@ -717,6 +732,7 @@ def stuck_runs(con, offset, status):
     for lo, hi in tiles:
         runs += con.execute(set_aside, {"lo": lo, "hi": hi}).fetchall()
         release()
+    con.execute("DROP TABLE vessel_month_totals")
     # ponytail: a file's run is found and applied per tile, so one that crosses a tile edge
     # is two; judge across tiles if the seams show
     # A tile's soundings for a group of its vessels at a time (SEARCH_READ), then one vessel's
@@ -1214,6 +1230,19 @@ def solve_without_lost(con, n_units):
             return offset, se, anchored, anchor, pixels, transits
 
 
+def reset_lost(con, vessels):
+    """Mark none of `vessels`' rows in `cal_obs` lost, a run of tiles at a time."""
+    if not vessels:
+        return
+    for lo, hi in tile_ranges(con):
+        con.execute(
+            """UPDATE cal_obs SET lost = false WHERE lost AND list_contains($vessels, vessel)
+            AND tile_id BETWEEN $lo AND $hi""",
+            {"vessels": vessels, "lo": lo, "hi": hi},
+        )
+        release()
+
+
 def judge_lost(con, offset, anchored):
     """Mark each row of `cal_obs` lost or not by `offset`, a tile at a time, so memory
     follows a tile's rows. Over the seabed `stuck_runs` judges by, the survey's or the
@@ -1302,14 +1331,7 @@ def run(con, references=(), accept_losses=False) -> dict:
     first, *_ = solve_without_lost(con, len(names))
     segments = without_lost_steps(con, segments_from(series(transit_offsets(con, first))))
     # Pass 2: a unit per segment. A vessel with steps was judged by one offset across them.
-    if segments:
-        for lo, hi in tile_ranges(con):
-            con.execute(
-                """UPDATE cal_obs SET lost = false WHERE lost AND list_contains($vessels, vessel)
-                AND tile_id BETWEEN $lo AND $hi""",
-                {"vessels": list(segments), "lo": lo, "hi": hi},
-            )
-            release()
+    reset_lost(con, list(segments))
     names = units_for(con, segments)
     offset, se, anchored, anchor, pixels, transits = solve_without_lost(con, len(names))
     with step("judging transits"):
@@ -1435,7 +1457,9 @@ def publish(con, rows, stray=(), accept_losses=False, runs=()):
             con.executemany("INSERT INTO lake.lost_runs VALUES (?, ?, ?, ?, ?)", runs)
         # The tiles of soundings a run now takes, or no longer takes. A store calibrated
         # before months were judged by tile holds months with no tile, in every tile.
-        dirty = cells.stale(con, CHANGED_RUN_TILES, {}, "calibration", was_settled)
+        changed_run_tiles(con)
+        dirty = cells.stale(con, "FROM run_tiles", {}, "calibration", was_settled)
+        con.execute("DROP TABLE run_tiles")
         con.execute("DROP TABLE old_runs")
         # Until the calibration these runs were found under is recorded, they're stale.
         con.execute("DELETE FROM lake.store_meta WHERE key = 'stuck_runs'")
@@ -1451,6 +1475,23 @@ def publish(con, rows, stray=(), accept_losses=False, runs=()):
     log.info("calibrate: %d tiles stale from stuck runs", dirty)
     with step("assigning file offsets"):
         return dirty + assign(con, was_settled)
+
+
+def changed_run_tiles(con):
+    """The temp table `run_tiles`: the tiles of soundings under a run in `old_runs` or
+    `lake.lost_runs` but not both, found a run of tiles at a time. Temp, as it's made inside
+    a transaction that writes `lake`."""
+    con.execute(f"CREATE OR REPLACE TEMP TABLE changed_runs AS {CHANGED_RUNS}")
+    sizes = con.execute(
+        """SELECT tile_id, count(*) FROM lake.points
+        WHERE file_id IN (SELECT file_id FROM changed_runs) GROUP BY 1 ORDER BY 1"""
+    ).fetchall()
+    con.execute("CREATE OR REPLACE TEMP TABLE run_tiles (tile_id INTEGER)")
+    for lo, hi in ranges(sizes, RUN_POINTS):
+        con.execute(f"INSERT INTO run_tiles {CHANGED_RUN_TILES}", {"lo": lo, "hi": hi})
+        # Not `release`: a checkpoint can't run inside the transaction.
+        release_memory()
+    con.execute("DROP TABLE changed_runs")
 
 
 def calibrated_by(rows) -> str:

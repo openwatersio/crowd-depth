@@ -1568,7 +1568,17 @@ ON r.content_hash = f.content_hash AND (r.tile_id IS NULL OR r.tile_id = p.tile_
         ([2, 3], [2], set()),  # the one gone held no soundings
     ],
 )
-def test_changed_runs_mark_the_tiles_whose_soundings_they_hold(env, old, new, want):  # noqa: F811
+# Every tile at once, and a tile a run.
+@pytest.mark.parametrize("run_points", [calibrate.RUN_POINTS, 1])
+def test_changed_runs_mark_the_tiles_whose_soundings_they_hold(
+    env,  # noqa: F811
+    monkeypatch,
+    old,
+    new,
+    want,
+    run_points,
+):
+    monkeypatch.setattr(calibrate, "RUN_POINTS", run_points)
     # A sounding every 20 minutes, three in one tile then three in the next.
     rows = [(i * 1200, *at(5000, (i // 3 % 2) * cells.BASE + i % 3), 5.0) for i in range(72)]
     put_dated(env, 1, rows, "AQM-A")
@@ -1590,7 +1600,8 @@ def test_changed_runs_mark_the_tiles_whose_soundings_they_hold(env, old, new, wa
                 con.execute(
                     f"INSERT INTO {table} VALUES (?, 'AQM-A', ?, ?, ?)", [content, *runs[i]]
                 )
-        got = {t for (t,) in con.execute(calibrate.CHANGED_RUN_TILES).fetchall()}
+        calibrate.changed_run_tiles(con)
+        got = {t for (t,) in con.execute("FROM run_tiles").fetchall()}
         assert got == {t for (t,) in con.execute(PAIRWISE_RUN_TILES).fetchall()} == want
 
 
@@ -2591,6 +2602,8 @@ def judged_by_tile_runs(tmp_path, tile_rows, file_rows):
             "runs": sorted(calibrate.stuck_runs(con, offset, np.full(n, "anchored"))),
             "months": con.execute("SELECT * FROM vessel_months ORDER BY ALL").fetchall(),
             "unsampled": reference_mod.unsampled_tiles(con, "s102"),
+            "reset": calibrate.reset_lost(con, ["v1", "v2"])
+            or con.execute("SELECT count(*) FROM cal_obs WHERE lost").fetchone()[0],
             "steps": calibrate.without_lost_steps(
                 con, {v: [datetime(2026, 1, 1, 12)] for v, _ in names}
             ),
@@ -2598,6 +2611,44 @@ def judged_by_tile_runs(tmp_path, tile_rows, file_rows):
         return out
 
     return work(con)
+
+
+@pytest.mark.parametrize("run_points, fails", [(50_000, False), (10**9, True)])
+def test_finds_changed_runs_tiles_past_memory_and_the_spill_cap(
+    tmp_path, monkeypatch, run_points, fails
+):
+    # Every sounding under a changed run on a first calibrate, at 64 MB with the spill capped
+    # at 16 MB: the join over every tile at once fails.
+    monkeypatch.setattr(calibrate, "RUN_POINTS", run_points)
+    con = duckdb.connect()
+    con.execute("SET memory_limit = '64MB'")
+    con.execute(f"SET temp_directory = '{tmp_path}'")
+    con.execute("SET max_temp_directory_size = '16MB'")
+    con.execute("SET threads = 1")
+    con.execute(f"ATTACH '{tmp_path / 'lake.duckdb'}' AS lake")
+    # 3M soundings of 400 files over 64 tiles, a second apart, and a run in each file's tiles.
+    con.execute(
+        """CREATE TABLE lake.points AS SELECT (i % 400)::BIGINT AS file_id,
+          (i // 400 % 64)::INTEGER AS tile_id, TIMESTAMP '2026-01-01' + to_seconds(i) AS time
+        FROM range(3000000) r(i)"""
+    )
+    con.execute(
+        """CREATE TABLE lake.files AS SELECT i::BIGINT AS file_id, 'h' || i AS content_hash
+        FROM range(400) r(i)"""
+    )
+    con.execute(
+        """CREATE TABLE lake.lost_runs AS SELECT 'h' || (i % 400) AS content_hash, 'v' AS vessel,
+          (i // 400)::INTEGER AS tile_id, TIMESTAMP '2026-01-01' AS t_start,
+          TIMESTAMP '2026-02-01' AS t_end
+        FROM range(400 * 64) r(i)"""
+    )
+    con.execute("CREATE TEMP TABLE old_runs AS FROM lake.lost_runs LIMIT 0")
+    if fails:
+        with pytest.raises(duckdb.OutOfMemoryException):
+            calibrate.changed_run_tiles(con)
+    else:
+        calibrate.changed_run_tiles(con)
+        assert con.execute("SELECT count(*) FROM run_tiles").fetchone()[0] == 64
 
 
 # A tile a run and a file a batch; and runs of several tiles, splitting files' rows.
