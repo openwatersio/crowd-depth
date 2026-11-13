@@ -16,7 +16,7 @@ from rasterio.warp import transform_bounds
 from test_grid import LAT0, LON0, T0, at, put, put_dated
 from test_ingest import env  # noqa: F401  (a fixture)
 
-from grid import calibrate, catalog, cells, cli, ingest, overlay, tide
+from grid import calibrate, catalog, cells, cli, ingest, overlay, ranges, tide
 from grid import reference as reference_mod
 from grid.catalog import open_store
 from grid.objects import LocalObjects
@@ -1568,7 +1568,17 @@ ON r.content_hash = f.content_hash AND (r.tile_id IS NULL OR r.tile_id = p.tile_
         ([2, 3], [2], set()),  # the one gone held no soundings
     ],
 )
-def test_changed_runs_mark_the_tiles_whose_soundings_they_hold(env, old, new, want):  # noqa: F811
+# Every tile at once, and a tile a run.
+@pytest.mark.parametrize("run_points", [calibrate.RUN_POINTS, 1])
+def test_changed_runs_mark_the_tiles_whose_soundings_they_hold(
+    env,  # noqa: F811
+    monkeypatch,
+    old,
+    new,
+    want,
+    run_points,
+):
+    monkeypatch.setattr(calibrate, "RUN_POINTS", run_points)
     # A sounding every 20 minutes, three in one tile then three in the next.
     rows = [(i * 1200, *at(5000, (i // 3 % 2) * cells.BASE + i % 3), 5.0) for i in range(72)]
     put_dated(env, 1, rows, "AQM-A")
@@ -1590,7 +1600,8 @@ def test_changed_runs_mark_the_tiles_whose_soundings_they_hold(env, old, new, wa
                 con.execute(
                     f"INSERT INTO {table} VALUES (?, 'AQM-A', ?, ?, ?)", [content, *runs[i]]
                 )
-        got = {t for (t,) in con.execute(calibrate.CHANGED_RUN_TILES).fetchall()}
+        calibrate.changed_run_tiles(con)
+        got = {t for (t,) in con.execute("FROM run_tiles").fetchall()}
         assert got == {t for (t,) in con.execute(PAIRWISE_RUN_TILES).fetchall()} == want
 
 
@@ -2476,6 +2487,218 @@ def test_working_tables_reuse_the_file_space_they_free(tmp_path):
     work(con)
     # Two copies' blocks at most: the one replaced and the one replacing it.
     assert sizes[-1] <= sizes[1]
+
+
+def judged_past_limits(tmp_path, monkeypatch, tile_rows, file_rows):
+    """The steps after `crossings`, each over every tile, with DuckDB at 64 MB and its spill
+    capped at 16 MB, in runs of `tile_rows` medians and batches of `file_rows`."""
+    monkeypatch.setattr(calibrate, "TILE_ROWS", tile_rows)
+    monkeypatch.setattr(calibrate, "TRANSIT_ROWS", file_rows)
+    tmp_path = tmp_path / str(tile_rows)
+    tmp_path.mkdir()
+    con = duckdb.connect()
+    con.execute("SET memory_limit = '64MB'")
+    con.execute(f"SET temp_directory = '{tmp_path}'")
+    con.execute("SET max_temp_directory_size = '16MB'")
+    con.execute("SET threads = 1")
+    con.execute(f"ATTACH '{tmp_path / 'lake.duckdb'}' AS lake")
+    con.execute(
+        """CREATE TABLE lake.files AS SELECT i::BIGINT AS file_id, 'h' || i AS content_hash,
+          'v' || (i % 40) AS vessel, TIMESTAMP '2026-01-01' AS time_min,
+          TIMESTAMP '2026-01-02' AS time_max, 'active' AS status FROM range(4000) r(i)"""
+    )
+    # A survey at every pixel, flat and 10 m deep, which anchors.
+    con.execute(
+        """CREATE TABLE lake.reference_pixels AS SELECT (i % 64)::INTEGER AS tile_id,
+          ((i // 256) % 256)::INTEGER AS py, (i % 256)::INTEGER AS px, 10.0::FLOAT AS depth,
+          0.1::FLOAT AS relief, 0.5::FLOAT AS uncertainty, 's102' AS source
+        FROM range(65536) r(i)"""
+    )
+    con.execute(
+        "CREATE TABLE lake.points (cell_id INTEGER, tile_id INTEGER, unique_id VARCHAR, file_id BIGINT)"
+    )
+
+    @calibrate.on_disk
+    def work(con):
+        # 40 vessels of 100 files each, over 256² pixels in 64 tiles: about 11 vessels a
+        # pixel, a third of their medians lost.
+        con.execute(
+            """CREATE TABLE cal_obs AS SELECT (i % 64)::INTEGER AS tile_id,
+              ((i // 256) % 256)::INTEGER AS py, (i % 256)::INTEGER AS px,
+              'v' || (i % 40) AS vessel, (i % 4000)::BIGINT AS file_id,
+              TIMESTAMP '2026-01-01' AS t, (5 + random() * 10)::FLOAT AS m,
+              TIMESTAMP '2026-01-01' AS t_last, i % 3 = 0 AS lost
+            FROM range(750000) r(i)"""
+        )
+        names = calibrate.units_for(con, {})
+        calibrate.reference_px(con)
+        calibrate.crossings(con)
+        n = len(names)
+        offset, anchored = np.zeros(n), np.ones(n, bool)
+        anchor, *_ = calibrate.anchors(con, n)
+        transits = calibrate.transit_offsets(con, offset)
+        calibrate.judge_lost(con, offset, anchored)
+        calibrate.stuck_runs(con, offset, np.full(n, "anchored"))
+        assert reference_mod.unsampled_tiles(con, "s102") == []
+        # Last: it gives `file_units` a unit per segment.
+        calibrate.without_lost_steps(con, {v: [datetime(2026, 1, 1)] for v, _ in names})
+        return anchor, transits
+
+    return work(con)
+
+
+def test_judges_every_tile_past_memory_and_the_spill_cap(tmp_path, monkeypatch):
+    anchor, transits = judged_past_limits(tmp_path, monkeypatch, 12_500, 50_000)
+    assert not np.isnan(anchor).any()
+    assert len(transits) == 4000
+    # Every tile at once, `transit_offsets` runs out.
+    with pytest.raises(duckdb.OutOfMemoryException):
+        judged_past_limits(tmp_path, monkeypatch, 10**9, 10**9)
+
+
+def rounded(rows):
+    return [tuple(round(v, 9) if isinstance(v, float) else v for v in r) for r in rows]
+
+
+def judged_by_tile_runs(tmp_path, tile_rows, file_rows):
+    """Each step after `crossings`, over 64 tiles of medians and a survey of half of them,
+    with runs of `tile_rows` medians and batches of `file_rows`. One vessel reads 1 m over
+    the survey's 10 m, so it reads lost, and a month of it is set aside."""
+    con = duckdb.connect()
+    con.execute("SET threads = 1")
+    con.execute(f"ATTACH '{tmp_path / f'lake-{tile_rows}.duckdb'}' AS lake")
+    con.execute(
+        """CREATE TABLE lake.files AS SELECT i::BIGINT AS file_id, 'h' || i AS content_hash,
+          'v' || (i % 40) AS vessel, TIMESTAMP '2026-01-01' AS time_min,
+          TIMESTAMP '2026-01-02' AS time_max, 'active' AS status FROM range(4000) r(i)"""
+    )
+    con.execute(
+        """CREATE TABLE lake.reference_pixels AS SELECT (i % 64)::INTEGER AS tile_id,
+          ((i // 128) % 128)::INTEGER AS py, (i % 128)::INTEGER AS px, 10.0::FLOAT AS depth,
+          0.1::FLOAT AS relief, 0.5::FLOAT AS uncertainty, 's102' AS source
+        FROM range(16384) r(i) WHERE i % 64 < 32"""
+    )
+    con.execute(
+        "CREATE TABLE lake.points (cell_id INTEGER, tile_id INTEGER, unique_id VARCHAR, file_id BIGINT)"
+    )
+
+    @calibrate.on_disk
+    def work(con):
+        con.execute(
+            """CREATE TABLE cal_obs AS SELECT (i % 64)::INTEGER AS tile_id,
+              ((i // 128) % 128)::INTEGER AS py, (i % 128)::INTEGER AS px,
+              'v' || (i % 40) AS vessel, (i % 4000)::BIGINT AS file_id,
+              TIMESTAMP '2026-01-01' AS t,
+              (CASE WHEN i % 40 = 0 THEN 1 ELSE 5 + hash(i) % 1000 / 100 END)::FLOAT AS m,
+              TIMESTAMP '2026-01-01' AS t_last, i % 7 = 0 AS lost
+            FROM range(60000) r(i)"""
+        )
+        names = calibrate.units_for(con, {})
+        calibrate.reference_px(con)
+        calibrate.crossings(con)
+        n = len(names)
+        offset, anchored = np.zeros(n), np.ones(n, bool)
+        out = {
+            "anchors": [a.tolist() for a in calibrate.anchors(con, n)],
+            # Rounded: a run's sums add in another order, which moves the last bits.
+            "transits": rounded(calibrate.transit_offsets(con, offset)),
+            "all transits": rounded(calibrate.transit_offsets(con, offset, lost=True)),
+            "lost": calibrate.judge_lost(con, offset, anchored),
+            "runs": sorted(calibrate.stuck_runs(con, offset, np.full(n, "anchored"))),
+            "months": con.execute("SELECT * FROM vessel_months ORDER BY ALL").fetchall(),
+            "unsampled": reference_mod.unsampled_tiles(con, "s102"),
+            "reset": calibrate.reset_lost(con, ["v1", "v2"])
+            or con.execute("SELECT count(*) FROM cal_obs WHERE lost").fetchone()[0],
+            "steps": calibrate.without_lost_steps(
+                con, {v: [datetime(2026, 1, 1, 12)] for v, _ in names}
+            ),
+        }
+        return out
+
+    return work(con)
+
+
+@pytest.mark.parametrize("run_points, fails", [(50_000, False), (10**9, True)])
+def test_finds_changed_runs_tiles_past_memory_and_the_spill_cap(
+    tmp_path, monkeypatch, run_points, fails
+):
+    # Every sounding under a changed run on a first calibrate, at 64 MB with the spill capped
+    # at 16 MB: the join over every tile at once fails.
+    monkeypatch.setattr(calibrate, "RUN_POINTS", run_points)
+    con = duckdb.connect()
+    con.execute("SET memory_limit = '64MB'")
+    con.execute(f"SET temp_directory = '{tmp_path}'")
+    con.execute("SET max_temp_directory_size = '16MB'")
+    con.execute("SET threads = 1")
+    con.execute(f"ATTACH '{tmp_path / 'lake.duckdb'}' AS lake")
+    # 3M soundings of 400 files over 64 tiles, a second apart, and a run in each file's tiles.
+    con.execute(
+        """CREATE TABLE lake.points AS SELECT (i % 400)::BIGINT AS file_id,
+          (i // 400 % 64)::INTEGER AS tile_id, TIMESTAMP '2026-01-01' + to_seconds(i) AS time
+        FROM range(3000000) r(i)"""
+    )
+    con.execute(
+        """CREATE TABLE lake.files AS SELECT i::BIGINT AS file_id, 'h' || i AS content_hash
+        FROM range(400) r(i)"""
+    )
+    con.execute(
+        """CREATE TABLE lake.lost_runs AS SELECT 'h' || (i % 400) AS content_hash, 'v' AS vessel,
+          (i // 400)::INTEGER AS tile_id, TIMESTAMP '2026-01-01' AS t_start,
+          TIMESTAMP '2026-02-01' AS t_end
+        FROM range(400 * 64) r(i)"""
+    )
+    con.execute("CREATE TEMP TABLE old_runs AS FROM lake.lost_runs LIMIT 0")
+    if fails:
+        with pytest.raises(duckdb.OutOfMemoryException):
+            calibrate.changed_run_tiles(con)
+    else:
+        calibrate.changed_run_tiles(con)
+        assert con.execute("SELECT count(*) FROM run_tiles").fetchone()[0] == 64
+
+
+# A tile a run and a file a batch; and runs of several tiles, splitting files' rows.
+@pytest.mark.parametrize("tile_rows, file_rows", [(1, 1), (4_000, 30)])
+def test_a_run_of_tiles_at_a_time_gives_what_every_tile_at_once_does(
+    tmp_path, monkeypatch, tile_rows, file_rows
+):
+    monkeypatch.setattr(calibrate, "TILE_ROWS", tile_rows)
+    monkeypatch.setattr(calibrate, "TRANSIT_ROWS", file_rows)
+    monkeypatch.setattr(reference_mod, "PREFETCH_PIXELS", tile_rows)
+    batched = judged_by_tile_runs(tmp_path, tile_rows, file_rows)
+    monkeypatch.setattr(calibrate, "TILE_ROWS", 10**9)
+    monkeypatch.setattr(calibrate, "TRANSIT_ROWS", 10**9)
+    monkeypatch.setattr(reference_mod, "PREFETCH_PIXELS", 10**9)
+    whole = judged_by_tile_runs(tmp_path, 10**9, 10**9)
+    assert batched == whole
+    # Something to compare: a month set aside, lost medians, unsurveyed tiles.
+    assert whole["runs"] and whole["lost"] and whole["unsampled"] == list(range(32, 64))
+
+
+def test_ranges_split_runs_of_keys_by_their_rows():
+    assert ranges([], 10) == []
+    assert ranges([(1, 4), (2, 6), (5, 1)], 10) == [(1, 2), (5, 5)]
+    # A key past the limit is a run of its own.
+    assert ranges([(1, 4), (2, 30), (3, 4)], 10) == [(1, 1), (2, 2), (3, 3)]
+
+
+def test_a_calibrate_that_fails_keeps_what_it_reduced_and_sampled(env, tmp_path, monkeypatch):  # noqa: F811
+    # Kept at once, not at the next checkpoint 15 minutes on: the planet's last 6.7M pixels
+    # were sampled again by every run that failed in the solve.
+    for n, rows, vessel in FLEET:
+        put(env, n, rows, vessel)
+    env.run("noaa")
+    monkeypatch.setattr("grid.reference.coops_separation", lambda: lambda lon, lat: 0.0)
+    with open_store(env.store) as con:
+        untided(con)
+
+    def fail(*args):
+        raise RuntimeError("the solve failed")
+
+    monkeypatch.setattr(calibrate, "solve_without_lost", fail)
+    with pytest.raises(RuntimeError, match="solve failed"), open_store(env.store) as con:
+        calibrate.run(con, [reference(tmp_path / "ref.tif", (0, 110))])
+    assert env.query("SELECT count(*) > 0 FROM lake.file_medians") == [(True,)]
+    assert env.query("SELECT count(depth) > 0 FROM lake.reference_pixels") == [(True,)]
 
 
 def test_the_working_tables_move_changes_no_fingerprint():

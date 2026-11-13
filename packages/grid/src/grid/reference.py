@@ -39,7 +39,7 @@ from rasterio.warp import transform, transform_bounds
 from rasterio.windows import Window
 from scipy.ndimage import maximum_filter, minimum_filter, uniform_filter
 
-from . import cache, tide
+from . import cache, ranges, tide
 from .catalog import checkpoint
 from .cells import BASE, k_for
 
@@ -444,14 +444,20 @@ def tile_links(con, tile, name, catalogs):
 
 
 def unsampled_tiles(con, name):
-    """The 1° tiles holding calibration pixels a source hasn't been sampled at."""
-    rows = con.execute(
-        """SELECT DISTINCT tile_id FROM (SELECT DISTINCT tile_id, py, px FROM cal_obs
-          EXCEPT SELECT tile_id, py, px FROM lake.reference_pixels WHERE source = $name)
-        ORDER BY 1""",
-        {"name": name},
-    ).fetchall()
-    return [tile for (tile,) in rows]
+    """The 1° tiles holding calibration pixels a source hasn't been sampled at, found a run
+    of tiles at a time, so memory follows a run's pixels rather than the store's."""
+    sizes = con.execute("SELECT tile_id, count(*) FROM cal_obs GROUP BY 1 ORDER BY 1").fetchall()
+    tiles = []
+    for lo, hi in ranges(sizes, PREFETCH_PIXELS):
+        tiles += con.execute(
+            """SELECT DISTINCT tile_id FROM (
+              SELECT DISTINCT tile_id, py, px FROM cal_obs WHERE tile_id BETWEEN $lo AND $hi
+              EXCEPT SELECT tile_id, py, px FROM lake.reference_pixels
+              WHERE source = $name AND tile_id BETWEEN $lo AND $hi)
+            ORDER BY 1""",
+            {"name": name, "lo": lo, "hi": hi},
+        ).fetchall()
+    return [tile for (tile,) in tiles]
 
 
 def unsampled(con, tile, name):

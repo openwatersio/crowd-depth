@@ -27,3 +27,17 @@ def release():
     """Return memory the process has freed to the system, where the allocator is glibc's."""
     if _malloc_trim:
         _malloc_trim(0)
+
+
+def ranges(sizes, limit):
+    """`sizes`, as (key, rows) in key order, in runs of keys (first, last) of about `limit`
+    rows each: a key with more is a run of its own."""
+    out, size = [], 0
+    for key, n in sizes:
+        if out and size + n <= limit:
+            out[-1][1] = key
+            size += n
+        else:
+            out.append([key, key])
+            size = n
+    return [tuple(r) for r in out]
