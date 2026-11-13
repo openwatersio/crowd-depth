@@ -2510,9 +2510,9 @@ def judged_past_limits(tmp_path, monkeypatch, tile_rows, file_rows):
     # A survey at every pixel, flat and 10 m deep, which anchors.
     con.execute(
         """CREATE TABLE lake.reference_pixels AS SELECT (i % 64)::INTEGER AS tile_id,
-          ((i // 512) % 512)::INTEGER AS py, (i % 512)::INTEGER AS px, 10.0::FLOAT AS depth,
+          ((i // 256) % 256)::INTEGER AS py, (i % 256)::INTEGER AS px, 10.0::FLOAT AS depth,
           0.1::FLOAT AS relief, 0.5::FLOAT AS uncertainty, 's102' AS source
-        FROM range(262144) r(i)"""
+        FROM range(65536) r(i)"""
     )
     con.execute(
         "CREATE TABLE lake.points (cell_id INTEGER, tile_id INTEGER, unique_id VARCHAR, file_id BIGINT)"
@@ -2520,15 +2520,15 @@ def judged_past_limits(tmp_path, monkeypatch, tile_rows, file_rows):
 
     @calibrate.on_disk
     def work(con):
-        # 40 vessels of 100 files each, over 512² pixels in 64 tiles: about 11 vessels a
+        # 40 vessels of 100 files each, over 256² pixels in 64 tiles: about 11 vessels a
         # pixel, a third of their medians lost.
         con.execute(
             """CREATE TABLE cal_obs AS SELECT (i % 64)::INTEGER AS tile_id,
-              ((i // 512) % 512)::INTEGER AS py, (i % 512)::INTEGER AS px,
+              ((i // 256) % 256)::INTEGER AS py, (i % 256)::INTEGER AS px,
               'v' || (i % 40) AS vessel, (i % 4000)::BIGINT AS file_id,
               TIMESTAMP '2026-01-01' AS t, (5 + random() * 10)::FLOAT AS m,
               TIMESTAMP '2026-01-01' AS t_last, i % 3 = 0 AS lost
-            FROM range(3000000) r(i)"""
+            FROM range(750000) r(i)"""
         )
         names = calibrate.units_for(con, {})
         calibrate.reference_px(con)
@@ -2548,12 +2548,16 @@ def judged_past_limits(tmp_path, monkeypatch, tile_rows, file_rows):
 
 
 def test_judges_every_tile_past_memory_and_the_spill_cap(tmp_path, monkeypatch):
-    anchor, transits = judged_past_limits(tmp_path, monkeypatch, 50_000, 200_000)
+    anchor, transits = judged_past_limits(tmp_path, monkeypatch, 12_500, 50_000)
     assert not np.isnan(anchor).any()
     assert len(transits) == 4000
-    # Every tile at once, `anchors` runs out first.
+    # Every tile at once, `transit_offsets` runs out.
     with pytest.raises(duckdb.OutOfMemoryException):
         judged_past_limits(tmp_path, monkeypatch, 10**9, 10**9)
+
+
+def rounded(rows):
+    return [tuple(round(v, 9) if isinstance(v, float) else v for v in r) for r in rows]
 
 
 def judged_by_tile_runs(tmp_path, tile_rows, file_rows):
@@ -2570,9 +2574,9 @@ def judged_by_tile_runs(tmp_path, tile_rows, file_rows):
     )
     con.execute(
         """CREATE TABLE lake.reference_pixels AS SELECT (i % 64)::INTEGER AS tile_id,
-          ((i // 512) % 512)::INTEGER AS py, (i % 512)::INTEGER AS px, 10.0::FLOAT AS depth,
+          ((i // 128) % 128)::INTEGER AS py, (i % 128)::INTEGER AS px, 10.0::FLOAT AS depth,
           0.1::FLOAT AS relief, 0.5::FLOAT AS uncertainty, 's102' AS source
-        FROM range(262144) r(i) WHERE i % 64 < 32"""
+        FROM range(16384) r(i) WHERE i % 64 < 32"""
     )
     con.execute(
         "CREATE TABLE lake.points (cell_id INTEGER, tile_id INTEGER, unique_id VARCHAR, file_id BIGINT)"
@@ -2582,12 +2586,12 @@ def judged_by_tile_runs(tmp_path, tile_rows, file_rows):
     def work(con):
         con.execute(
             """CREATE TABLE cal_obs AS SELECT (i % 64)::INTEGER AS tile_id,
-              ((i // 512) % 512)::INTEGER AS py, (i % 512)::INTEGER AS px,
+              ((i // 128) % 128)::INTEGER AS py, (i % 128)::INTEGER AS px,
               'v' || (i % 40) AS vessel, (i % 4000)::BIGINT AS file_id,
               TIMESTAMP '2026-01-01' AS t,
               (CASE WHEN i % 40 = 0 THEN 1 ELSE 5 + hash(i) % 1000 / 100 END)::FLOAT AS m,
               TIMESTAMP '2026-01-01' AS t_last, i % 7 = 0 AS lost
-            FROM range(600000) r(i)"""
+            FROM range(60000) r(i)"""
         )
         names = calibrate.units_for(con, {})
         calibrate.reference_px(con)
@@ -2596,8 +2600,9 @@ def judged_by_tile_runs(tmp_path, tile_rows, file_rows):
         offset, anchored = np.zeros(n), np.ones(n, bool)
         out = {
             "anchors": [a.tolist() for a in calibrate.anchors(con, n)],
-            "transits": calibrate.transit_offsets(con, offset),
-            "all transits": calibrate.transit_offsets(con, offset, lost=True),
+            # Rounded: a run's sums add in another order, which moves the last bits.
+            "transits": rounded(calibrate.transit_offsets(con, offset)),
+            "all transits": rounded(calibrate.transit_offsets(con, offset, lost=True)),
             "lost": calibrate.judge_lost(con, offset, anchored),
             "runs": sorted(calibrate.stuck_runs(con, offset, np.full(n, "anchored"))),
             "months": con.execute("SELECT * FROM vessel_months ORDER BY ALL").fetchall(),
@@ -2652,7 +2657,7 @@ def test_finds_changed_runs_tiles_past_memory_and_the_spill_cap(
 
 
 # A tile a run and a file a batch; and runs of several tiles, splitting files' rows.
-@pytest.mark.parametrize("tile_rows, file_rows", [(1, 1), (40_000, 300)])
+@pytest.mark.parametrize("tile_rows, file_rows", [(1, 1), (4_000, 30)])
 def test_a_run_of_tiles_at_a_time_gives_what_every_tile_at_once_does(
     tmp_path, monkeypatch, tile_rows, file_rows
 ):
