@@ -44,6 +44,7 @@ import {
   tidesUrl,
   withTide,
 } from "./tiles/tide.js";
+import { createPreview } from "./tiles/preview.js";
 import { createQCThread } from "./tiles/qc-thread.js";
 import { registerPlotterExtension } from "./plotterext/provider.js";
 import { DEFAULT_OWN_STYLE, TINTS, type OwnStyle } from "./tiles/style.js";
@@ -210,6 +211,7 @@ export function startChart({
     safetyDepth: config.chart?.safetyDepth ?? DEFAULT_SAFETY_DEPTH_M,
     own: ownStyle(config),
     detail,
+    preview: createPreview(writer, tiles.preview),
   };
   current = started;
   // Only this start's own state: an older start can end after a newer one
