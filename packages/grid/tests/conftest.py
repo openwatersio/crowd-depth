@@ -1,4 +1,5 @@
 import os
+import threading
 
 import pytest
 
@@ -10,6 +11,7 @@ def own_cache(tmp_path, monkeypatch):
     """Each test gets its own download cache, never the machine's."""
     monkeypatch.setenv("GRID_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setattr(reference, "uncached", {})
+    monkeypatch.setattr(reference, "stopping", threading.Event())
 
 
 if "PYTEST_XDIST_WORKER" in os.environ:

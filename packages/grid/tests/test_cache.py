@@ -3,6 +3,7 @@ import hashlib
 import io
 import os
 import sqlite3
+import threading
 import urllib.request
 from datetime import date, datetime
 from pathlib import Path
@@ -433,3 +434,146 @@ def test_a_cached_gauge_month_of_another_shape_is_fetched_again(tmp_path, kept):
     assert gauge_rows(tmp_path / "a", month, date(2026, 6, 1), residuals) == 5
     # And replaced, for the next store.
     assert gauge_rows(tmp_path / "b", month, date(2026, 6, 1), offline) == 5
+
+
+def many(bodies, boxes):
+    """A tile scheme listing several rasters, each over its (minx, maxx, miny, maxy)."""
+    path = cache.root().parent / "scheme-many.gpkg"
+    with contextlib.closing(sqlite3.connect(path)) as db:
+        db.execute("CREATE TABLE gpkg_contents (table_name TEXT)")
+        db.execute("INSERT INTO gpkg_contents VALUES ('t')")
+        db.execute(
+            'CREATE TABLE t (fid INTEGER PRIMARY KEY, "GeoTIFF_Link" TEXT,'
+            ' "GeoTIFF_SHA256_Checksum" TEXT)'
+        )
+        db.execute('CREATE VIRTUAL TABLE "rtree_t_geom" USING rtree(id, minx, maxx, miny, maxy)')
+        for i, ((link, body), box) in enumerate(zip(bodies.items(), boxes)):
+            db.execute(
+                "INSERT INTO t VALUES (?, ?, ?)", [i, link, hashlib.sha256(body).hexdigest()]
+            )
+            db.execute('INSERT INTO "rtree_t_geom" VALUES (?, ?, ?, ?, ?)', [i, *box])
+        db.commit()
+    files = bucket_files(path.read_bytes())
+    del files[LINK]
+    return files | bodies
+
+
+@pytest.mark.parametrize(("bad", "per_batch"), [(False, 64), (False, 1), (True, 64)])
+def test_sampling_downloads_the_rasters_pixels_need_several_at_once(
+    monkeypatch, tmp_path, bad, per_batch
+):
+    bodies = {
+        f"https://bucket/BlueTopo/T{i}/BlueTopo_T{i}.tiff": RASTER + bytes([i]) for i in range(6)
+    }
+    # Five rasters over two 1° tiles hold a pixel; the sixth, in the tile's corner, none.
+    boxes = [
+        (0, 0.5, 0, 0.5),
+        (0, 1, 0, 1),
+        (1, 2, 0, 1),
+        (1, 2, 0, 0.5),
+        (0, 1, 0, 0.2),
+        (0, 0.1, 0.9, 1),
+    ]
+    files = many(bodies, boxes)
+    cut, failing, *_ = bodies
+    # Each download waits until a second is under way, so they can only finish together.
+    lock, live, peak, started = threading.Lock(), [0], [0], threading.Event()
+    asked = serve(monkeypatch, files, cut=[cut])
+    served = urllib.request.urlopen
+
+    def urlopen(url, timeout=None):
+        if bad and url == failing:
+            raise ValueError("a link urlopen can't take")
+        if url not in bodies:
+            return served(url, timeout)
+        with lock:
+            live[0] += 1
+            peak[0] = max(peak[0], live[0])
+            if live[0] > 1:
+                started.set()
+        started.wait(5)
+        try:
+            return served(url, timeout)
+        finally:
+            with lock:
+                live[0] -= 1
+
+    read = []
+
+    def sample_raster(path, lon, lat, depth, relief, unc, shift_at):
+        read.append(path)
+        depth[:], relief[:], unc[:] = 5.0, 0.1, 0.5
+        return True
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(reference, "sample_raster", sample_raster)
+    monkeypatch.setattr(reference, "FETCH_WORKERS", 3)
+    # One tile a batch: each tile's rasters are fetched, then it's sampled, in turn.
+    monkeypatch.setattr(reference, "PREFETCH_TILES", per_batch)
+    west, east = 90 * 360 + 180, 90 * 360 + 181  # the tiles at 0° N, 0° E and 1° E
+    with open_store(LocalObjects(tmp_path / "store")) as con:
+        con.execute(
+            "CREATE TEMP TABLE cal_obs AS SELECT * FROM (VALUES (?, 1, 1), (?, 1, 1)) v(tile_id, py, px)",
+            [west, east],
+        )
+        if bad:
+            # The tile the bad link touches meets its error, in order, once the rest are fetched.
+            with pytest.raises(ValueError, match="can't take"):
+                reference.sample(con, ["bluetopo"])
+            assert not read  # the west tile, first, needs it
+        else:
+            asked_before = len(asked)
+            assert reference.sample(con, ["bluetopo"]) == 2
+            # Every raster read from the cache, but the cut-off one over HTTP; none twice.
+            assert sorted(read) == sorted(
+                f"/vsicurl/{u}"
+                if u == cut
+                else str(next(cache.path("reference", "bluetopo").rglob(u.rsplit("/", 1)[-1])))
+                for u in list(bodies)[:5]
+            )
+            assert len([u for u in asked[asked_before:] if u in bodies]) == 5
+            assert con.execute("SELECT count(*) FROM lake.reference_pixels").fetchone()[0] == 2
+    assert 1 < peak[0] <= 3
+    fetched = {u for u in asked if u in bodies}
+    assert fetched == {u for u in list(bodies)[:5] if not (bad and u == failing)}
+
+
+def test_an_interrupted_prefetch_stops_its_downloads(monkeypatch):
+    # A download under way when the run is interrupted ends at its next chunk.
+    chunks = []
+
+    class Endless(Response):
+        def read(self, n=-1):
+            chunks.append(n)
+            if len(chunks) == 2:
+                reference.stopping.set()
+            return b"x" * 16
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=None: Endless(b"", 2**40))
+    with pytest.raises(reference.Stopped):
+        reference.download(LINK, cache.path("reference", "x", "y"))
+    assert len(chunks) == 2 and not list(cache.path("reference", "x").glob("*"))
+
+
+def test_a_batch_takes_no_tile_that_would_pass_its_raster_bound(monkeypatch):
+    # Four rasters a batch: tiles of three each go one at a time, and a tile of nine alone.
+    rasters = {1: ["a", "b", "c"], 2: ["c", "d", "e"], 3: list("fghijklmn")}
+    looked, fetched, sampled = [], [], []
+
+    def tile_links(con, tile, name, catalogs):
+        looked.append(tile)
+        return tile, (None, [0.0], [0.0]), [(link, None) for link in rasters[tile]]
+
+    def sample_tile(con, tile, name, catalogs, shift_at, pixels):
+        sampled.append(tile)
+        return 1, 1
+
+    monkeypatch.setattr(reference, "FETCH_WORKERS", 1)
+    monkeypatch.setattr(reference, "unsampled_tiles", lambda con, name: list(rasters))
+    monkeypatch.setattr(reference, "tile_links", tile_links)
+    monkeypatch.setattr(reference, "prefetch", lambda name, want: fetched.append(sorted(want)))
+    monkeypatch.setattr(reference, "sample_tile", sample_tile)
+    monkeypatch.setattr(reference, "checkpoint", lambda con: None)
+    assert reference.sample(None, ["bluetopo"]) == 3
+    assert fetched == [rasters[1], rasters[2], rasters[3]]
+    assert sampled == looked == [1, 2, 3]

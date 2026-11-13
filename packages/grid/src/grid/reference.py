@@ -11,9 +11,11 @@ cover one, calibration takes the one with the least uncertainty.
 A source is `s102` or `bluetopo`, read from NOAA's buckets through each one's tile
 scheme, or a local file or directory of their rasters. NOAA's rasters are downloaded
 whole into the shared cache (cache.py) on first use, keyed by the SHA-256 the tile
-scheme gives, and checked against it.
+scheme gives, and checked against it, several at once for a batch of tiles before
+they're sampled.
 """
 
+import collections
 import contextlib
 import functools
 import hashlib
@@ -24,8 +26,10 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import threading
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -62,6 +66,14 @@ MEAN_M = 10
 RELIEF_M = 20
 BLOCK = 2048  # reference cells a side read at once
 MISMATCH_RETRY_S = 86400
+# Rasters downloaded at once: on a slow link, one stream from NOAA's buckets got a third of
+# what eight together did.
+FETCH_WORKERS = 8
+PREFETCH_TILES = 64  # most 1° tiles whose rasters are fetched, then sampled, at once
+# Pixels past which a batch takes no more tiles: about 50 MB of their coordinates.
+PREFETCH_PIXELS = 2_000_000
+# Set to stop the downloads under way, as when the run is interrupted.
+stopping = threading.Event()
 
 
 def catalog(name):
@@ -152,7 +164,11 @@ def download(url, entry, sha=None):
     digest, size = hashlib.sha256(), 0
     with cache.writing(entry) as tmp, urllib.request.urlopen(url, timeout=300) as r:
         with open(tmp, "wb") as f:
-            while chunk := r.read(2**20):
+            # Small reads, so an interrupted run stops a flowing download within one; a
+            # stalled one stops at its next read, up to the 300 s timeout.
+            while chunk := r.read(2**16):
+                if stopping.is_set():
+                    raise Stopped(url)
                 digest.update(chunk)
                 f.write(chunk)
                 size += len(chunk)
@@ -162,6 +178,10 @@ def download(url, entry, sha=None):
             raise OSError(f"{size} bytes of {expected}")
         if sha and digest.hexdigest() != sha:
             raise Mismatch(f"SHA-256 {digest.hexdigest()}, catalog gives {sha}")
+
+
+class Stopped(BaseException):
+    """A download the run stopped; not an error `fetch` reads remotely instead."""
 
 
 class Mismatch(ValueError):
@@ -267,6 +287,13 @@ def rasters(source, box, catalogs, lon=None, lat=None):
         if not found:
             raise FileNotFoundError(f"no reference rasters at {source}")
         return found, []
+    found, pending = links(source, box, catalogs, lon, lat)
+    return [fetch(source, link, sha) for link, sha in found], pending
+
+
+def links(source, box, catalogs, lon=None, lat=None):
+    """A catalog source's (link, checksum) of the rasters `rasters` gives, and its tiles
+    still to come."""
     if source not in catalogs:
         catalogs[source] = catalog(source)
     path, table, column, checksum, _ = catalogs[source]
@@ -275,7 +302,7 @@ def rasters(source, box, catalogs, lon=None, lat=None):
         # A checksum column NOAA renamed is no checksum: those rasters are read remotely.
         columns = {c for _, c, *_ in db.execute(f'PRAGMA table_info("{table}")')}
         sha = f't."{checksum}"' if checksum in columns else "NULL"
-        links = db.execute(
+        rows = db.execute(
             f"""SELECT t."{column}", {sha}, r.minx, r.miny, r.maxx, r.maxy FROM "{table}" t
             JOIN "rtree_{table}_geom" r ON r.id = t.fid
             WHERE r.minx < ? AND r.maxx > ? AND r.miny < ? AND r.maxy > ? ORDER BY 1""",
@@ -289,8 +316,30 @@ def rasters(source, box, catalogs, lon=None, lat=None):
             ((lon >= minx - m) & (lon < maxx + m) & (lat >= miny - m) & (lat < maxy + m)).any()
         )
 
-    found = [fetch(source, link, sha) for link, sha, *b in links if link and holds_point(*b)]
-    return found, [bounds for link, _, *bounds in links if not link]
+    found = [(link, sha) for link, sha, *b in rows if link and holds_point(*b)]
+    return found, [bounds for link, _, *bounds in rows if not link]
+
+
+def prefetch(name, want):
+    """Download a catalog source's rasters, a {link: checksum}, FETCH_WORKERS at once, so
+    sampling reads them from the cache. A raster that fails in a way `fetch` doesn't handle
+    is left to the tile that needs it, which meets the same error in order."""
+
+    def get(item):
+        try:
+            fetch(name, *item)
+        except Exception as e:  # noqa: BLE001  (raised again where the tile needs it)
+            log.warning("reference: %s not prefetched (%r)", item[0], e)
+
+    pool = ThreadPoolExecutor(FETCH_WORKERS)
+    try:
+        list(pool.map(get, want.items()))
+    except BaseException:
+        stopping.set()
+        raise
+    finally:
+        pool.shutdown(cancel_futures=True)
+        stopping.clear()
 
 
 def coops_separation(gauges=None, datums=None):
@@ -343,7 +392,8 @@ def kind(src):
 
 def sample(con, sources, separation=None):
     """Sample each source at the calibration pixels (working table `cal_obs`) it hasn't been
-    sampled at, a tile at a time, so memory follows a tile's pixels."""
+    sampled at, in batches of tiles whose rasters are downloaded together, so memory
+    follows a batch's pixels: about PREFETCH_PIXELS, plus the last tile's and the next's."""
 
     def shift_at(lon, lat):
         # MLLW above NAVD88, from CO-OPS only once a NAVD88 raster needs it.
@@ -356,24 +406,57 @@ def sample(con, sources, separation=None):
     http = {"GDAL_HTTP_TIMEOUT": 60, "GDAL_HTTP_MAX_RETRY": 3, "GDAL_HTTP_RETRY_DELAY": 5}
     with rasterio.Env(**http):
         for name in sources:
-            tiles = con.execute(
-                """SELECT DISTINCT tile_id FROM (SELECT DISTINCT tile_id, py, px FROM cal_obs
-                  EXCEPT SELECT tile_id, py, px FROM lake.reference_pixels WHERE source = $name)
-                ORDER BY 1""",
-                {"name": name},
-            ).fetchall()
-            for (tile,) in tiles:
-                n, got = sample_tile(con, tile, name, catalogs, shift_at)
-                total, found = total + n, found + got
-                checkpoint(con)
+            tiles = collections.deque(unsampled_tiles(con, name))
+            ahead = None  # the tile, pixels and links that didn't fit the last batch
+            while tiles:
+                # A batch at a time, so downloads overlap yet sampled tiles are checkpointed
+                # as they go, and memory holds only a batch's pixels.
+                batch, want, held = {}, {}, 0
+                while tiles and len(batch) < PREFETCH_TILES and held < PREFETCH_PIXELS:
+                    tile, pixels, fetch = ahead or tile_links(con, tiles[0], name, catalogs)
+                    ahead = None
+                    # A tile whose rasters would take the batch past its bound waits for
+                    # the next; one past it alone is a batch of its own.
+                    if batch and len(want.keys() | dict(fetch).keys()) > 4 * FETCH_WORKERS:
+                        ahead = tile, pixels, fetch
+                        break
+                    tiles.popleft()
+                    batch[tile] = pixels
+                    held += len(pixels[2])
+                    want.update(fetch)
+                prefetch(name, want)
+                for tile, pixels in batch.items():
+                    n, got = sample_tile(con, tile, name, catalogs, shift_at, pixels)
+                    total, found = total + n, found + got
+                    checkpoint(con)
     log.info("reference: %d pixel samples, %d with a depth", total, found)
     return total
 
 
-def sample_tile(con, tile, name, catalogs, shift_at):
-    """Sample one source at one tile's pixels it hasn't been sampled at. Pixels it doesn't
-    cover are recorded with no depth, so they aren't tried again; if one of its rasters
-    there was skipped, none of the tile is kept, and it is all tried again."""
+def tile_links(con, tile, name, catalogs):
+    """A 1° tile, its `unsampled` pixels, and the (link, checksum) of a catalog source's
+    rasters there."""
+    pixels = _, lon, lat = unsampled(con, tile, name)
+    if name not in CATALOGS:
+        return tile, pixels, []
+    lat0, lon0 = tile // 360 - 90, tile % 360 - 180
+    return tile, pixels, links(name, (lon0, lat0, lon0 + 1, lat0 + 1), catalogs, lon, lat)[0]
+
+
+def unsampled_tiles(con, name):
+    """The 1° tiles holding calibration pixels a source hasn't been sampled at."""
+    rows = con.execute(
+        """SELECT DISTINCT tile_id FROM (SELECT DISTINCT tile_id, py, px FROM cal_obs
+          EXCEPT SELECT tile_id, py, px FROM lake.reference_pixels WHERE source = $name)
+        ORDER BY 1""",
+        {"name": name},
+    ).fetchall()
+    return [tile for (tile,) in rows]
+
+
+def unsampled(con, tile, name):
+    """A 1° tile's calibration pixels a source hasn't been sampled at, and their centres'
+    longitudes and latitudes."""
     px = con.execute(
         """SELECT DISTINCT py, px FROM cal_obs WHERE tile_id = $tile
         EXCEPT SELECT py, px FROM lake.reference_pixels WHERE tile_id = $tile AND source = $name""",
@@ -382,6 +465,16 @@ def sample_tile(con, tile, name, catalogs, shift_at):
     lat0, lon0 = tile // 360 - 90, tile % 360 - 180
     lat = lat0 + (px["py"] + 0.5) * 2 / BASE
     lon = lon0 + (px["px"] + 0.5) * 2 * k_for(lat0) / BASE
+    return px, lon, lat
+
+
+def sample_tile(con, tile, name, catalogs, shift_at, pixels=None):
+    """Sample one source at one tile's pixels it hasn't been sampled at. Pixels it doesn't
+    cover are recorded with no depth, so they aren't tried again; if one of its rasters
+    there was skipped, none of the tile is kept, and it is all tried again. `pixels` is
+    `unsampled`'s, if already read."""
+    px, lon, lat = pixels or unsampled(con, tile, name)
+    lat0, lon0 = tile // 360 - 90, tile % 360 - 180
     depth, relief, unc = (np.full(len(lat), np.nan) for _ in range(3))
     paths, pending = rasters(name, (lon0, lat0, lon0 + 1, lat0 + 1), catalogs, lon, lat)
     # A raster that didn't match its checksum is skipped, like one that can't be read.
