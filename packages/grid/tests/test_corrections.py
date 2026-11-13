@@ -1,5 +1,7 @@
 import contextlib
+import inspect
 import math
+import os
 import re
 import shutil
 import sqlite3
@@ -2418,3 +2420,73 @@ def test_a_past_months_first_empty_answer_leaves_it_open(env):  # noqa: F811
         assert con.execute("SELECT DISTINCT method FROM lake.tide_levels").fetchall() == [
             ("observed",)
         ]
+
+
+def spilled_crossings(tmp_path, wrap):
+    """`crossings` over 3M medians, with DuckDB at 64 MB and its spill capped at 16 MB."""
+    con = duckdb.connect()
+    con.execute("SET memory_limit = '64MB'")
+    con.execute(f"SET temp_directory = '{tmp_path}'")
+    con.execute("SET max_temp_directory_size = '16MB'")
+    con.execute("SET threads = 1")
+
+    def work(con):
+        # 40 vessels of 100 files each, over 512² pixels in 8 tiles: about 11 vessels a pixel.
+        con.execute(
+            """CREATE TABLE cal_obs AS SELECT (i % 8)::INTEGER AS tile_id,
+              ((i // 512) % 512)::INTEGER AS py, (i % 512)::INTEGER AS px,
+              'v' || (i % 40) AS vessel, (i % 4000)::BIGINT AS file_id,
+              TIMESTAMP '2026-01-01' AS t, (random() * 30)::FLOAT AS m,
+              TIMESTAMP '2026-01-01' AS t_last, false AS lost
+            FROM range(3000000) r(i)"""
+        )
+        con.execute(
+            """CREATE TABLE file_units AS SELECT DISTINCT vessel, file_id,
+              (file_id % 40)::INTEGER AS unit FROM cal_obs"""
+        )
+        calibrate.crossings(con)
+        return con.execute("SELECT count(*) FROM xrows").fetchone()[0]
+
+    return wrap(work)(con)
+
+
+def test_calibrates_medians_past_memory_and_the_spill_cap(tmp_path):
+    assert spilled_crossings(tmp_path, calibrate.on_disk) > 0
+    assert not list(tmp_path.glob("calibrate-*"))
+    # The same tables held in memory spill uncompressed, past the cap.
+    with pytest.raises(duckdb.OutOfMemoryException):
+        spilled_crossings(tmp_path, lambda fn: fn)
+
+
+def test_working_tables_reuse_the_file_space_they_free(tmp_path):
+    con = duckdb.connect()
+    con.execute(f"SET temp_directory = '{tmp_path}'")
+    path = tmp_path / f"calibrate-{os.getpid()}.duckdb"
+    sizes = []
+
+    @calibrate.on_disk
+    def work(con):
+        for _ in range(10):
+            con.execute(
+                "CREATE OR REPLACE TABLE t AS SELECT random()::FLOAT AS m FROM range(2000000)"
+            )
+            calibrate.release()
+            sizes.append(path.stat().st_size)
+
+    work(con)
+    # Two copies' blocks at most: the one replaced and the one replacing it.
+    assert sizes[-1] <= sizes[1]
+
+
+def test_the_working_tables_move_changes_no_fingerprint():
+    # Hashed as TEMP tables, as they were: a CREATE that `as_hashed` can't restore would
+    # reduce every store's files again and leave its stuck runs stale.
+    hashed = [
+        calibrate.DEPENDENTS,
+        *calibrate.SEARCH,
+        inspect.getsource(calibrate.reference_px),
+        inspect.getsource(calibrate.stuck_runs),
+    ]
+    for text in map(calibrate.as_hashed, hashed):
+        assert "CREATE TABLE" not in text
+        assert "CREATE OR REPLACE TABLE" not in text

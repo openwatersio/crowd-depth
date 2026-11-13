@@ -37,24 +37,43 @@ No depth scale factor is fitted: at 2–20 m it barely narrows the spread.
 
 import bisect
 import contextlib
+import functools
 import hashlib
 import inspect
 import itertools
 import logging
 import math
+import os
 import time
 from datetime import datetime
+from pathlib import Path
 
+import duckdb
 import numpy as np
 from scipy.sparse import coo_matrix, csc_matrix, csr_matrix, diags
 from scipy.sparse.csgraph import connected_components
 from scipy.sparse.linalg import splu
 
-from . import catalog, cells, manifest, reference, release
+from . import catalog, cells, manifest, reference
+from . import release as release_memory
 from .cells import BASE, K_LIST
 from .qc import QC_VERSION, TRACK_REASONS
 
 log = logging.getLogger(__name__)
+
+# The connection whose working tables `on_disk` holds in a file, and the file's WAL,
+# while it does.
+working = None
+
+
+def release():
+    """Hand back what a unit of work freed: the process's memory, and the blocks of the
+    working tables it dropped or replaced, which the file reuses only after a checkpoint
+    and otherwise grows by, a copy per replacement. Only after a write: the WAL is gone
+    from one checkpoint to the next write, so a loop that only reads costs nothing."""
+    release_memory()
+    if working is not None and working[1].exists():
+        working[0].execute("CHECKPOINT cal")
 
 
 @contextlib.contextmanager
@@ -64,6 +83,47 @@ def step(name):
     t = time.monotonic()
     yield
     log.info("calibrate: %s took %.0f s", name, time.monotonic() - t)
+
+
+def on_disk(fn):
+    """Run `fn(con, ...)` with its working tables in a database file in DuckDB's temp
+    directory. They hold every file-pixel median of the store, a planet's beyond any
+    memory: in a file, DuckDB keeps them compressed and reads them back a block at a time,
+    where temp tables past the memory limit spill uncompressed. Tables made inside a
+    transaction that writes `lake` stay TEMP, since a transaction writes one database."""
+
+    @functools.wraps(fn)
+    def wrapped(con, *args, **kwargs):
+        temp = con.execute("SELECT current_setting('temp_directory')").fetchone()[0]
+        path = Path(temp) / f"calibrate-{os.getpid()}.duckdb"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        wal = path.with_name(path.name + ".wal")
+        # A killed run of the same pid (1, in a container) can leave its file behind.
+        path.unlink(missing_ok=True)
+        wal.unlink(missing_ok=True)
+        was = con.execute("SELECT current_database()").fetchone()[0]
+        con.execute(f"ATTACH {catalog.literal(str(path))} AS cal")
+        global working
+        try:
+            con.execute("USE cal")
+            working = con, wal
+            return fn(con, *args, **kwargs)
+        finally:
+            working = None
+            # A transaction `fn` left open would refuse the switch and hide its error.
+            with contextlib.suppress(duckdb.Error):
+                con.execute("ROLLBACK")
+            con.execute(f'USE "{was}"')
+            # Or detaching writes out the tables a failed run left, only to delete them.
+            for (table,) in con.execute(
+                "SELECT table_name FROM duckdb_tables() WHERE database_name = 'cal'"
+            ).fetchall():
+                con.execute(f'DROP TABLE cal."{table}"')
+            con.execute("DETACH cal")
+            path.unlink(missing_ok=True)
+            wal.unlink(missing_ok=True)
+
+    return wrapped
 
 
 MAX_DEPTH_M = 200
@@ -273,7 +333,7 @@ LEFT JOIN stations USING (file_id) LEFT JOIN tide USING (file_id)
 # time, widened to whole seconds. Only files that haven't moved are joined, so a first run
 # doesn't pair every file of a vessel with every other.
 DEPENDENTS = """
-CREATE OR REPLACE TEMP TABLE cal_dirty AS
+CREATE OR REPLACE TABLE cal_dirty AS
 WITH moved AS (
   SELECT file_id FROM cal_inputs ANTI JOIN lake.file_median_inputs USING (file_id, inputs)
   UNION SELECT file_id FROM lake.file_median_inputs ANTI JOIN cal_inputs USING (file_id)
@@ -293,9 +353,18 @@ SELECT DISTINCT r.file_id, r.vessel FROM rest r JOIN m ON m.vessel = r.vessel AN
     AND date_trunc('second', m.time_max) + INTERVAL 1 SECOND > r.time_min))
 """
 
+
+def as_hashed(text):
+    """`text` as the fingerprints hash it: with its working tables TEMP, as they were
+    before `on_disk`, which changes where they're kept and not what they hold."""
+    return text.replace("CREATE OR REPLACE TABLE", "CREATE OR REPLACE TEMP TABLE")
+
+
 # The code a file's medians come from: once it changes, every file is reduced again.
 CODE = hashlib.sha256(
-    repr((REDUCE, TIDE_CELLS_CODE, MEDIAN_INPUTS, DEPENDENTS, catalog.ACTIVE_POINTS)).encode()
+    repr(
+        (REDUCE, TIDE_CELLS_CODE, MEDIAN_INPUTS, as_hashed(DEPENDENTS), catalog.ACTIVE_POINTS)
+    ).encode()
 ).hexdigest()[:16]
 
 # Rows at anchor-quality reference pixels (`anchor_px`), with the difference from the
@@ -306,14 +375,14 @@ FROM cal_obs o JOIN anchor_px r USING (tile_id, py, px)
 WHERE abs(o.m - r.depth) < {ANCHOR_DIFF_M}
 """
 
-# The temp table `search_soundings`: one tile's soundings of the vessels in `$vessels`; then
+# The working table `search_soundings`: one tile's soundings of the vessels in `$vessels`; then
 # `searched`: those of `$vessel`, each file's in order (ties broken by row, so a run comes out
 # the same every time), and whether each reads lost over a seabed (`unit_offsets`,
 # `seabed_px`). Two statements, on SEARCH_THREADS: as one, on 18, a vessel's 5.0M soundings in
 # a Chesapeake tile ran out of memory at a 768 MB limit.
 SEARCH = (
     f"""
-CREATE OR REPLACE TEMP TABLE search_soundings AS
+CREATE OR REPLACE TABLE search_soundings AS
 SELECT p.file_id, p.row, p.unique_id AS vessel, p.time, p.lon, p.lat, p.depth_raw AS raw,
   p.depth_raw - coalesce(p.tide, 0) AS tr,
   floor((p.lat - (p.tile_id // 360 - 90)) * {BASE} / 2)::INTEGER AS py,
@@ -329,7 +398,7 @@ WHERE p.depth_raw > 0 AND p.depth_raw <= {MAX_DEPTH_M} AND p.time IS NOT NULL
       -- A held depth is what a stuck sounder reads: in, or the run breaks around it.
       AND NOT (flag = 'unconfirmed' AND reason = 'flatline'))""",
     f"""
-CREATE OR REPLACE TEMP TABLE searched AS
+CREATE OR REPLACE TABLE searched AS
 SELECT p.*,
   coalesce(tr < {LOST_BOTTOM} * (u.o + s.z) AND tr < u.o + s.z - {LOST_MARGIN_M}, false) AS lost,
   coalesce(s.flat, false) AS flat,
@@ -435,9 +504,9 @@ WHERE p.time <= d.t_end
 def fill_tide_cells(con):
     """Find the tide cells of each active file whose soundings are new or moved, a
     partition at a time, in one transaction, so no file is left with only some."""
-    con.execute(f"CREATE OR REPLACE TEMP TABLE cal_own AS {FILE_OWN}", {"code": TIDE_CELLS_CODE})
+    con.execute(f"CREATE OR REPLACE TABLE cal_own AS {FILE_OWN}", {"code": TIDE_CELLS_CODE})
     con.execute(
-        """CREATE OR REPLACE TEMP TABLE cal_stale AS FROM cal_own
+        """CREATE OR REPLACE TABLE cal_stale AS FROM cal_own
         ANTI JOIN (SELECT DISTINCT file_id, own FROM lake.file_tide_cells) USING (file_id, own)"""
     )
     try:
@@ -462,16 +531,16 @@ def fill_tide_cells(con):
 
 
 def reduce(con, full=False):
-    """Fill the temp table `cal_obs` from each active file's kept medians, after reducing
+    """Fill the working table `cal_obs` from each active file's kept medians, after reducing
     again the files whose inputs moved (MEDIAN_INPUTS, DEPENDENTS), or every file if
     `full`, in units of REDUCE_POINTS soundings, so memory follows a unit rather than the
     densest tile.
     Returns how many tiles and files it read."""
     manifest.ensure_file_tiles(con)
     fill_tide_cells(con)
-    con.execute(f"CREATE OR REPLACE TEMP TABLE cal_inputs AS {MEDIAN_INPUTS}", {"code": CODE})
+    con.execute(f"CREATE OR REPLACE TABLE cal_inputs AS {MEDIAN_INPUTS}", {"code": CODE})
     con.execute(
-        "CREATE OR REPLACE TEMP TABLE cal_dirty AS SELECT file_id, vessel FROM cal_inputs"
+        "CREATE OR REPLACE TABLE cal_dirty AS SELECT file_id, vessel FROM cal_inputs"
         if full
         else DEPENDENTS
     )
@@ -521,9 +590,7 @@ def reduce(con, full=False):
     ).fetchall()
     log.info("calibrate: reduced %d of %d files, in %d tiles", files, of, len(tiles))
     # Whether a median reads lost depends on the offsets, so it's judged each run, not kept.
-    con.execute(
-        "CREATE OR REPLACE TEMP TABLE cal_obs AS SELECT *, false AS lost FROM lake.file_medians"
-    )
+    con.execute("CREATE OR REPLACE TABLE cal_obs AS SELECT *, false AS lost FROM lake.file_medians")
     con.execute("DROP TABLE cal_inputs")
     con.execute("DROP TABLE cal_dirty")
     return len(tiles), files
@@ -536,11 +603,11 @@ def reference_px(con):
     once per run and a tile at a time, so memory follows a tile's reference pixels rather than every one."""
     best = "QUALIFY row_number() OVER (PARTITION BY py, px ORDER BY uncertainty, source) = 1"
     con.execute(
-        """CREATE OR REPLACE TEMP TABLE anchor_px (tile_id INTEGER, py INTEGER, px INTEGER,
+        """CREATE OR REPLACE TABLE anchor_px (tile_id INTEGER, py INTEGER, px INTEGER,
         depth FLOAT)"""
     )
     con.execute(
-        """CREATE OR REPLACE TEMP TABLE survey_px (tile_id INTEGER, py INTEGER, px INTEGER,
+        """CREATE OR REPLACE TABLE survey_px (tile_id INTEGER, py INTEGER, px INTEGER,
         depth FLOAT, flat BOOLEAN)"""
     )
     # Only tiles calibration has medians in: no other pixel is joined.
@@ -574,13 +641,13 @@ def stuck_runs(con, offset, status):
     applied = np.isin(status, APPLIED)
     con.register("offsets_np", {"unit": np.flatnonzero(applied), "o": np.asarray(offset)[applied]})
     con.execute(
-        """CREATE OR REPLACE TEMP TABLE unit_offsets AS
+        """CREATE OR REPLACE TABLE unit_offsets AS
         SELECT u.vessel, u.file_id, o.o FROM file_units u JOIN offsets_np o USING (unit)"""
     )
     con.unregister("offsets_np")
     # A tile at a time: the medians can't spill, and every row of a pixel is in its tile.
     con.execute(
-        """CREATE OR REPLACE TEMP TABLE seabed_px (tile_id INTEGER, py INTEGER, px INTEGER,
+        """CREATE OR REPLACE TABLE seabed_px (tile_id INTEGER, py INTEGER, px INTEGER,
         z DOUBLE, flat BOOLEAN)"""
     )
     for (tile,) in con.execute("SELECT DISTINCT tile_id FROM cal_obs ORDER BY 1").fetchall():
@@ -604,7 +671,7 @@ def stuck_runs(con, offset, status):
     # judged, and how many read lost.
     lost = f"o.m < {LOST_BOTTOM} * (s.z + u.o) AND o.m < s.z + u.o - {LOST_MARGIN_M}"
     con.execute(
-        f"""CREATE OR REPLACE TEMP TABLE vessel_months AS
+        f"""CREATE OR REPLACE TABLE vessel_months AS
         SELECT o.vessel, date_trunc('month', o.t) AS month, o.tile_id, count(*) AS judged,
           count(*) FILTER (WHERE {lost}) AS lost
         FROM cal_obs o JOIN unit_offsets u USING (vessel, file_id)
@@ -613,7 +680,7 @@ def stuck_runs(con, offset, status):
     )
     # Searched by the month across its tiles, as the search finds runs in any of them.
     con.execute(
-        f"""CREATE OR REPLACE TEMP TABLE stuck_vessels AS
+        f"""CREATE OR REPLACE TABLE stuck_vessels AS
         SELECT DISTINCT vessel FROM vessel_months GROUP BY vessel, month
         HAVING sum(judged) >= {MONTH_PIXELS} AND sum(lost) >= {STUCK_SHARE} * sum(judged)"""
     )
@@ -715,7 +782,7 @@ def stuck_reads(con):
 
 
 def units_for(con, segments):
-    """The temp table `file_units`: each vessel file's unit, by its segments' start times.
+    """The working table `file_units`: each vessel file's unit, by its segments' start times.
 
     `segments` is {vessel: [start times after the first]}; a vessel without steps is one
     unit. A file falls in a segment by its first sounding's time, as `publish` assigns it.
@@ -733,9 +800,7 @@ def units_for(con, segments):
             index[key] = len(names)
             names.append(key)
         rows.append((vessel, file_id, index[key]))
-    con.execute(
-        "CREATE OR REPLACE TEMP TABLE file_units (vessel VARCHAR, file_id BIGINT, unit INTEGER)"
-    )
+    con.execute("CREATE OR REPLACE TABLE file_units (vessel VARCHAR, file_id BIGINT, unit INTEGER)")
     if rows:
         v, f, u = zip(*rows)
         arrays = {"vessel": np.array(v), "file_id": np.array(f), "unit": np.array(u)}
@@ -746,7 +811,7 @@ def units_for(con, segments):
 
 
 def crossings(con):
-    """The temp table `xrows`: each unit's median at pixels two or more units share, from
+    """The working table `xrows`: each unit's median at pixels two or more units share, from
     rows not read lost, weighted so each transit counts once across its crossing pixels.
     Only `solved` pixels, which two units share without their lost rows, enter the solve:
     the others only give a transit that lost the bottom a depth to show it against, as the
@@ -756,7 +821,7 @@ def crossings(con):
         t for (t,) in con.execute("SELECT DISTINCT tile_id FROM cal_obs ORDER BY 1").fetchall()
     ]
     con.execute(
-        """CREATE OR REPLACE TEMP TABLE xobs AS
+        """CREATE OR REPLACE TABLE xobs AS
         SELECT o.*, u.unit, true AS solved FROM cal_obs o JOIN file_units u USING (vessel, file_id)
         LIMIT 0"""
     )
@@ -775,12 +840,12 @@ def crossings(con):
             {"tile": tile},
         )
     con.execute(
-        """CREATE OR REPLACE TEMP TABLE xweights AS
+        """CREATE OR REPLACE TABLE xweights AS
         SELECT vessel, file_id, count(*) FILTER (WHERE solved) AS solved_n, count(*) AS n
         FROM xobs WHERE NOT lost GROUP BY ALL"""
     )
     con.execute(
-        """CREATE OR REPLACE TEMP TABLE xrows (tile_id INTEGER, py INTEGER, px INTEGER,
+        """CREATE OR REPLACE TABLE xrows (tile_id INTEGER, py INTEGER, px INTEGER,
         unit INTEGER, solved BOOLEAN, m FLOAT, b DOUBLE)"""
     )
     for tile in tiles:
@@ -935,7 +1000,7 @@ def transit_offsets(con, offset, lost=False):
     whole = f"{bool(lost)} OR count(*) FILTER (WHERE NOT e.lost) < {STEP_PIXELS}"
     con.register("offsets_np", {"unit": np.arange(len(offset)), "o": offset})
     con.execute(
-        f"""CREATE OR REPLACE TEMP TABLE transit_e AS
+        f"""CREATE OR REPLACE TABLE transit_e AS
         WITH x AS (SELECT x.*, o.o FROM xrows x JOIN offsets_np o USING (unit)),
         px AS (
           SELECT tile_id, py, px, sum(b * (m - o)) AS t, sum(b) AS w FROM x GROUP BY ALL
@@ -1105,14 +1170,14 @@ def judge_lost(con, offset, anchored):
         "offsets_np", {"unit": np.flatnonzero(anchored), "o": np.asarray(offset)[anchored]}
     )
     con.execute(
-        """CREATE OR REPLACE TEMP TABLE unit_offsets AS
+        """CREATE OR REPLACE TABLE unit_offsets AS
         SELECT u.vessel, u.file_id, o.o FROM file_units u JOIN offsets_np o USING (unit)"""
     )
     con.unregister("offsets_np")
     changed = 0
     for (tile,) in con.execute("SELECT DISTINCT tile_id FROM cal_obs ORDER BY 1").fetchall():
         con.execute(
-            f"""CREATE OR REPLACE TEMP TABLE lost_change AS
+            f"""CREATE OR REPLACE TABLE lost_change AS
             WITH o AS (
               SELECT c.py, c.px, c.vessel, c.file_id, c.m, c.lost, u.o
               FROM cal_obs c JOIN unit_offsets u USING (vessel, file_id)
@@ -1161,6 +1226,7 @@ def crossing_transits(con, n_units):
     return n
 
 
+@on_disk
 def run(con, references=(), accept_losses=False) -> dict:
     """Calibrate every vessel segment and publish the offsets that moved, after sampling
     `references` (see reference.py) at pixels they haven't been sampled at."""
@@ -1335,11 +1401,11 @@ def calibrated_by(rows) -> str:
     )
     # The runs' queries, their constants, and the QC whose flags they read.
     rule = (
-        *SEARCH,
+        *map(as_hashed, SEARCH),
         STUCK,
         FLAT,
-        inspect.getsource(reference_px),
-        inspect.getsource(stuck_runs),
+        as_hashed(inspect.getsource(reference_px)),
+        as_hashed(inspect.getsource(stuck_runs)),
         FLAT_RELIEF_M,
         ANCHOR_UNCERTAINTY_M,
         CROWD_VESSELS,

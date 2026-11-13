@@ -25,6 +25,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -232,6 +233,9 @@ def main(argv=None):
     with open_store(
         open_objects(args.store), write=args.command not in ("stats", "overlay", "benchmark")
     ) as con:
+        # Past this, a query fails rather than fill the disk its spill shares with the store.
+        if os.environ.get("GRID_MAX_TEMP_SIZE"):
+            con.execute("SET max_temp_directory_size = ?", [os.environ["GRID_MAX_TEMP_SIZE"]])
         if args.command == "ingest":
             for name in args.source or SOURCES:
                 url = getattr(args, f"{name}_url")
