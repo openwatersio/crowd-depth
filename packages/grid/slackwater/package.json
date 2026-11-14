@@ -5,6 +5,6 @@
   "type": "module",
   "dependencies": {
     "@slackwater/database": "1.0.0-beta.20261102",
-    "slackwater": "1.0.0-beta.4"
+    "slackwater": "1.0.0-beta.6"
   }
 }

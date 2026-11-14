@@ -63,19 +63,19 @@
     "esbuild": "^0.28.2",
     "pbf": "^5.1.2",
     "publint": "^0.3.25",
-    "signalk-plotterext-bus": "^0.24.0"
+    "signalk-plotterext-bus": "^0.25.0"
   },
   "dependencies": {
     "@js-temporal/polyfill": "^0.5",
-    "@signalk/server-api": "^2.35.0",
+    "@signalk/server-api": "^2.37.0",
     "cron": "^4.3.4",
     "csv-parse": "^7.0.3",
     "d3-contour": "^4.0.3",
     "debug": "^4.4.3",
     "geojson": "^0.5.0",
-    "geolib": "^4.0.1",
+    "geolib": "^4.0.2",
     "json-stream-stringify": "^3.1.6",
-    "stream-chain": "^4.4.1",
+    "stream-chain": "^4.4.2",
     "stream-transform": "^3.6.0",
     "uuid": "^14.0.3"
   },
