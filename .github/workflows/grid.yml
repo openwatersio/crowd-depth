@@ -21,13 +21,15 @@ permissions:
 
 jobs:
   test:
-    name: Grid tests (Python ${{ matrix.python }})
+    name: Grid tests (Python ${{ matrix.python }}, ${{ matrix.shard }}/2)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       matrix:
         # The oldest version pyproject.toml allows, and the newest.
         python: ["3.12", "3.14"]
+        # Each version's tests split across two jobs, which run at once.
+        shard: [1, 2]
     defaults:
       run:
         working-directory: packages/grid
@@ -41,7 +43,11 @@ jobs:
           UV_PYTHON: ${{ matrix.python }}
         run: ./docker.sh sh -c 'uv run --locked ruff check && uv run --locked ruff format --check'
 
+      # One worker per logical CPU: `-n auto` counts physical cores, two of the runner's four.
       - name: Run tests
         env:
           UV_PYTHON: ${{ matrix.python }}
-        run: ./docker.sh uv run --locked pytest -n auto
+        # Runners' CPUs differ from job to job, and their speed with them.
+        run: |
+          grep -m1 "model name" /proc/cpuinfo || true
+          ./docker.sh uv run --locked pytest -n logical --shard ${{ matrix.shard }}/2 --durations=30
