@@ -2485,8 +2485,9 @@ def test_working_tables_reuse_the_file_space_they_free(tmp_path):
             sizes.append(path.stat().st_size)
 
     work(con)
-    # Two copies' blocks at most: the one replaced and the one replacing it.
-    assert sizes[-1] <= sizes[1]
+    # Two copies' blocks: the one replaced and the one replacing it. A few 256 KiB blocks
+    # more come and go with DuckDB's metadata; a copy kept would be about 8 MB.
+    assert sizes[-1] <= sizes[1] + 4 * 256 * 1024
 
 
 def judged_past_limits(tmp_path, monkeypatch, tile_rows, file_rows):
