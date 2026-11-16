@@ -11,7 +11,9 @@ with neither, or one the cache can't take, is read from Stillwell instead.
 
 import contextlib
 import functools
+import http.client
 import re
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -27,6 +29,11 @@ HOST = "https://stillwell.openwaters.io"
 MAX_FLAG = 2
 # Each read is a few year files; several run at once beside the Slackwater helper.
 MEMORY_LIMIT = "256MB"
+# One lock per cached year, so threads asking for the same year file download it once.
+_locks: dict[Path, threading.Lock] = {}
+_locks_lock = threading.Lock()
+# The year file whose download last failed, by lock.
+_failed: dict[Path, Path] = {}
 
 
 def _sql(query: str, params=None) -> list:
@@ -118,18 +125,33 @@ def year_file(source: str, station: str, epoch: int, year: int) -> Path | str | 
         return href
     folder = cache.path("stillwell", "obs", source, urllib.parse.quote(station, safe=""), epoch)
     dest = folder / f"{year}.{tag}.parquet"
-    if dest.exists():
-        return dest
+    key = folder / str(year)
+    with _locks_lock:
+        lock = _locks.setdefault(key, threading.Lock())
+    # A thread that waited on a download of its file that failed reads from Stillwell,
+    # rather than wait out another timeout.
+    waited = not lock.acquire(blocking=False)
+    if waited:
+        lock.acquire()
     try:
-        with cache.writing(dest) as tmp, urllib.request.urlopen(href, timeout=300) as r:
-            tmp.write_bytes(r.read())
-    except OSError:
-        return href
-    for old in folder.glob(f"{year}.*.parquet"):
-        if old != dest:
-            with contextlib.suppress(OSError):
-                old.unlink()
-    return dest
+        if dest.exists():
+            return dest
+        if waited and _failed.get(key) == dest:
+            return href
+        try:
+            with cache.writing(dest) as tmp, urllib.request.urlopen(href, timeout=300) as r:
+                tmp.write_bytes(r.read())
+        except (OSError, http.client.HTTPException):
+            _failed[key] = dest
+            return href
+        _failed.pop(key, None)
+        for old in folder.glob(f"{year}.*.parquet"):
+            if old != dest:
+                with contextlib.suppress(OSError):
+                    old.unlink()
+        return dest
+    finally:
+        lock.release()
 
 
 def spans(source: str, station: str, start: datetime, end: datetime) -> list[tuple]:
