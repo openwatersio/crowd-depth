@@ -1,5 +1,7 @@
 import hashlib
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -142,6 +144,62 @@ def test_a_year_file_is_downloaded_again_only_when_its_version_changes(bucket):
     stillwell.years.cache_clear()
     second = stillwell.year_file("coops", "g1", 1, 2024)
     assert second != first and second.exists() and not first.exists()
+    assert Handler.gets.count("/obs/coops/g1/2024.parquet") == 2
+
+
+def test_threads_asking_for_one_year_file_download_it_once(bucket, monkeypatch):
+    obs(bucket, "g1/2024.parquet", [("2024-03-01 00:00:00", 1.5, 0)])
+    years(bucket, [("coops/g1", 1, 2024, "aaa")])
+    do_get = Handler.do_GET
+
+    def slow_get(self):
+        # Long enough for every thread to reach the download before the first finishes.
+        time.sleep(0.2)
+        do_get(self)
+
+    monkeypatch.setattr(Handler, "do_GET", slow_get)
+    stillwell.years("coops")  # so every thread reaches the download at once
+    start = threading.Barrier(8)
+
+    def fetch(_):
+        start.wait()
+        return stillwell.year_file("coops", "g1", 1, 2024)
+
+    with ThreadPoolExecutor(8) as pool:
+        paths = list(pool.map(fetch, range(8)))
+    assert Handler.gets.count("/obs/coops/g1/2024.parquet") == 1
+    assert len(set(paths)) == 1
+    assert all(duckdb.sql(f"SELECT count(*) FROM '{p}'").fetchone() == (1,) for p in paths)
+
+
+def test_threads_waiting_on_a_failed_download_read_from_stillwell(bucket, monkeypatch):
+    obs(bucket, "g1/2024.parquet", [("2024-03-01 00:00:00", 1.5, 0)])
+    years(bucket, [("coops/g1", 1, 2024, "aaa")])
+
+    do_get = Handler.do_GET
+
+    def unavailable(self):
+        if not self.path.startswith("/obs/"):
+            return do_get(self)
+        Handler.gets.append(self.path)
+        time.sleep(0.2)
+        self.send_error(503)
+
+    monkeypatch.setattr(Handler, "do_GET", unavailable)
+    stillwell.years("coops")  # so every thread reaches the download at once
+    start = threading.Barrier(8)
+
+    def fetch(_):
+        start.wait()
+        return stillwell.year_file("coops", "g1", 1, 2024)
+
+    with ThreadPoolExecutor(8) as pool:
+        paths = list(pool.map(fetch, range(8)))
+    href = stillwell.url("coops", "g1", 1, 2024)
+    assert paths == [href] * 8
+    assert Handler.gets.count("/obs/coops/g1/2024.parquet") == 1
+    # A later call tries again.
+    assert stillwell.year_file("coops", "g1", 1, 2024) == href
     assert Handler.gets.count("/obs/coops/g1/2024.parquet") == 2
 
 
