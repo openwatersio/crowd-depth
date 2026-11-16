@@ -31,4 +31,12 @@ Not built: widening the cell's tolerance for a candidate shoal from max(1 m, 3 �
 | 100k–1M (30)                       |                27,740 |        2,445 (9%) |   21,048 → 1,876 |
 | Dense, 1M or more (10)             |               621,595 |     142,942 (23%) | 358,241 → 80,752 |
 
-Unconfirmed shoals punch no holes in the surface, so what the wider tolerance would change is which soundings publish as unconfirmed and which can confirm, not the surface's holes. Vessel offsets caused many of these candidates, so it is measured again on a calibrated store before it is adopted ([backlog.md](backlog.md#4-clean-up-qc-and-seams)).
+Unconfirmed shoals punch no holes in the surface, so what the wider tolerance would change is which soundings publish as unconfirmed and which can confirm, not the surface's holes. On the calibrated, tide-reduced Chesapeake store at main 56620f4, every leaf's cells rebuilt with the wider tolerance on the candidate side only ([tolwide.py](../../../packages/grid/spikes/channel-speckle/tolwide.py)) give:
+
+| Tiles                | Unconfirmed cell shoals | With the wider tolerance | Confirmed cell shoals | With the wider tolerance |
+| -------------------- | ----------------------: | -----------------------: | --------------------: | -----------------------: |
+| Under 100k soundings |                   9,472 |              1,329 (14%) |                39,976 |                   26,924 |
+| 100k–1M              |                  21,301 |              3,185 (15%) |                42,653 |                   26,408 |
+| 1M or more           |                 175,846 |             63,959 (36%) |               621,897 |                  124,833 |
+
+A sounding within the wider tolerance isn't a candidate at all, so confirmed shoals fall with unconfirmed ones, by three quarters across the store. Confirmed shoals cap the surface, so the surface is benchmarked with it before it is adopted ([backlog.md](backlog.md#4-clean-up-qc-and-seams)).

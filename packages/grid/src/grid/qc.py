@@ -383,9 +383,9 @@ def run_batch(con, batch_id: int, fresh=False):
         FROM lake.points p JOIN lake.files f USING (file_id) WHERE p.batch_id = $batch""",
         params,
     )
-    # ponytail: holds a batch's columns and one file's working arrays, about 200 bytes a
-    # sounding, so memory follows the largest file; judge a huge file a few transits at a
-    # time if one outgrows a worker
+    # ponytail: holds a batch's columns, about 52 bytes a sounding, and one file's working
+    # arrays, about 170 bytes a sounding, so memory follows the largest file; judge a huge
+    # file a few transits at a time if one outgrows a worker
     a = con.execute(
         """SELECT file_id, "row", t, lon, lat, d, arrival FROM qc_points
         ORDER BY file_id, "row" """

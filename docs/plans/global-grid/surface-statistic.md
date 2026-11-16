@@ -119,7 +119,19 @@ Still open, in [backlog.md](backlog.md): leaving uncalibrated vessels out of the
 
 Interpolated pixels widen σ by 0.005 m per metre from the nearest sounding. That takes Tangier Sound from 2.7% to 2.1% too deep and changes nothing in Thimble, where every pixel is within 100 m of a track.
 
-In `grid tiles`, the cells job for Thimble's tile, the densest (28M soundings), finishes in a 2 GB Linux cgroup at 1.74 GB in 202 s, and its surface on one thread at 2.05 GB in 430–540 s ([per-tile-pipeline.md](per-tile-pipeline.md#measured-with-snakemake)). Vessel smoothing and σ are worked about 2 million window entries at a time.
+In `grid tiles`, Thimble's tile, the densest (28M soundings), is cut into 16 leaves; in a full build at main 56620f4 its densest leaf's cells take 296 s at 1.63 GB and its surface 648 s at 1.55 GB, in a build running up to 18 jobs at once ([per-tile-pipeline.md](per-tile-pipeline.md#measured-with-snakemake)). Vessel smoothing and σ are worked about 2 million window entries at a time.
+
+### k on the benchmark
+
+Tile 45463's surface rebuilt at three values of k from a full build at main 56620f4 (November 2026), and scored by `grid benchmark`'s rules against S-102 and BlueTopo, on the whole tile, on Thimble Shoal Channel's east-half box, and on the box's pixels whose reference is 12 m or deeper ([boxscore.py](../../../packages/grid/spikes/surface-statistic/boxscore.py), [ksweep.py](../../../packages/grid/spikes/surface-statistic/ksweep.py)):
+
+|        k | Tile: bias | Tile: too deep | Tile: false shoals | Tile held out: too deep | Tile held out: false shoals | Box: too deep | Box: false shoals | Channel: too deep | Channel: false shoals |
+| -------: | ---------: | -------------: | -----------------: | ----------------------: | --------------------------: | ------------: | ----------------: | ----------------: | --------------------: |
+|      1.5 |      −0.56 |         13.14% |             13.12% |                  27.81% |                      22.10% |         5.98% |            10.55% |            15.84% |                33.49% |
+| **1.75** |      −0.64 |         12.20% |             14.06% |                  25.88% |                      23.71% |         5.36% |            12.33% |            14.42% |                36.98% |
+|      2.0 |      −0.71 |         11.33% |             15.21% |                  24.09% |                      25.49% |         4.76% |            14.69% |            12.89% |                39.90% |
+
+Each step of 0.25 trades about 0.9 points of the tile's pixels too deep for 0.9–1.2 points more false shoals, and in the channel about 1.5 points too deep for 3 points of false shoals, with no value where the trade changes. The benchmark counts a pixel too deep when it is more than 1 m deeper than its reference's depth less its relief, which on a slope is shoaler than any surveyed depth there; the box's 3,302 slope pixels are 21% too deep and 41% false shoals at k = 1.75. So its channel shares can't be set against [Results](#results)' 0.3%, which counts from the shoalest BlueTopo cell under the pixel, and the rule that chose 1.75, the smallest k under 0.5% of the channel too deep, can't be checked on the benchmark. Nothing here argues for moving k: a higher one buys safety at a fixed price in false shoals, and how much that safety is worth is a choice, not a measurement.
 
 ### Legibility
 

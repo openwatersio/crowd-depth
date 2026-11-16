@@ -52,6 +52,8 @@ Across space and depth the offset holds to about 0.15 m, and the tail is the ste
 
 **Tide is most of what's left.** Nothing here is tide-reduced. Subtracting the hourly water level at the nearest of Sewells Point or Annapolis, with no zone offsets, cuts the spread of per-transit offsets from 0.31 to 0.23 m (median over 132 vessels) and from 0.67 to 0.47 m (90th percentile), and the within-vessel σ from 0.33 to 0.27 m. Tide reduction belongs before calibration, not after it.
 
+**In the store.** `grid calibrate` on the Chesapeake store at main 56620f4 (November 2026), tide-reduced and anchored on S-102 and BlueTopo, solves 341 segments of 303 vessels: 274 anchored on references (236 vessels), 9 tied by crossings and 58 left uncalibrated, so 245 vessels are calibrated. Segment offsets are −3.71 / −0.70 / +0.03 m at the 10th / 50th / 90th percentile, from −8.89 to +0.78 m; 104 segments read more than 1 m shallow and 42 more than 3 m. An offset's standard error is 0.04 m at the median and 0.11 m at the 90th percentile. It finds 38 steps in 25 vessels, of 0.65 m (median), 2.10 m (90th percentile) and 4.76 m (largest), against the spike's 62, on tide-reduced readings with lost ones left out. Counting only transits with five or more pixels at anchor quality (2–20 m, uncertainty under 2 m, relief under 0.5 m), 13 segments have five or more such transits, and in them a transit's offset spreads around its segment's by a robust σ of 0.16 m (median) and 0.25 m (90th percentile), against 0.26 and 0.50 m for the spike's untided vessels without steps.
+
 ## 2. Calibration from crossings
 
 | Anchors                                      | Held-out error, median | 90th percentile |
@@ -131,7 +133,7 @@ Not built: calibration residuals in σ (the backlog's "Better σ"), and anchors 
 
 - **Sparse areas and rocky bottom.** The Chesapeake is soft and dense. With few crossings or one vessel per area the network is thin, and on rock, position error matters more than here.
 - **Outside BlueTopo.** Every held-out vessel here sailed in BlueTopo waters, where the anchors were dense. A crossover network with anchors only at its edges, as in most of the world, was not tested beyond the few-anchors runs above.
-- **Tide-reduced calibration.** Only the effect on spread was measured, with a crude nearest-gauge correction.
+- **Tide-reduced calibration on more segments.** Only 13 of the store's segments have five or more transits with five anchor-quality pixels each to measure a spread on ([In the store](#stability)), and the scores in section 3 predate tide reduction.
 - **Track-intersection crossovers.** Crossings are shared 2/3″ pixels, not x2sys's interpolated intersections, so position error on slopes is noise the robust weights absorb. Coarser or finer pixels were not compared.
 - **Squat and loading.** Large vessels' draft changes with speed and cargo. Per-transit offsets carry this as noise, and nothing here separates it.
 - **Open Waters soundings.** The set is NOAA CSB CSVs only.
