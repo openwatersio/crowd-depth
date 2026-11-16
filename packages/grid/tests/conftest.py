@@ -1,9 +1,25 @@
 import os
 import threading
+import zlib
 
 import pytest
 
 from grid import reference
+
+
+def pytest_addoption(parser):
+    parser.addoption("--shard", help="I/N: run the Ith of N shares of the tests, as CI's jobs do")
+
+
+def pytest_collection_modifyitems(config, items):
+    if shard := config.getoption("shard"):
+        i, n = map(int, shard.split("/"))
+        if not 1 <= i <= n:
+            raise pytest.UsageError(f"--shard {shard}: I must be 1 to N")
+        # By a hash of each test's id, so a new test lands in a share without being listed.
+        mine = [t for t in items if zlib.crc32(t.nodeid.encode()) % n == i - 1]
+        config.hook.pytest_deselected(items=[t for t in items if t not in mine])
+        items[:] = mine
 
 
 @pytest.fixture(autouse=True)
