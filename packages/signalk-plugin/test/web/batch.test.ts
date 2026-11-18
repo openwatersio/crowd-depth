@@ -156,22 +156,3 @@ test("the plugin's batch for the view replaces the runtime's own", () => {
     tiles: [[15, 1, 2]],
   });
 });
-
-test("a ribbon stays drawn after its first sounding is stored, until its tile lands", () => {
-  let t = 0;
-  const batch = createBatch(5_000, () => t);
-  // Soundings 1 and 2, and the ribbon from 1 to 2, id -1.
-  batch.next({ ...live(1, [1, 2, -1]), all: true });
-  batch.taken();
-  // 1 is written to a cell and leaves; so does the ribbon from it, stored as -1.
-  t = 1_000;
-  expect(
-    batch.next({ ...live(2, [2], [[15, 1, 1]]), stored: [1, -1] }),
-  ).toEqual({});
-  batch.taken();
-  t = 6_000;
-  expect(batch.next(live(2, [2])).refresh).toEqual({ tiles: [[15, 1, 1]] });
-  batch.taken();
-  t = 8_000;
-  expect(batch.next(live(2, [2]))).toEqual({ remove: [1, -1] });
-});

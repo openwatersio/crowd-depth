@@ -4,6 +4,11 @@ import { CellStore, OVERVIEW_LEVELS } from "./cells.js";
 import type { Prepared } from "./portray.js";
 import type { Changed } from "./writer.js";
 import {
+  readPreview,
+  type GeoFeature,
+  type PreviewRequest,
+} from "./preview.js";
+import {
   M_PER_DEG_LAT,
   cellCenter,
   mPerDegLon,
@@ -215,18 +220,21 @@ function createTileWorker(file: string, detail: Detail) {
   let next = 0;
   const waiting = new Map<
     number,
-    { resolve: (t: Buffer | undefined) => void; reject: (e: Error) => void }
+    {
+      resolve: (t: { tile?: Uint8Array; preview?: GeoFeature[] }) => void;
+      reject: (e: Error) => void;
+    }
   >();
   const start = () => {
     worker = new Worker(new URL("./tile-worker.js", import.meta.url), {
       workerData: { file, detail },
     });
     worker.unref();
-    worker.on("message", ({ id, tile, error }) => {
+    worker.on("message", ({ id, error, ...result }) => {
       const w = waiting.get(id);
       waiting.delete(id);
       if (error) w?.reject(new Error(error));
-      else w?.resolve(tile ? Buffer.from(tile) : undefined);
+      else w?.resolve(result);
     });
     const fail = (err: Error) => {
       for (const w of waiting.values()) w.reject(err);
@@ -240,6 +248,16 @@ function createTileWorker(file: string, detail: Detail) {
       fail(new Error(`tile worker exited (${code})`)),
     );
   };
+  const ask = (message: object) => {
+    if (!worker) start();
+    const id = next++;
+    return new Promise<{ tile?: Uint8Array; preview?: GeoFeature[] }>(
+      (resolve, reject) => {
+        waiting.set(id, { resolve, reject });
+        worker!.postMessage({ id, ...message });
+      },
+    );
+  };
   return {
     /** Whether a tile is being built or waits to be. */
     get busy() {
@@ -251,12 +269,12 @@ function createTileWorker(file: string, detail: Detail) {
       y: number,
       share: boolean,
     ): Promise<Buffer | undefined> {
-      if (!worker) start();
-      const id = next++;
-      return new Promise((resolve, reject) => {
-        waiting.set(id, { resolve, reject });
-        worker!.postMessage({ id, z, x, y, share });
-      });
+      return ask({ z, x, y, share }).then(({ tile }) =>
+        tile ? Buffer.from(tile) : undefined,
+      );
+    },
+    preview(req: PreviewRequest): Promise<GeoFeature[]> {
+      return ask({ preview: req }).then(({ preview }) => preview ?? []);
     },
     clear(keys?: string[]) {
       worker?.postMessage({ clear: keys ?? true });
@@ -687,6 +705,19 @@ export function createTileService(
       oldest = rev + 1;
       changes.length = 0;
       scan();
+    },
+
+    /** The preview over a window, on an idle thread if there is one. */
+    preview(req: PreviewRequest): Promise<GeoFeature[]> {
+      const w =
+        workers.find((t) => !t.busy) ?? workers[turn++ % workers.length];
+      // A thread busy with it is skipped by building ahead, which resumes after.
+      if (w) return w.preview(req).finally(pump);
+      try {
+        return Promise.resolve(readPreview(store, req, detail));
+      } catch (err) {
+        return Promise.reject(err as Error);
+      }
     },
 
     /** A plotter polled for changes, showing `view` (zoom and box) where it said: tiles

@@ -427,3 +427,46 @@ test.skipIf(!existsSync(dist))(
     }
   },
 );
+
+test.skipIf(!existsSync(dist))(
+  "the preview is worked out on a tile thread, as it is here",
+  async () => {
+    const { createDB } = await import("../../dist/storage.js");
+    const { createCellStore } = await import("../../dist/tiles/cells.js");
+    const { createTileService } = await import("../../dist/tiles/service.js");
+    const { readPreview, previewWindow } =
+      await import("../../dist/tiles/preview.js");
+    const { cellAt, cellCenter } = await import("../../dist/tiles/geometry.js");
+    const dir = mkdtempSync(join(tmpdir(), "crowd-depth-"));
+    const file = join(dir, "bathymetry.sqlite");
+    const db = createDB(file);
+    const store = createCellStore(db);
+    const tiles = createTileService(store, file);
+    try {
+      const pass = (i: number, depth: number) => ({
+        ...cellAt(-76.2, 36.975 + i / 5400),
+        depth,
+        day: 20000,
+      });
+      // Stored water, crossed again: the pending passes fold into it.
+      store.addPasses(Array.from({ length: 20 }, (_, i) => pass(i, 6)));
+      const passes = Array.from({ length: 20 }, (_, i) => pass(i, 5));
+      const req = {
+        ...previewWindow(
+          passes.map((p) => cellCenter(p.py, p.px)),
+          cellCenter(passes[19].py, passes[19].px),
+        ),
+        passes,
+        shoals: [],
+        written: [],
+      };
+      const here = readPreview(store, req);
+      expect(here.length).toBeGreaterThan(0);
+      expect(await tiles.preview(req)).toEqual(here);
+    } finally {
+      tiles.close();
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);

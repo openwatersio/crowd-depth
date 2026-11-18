@@ -58,7 +58,7 @@ export interface Traced {
 }
 
 /** Pixels a side past a tile traced: its buffer and the bicubic's support. */
-const PAD_PX = BUFFER_PX + SUPPORT_PX;
+export const PAD_PX = BUFFER_PX + SUPPORT_PX;
 
 /** The smooth fields over a square of the raster, at its own pixels, before they're
  * upsampled: what tiles cut from the same raster share. */
@@ -227,10 +227,15 @@ export function smoothFields(
 }
 
 /** The tile `n` pixels a side whose pixels start at (`ox`, `oy`) past PAD_PX in `p`,
- * traced: its square of the fields, upsampled. */
-export function cut(p: Prepared, ox: number, oy: number, n: number): Traced {
+ * traced: its square of the fields, upsampled to `u` samples a pixel. */
+export function cut(
+  p: Prepared,
+  ox: number,
+  oy: number,
+  n: number,
+  u = Math.max(1, Math.round(SAMPLES / n)),
+): Traced {
   const w = n + 2 * PAD_PX;
-  const u = Math.max(1, Math.round(SAMPLES / n));
   const slice = (v: Float64Array) => {
     const a = new Float64Array(w * w);
     for (let y = 0; y < w; y++) {

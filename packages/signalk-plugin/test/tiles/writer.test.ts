@@ -462,3 +462,67 @@ test("under way, a sounding is stored within about 25 s: QC's look-ahead, the pa
     vi.useRealTimers();
   }
 });
+
+test("what's pending is what the cells take once it's all written", async () => {
+  // Some judged and in passes, some still waiting on QC's lookahead.
+  const { store, writer } = run(track(40));
+  const { passes, newest, written } = writer.pending();
+  expect(newest?.lat).toBeCloseTo(36.98 + 39 * 0.0003);
+  expect(written).toEqual([]);
+  const preview = createCellStore(createDB(":memory:"));
+  preview.addPasses(passes);
+  await end(writer);
+  const cells = (s: typeof store) => s.cells(-76.3, 36, -76.1, 37.1);
+  expect(cells(preview)).toEqual(cells(store));
+  // Once written, they're listed as written, and nothing's pending.
+  const after = writer.pending();
+  expect(after.passes).toEqual([]);
+  expect(after.written.length).toBe(cells(store).length);
+});
+
+test("taking what's pending leaves the writer's own passes as they were", async () => {
+  const { store, writer } = run(track(40));
+  writer.pending();
+  writer.pending();
+  await end(writer);
+  const again = run(track(40));
+  await end(again.writer);
+  const cells = (s: typeof store) => s.cells(-76.3, 36, -76.1, 37.1);
+  expect(cells(store)).toEqual(cells(again.store));
+});
+
+test("QC's verdict counts as a change to what's pending", async () => {
+  // A QC thread that answers only when told.
+  let answer: (() => void) | undefined;
+  const store = createCellStore(createDB(":memory:"));
+  const writer = createCellWriter(store, {
+    flushIntervalMs: 100_000,
+    qc: (buffer, arrival) =>
+      new Promise((resolve) => {
+        answer = () => resolve(trackQC(buffer, arrival, DEFINITIONS.qc));
+      }),
+  });
+  for (const d of track(20)) writer.write(d, () => {});
+  const before = writer.version();
+  answer!();
+  await new Promise((r) => setTimeout(r, 0));
+  expect(writer.version()).toBeGreaterThan(before);
+  await end(writer);
+});
+
+test("a frozen sounder's run isn't pending past a spike's length", () => {
+  // Under way, then the sounder sticks at 12 m: QC holds the run for its stuck check.
+  const { writer } = run([
+    ...track(20),
+    ...track(30, {
+      from: 20,
+      at: start.add({ seconds: 200 }),
+      depth: () => 12,
+    }),
+  ]);
+  const { passes } = writer.pending();
+  const stuck = passes.filter((p) => p.depth === 12);
+  // The look-ahead's worth of it, as a spike, at most a few cells.
+  expect(stuck.length).toBeLessThanOrEqual(12);
+  expect(passes.length).toBeGreaterThan(stuck.length);
+});

@@ -2,17 +2,9 @@ import type { Request, Response } from "express";
 import type { ServerAPI } from "@signalk/server-api";
 import { ASSET_BASE } from "../plotterext/manifest.js";
 import { charted, type Sounding } from "./writer.js";
-import { FIRST_DEVIATION_M, cellDepth } from "./cells.js";
-import {
-  CELL_M,
-  MAX_AREA_DEPTH_M,
-  MAX_ZOOM,
-  MIN_ZOOM,
-  areaBand,
-  depthLabels,
-  type Detail,
-} from "./surface.js";
+import { MAX_ZOOM, MIN_ZOOM, depthLabels, type Detail } from "./surface.js";
 import type { TileService } from "./service.js";
+import type { GeoFeature, Preview } from "./preview.js";
 import { buildStyle, type OwnStyle } from "./style.js";
 
 /** The style, tiles and change feed, under the extension's top-level route. */
@@ -24,11 +16,8 @@ export const LIVE_PATH = `${ASSET_BASE}/live`;
  * backfill runs, thinned to as many again, so the whole track stays on the chart. */
 const NEWEST_PROVISIONAL = 1000;
 
-/** Soundings joined in the ribbon along the boat's pass, at most this far apart. */
-const RIBBON_GAP_US = 30_000_000;
-const RIBBON_GAP_M = 100;
-/** Ground metres per pixel at style zoom 0, 512-pixel tiles, on the equator. */
-const M_PER_PX_Z0 = 78271.517;
+/** How long a poll waits for the preview being worked out, before it sends the last. */
+const PREVIEW_WAIT_MS = 1000;
 
 /** Refreshes are batched to one per this long, at least and at most. */
 const REFRESH_MIN_MS = 5_000;
@@ -70,58 +59,15 @@ export function parseView(view: unknown) {
   return [z, west, south, east, north] as const;
 }
 
-/** A sounding's depth as its cell would publish it after its first pass, `m − kσ`. */
-const firstPassDepth = (s: Sounding) =>
-  cellDepth({ m: charted(s), d: FIRST_DEVIATION_M, t: s.tide?.sigma });
-
-/** The provisional soundings as points, and the pass they make as a ribbon, so the boat
- * sees the surface's colour under it before the tiles do: a line from each to the next,
- * as wide as a cell, in the depth area of the shoaler end as a first pass would draw it,
- * in the tiles' bands at their `detail` and, zoomed out, the chart's. A line's id is its
- * first sounding's, negated, so it's kept as long as that sounding is. */
-export function provisionalFeatures(
-  soundings: Sounding[],
-  detail: Detail = "high",
-) {
-  const points = soundings.map((s) => ({
+/** The provisional soundings as points, each named for its time, so the runtime can
+ * tell which have left. */
+export function provisionalFeatures(soundings: Sounding[]) {
+  return soundings.map((s) => ({
     type: "Feature",
-    // A sounding's id is its time, so the runtime can tell which have left.
     id: s.time,
     geometry: { type: "Point", coordinates: [s.lon, s.lat] },
     properties: depthLabels(charted(s)),
   }));
-  const ribbon = soundings.slice(1).flatMap((s, i) => {
-    const p = soundings[i];
-    const cos = Math.cos((s.lat * Math.PI) / 180);
-    const m = Math.hypot(
-      (s.lat - p.lat) * 110540,
-      (s.lon - p.lon) * 111320 * cos,
-    );
-    if (s.time - p.time > RIBBON_GAP_US || m > RIBBON_GAP_M) return [];
-    const d = Math.min(firstPassDepth(p), firstPassDepth(s));
-    // Past the deepest area the tiles draw.
-    if (d >= MAX_AREA_DEPTH_M) return [];
-    return [
-      {
-        type: "Feature",
-        id: -p.time,
-        geometry: {
-          type: "LineString",
-          coordinates: [
-            [p.lon, p.lat],
-            [s.lon, s.lat],
-          ],
-        },
-        // Its width in pixels at style zoom 0, doubling with each zoom.
-        properties: {
-          DRVAL1: areaBand(d, detail === "high"),
-          coarse: areaBand(d, false),
-          w0: CELL_M / (M_PER_PX_Z0 * cos),
-        },
-      },
-    ];
-  });
-  return [...points, ...ribbon];
 }
 
 /** Keep the newest soundings of `n`, in time order, and an even share of the rest. */
@@ -139,6 +85,7 @@ export interface Layer {
   safetyDepth: number;
   own: OwnStyle;
   detail?: Detail;
+  preview?: Preview;
 }
 
 /** The server API also carries Express's route methods, which the typed
@@ -169,10 +116,11 @@ function allowed(app: RouteApp, req: Request): boolean {
  *
  * - `style.json`: the MapLibre style the data overlay draws.
  * - `tiles/{z}/{x}/{y}.pbf`: S-57 vector tiles of the boat's cells.
- * - `live?since=<rev>&view=<zoom,west,south,east,north>`: the tiles changed since a
- *   revision, how long to batch their refreshes for the plotter's view, and the
- *   provisional soundings and their ribbon as GeoJSON, which the extension's runtime
- *   polls.
+ * - `live?since=<rev>&view=<zoom,west,south,east,north>&preview=<rev>&unit=<m|ft>`: the
+ *   tiles changed since a revision, how long to batch their refreshes for the plotter's
+ *   view, the provisional soundings, and the preview, where it's not
+ *   the revision the runtime holds, with contours in its unit, all as GeoJSON, which the
+ *   extension's runtime polls.
  *
  * `getLayer` is read per request because the routes outlive a plugin restart.
  *
@@ -197,7 +145,17 @@ export function registerLayerRoutes(
         res.status(503).json({ error: "chart layer not running" });
         return;
       }
-      return handler(req, res, layer);
+      // An async handler's failure, as a sync one's would through Express, is a 500.
+      const failed = (err: unknown) => {
+        a.error?.(`Chart layer: ${req.path} failed: ${err}`);
+        if (!res.headersSent) res.status(500).json({ error: "failed" });
+      };
+      try {
+        const done = handler(req, res, layer);
+        return done instanceof Promise ? done.catch(failed) : done;
+      } catch (err) {
+        failed(err);
+      }
     };
 
   a.get(
@@ -252,26 +210,57 @@ export function registerLayerRoutes(
 
   a.get(
     LIVE_PATH,
-    guard((req, res, layer) => {
+    guard(async (req, res, layer) => {
+      const view = parseView(req.query.view);
+      // Only to a runtime that draws it, which says which it holds.
+      const held = Number(req.query.preview);
+      let preview: { rev: number; features: GeoFeature[] } | undefined;
+      if (layer.preview && req.query.preview !== undefined) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        preview = await Promise.race([
+          layer.preview.get(view?.slice(1) as [number, number, number, number]),
+          new Promise<undefined>((r) => {
+            timer = setTimeout(() => r(undefined), PREVIEW_WAIT_MS);
+          }),
+        ]).finally(() => clearTimeout(timer));
+        preview ??= layer.preview.latest();
+        if (preview.rev === held) preview = undefined;
+        // Contours in the plotter's unit only, where it says which.
+        const unit = req.query.unit;
+        if (preview && (unit === "m" || unit === "ft")) {
+          preview = {
+            rev: preview.rev,
+            features: preview.features.filter(
+              (f) =>
+                f.properties.unit === undefined || f.properties.unit === unit,
+            ),
+          };
+        }
+      }
       const since = Number(req.query.since ?? -1);
       const provisional = layer.provisional();
-      const view = parseView(req.query.view);
       layer.tiles.watched(view);
-      const held = view && layer.tiles.held(...view);
+      const bytes = view && layer.tiles.held(...view);
       res.set("Cache-Control", "no-store").json({
         ...layer.tiles.since(Number.isInteger(since) ? since : -1),
-        ...(held !== undefined ? { refreshMs: refreshMs(held) } : {}),
-        // Ids of soundings just written to cells, and of the ribbon from each, which the
-        // runtime keeps drawing until their tiles are refreshed; any other feature that
-        // leaves `provisional` is gone.
-        stored: layer.stored().flatMap((id) => [id, -id]),
+        ...(bytes !== undefined ? { refreshMs: refreshMs(bytes) } : {}),
+        // The surface round the boat as it stands, when it's changed.
+        ...(preview && {
+          preview: {
+            rev: preview.rev,
+            type: "FeatureCollection",
+            features: preview.features,
+          },
+        }),
+        // Ids of soundings just written to cells, which the runtime keeps drawing until
+        // their tiles are refreshed; any other that leaves `provisional` is gone.
+        stored: layer.stored(),
         provisional: {
           type: "FeatureCollection",
           features: provisionalFeatures(
             provisional
               .sort((a, b) => a.time - b.time)
               .filter(thin(provisional.length)),
-            layer.detail,
           ),
         },
       });

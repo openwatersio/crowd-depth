@@ -150,6 +150,71 @@ interface OpenPass {
   last: number;
 }
 
+/** The pass a cell gets from an open pass. */
+function toPass(pass: OpenPass): Pass {
+  return {
+    py: pass.py,
+    px: pass.px,
+    day: Math.floor(pass.last / 86_400_000_000),
+    ...(pass.depths.length
+      ? { depth: median(pass.depths), tide: pass.tide }
+      : { depth: median(pass.raw) }),
+  };
+}
+
+/** Take an accepted sounding into the open passes of every cell within a pixel, closing
+ * with `close` each pass it ends: its cell's pass may be over, and the boat has left the
+ * others'. */
+function into(
+  open: Map<string, OpenPass>,
+  s: Sounding,
+  close: (k: string, pass: OpenPass) => void,
+) {
+  const at = cellAt(s.lon, s.lat);
+  const near = new Set<string>();
+  for (const n of neighbours(at.py, at.px)) {
+    const k = key(n);
+    // Across a latitude band's edge two neighbours can be one cell.
+    if (near.has(k)) continue;
+    near.add(k);
+    let pass = open.get(k);
+    if (
+      pass &&
+      (s.time - pass.last > OTHER_PASS_US ||
+        s.time - pass.first > MAX_PASS_US ||
+        pass.depths.length + pass.raw.length >= MAX_PASS_DEPTHS)
+    ) {
+      close(k, pass);
+      pass = undefined;
+    }
+    if (!pass) {
+      pass = {
+        ...n,
+        depths: [],
+        tide: 0,
+        raw: [],
+        soundings: [],
+        sounded: false,
+        first: s.time,
+        last: s.time,
+      };
+      open.set(k, pass);
+    }
+    if (s.tide) {
+      pass.depths.push(charted(s));
+      pass.tide = Math.max(pass.tide, s.tide.sigma);
+    } else {
+      pass.raw.push(s.depth);
+    }
+    pass.last = s.time;
+    if (n.py === at.py && n.px === at.px) {
+      pass.sounded = true;
+      pass.soundings.push(s);
+    }
+  }
+  for (const [k, pass] of open) if (!near.has(k)) close(k, pass);
+}
+
 /**
  * The live layer's pipeline from corrected soundings to cells: the grid's track QC on a
  * buffer of recent soundings, a pass per cell, and each pass's median folded into its
@@ -214,74 +279,30 @@ export function createCellWriter(
   const open = new Map<string, OpenPass>();
   let passes: Pass[] = [];
   let unwritten: Sounding[] = [];
-  /** Soundings written in the last {@link STORED_MS}, by time, and when. */
+  /** Soundings written in the last {@link STORED_MS}, by time, and when; and the cells
+   * their passes went to. */
   let stored: { id: number; at: number }[] = [];
+  let written: { py: number; px: number; at: number }[] = [];
   let shoals: Shoal[] = [];
   let latest = 0;
   let held = false;
   let failures = 0;
   let holdTimer: ReturnType<typeof setTimeout> | undefined;
 
+  /** Soundings taken in and QC's verdicts, counted, so the preview knows when it's
+   * stale; and writes of passes, so it knows when it read the cells across one. */
+  let version = 0;
+  let flushes = 0;
+
   const closePass = (k: string, pass: OpenPass) => {
     open.delete(k);
     if (pass.sounded) {
       unwritten.push(...pass.soundings);
-      passes.push({
-        py: pass.py,
-        px: pass.px,
-        day: Math.floor(pass.last / 86_400_000_000),
-        ...(pass.depths.length
-          ? { depth: median(pass.depths), tide: pass.tide }
-          : { depth: median(pass.raw) }),
-      });
+      passes.push(toPass(pass));
     }
   };
 
-  const accept = (s: Sounding) => {
-    const at = cellAt(s.lon, s.lat);
-    const near = new Set<string>();
-    for (const n of neighbours(at.py, at.px)) {
-      const k = key(n);
-      // Across a latitude band's edge two neighbours can be one cell.
-      if (near.has(k)) continue;
-      near.add(k);
-      let pass = open.get(k);
-      if (
-        pass &&
-        (s.time - pass.last > OTHER_PASS_US ||
-          s.time - pass.first > MAX_PASS_US ||
-          pass.depths.length + pass.raw.length >= MAX_PASS_DEPTHS)
-      ) {
-        closePass(k, pass);
-        pass = undefined;
-      }
-      if (!pass) {
-        pass = {
-          ...n,
-          depths: [],
-          tide: 0,
-          raw: [],
-          soundings: [],
-          sounded: false,
-          first: s.time,
-          last: s.time,
-        };
-        open.set(k, pass);
-      }
-      if (s.tide) {
-        pass.depths.push(charted(s));
-        pass.tide = Math.max(pass.tide, s.tide.sigma);
-      } else {
-        pass.raw.push(s.depth);
-      }
-      pass.last = s.time;
-      if (n.py === at.py && n.px === at.px) {
-        pass.sounded = true;
-        pass.soundings.push(s);
-      }
-    }
-    for (const [k, pass] of open) if (!near.has(k)) closePass(k, pass);
-  };
+  const accept = (s: Sounding) => into(open, s, closePass);
 
   /** Which soundings QC can judge now, to `end`, or none. */
   const ready = (all: boolean) => {
@@ -313,6 +334,7 @@ export function createCellWriter(
       if (was === undefined || RANK[flag] > RANK[was]) flags[k] = flag;
     }
     ruled = { at: base + judged, flags };
+    version++;
   };
 
   /** Fold judged soundings in, a share at a time, or all of them. */
@@ -432,6 +454,7 @@ export function createCellWriter(
       // first: writing one again changes nothing, where a pass would count twice.
       if (found.length) store.addShoals(found);
       const cells = store.addPasses(batch, overviews);
+      flushes++;
       passes = passes.slice(batch.length);
       shoals = shoals.slice(found.length);
       if (!bulk) {
@@ -439,6 +462,8 @@ export function createCellWriter(
         stored = stored.filter((s) => s.at >= at - STORED_MS);
         for (const s of [...unwritten, ...found])
           stored.push({ id: s.time, at });
+        written = written.filter((c) => c.at >= at - STORED_MS);
+        for (const p of batch) written.push({ py: p.py, px: p.px, at });
       }
       unwritten = [];
       onChange([...cells.map((c) => cellCenter(c.py, c.px)), ...found]);
@@ -466,6 +491,7 @@ export function createCellWriter(
         const prev = buffer[buffer.length - 1];
         path.push(prev ? path[path.length - 1] + metres(prev, s) : 0);
         buffer.push(s);
+        version++;
         latest = Math.max(latest, time);
         const batch = Math.max(
           bulk
@@ -557,6 +583,62 @@ export function createCellWriter(
       const since = Date.now() - STORED_MS;
       stored = stored.filter((s) => s.at >= since);
       return stored.map((s) => s.id);
+    },
+    /** Bumped with each sounding taken in and each QC verdict. */
+    version: () => version,
+    /** Bumped with each write of passes to the cells. */
+    flushes: () => flushes,
+    /** What the cells would take were every sounding held written now: the passes held,
+     * those still open as if closed, and the soundings not yet folded in, as passes
+     * where QC hasn't rejected them; the unconfirmed shoals; the cells written in the
+     * last {@link STORED_MS}, whose tiles may not show them yet; and the newest sounding. */
+    pending(): {
+      passes: Pass[];
+      shoals: Shoal[];
+      written: { py: number; px: number }[];
+      newest?: Sounding;
+    } {
+      const out = [...passes];
+      const found = [...shoals];
+      const draft = new Map(
+        [...open].map(([k, p]) => [
+          k,
+          { ...p, depths: [...p.depths], raw: [...p.raw], soundings: [] },
+        ]),
+      );
+      const close = (k: string, p: OpenPass) => {
+        draft.delete(k);
+        if (p.sounded) out.push(toPass(p));
+      };
+      // A run of one depth QC holds for the stuck-sounder check is left out once it's
+      // longer than a spike: a frozen sounder would otherwise draw its depth for up to
+      // QC.flat_m of track before QC rejects it.
+      let to = buffer.length;
+      if (to > judged) {
+        const run = ready(false);
+        if (run < to - LOOKAHEAD) to = Math.max(judged, run);
+      }
+      for (let i = judged; i < to; i++) {
+        const s = buffer[i];
+        const flag = ruled?.flags[base + i - ruled.at];
+        if (flag === undefined || flag === "review") into(draft, s, close);
+        else if (flag === "unconfirmed") {
+          found.push({
+            time: s.time,
+            lon: s.lon,
+            lat: s.lat,
+            depth: charted(s),
+          });
+        }
+      }
+      for (const [k, p] of [...draft]) close(k, p);
+      const since = Date.now() - STORED_MS;
+      return {
+        passes: out,
+        shoals: found,
+        written: written.filter((c) => c.at >= since),
+        newest: buffer[buffer.length - 1],
+      };
     },
     /** Soundings not yet in a stored cell: unjudged, in a pass still open, or held. */
     provisional(): Sounding[] {

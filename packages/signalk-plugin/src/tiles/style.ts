@@ -218,36 +218,43 @@ export function buildStyle({
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
       },
+      preview: {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      },
     },
     layers: [
-      // The boat's latest pass in the colour of its depth area, as wide as the cells,
-      // until the tiles under it refresh: below the areas, so over water sounded before
-      // the stored area shows, which may be shoaler than this pass.
+      // The surface round the boat as its soundings not yet in a tile draw it, the same
+      // way: below the tiles, which take over as they refresh, so over water sounded
+      // before the stored area shows. Its contours dashed, as provisional.
       {
-        id: "ribbon",
-        type: "line",
-        source: "provisional",
-        filter: ["==", ["geometry-type"], "LineString"],
-        layout: { "line-cap": "round", "line-join": "round" },
+        id: "preview-depare",
+        type: "fill",
+        source: "preview",
+        // By property, as hosts differ on whether a MultiPolygon's type is "Polygon".
+        filter: ["has", "DRVAL1"],
         paint: {
-          // In the bands the tiles under it draw: the chart's, zoomed out.
-          "line-color": [
+          "fill-color": [
             "step",
             ["zoom"],
             areaColor("coarse"),
             FINE_ZOOM,
             areaColor("DRVAL1"),
           ],
-          "line-opacity": 0.85,
-          "line-width": [
-            "interpolate",
-            ["exponential", 2],
-            ["zoom"],
-            0,
-            ["get", "w0"],
-            24,
-            ["*", ["get", "w0"], 2 ** 24],
-          ],
+          "fill-opacity": 0.85,
+        },
+      },
+      {
+        id: "depcnt-preview",
+        type: "line",
+        source: "preview",
+        filter: ["has", "VALDCO"],
+        minzoom: FINE_ZOOM,
+        paint: {
+          "line-color": ["global-state", "ownColor"],
+          "line-width": ["case", major, 1.2, 0.6],
+          "line-opacity": ["case", otherUnit, 0, major, 0.9, 0.35],
+          "line-dasharray": [3, 2],
         },
       },
       {
