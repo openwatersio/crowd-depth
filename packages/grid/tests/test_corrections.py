@@ -54,6 +54,8 @@ def stations():
         {"id": "stnd", "lon": lon, "lat": lat, **ok, "chart_datum": "STND", "has_datums": False},
         # A lake gauge: its lowest low water is from its level record, not a tide.
         {"id": "lake", "lon": lon, "lat": lat, **ok, "chart_datum": "LLWLT", "diurnal_range": 0.08},
+        # Gauge g1's own station, which Slackwater predicts; not open for commercial use.
+        {"id": "noaa/g1", "lon": lon + 0.2, "lat": lat + 0.1, **ok, "commercial_use": False},
     ]
 
 
@@ -273,6 +275,45 @@ def test_a_final_stillwell_month_is_fetched_again_when_its_residuals_would_chang
         # Stillwell's quality control takes back every value that month.
         files["version"], files["rows"] = "ddd", False
         assert run() == pytest.approx(1.75, abs=1e-6)
+
+
+def test_stillwell_takes_the_nearest_gauge_slackwater_can_predict(env, monkeypatch):  # noqa: F811
+    lon, lat = at(5000, 0)
+    put(env, 1, [(0, lon, lat, 5.0)])
+    env.run("noaa")
+    # A river gauge at the station, with no tide for Slackwater to predict, and g1 farther.
+    river = {"id": "river", "lon": lon + 0.2, "lat": lat}
+    g1 = {"id": "g1", "lon": lon + 0.2, "lat": lat + 0.1}
+    later = date(2027, 1, 1)
+    asked = []
+
+    def from_stillwell(gauge, month):
+        asked.append(gauge)
+        return [(t, 0.2) for t, _ in residuals(gauge, month)]
+
+    monkeypatch.setattr(tide, "stillwell_residuals", from_stillwell)
+    monkeypatch.setattr(tide, "stillwell_version", lambda *a: "v")
+    monkeypatch.setattr(tide, "stillwell_digest", lambda *a: "d")
+    gauge = "SELECT gauge FROM lake.tide_stations WHERE station = 'far'"
+    with open_store(env.store) as con:
+        tide.build(con, stations, lambda: [river], residuals, levels, version="v1", today=later)
+        assert con.execute(gauge).fetchall() == [("river",)]
+        # Stillwell mode leaves it: its observed level is the river's stage, not weather.
+        monkeypatch.setenv("GRID_WATER_LEVELS", "stillwell")
+        tide.build(con, stations, lambda: [river], None, levels, version="v1", today=later)
+        assert con.execute(gauge).fetchall() == [(None,)]
+        assert asked == []
+        [(h,)] = con.execute(
+            """SELECT tide FROM corrected_points_in(
+              (SELECT any_value(cell_id) FROM lake.points), [], 0, 10800)"""
+        ).fetchall()
+        assert h == pytest.approx(1.75, abs=1e-6)
+        # The next gauge in reach that Slackwater can predict takes its place.
+        tide.build(con, stations, lambda: [river, g1], None, levels, version="v1", today=later)
+        assert con.execute(gauge).fetchall() == [("g1",)]
+        assert set(asked) == {"g1"}
+    [(_, _, _, h, _, _)] = corrected(env)
+    assert h == pytest.approx(1.75 + 0.2, abs=1e-6)
 
 
 def test_a_stillwell_error_keeps_the_month_as_it_was(tmp_path, monkeypatch):
