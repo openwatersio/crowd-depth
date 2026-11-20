@@ -13,7 +13,7 @@ from botocore.exceptions import ClientError
 from grid import cli, objects, tiles
 from grid.catalog import Lock, Locked
 from grid.objects import Conflict, LocalObjects, S3Objects
-from grid.publish import ARCHIVE, KINDS, LOCK, MANIFEST, RETIRED_FOR, publish
+from grid.publish import ARCHIVE, DEPTH, KINDS, LOCK, MANIFEST, RETIRED_FOR, publish
 
 DAY = datetime(2026, 11, 3, tzinfo=UTC)
 
@@ -56,6 +56,7 @@ def test_a_run_publishes_its_archive_and_each_tiles_files_by_content(tmp_path):
         "kept": 0,
         "archive": "replaced",
         "deleted": 0,
+        "depth": "kept",
     }
     assert out.get(ARCHIVE)[0] == b"archive 1"
     got = manifest(out)
@@ -203,12 +204,14 @@ def test_a_store_with_every_tile_withdrawn_takes_everything_down(tmp_path):
     run, out = tmp_path / "run", LocalObjects(tmp_path / "out")
     make_run(run, {1: full(1)})
     publish(run, out, now=DAY)
+    out.put(DEPTH, b"depth.tif from grid depth")
     tiles.forget(run, 1)
     make_run(run, {})
     (run / ARCHIVE).unlink()
     done = publish(run, out, now=DAY + timedelta(hours=1))
     assert done["archive"] == "deleted" and done["deleted"] == 3
     assert out.get(ARCHIVE) is None and tile_keys(out) == []
+    assert out.get(DEPTH) is None and done["depth"] == "deleted"
     assert manifest(out)["tiles"] == {} and manifest(out)["archive"] is None
 
 

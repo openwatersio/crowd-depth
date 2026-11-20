@@ -15,6 +15,7 @@
     grid --store DIR_OR_S3_URL compact
     grid --store DIR_OR_S3_URL stats
     grid cache [--prune]
+    grid depth --out DIR [--publish DIR_OR_S3_URL [--take-down]]
 
 Sources default to the NOAA CSB bucket and the Open Waters R2 bucket. R2 access
 reads S3_ENDPOINT, S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY. Downloads are kept in
@@ -29,7 +30,19 @@ import os
 import sys
 from pathlib import Path
 
-from . import benchmark, cache, calibrate, catalog, cells, overlay, qc, reference, tide, tiles
+from . import (
+    benchmark,
+    cache,
+    calibrate,
+    catalog,
+    cells,
+    depth,
+    overlay,
+    qc,
+    reference,
+    tide,
+    tiles,
+)
 from .catalog import open_store
 from .ingest import Ingest, confirm_withdrawals
 from .objects import open_objects
@@ -199,9 +212,34 @@ def main(argv=None):
         help="First remove reference rasters and tile schemes of old releases, source files"
         " past GRID_CACHE_FILES_GB, and what dead writes left",
     )
+    d = sub.add_parser(
+        "depth", help="Merge a `grid tiles` run's depths into one COG, depth.tif, for QGIS"
+    )
+    d.add_argument("--out", required=True, type=Path, help="The run directory")
+    d.add_argument(
+        "--publish",
+        help="Then upload depth.tif if it changed: a local directory or s3://bucket/prefix on R2",
+    )
+    d.add_argument(
+        "--take-down",
+        action="store_true",
+        help="When the run has no tiles left, delete the depth.tif published at --publish",
+    )
     args = p.parse_args(argv)
     if args.command == "cache":
         return show_cache(args.prune)
+    if args.command == "depth":
+        if args.take_down and not args.publish:
+            p.error("--take-down needs --publish")
+        target = open_objects(args.publish) if args.publish else None
+        store = open_objects(args.store).url if args.store else None
+        if target and clashes(target.url, store, args.out):
+            p.error("--publish must be a place of its own, apart from --store and --out")
+        logging.basicConfig(
+            level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+        )
+        print(json.dumps(depth.build(args.out, objects=target, take_down=args.take_down)))
+        return 0
     if not args.store:
         p.error("--store is required")
     if args.command == "ingest" and args.keys and len(set(args.source or SOURCES)) != 1:
@@ -304,9 +342,10 @@ def main(argv=None):
 def clashes(publish: str, store: str, run: Path) -> bool:
     """Whether a publish target holds or sits in the store or the run directory."""
     if publish.startswith("s3://"):
-        return publish.startswith(store) or store.startswith(publish)
+        return bool(store) and (publish.startswith(store) or store.startswith(publish))
     at = Path(publish).resolve()
-    others = [run.resolve()] + ([] if store.startswith("s3://") else [Path(store).resolve()])
+    stored = [Path(store).resolve()] if store and not store.startswith("s3://") else []
+    others = [run.resolve(), *stored]
     return any(at == o or at in o.parents or o in at.parents for o in others)
 
 
