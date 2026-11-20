@@ -15,6 +15,7 @@
     grid --store DIR_OR_S3_URL compact
     grid --store DIR_OR_S3_URL stats
     grid cache [--prune]
+    grid rainbow --out DIR
 
 Sources default to the NOAA CSB bucket and the Open Waters R2 bucket. R2 access
 reads S3_ENDPOINT, S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY. Downloads are kept in
@@ -29,7 +30,19 @@ import os
 import sys
 from pathlib import Path
 
-from . import benchmark, cache, calibrate, catalog, cells, overlay, qc, reference, tide, tiles
+from . import (
+    benchmark,
+    cache,
+    calibrate,
+    catalog,
+    cells,
+    overlay,
+    qc,
+    rainbow,
+    reference,
+    tide,
+    tiles,
+)
 from .catalog import open_store
 from .ingest import Ingest, confirm_withdrawals
 from .objects import open_objects
@@ -199,9 +212,19 @@ def main(argv=None):
         help="First remove reference rasters and tile schemes of old releases, source files"
         " past GRID_CACHE_FILES_GB, and what dead writes left",
     )
+    r = sub.add_parser(
+        "rainbow", help="Draw a `grid tiles` run's surfaces as a rainbow survey chart for QGIS"
+    )
+    r.add_argument("--out", required=True, type=Path, help="The run directory")
     args = p.parse_args(argv)
     if args.command == "cache":
         return show_cache(args.prune)
+    if args.command == "rainbow":
+        logging.basicConfig(
+            level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+        )
+        print(json.dumps(rainbow.render(args.out)))
+        return 0
     if not args.store:
         p.error("--store is required")
     if args.command == "ingest" and args.keys and len(set(args.source or SOURCES)) != 1:

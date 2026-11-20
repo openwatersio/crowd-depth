@@ -39,6 +39,8 @@ The web jobs cut at z8. Every shoalest-wins pyramid level shown at z8 or past it
 
 `RUN/jobs.jsonl` gets a line per finished job: its stage, key, time and peak memory, its own and the tools'. A failed job's traceback is in its log under `RUN/logs/`.
 
+**Rainbow chart.** `grid rainbow --out RUN` draws each surface of a run as a rainbow survey chart for QGIS ([rainbow.py](../../../packages/grid/src/grid/rainbow.py)): `RUN/rainbow/{tile}.tif`, an RGBA COG on the surface's grid, mosaicked into `RUN/rainbow.vrt`. It redraws only tiles whose surface or drawing code changed since their chart was drawn, by the surface's size and time and a hash of the module, as recorded in `RUN/rainbow/drawn.json`, and removes the charts of tiles gone since. It takes the run directory's lock: it refuses while a build holds it, and a build refuses while it draws. A build doesn't touch charts, so a withdrawn tile's chart stays in `RUN/rainbow/` until the next `grid rainbow`. `grid tiles` doesn't run it, and charts aren't published. It draws four tiles at once; on the Mac Studio a dense tile peaked at 0.6 GB (November 2026). A tile that can't be drawn is named in its error once the rest are drawn and mosaicked.
+
 ## Publishing
 
 With `--publish`, a run that finished every job makes what's published at an R2 prefix (`s3://bucket/prefix`, with the store's `S3_*` credentials) or a local directory match the run directory, still holding the run directory's lock ([publish.py](../../../packages/grid/src/grid/publish.py)). A run with a failed job, or a dry run, publishes nothing, and what was published stays. The target must stand apart from the store and the run directory.
