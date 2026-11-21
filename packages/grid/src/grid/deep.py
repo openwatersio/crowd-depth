@@ -113,7 +113,9 @@ def download(vrt):
 def build_vrt(vrt, folder, tifs):
     with cache.writing(vrt) as out:
         subprocess.run(
-            ["gdalbuildvrt", "-q", str(out), *(str(folder / n) for n in tifs)], check=True
+            # cache.writing has already made the file; some GDAL builds refuse an existing one.
+            ["gdalbuildvrt", "-q", "-overwrite", str(out), *(str(folder / n) for n in tifs)],
+            check=True,
         )
 
 
