@@ -82,8 +82,10 @@ test.skipIf(!existsSync(dist))(
       const before = await bands(x, y);
       // Written as a backfill writes, on its own connection, which tells the tile
       // service only when it ends.
-      const backfill = createCellStore(createDB(file));
+      const backfillDB = createDB(file);
+      const backfill = createCellStore(backfillDB);
       for (let k = 0; k < 20; k++) backfill.addPasses(pass(30));
+      backfillDB.close();
       // A tile beside it, not built yet, under the same ancestor.
       const sibling = await bands(x, y ^ 1);
       expect(before.length).toBeGreaterThan(0);
