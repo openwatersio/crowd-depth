@@ -1,5 +1,5 @@
 import { detectSensor, sourceDevice } from "./device-info.js";
-import { detectGpsdSensor } from "./gpsd-info.js";
+import { cachedGpsdSensor } from "./gpsd-info.js";
 import { ServerAPI } from "@signalk/server-api";
 import { Temporal } from "@js-temporal/polyfill";
 import { DEFAULT_OWN_STYLE, TINTS, type Tint } from "./tiles/style.js";
@@ -191,13 +191,26 @@ function withoutUndefined<T>(value: T): T {
 }
 
 function buildSchema(app: ServerAPI) {
-  const defaultPath = DepthPaths.find((path) =>
-    app.getSelfPath(`environment.depth.${path}.value`),
+  const saved = (
+    app.readPluginOptions?.() as { configuration?: Partial<Config> } | undefined
+  )?.configuration;
+  const defaultPath =
+    saved?.path ??
+    DepthPaths.find(
+      (path) =>
+        app.getSelfPath(`environment.depth.${path}.value`) !== undefined,
+    );
+  function choices(path: string, configured?: string) {
+    const sources = sourcesFor(app, path);
+    if (configured && !sources.available.includes(configured))
+      sources.available.unshift(configured);
+    return { ...sources, selected: configured || sources.selected };
+  }
+  const positionSources = choices("navigation.position", saved?.gnss?.source);
+  const depthSources = choices(
+    `environment.depth.${defaultPath}`,
+    saved?.sounder?.source,
   );
-  const positionSources = sourcesFor(app, "navigation.position");
-  const depthSources = defaultPath
-    ? sourcesFor(app, `environment.depth.${defaultPath}`)
-    : { selected: undefined, available: [] };
   return {
     type: "object",
     description:
@@ -402,18 +415,13 @@ function buildSchema(app: ServerAPI) {
 }
 
 /** Hints only: opening the form must not save detected values as overrides. */
-export async function uiSchema(app: ServerAPI) {
-  const saved = (
-    app.readPluginOptions?.() as { configuration?: Partial<Config> } | undefined
-  )?.configuration;
+export function uiSchema(app: ServerAPI) {
   const defaults = schema(app).properties;
-  const sounderSource =
-    saved?.sounder?.source ?? defaults.sounder.properties.source.default;
-  const gpsSource =
-    saved?.gnss?.source ?? defaults.gnss.properties.source.default;
+  const sounderSource = defaults.sounder.properties.source.default;
+  const gpsSource = defaults.gnss.properties.source.default;
   const sounder = detectSensor(app, sounderSource);
   const gnss = detectSensor(app, gpsSource);
-  const gpsd = gnss.make ? {} : await detectGpsdSensor(app, gpsSource);
+  const gpsd = gnss.make || gnss.model ? {} : cachedGpsdSensor(app, gpsSource);
   return {
     sounder: {
       make: { "ui:placeholder": sounder.make ?? "" },

@@ -1,3 +1,9 @@
+import {
+  createServer as createTcpServer,
+  type AddressInfo,
+  type Socket,
+} from "node:net";
+import gpsdProvider from "../test/fixtures/gpsd-provider.json" with { type: "json" };
 import { afterEach, describe, expect, test } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer, type Server } from "node:http";
@@ -126,12 +132,14 @@ interface ServerOptions {
   /** crowd-depth is enabled at boot, or later through the admin API. */
   enableAtBoot: boolean;
   historyRows?: object[];
+  gpsdPort?: number;
 }
 
 async function startSignalK({
   trustedNodeUrl,
   enableAtBoot,
   historyRows,
+  gpsdPort,
 }: ServerOptions) {
   const configDir = await mkdtemp(join(tmpdir(), "crowd-depth-e2e-"));
   cleanups.push(() => rm(configDir, { recursive: true, force: true }));
@@ -156,9 +164,14 @@ async function startSignalK({
     join(configDir, "package.json"),
     JSON.stringify({ name: "e2e-config", private: true, dependencies }),
   );
+  const provider = structuredClone(gpsdProvider);
+  if (gpsdPort) provider.pipeElements[0].options!.port = gpsdPort;
   await writeFile(
     join(configDir, "settings.json"),
-    JSON.stringify({ interfaces: {}, pipedProviders: [] }),
+    JSON.stringify({
+      interfaces: {},
+      pipedProviders: gpsdPort ? [provider] : [],
+    }),
   );
   await writeFile(
     join(configDir, "defaults.json"),
@@ -174,7 +187,12 @@ async function startSignalK({
   if (enableAtBoot) {
     await writeFile(
       join(configDir, "plugin-config-data", "crowd-depth.json"),
-      JSON.stringify({ enabled: true, configuration: config }),
+      JSON.stringify({
+        enabled: true,
+        configuration: gpsdPort
+          ? { ...config, gnss: { ...config.gnss, source: `${provider.id}.GP` } }
+          : config,
+      }),
     );
   }
 
@@ -310,6 +328,23 @@ describe.skipIf(!RUN)("uploads from a real Signal K server", () => {
     // Soundings sent before the plugin subscribes would be lost.
     await sk.waitForStatus(/Next report at/);
 
+    // Signal K must await the async hook before serializing its admin response.
+    const plugins = (await (
+      await fetch(`${sk.base}/skServer/plugins`)
+    ).json()) as {
+      id: string;
+      uiSchema?: unknown;
+    }[];
+    expect(
+      plugins.find((plugin) => plugin.id === "crowd-depth")?.uiSchema,
+    ).toEqual({
+      sounder: {
+        make: { "ui:placeholder": "" },
+        model: { "ui:placeholder": "" },
+      },
+      gnss: { make: { "ui:placeholder": "" }, model: { "ui:placeholder": "" } },
+    });
+
     const fix = (i: number) => ({
       path: "navigation.position",
       value: { latitude: -17.6 + i * 1e-4, longitude: 177.43 },
@@ -386,4 +421,60 @@ describe.skipIf(!RUN)("uploads from a real Signal K server", () => {
     await new Promise((r) => setTimeout(r, 4000));
     expect(node.uploads).toEqual([]);
   });
+});
+
+describe.skipIf(!RUN)("identity hints through the real admin API", () => {
+  test.each([true, false])(
+    "GPSD replies=%s: plugin listing stays responsive",
+    async (respond) => {
+      let requests = 0;
+      const sockets = new Set<Socket>();
+      const gpsd = createTcpServer((socket) => {
+        sockets.add(socket);
+        socket.on("close", () => sockets.delete(socket));
+        socket.on("data", (data) => {
+          if (data.toString().includes("?DEVICES;")) {
+            requests++;
+            if (respond)
+              socket.end(
+                '{"class":"DEVICES","devices":[{"driver":"Garmin USB binary"}]}\n',
+              );
+          }
+        });
+      }).listen(0, "127.0.0.1");
+      await once(gpsd, "listening");
+      cleanups.push(async () => {
+        for (const socket of sockets) socket.destroy();
+        await new Promise<void>((resolve) => gpsd.close(() => resolve()));
+      });
+      const node = await startTrustedNode();
+      const sk = await startSignalK({
+        trustedNodeUrl: node.url,
+        enableAtBoot: true,
+        gpsdPort: (gpsd.address() as AddressInfo).port,
+      });
+      await sk.waitForStatus(/Next report at/);
+      const hints = async () => {
+        const response = await fetch(`${sk.base}/skServer/plugins`);
+        expect(response.ok).toBe(true);
+        const plugins = (await response.json()) as {
+          id: string;
+          uiSchema: { gnss: { make: { "ui:placeholder": string } } };
+        }[];
+        return plugins.find((p) => p.id === "crowd-depth")!.uiSchema.gnss.make[
+          "ui:placeholder"
+        ];
+      };
+      const start = performance.now();
+      const values = await Promise.all(Array.from({ length: 6 }, hints));
+      expect(performance.now() - start).toBeLessThan(1000);
+      if (respond) {
+        await waitFor(async () => (await hints()) === "Garmin", sk.log);
+      } else {
+        expect(values).toEqual(Array(6).fill(""));
+      }
+      await waitFor(async () => requests === 1, sk.log);
+      expect(requests).toBe(1);
+    },
+  );
 });
