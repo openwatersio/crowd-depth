@@ -6,9 +6,8 @@ import { expect, test } from "vitest";
 // The worker thread loads the built module, so this runs against dist/, which CI
 // builds before the tests.
 //
-// Closing the tile service stops its worker without waiting for it, and Windows
-// refuses to delete the database while the worker still has it open, so the
-// cleanups retry.
+// Windows refuses to delete a database a worker still has open, so each test
+// awaits the tile service closing before it removes the directory.
 const dist = new URL("../../dist/tiles/service.js", import.meta.url);
 
 test.skipIf(!existsSync(dist))(
@@ -35,7 +34,7 @@ test.skipIf(!existsSync(dist))(
       const tile = await tiles.get(...at);
       expect(tile?.length).toBeGreaterThan(0);
     } finally {
-      tiles.close();
+      await tiles.close();
       db.close();
       rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
     }
@@ -91,7 +90,7 @@ test.skipIf(!existsSync(dist))(
       expect(sibling.length).toBeGreaterThan(0);
       expect(Math.min(...sibling)).toBeGreaterThan(Math.max(...before));
     } finally {
-      tiles.close();
+      await tiles.close();
       db.close();
       rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
     }
@@ -391,7 +390,7 @@ test.skipIf(!existsSync(dist))(
         readTile(store, ...up, "high", false),
       );
     } finally {
-      tiles.close();
+      await tiles.close();
       db.close();
       rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
     }
@@ -425,7 +424,7 @@ test.skipIf(!existsSync(dist))(
     try {
       expect(() => tiles.changed([{ lon: -76.2, lat: 36.98 }])).not.toThrow();
     } finally {
-      tiles.close();
+      await tiles.close();
       db.close();
       rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
     }
@@ -468,7 +467,7 @@ test.skipIf(!existsSync(dist))(
       expect(here.length).toBeGreaterThan(0);
       expect(await tiles.preview(req)).toEqual(here);
     } finally {
-      tiles.close();
+      await tiles.close();
       db.close();
       rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
     }

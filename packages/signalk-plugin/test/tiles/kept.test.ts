@@ -49,7 +49,7 @@ test("a tile built once is read back after a restart", async () => {
   );
   const tile = await tiles.get(...at);
   expect(tile?.length).toBeGreaterThan(0);
-  tiles.close();
+  await tiles.close();
 
   const again = createKeptTiles(db, "high");
   expect(again.get(...at)).toEqual(tile);
@@ -287,7 +287,7 @@ test("tiles built while a backfill writes aren't kept", async () => {
   tiles.reset();
   await tiles.get(...at);
   expect(kept.get(...at)?.length).toBeGreaterThan(0);
-  tiles.close();
+  await tiles.close();
   db.close();
 });
 
@@ -322,7 +322,7 @@ test("a tile changed in the last few minutes isn't kept", async () => {
     tiles.reset();
     await tiles.get(...at);
     expect(kept.get(...at)?.length).toBeGreaterThan(0);
-    tiles.close();
+    await tiles.close();
     db.close();
   } finally {
     vi.useRealTimers();
