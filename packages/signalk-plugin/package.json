@@ -60,12 +60,18 @@
   "devDependencies": {
     "@mapbox/vector-tile": "^3.0.0",
     "@types/d3-contour": "^3.0.6",
+    "@types/debug": "^4.1.12",
     "@types/express": "^5.0.6",
     "@types/geojson": "^7946.0.16",
+    "@types/node": "^26.6.6",
+    "ajv": "^8.17.1",
     "esbuild": "^0.28.2",
+    "nock": "^15.0.5",
     "pbf": "^5.1.2",
     "publint": "^0.3.25",
-    "signalk-plotterext-bus": "^0.24.0"
+    "signalk-plotterext-bus": "^0.24.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0"
   },
   "dependencies": {
     "@js-temporal/polyfill": "^0.5",
