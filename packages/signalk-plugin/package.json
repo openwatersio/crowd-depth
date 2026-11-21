@@ -22,7 +22,8 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/openwatersio/crowd-depth.git"
+    "url": "git+https://github.com/openwatersio/crowd-depth.git",
+    "directory": "packages/signalk-plugin"
   },
   "license": "MIT",
   "publishConfig": {
@@ -42,14 +43,15 @@
     "bin",
     "icon.svg",
     "public",
-    "THIRD_PARTY_NOTICES.md"
+    "THIRD_PARTY_NOTICES.md",
+    "docs/screenshots"
   ],
   "scripts": {
     "build": "tsc -b && node scripts/build-web.mjs",
     "dev": "tsc -w",
     "prepack": "npm run build",
     "lint": "tsc -b && tsc -p tsconfig.web.json && publint --strict",
-    "test": "vitest",
+    "test": "vitest --root ../.. --project crowd-depth",
     "test:e2e": "vitest run --config vitest.e2e.config.ts"
   },
   "engines": {
@@ -81,6 +83,9 @@
   },
   "signalk": {
     "displayName": "Crowd Depth",
-    "appIcon": "icon.svg"
+    "appIcon": "icon.svg",
+    "screenshots": [
+      "./docs/screenshots/settings.png"
+    ]
   }
 }

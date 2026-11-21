@@ -13,7 +13,7 @@ packages/
   api/              # "crowd-depth-api" — the trusted node API (Cloudflare Worker, not published)
   grid/             # Python (uv): the global depth grid pipeline, see docs/plans/global-grid
 docs/               # CSB reference material (schemas, IHO/NOAA guidance PDFs)
-.github/workflows/  # CI (test.yml, grid.yml, lockfile.yml), PR previews (preview.yml), and npm publishing (release.yml)
+.github/workflows/  # CI (test.yml, plugin-ci.yml, grid.yml, lockfile.yml), PR previews (preview.yml), and npm publishing (release.yml)
 ```
 
 ### `packages/signalk-plugin` (npm: `crowd-depth`)
@@ -82,6 +82,8 @@ npm pack --dry-run -w crowd-depth
 ```
 
 It also runs the end-to-end suite (below) and boots the API Worker under `wrangler dev` with production settings, failing if it crashes at startup.
+
+`.github/workflows/plugin-ci.yml` runs Signal K's shared plugin CI on the plugin: it installs, builds and tests it on Linux, macOS and Windows. The [Signal K plugin registry](https://signalk.org/signalk-plugin-registry/) scores the plugin partly by this run on the commit a release was published from, which it finds through the published package's `gitHead`.
 
 ### Working on the plugin
 
