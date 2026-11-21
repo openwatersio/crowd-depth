@@ -87,6 +87,6 @@ test("serves the built pages without Express and passes other paths on", async (
     expect(request("/bathymetry/meta").passed).toBe(true);
     expect(request("/missing.html").passed).toBe(true);
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true, maxRetries: 10 });
   }
 });

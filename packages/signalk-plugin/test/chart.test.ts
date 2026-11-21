@@ -164,7 +164,7 @@ test("the chart tables migrate onto an existing database", () => {
     expect(store.getMeta("through")).toBe("2026-10-16T09:00:00Z");
     db.close();
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
   }
 });
 
@@ -795,7 +795,7 @@ test("a database from a preview build moves to cells", () => {
     expect(store.getMeta("through")).toBeUndefined();
     db.close();
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
   }
 });
 

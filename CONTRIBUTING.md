@@ -13,7 +13,7 @@ packages/
   api/              # "crowd-depth-api" — the trusted node API (Cloudflare Worker, not published)
   grid/             # Python (uv): the global depth grid pipeline, see docs/plans/global-grid
 docs/               # CSB reference material (schemas, IHO/NOAA guidance PDFs)
-.github/workflows/  # CI (test.yml, grid.yml, lockfile.yml), PR previews (preview.yml), and npm publishing (release.yml)
+.github/workflows/  # CI (test.yml, plugin-ci.yml, grid.yml, lockfile.yml), PR previews (preview.yml), and npm publishing (release.yml)
 ```
 
 ### `packages/signalk-plugin` (npm: `crowd-depth`)
@@ -82,6 +82,8 @@ npm pack --dry-run -w crowd-depth
 ```
 
 It also runs the end-to-end suite (below) and boots the API Worker under `wrangler dev` with production settings, failing if it crashes at startup.
+
+`.github/workflows/plugin-ci.yml` runs Signal K's shared plugin CI on the plugin: it installs, builds and tests it on Linux, macOS and Windows. The [Signal K plugin registry](https://signalk.org/signalk-plugin-registry/) scores the plugin partly by this run on the commit a release was published from, which it finds through the published package's `gitHead`.
 
 ### Working on the plugin
 
@@ -209,7 +211,7 @@ Releases are cut from GitHub:
 2. Create a tag `vX.Y.Z` (semver) targeting `main`.
 3. Set the release title to a short headline of what changed, in sentence case with no version or closing period, and put any new requirement in it ("Requires Node 24"). Patch releases get a headline too.
 4. Write the notes for boaters running the plugin, following the [release notes guidance](https://github.com/openwatersio/.github/blob/main/docs/agents/releases.md#release-notes): open with what is new and for whom, list breaking changes and upgrade steps first, then the changes people will notice with a link to each pull request. Leave out chores, CI, and dependency bumps unless they change a runtime requirement.
-5. Publish. The [release workflow](.github/workflows/release.yml) builds and packs the plugin from the tag's commit with the version from the tag, publishes that tarball to npm via trusted publishing (OIDC — no tokens to manage), commits the version bump to `package.json` and `package-lock.json` back to `main`, and re-points the tag at that commit. Each step is its own job with only the permissions it needs: the job that installs dependencies and builds holds no token that can publish or push, though what it packs is what gets published. The tag must be the tip of `main` when the release runs, or the build refuses it; delete the release and tag and cut them again. Releases run one at a time, and one published while another is running is refused or cancelled, since the first one's version bump moves `main`; cut it again once the first finishes. If `main` moves after the build, the last job fails and leaves `main` and the tag as they were; the package is already on npm, so bump the version in a pull request.
+5. Publish. The [release workflow](.github/workflows/release.yml) builds and packs the plugin from the tag's commit with the version from the tag, publishes that tarball to npm via trusted publishing (OIDC — no tokens to manage), commits the version bump to `package.json` and `package-lock.json` back to `main`, and re-points the tag at that commit. Each step is its own job with only the permissions it needs: the job that installs dependencies and builds holds no token that can publish or push, though what it packs is what gets published. The tag must be the tip of `main` when the release runs, or the build refuses it; delete the release and tag and cut them again. Releases run one at a time, and one published while another is running is refused or cancelled, since the first one's version bump moves `main`; cut it again once the first finishes. If `main` moves after the build, the last job fails and leaves `main` and the tag as they were; the package is already on npm, so bump the version in a pull request. The build records the tag's commit as the package's `gitHead`, which the Signal K plugin registry uses to find that commit's plugin-ci run. The version bump commit is pushed by the workflow, so no workflow runs on it: release from a commit that landed through a pull request, not straight after another release, or run plugin-ci on the bump commit by hand first.
 
 There is no manual `npm publish` or local version bump — the tag is the
 version. Signal K servers pick the new version up from npm in the AppStore.

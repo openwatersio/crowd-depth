@@ -217,7 +217,7 @@ export function startChart({
   // Only this start's own state: an older start can end after a newer one
   // replaced it.
   const stop = () => {
-    tiles.close();
+    void tiles.close();
     qc?.close();
     if (current === started) current = undefined;
   };

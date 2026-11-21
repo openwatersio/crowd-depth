@@ -279,12 +279,14 @@ function createTileWorker(file: string, detail: Detail) {
     clear(keys?: string[]) {
       worker?.postMessage({ clear: keys ?? true });
     },
-    close() {
-      void worker?.terminate();
+    /** Resolves once the thread has exited and let go of the database file. */
+    close(): Promise<void> {
+      const exiting = worker?.terminate();
       worker = undefined;
       for (const w of waiting.values())
         w.reject(new Error("tile worker closed"));
       waiting.clear();
+      return exiting ? exiting.then(() => undefined) : Promise.resolve();
     },
   };
 }
@@ -780,11 +782,12 @@ export function createTileService(
       return { rev, tiles: [...tiles.values()] };
     },
 
-    close() {
+    /** Resolves once every worker thread has exited. */
+    close(): Promise<void> {
       closed = true;
       clearInterval(timer);
       clearInterval(settler);
-      for (const w of workers) w.close();
+      return Promise.all(workers.map((w) => w.close())).then(() => undefined);
     },
   };
 }
