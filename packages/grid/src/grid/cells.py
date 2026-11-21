@@ -17,14 +17,14 @@ from pathlib import Path
 
 import numpy as np
 
-from . import catalog, definitions, qc, statistic
+from . import catalog, deep, definitions, qc, statistic
 from .catalog import BASE_ROW, MIN_DEPTH_M, POINT_ID, checkpoint
 from .definitions import CELLS, QC
 from .qc import HAZARD_M, MAX_DEPTH_M, QC_VERSION, SHALLOW_M, TRACK_REASONS
 
 log = logging.getLogger(__name__)
 
-GRID_VERSION = 12
+GRID_VERSION = 13
 BATCH_POINTS = 5_000_000
 BASE = CELLS["rows_per_degree"]  # base rows per 1° tile
 MIN_VESSELS = 2
@@ -36,6 +36,7 @@ CELL_REASONS = [
     "consensus_deep",
     "consensus_far_deep",
     "consensus_shoal",
+    "deep_reference",
 ]
 # A sounding of the same vessel this far apart in time is another pass.
 OTHER_PASS = "4 hours"
@@ -306,7 +307,7 @@ WITH flags AS (
 pts AS (
   SELECT a.point_id, a.content_key, a.tile_id, a.cell_id, a.unique_id AS vessel, a.time,
     a.lon, a.lat,
-    a.depth AS d, a.depth_raw AS raw, coalesce(f.hunting, false) AS hunting, a.tide IS NOT NULL AS tided, a.offset_m IS NOT NULL AS calibrated, a.sigma,
+    a.depth AS d, a.depth_raw AS raw, coalesce(f.hunting, false) AS hunting, a.tide IS NOT NULL AS tided, a.offset_m IS NOT NULL AS calibrated, a.sigma, a.deep_ref,
     f.flag,
     a.tile_id // 360 - 90 AS lat0, a.tile_id % 360 - 180 AS lon0,
     {K_LIST}[a.tile_id // 360 - 90 + 91] AS k
@@ -318,7 +319,7 @@ pts AS (
     AND a.depth_raw > 0 AND a.depth_raw <= {MAX_DEPTH_M} AND a.depth >= {MIN_DEPTH_M}
     -- A run calibration found its sounder had lost the bottom sets no depths and votes in
     -- no consensus, as a reject: it publishes as shoals.
-    AND NOT a.excluded AND NOT a.lost_bottom AND NOT a.awaiting_tide
+    AND NOT a.excluded AND NOT a.lost_bottom AND NOT a.awaiting_tide AND NOT a.off_reference
 ),
 idx AS (
   SELECT *,
@@ -414,26 +415,34 @@ SELECT * FROM group_accepted WHERE r >= $rlo AND r < $rhi;
 CREATE OR REPLACE TEMP TABLE children AS
 WITH votes AS (
   SELECT tile_id, level, cr, cc, r, c, vessel, median(d) FILTER (WHERE keep_v) AS m,
-    min(d) FILTER (WHERE outlier = 'shoal') AS shoal
+    min(d) FILTER (WHERE outlier = 'shoal') AS shoal,
+    -- 0 where any sounding isn't in judged deep water, so none is ever left out for it.
+    min(coalesce(deep_ref, 0)) AS deep_ref
   FROM {sample("accepted", CELL + ["r", "c", "vessel"], "keep_v")} GROUP BY ALL
 ),
 own AS (
-  SELECT tile_id, level, cr, cc, r, c, median(m) AS m, min(shoal) AS shoal FROM votes GROUP BY ALL
+  SELECT tile_id, level, cr, cc, r, c, median(m) AS m, min(shoal) AS shoal,
+    min(deep_ref) AS deep_ref
+  FROM votes GROUP BY ALL
 )
 -- The pixel's median of the vessels' smoothed votes less K σ, and never deeper than the
 -- base cell's own vessels' median less K σ: smoothing along a track can't take a narrow
 -- shoal every vessel read out of the soundings. A confirmed shoal sets the depth when
 -- it's shoaler, however many deeper vessels surround it. The margin alone never makes
 -- water drying: below 0 only where the median or a confirmed shoal is. Never past the
--- drying band's floor, MIN_DEPTH_M, which the overlay's bands start from.
+-- drying band's floor, MIN_DEPTH_M, which the overlay's bands start from. In water GEBCO
+-- says is deep, a base cell the margin takes shoaler than any sounding there may read
+-- (deep.RATIO of it) doesn't publish: a σ of hundreds of metres on a deep slope says the
+-- cell doesn't know its depth, and 0 m there would be a false shoal.
+SELECT * FROM (
 SELECT *, CASE WHEN low IS NOT NULL THEN greatest(low, dry_floor, {MIN_DEPTH_M}) END AS depth
 FROM (
-  SELECT v.tile_id, v.level, v.cr, v.cc, v.r, v.c, ps.sigma,
+  SELECT v.tile_id, v.level, v.cr, v.cc, v.r, v.c, ps.sigma, v.deep_ref,
     least(ps.depth, v.m - {statistic.K} * ps.sigma, v.shoal) AS low,
     least(0, ps.median, v.m, v.shoal) AS dry_floor
   FROM own v JOIN pixel_sigma ps
     ON ps.tile_id = v.tile_id AND ps.py = v.r // 2 AND ps.px = v.c // 2
-);
+)) WHERE depth IS NULL OR deep_ref = 0 OR depth >= {deep.RATIO} * deep_ref;
 
 CREATE OR REPLACE TEMP TABLE stats AS
 -- An aggregated cell keeps its shoalest base cell, so aggregation never hides an accepted
@@ -510,10 +519,15 @@ WHERE outlier = 'shoal' AND point_id IN (SELECT point_id FROM confirmed)
 # whole tile, since dedupe only drops a sounding's twins, which share its position and
 # so its row.
 TILE_POINTS = f"""
-SELECT point_id, content_key, tile_id, cell_id, unique_id, time, lon, lat, depth_raw, depth,
-  tide, offset_m,
-  sigma, excluded, lost_bottom, awaiting_tide, {BASE_ROW} AS r
+SELECT p.point_id, p.content_key, p.tile_id, p.cell_id, p.unique_id, p.time, p.lon, p.lat,
+  p.depth_raw, p.depth, p.tide, p.offset_m, p.sigma, p.excluded, p.lost_bottom, p.awaiting_tide,
+  {BASE_ROW} AS r,
+  -- Far shallower than GEBCO's deep water around it: a sounder that lost the bottom.
+  coalesce(p.depth < {deep.RATIO} * g.ref, false) AS off_reference, g.ref AS deep_ref
 FROM corrected_points_in($partition, $tiles, $rlo, $rhi) p
+LEFT JOIN deep_ref g ON g.tile_id = p.tile_id
+  AND g.gy = least(floor((p.lat - (p.tile_id // 360 - 90)) * {deep.PER_DEGREE})::INTEGER, {deep.PER_DEGREE - 1})
+  AND g.gx = least(floor((p.lon - (p.tile_id % 360 - 180)) * {deep.PER_DEGREE})::INTEGER, {deep.PER_DEGREE - 1})
 """
 
 # Active soundings that are still unconfirmed shoals, neither confirmed nor rejected since,
@@ -529,7 +543,7 @@ SELECT p.tile_id, p.r,
   p.lon, p.lat, p.depth_raw, p.depth
 FROM tile_points p
 -- A segment too deep to correct publishes nothing, its shoals included.
-WHERE NOT p.excluded AND NOT p.awaiting_tide
+WHERE NOT p.excluded AND NOT p.awaiting_tide AND NOT p.off_reference
   -- A run whose sounder lost the bottom warns of no hazard from deeper than HAZARD_M, nor from
   -- a reading under SHALLOW_M, a sounder's junk.
   AND NOT (p.lost_bottom AND (p.depth >= {HAZARD_M} OR p.depth_raw < {SHALLOW_M}))
@@ -852,6 +866,7 @@ CODE = hashlib.sha256(
             qc.__file__,
             catalog.__file__,
             statistic.__file__,
+            deep.__file__,
             Path(definitions.__file__).with_suffix(".json"),
         )
     )
@@ -913,6 +928,8 @@ def build(con, tiles: list[int] | None = None) -> dict:
         if set(unit_tiles) <= done:
             totals["kept"] += len(bands)
             continue
+        # Before the tiles' cells are cleared: a first run downloads GEBCO here.
+        con.register("deep_ref", deep.shoalest(unit_tiles))
         clear(con, partition, unit_tiles)
         for i, (rlo, rhi) in enumerate(bands):
             params = {"partition": partition, "tiles": unit_tiles, "rlo": rlo, "rhi": rhi}
@@ -929,6 +946,15 @@ def build(con, tiles: list[int] | None = None) -> dict:
                     AND {BASE_ROW} BETWEEN $rlo AND $rhi - 1)""",
                 params,
             )
+        con.unregister("deep_ref")
+        con.execute(
+            f"""INSERT INTO lake.qc_flags BY NAME
+            SELECT point_id, tile_id, 'reject' AS flag, 'deep_reference' AS reason,
+              $partition::SMALLINT AS cell_id, {QC_VERSION} AS qc_version
+            FROM tile_points WHERE off_reference AND NOT excluded AND NOT awaiting_tide
+              AND depth_raw > 0 AND depth_raw <= {MAX_DEPTH_M}""",
+            {"partition": partition},
+        )
         # Flags band by band, then σ from every band's votes, then each band's cells.
         for i, (rlo, rhi) in enumerate(bands):
             classify(con, partition, unit_tiles, rlo, rhi, first=not i)

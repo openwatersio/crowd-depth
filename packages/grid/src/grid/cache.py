@@ -9,6 +9,7 @@ It lives at GRID_CACHE_DIR, or $XDG_CACHE_HOME/crowd-depth-grid, or
   least recently used first. Open Waters uploads aren't kept: a withdrawn one must leave.
 - `coops`: CO-OPS gauge months, once final.
 - `stillwell`: Stillwell's year files, keyed by their version or ETag.
+- `gebco`: GEBCO's global grid, unpacked under a VRT (deep.py).
 
 An entry is written to a temporary file beside it and renamed into place, so another
 process sees a whole entry or none, and an interrupted write leaves only a `.part` file.
