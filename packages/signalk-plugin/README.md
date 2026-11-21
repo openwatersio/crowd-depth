@@ -169,3 +169,16 @@ The plotter extension's provider and page serving are adapted from [signalk-live
 See [CONTRIBUTING.md](https://github.com/openwatersio/crowd-depth/blob/main/CONTRIBUTING.md)
 for repo layout, the local Signal K `npm link` workflow, testing, and
 releases.
+
+### Detected sensor identities
+
+The Make and Model fields show optional hints from the selected NMEA 2000
+source. GPSD connections can also identify certain manufacturers; a GPSD driver
+name is not assumed to be a retail model. Unknown or ambiguous devices leave the
+hints blank. Detection uses the configured GPSD endpoint and gives up after two
+seconds if it is unavailable.
+
+These placeholders are informational: enter a value to include it in reports.
+They do not save an override or change existing settings. After saving a different
+source, reload the form to refresh the hints. Automatically attaching detected
+identities to historical reports requires configuration history and is deferred.

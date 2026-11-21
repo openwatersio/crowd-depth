@@ -1,3 +1,5 @@
+import { detectSensor, sourceDevice } from "./device-info.js";
+import { detectGpsdSensor } from "./gpsd-info.js";
 import { ServerAPI } from "@signalk/server-api";
 import { Temporal } from "@js-temporal/polyfill";
 import { DEFAULT_OWN_STYLE, TINTS, type Tint } from "./tiles/style.js";
@@ -102,22 +104,7 @@ export function resolveSource(
  * the raw sourceRef when no device details are known.
  */
 function sourceLabel(app: ServerAPI, sourceRef: string): string {
-  const dot = sourceRef.indexOf(".");
-  const label = dot === -1 ? sourceRef : sourceRef.slice(0, dot);
-  const instance = dot === -1 ? "" : sourceRef.slice(dot + 1);
-  const sources = app.getPath("sources") as
-    | Record<string, Record<string, { n2k?: Record<string, unknown> }>>
-    | undefined;
-  const connection = sources?.[label];
-  // The sources tree keys devices by numeric bus address, but with
-  // useCanName the sourceRef carries the hex CAN name instead, so fall
-  // back to matching each device's n2k.canName (mirrors the admin UI's
-  // getDeviceInfo in signalk-server's sourceLabels.ts).
-  const n2k =
-    connection?.[instance]?.n2k ??
-    Object.values(connection ?? {}).find(
-      (device) => device?.n2k?.canName === instance,
-    )?.n2k;
+  const n2k = sourceDevice(app, sourceRef);
   const name = [n2k?.manufacturerCode, n2k?.modelId]
     .filter((p): p is string => typeof p === "string" && p.length > 0)
     .join(" ");
@@ -410,6 +397,31 @@ function buildSchema(app: ServerAPI) {
           },
         },
       },
+    },
+  };
+}
+
+/** Hints only: opening the form must not save detected values as overrides. */
+export async function uiSchema(app: ServerAPI) {
+  const saved = (
+    app.readPluginOptions?.() as { configuration?: Partial<Config> } | undefined
+  )?.configuration;
+  const defaults = schema(app).properties;
+  const sounderSource =
+    saved?.sounder?.source ?? defaults.sounder.properties.source.default;
+  const gpsSource =
+    saved?.gnss?.source ?? defaults.gnss.properties.source.default;
+  const sounder = detectSensor(app, sounderSource);
+  const gnss = detectSensor(app, gpsSource);
+  const gpsd = gnss.make ? {} : await detectGpsdSensor(app, gpsSource);
+  return {
+    sounder: {
+      make: { "ui:placeholder": sounder.make ?? "" },
+      model: { "ui:placeholder": sounder.model ?? "" },
+    },
+    gnss: {
+      make: { "ui:placeholder": gnss.make ?? gpsd.make ?? "" },
+      model: { "ui:placeholder": gnss.model ?? "" },
     },
   };
 }

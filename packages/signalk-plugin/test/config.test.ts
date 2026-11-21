@@ -137,3 +137,40 @@ describe("depthReference", () => {
     ).toEqual({ offset: 0, reference: "Unknown" });
   });
 });
+
+test("identity placeholders use saved selections and leave configuration fields intact", async () => {
+  const { uiSchema } = await import("../src/config.js");
+  const app = mockApp(
+    { "navigation.position": { $source: "bus.1" } },
+    {
+      bus: {
+        "1": { n2k: { manufacturerCode: "First", modelId: "GPS 1" } },
+        "2": { n2k: { manufacturerCode: "Second", modelId: "GPS 2" } },
+      },
+    },
+  );
+  app.readPluginOptions = () =>
+    ({ configuration: { gnss: { source: "bus.2" } } }) as ReturnType<
+      ServerAPI["readPluginOptions"]
+    >;
+  const before = schema(app);
+  expect((await uiSchema(app)).gnss).toEqual({
+    make: { "ui:placeholder": "Second" },
+    model: { "ui:placeholder": "GPS 2" },
+  });
+  expect(schema(app)).toEqual(before);
+  expect(before.properties.gnss.required).toEqual(["x", "y", "z"]);
+  expect(before.properties).toHaveProperty("path");
+  expect(before.properties.gnss.properties.make).not.toHaveProperty("default");
+});
+
+test("identity placeholders are optional when no devices or server settings are available", async () => {
+  const { uiSchema } = await import("../src/config.js");
+  expect(await uiSchema(mockApp({}, undefined))).toEqual({
+    sounder: {
+      make: { "ui:placeholder": "" },
+      model: { "ui:placeholder": "" },
+    },
+    gnss: { make: { "ui:placeholder": "" }, model: { "ui:placeholder": "" } },
+  });
+});
