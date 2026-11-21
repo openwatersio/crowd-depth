@@ -38,7 +38,7 @@ from rasterio.windows import Window
 from scipy.ndimage import gaussian_filter, minimum_filter
 from scipy.spatial import cKDTree
 
-from . import statistic
+from . import deep, statistic
 from .catalog import MIN_DEPTH_M
 from .cells import BASE, CELL_SAMPLE, k_for
 from .definitions import SURFACE
@@ -358,6 +358,7 @@ def grid_tile(tile_id: int, got, out: Path):
         if len(upx):
             upx, upy, _, spread, csig = statistic.sigma_b(epx, epy, em, es, central=at_central)
             sigma_of = statistic.sigma_at(upx, upy, spread, csig)
+        floor = deep_floor(tile_id, cols)
         sparse = Path(tmp) / "sparse.tif"
         with open_sparse(sparse, lon0, lat0, shape) as dst:
             for key, (r0, c0, r1, c1, wr0, wc0, wr1, wc1) in windows.items():
@@ -371,6 +372,9 @@ def grid_tile(tile_id: int, got, out: Path):
                 sigma[rr, cc] = sigma_of(qx, qy, distance[rr, cc])
                 count, confirmed = sounded_at.rasters(wr0, wc0, wr1, wc1)
                 depth = finish(surface, sigma, around(confirmed)[inner])
+                # In deep water, a pixel its margin takes shoaler than any sounding there may
+                # read doesn't know its depth: left empty, as cells leave theirs out.
+                depth[depth < floor(r0, c0, r1, c1)] = NODATA
                 distance[depth == NODATA] = NODATA
                 sigma[depth == NODATA] = NODATA
                 near_px = np.where(depth == NODATA, NODATA, only_near.pop(key)).astype(np.float32)
@@ -469,6 +473,23 @@ def interpolate(tmp, px, py, values, scale_x, scale_y, cols, extent):
         check=True,
     )  # fmt: skip
     return grid
+
+
+def deep_floor(tile_id, cols):
+    """A function of a block's rows [r0, r1) and columns [c0, c1) giving, per pixel, the
+    shallowest depth anything may publish in GEBCO's deep water (deep.RATIO of its
+    shoalest depth nearby), and -inf elsewhere."""
+    got = deep.shoalest([tile_id])
+    ref = np.full((deep.PER_DEGREE, deep.PER_DEGREE), -np.inf, dtype=np.float32)
+    ref[got["gy"], got["gx"]] = deep.RATIO * got["ref"]
+
+    def floor(r0, c0, r1, c1):
+        # The GEBCO pixel holding each pixel's centre.
+        gy = ((ROWS - 1 - np.arange(r0, r1) + 0.5) * deep.PER_DEGREE // ROWS).astype(int)
+        gx = ((np.arange(c0, c1) + 0.5) * deep.PER_DEGREE // cols).astype(int)
+        return ref[np.ix_(gy, gx)]
+
+    return floor
 
 
 def blur(depth):

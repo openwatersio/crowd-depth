@@ -766,7 +766,10 @@ def test_the_overlay_credits_the_stations_and_surveys_it_used(env, tmp_path, mon
     put(env, 1, [(0, lon, lat, 5.0)])
     env.run("noaa")
     with open_store(env.store) as con:
-        assert overlay.attribution(con) == "Crowd Depth, NOAA DCDB crowdsourced bathymetry"
+        assert overlay.attribution(con) == (
+            "Crowd Depth, NOAA DCDB crowdsourced bathymetry; deep water from "
+            "GEBCO Compilation Group (2026) GEBCO 2026 Grid"
+        )
         tide.build(con, stations, list, residuals, levels, version="v1")
         credit = overlay.attribution(con)
     assert "Slackwater" in credit and "Far station, CC BY 4.0" in credit

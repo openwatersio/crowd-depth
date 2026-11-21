@@ -577,3 +577,46 @@ def test_a_batch_takes_no_tile_that_would_pass_its_raster_bound(monkeypatch):
     assert reference.sample(None, ["bluetopo"]) == 3
     assert fetched == [rasters[1], rasters[2], rasters[3]]
     assert sampled == looked == [1, 2, 3]
+
+
+def test_deep_reference_is_downloaded_once_into_the_cache(tmp_path, monkeypatch):
+    import hashlib
+    import zipfile
+
+    from conftest import heights
+
+    from grid import deep
+
+    tif = heights(tmp_path / "gebco_test.tif", [[-1500] * 4] * 2, (-180, -90, 180, 90))
+    zipped = tmp_path / "gebco.zip"
+    with zipfile.ZipFile(zipped, "w") as z:
+        z.write(tif, "gebco_test.tif")
+    monkeypatch.delenv("GRID_DEEP_REFERENCE")
+    monkeypatch.setattr(deep, "URL", zipped.as_uri())
+    monkeypatch.setattr(deep, "SHA256", "0" * 64)
+    with pytest.raises(RuntimeError, match="SHA-256"):
+        deep.ensure()
+    assert not cache.path("gebco", f"{deep.NAME}.vrt").exists()
+    monkeypatch.setattr(deep, "SHA256", hashlib.sha256(zipped.read_bytes()).hexdigest())
+    vrt = deep.ensure()
+    assert vrt.exists() and sorted(p.name for p in vrt.parent.iterdir()) == sorted(
+        [vrt.name, deep.NAME]
+    )
+    zipped.unlink()
+    assert deep.ensure() == vrt  # from the cache, not downloaded again
+    vrt.unlink()  # as a run that stopped after unpacking leaves it
+    assert deep.ensure() == vrt and vrt.exists()
+    assert set(deep.shoalest([44382])["ref"]) == {1500}
+
+
+def test_no_data_in_a_deep_reference_judges_nothing(tmp_path, monkeypatch):
+    import rasterio
+    from conftest import heights
+
+    from grid import deep
+
+    tif = heights(tmp_path / "holes.tif", [[-9999] * 4] * 2, (-180, -90, 180, 90))
+    with rasterio.open(tif, "r+") as dst:
+        dst.nodata = -9999
+    monkeypatch.setenv("GRID_DEEP_REFERENCE", str(tif))
+    assert len(deep.shoalest([44382])["ref"]) == 0
