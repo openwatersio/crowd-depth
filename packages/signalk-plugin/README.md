@@ -83,6 +83,17 @@ take a few minutes to measure them. Where your vessel already reports
   (positive to starboard), and above the waterline, in meters.
 - **Details** (optional) — Make and model.
 
+### Detected sensor identities
+
+The Make and Model fields show optional hints from the selected NMEA 2000
+source. GPSD’s Garmin binary drivers can also identify Garmin receivers; a GPSD driver
+name is not assumed to be a retail model or receiver manufacturer. In particular, a u-blox driver identifies a chipset, so its manufacturer hint stays blank. Unknown or ambiguous devices leave the
+hints blank. Detection uses the configured GPSD endpoint. Lookups run in the background with a two-second timeout; opening the plugin list never waits for GPSD. Results, including failures, are cached for one minute. The first load or a refresh can show blank hints; reload after the lookup completes. Concurrent requests share one lookup.
+
+These placeholders are informational: enter a value to include it in reports.
+They do not save an override or change existing settings. Hints describe the saved source and depth path. Unsaved edits do not refresh them; save and reload the form to update the hints. Automatically attaching detected
+identities to historical reports requires configuration history and is deferred.
+
 ### Data Sharing
 
 - **Share data anonymously** — Withhold your vessel name and MMSI and report

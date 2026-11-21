@@ -1,5 +1,5 @@
 import { ServerAPI, Plugin } from "@signalk/server-api";
-import { schema, Config } from "./config.js";
+import { schema, uiSchema, Config } from "./config.js";
 import { createReporter } from "./reporters/index.js";
 import { createSqliteSource } from "./sources/sqlite.js";
 import { BATHY_HISTORY_WAIT, ENV } from "./constants.js";
@@ -51,6 +51,10 @@ export default function createPlugin(app: ServerAPI): Plugin {
 
     stop() {
       abortController?.abort("Stopping crowd-depth plugin");
+    },
+
+    uiSchema() {
+      return uiSchema(app);
     },
 
     schema() {
