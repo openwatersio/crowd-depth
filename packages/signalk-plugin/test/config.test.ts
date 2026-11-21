@@ -88,6 +88,13 @@ test("does not require the transducer depth", () => {
   expect(s.properties.sounder.required).not.toContain("z");
 });
 
+test("survives a JSON round trip before the vessel reports any data", () => {
+  // The server stores the schema as JSON, which drops undefined values.
+  const s = schema(mockApp({}, {}));
+  expect(JSON.parse(JSON.stringify(s))).toEqual(s);
+  expect(s.properties.sounder.properties.x).not.toHaveProperty("default");
+});
+
 describe("depthReference", () => {
   const sounder = { x: 0, y: 0, z: 0.5, draft: 1.8 };
 

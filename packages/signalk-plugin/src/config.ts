@@ -184,7 +184,26 @@ export function depthReference(config: Pick<Config, "path" | "sounder">): {
   }
 }
 
+/**
+ * The plugin's config schema. Defaults read from the vessel's data are
+ * undefined until that data arrives; the server stores the schema as JSON,
+ * which would drop those keys anyway, so they are left out.
+ */
 export function schema(app: ServerAPI) {
+  return withoutUndefined(buildSchema(app));
+}
+
+function withoutUndefined<T>(value: T): T {
+  if (Array.isArray(value)) return value.map(withoutUndefined) as T;
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([, v]) => v !== undefined)
+      .map(([k, v]) => [k, withoutUndefined(v)]),
+  ) as T;
+}
+
+function buildSchema(app: ServerAPI) {
   const defaultPath = DepthPaths.find((path) =>
     app.getSelfPath(`environment.depth.${path}.value`),
   );
