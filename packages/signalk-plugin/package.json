@@ -51,7 +51,7 @@
     "dev": "tsc -w",
     "prepack": "npm run build",
     "lint": "tsc -b && tsc -p tsconfig.web.json && publint --strict",
-    "test": "vitest --root ../.. --project crowd-depth",
+    "test": "vitest",
     "test:e2e": "vitest run --config vitest.e2e.config.ts"
   },
   "engines": {
