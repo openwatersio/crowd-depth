@@ -5,6 +5,10 @@ import { expect, test } from "vitest";
 
 // The worker thread loads the built module, so this runs against dist/, which CI
 // builds before the tests.
+//
+// Closing the tile service stops its worker without waiting for it, and Windows
+// refuses to delete the database while the worker still has it open, so the
+// cleanups retry.
 const dist = new URL("../../dist/tiles/service.js", import.meta.url);
 
 test.skipIf(!existsSync(dist))(
@@ -33,7 +37,7 @@ test.skipIf(!existsSync(dist))(
     } finally {
       tiles.close();
       db.close();
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
     }
   },
 );
@@ -89,7 +93,7 @@ test.skipIf(!existsSync(dist))(
     } finally {
       tiles.close();
       db.close();
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
     }
   },
 );
@@ -140,7 +144,7 @@ test.skipIf(!existsSync(dist))(
       expect(store.cells(-76.3, 36.9, -76.1, 38, 6).length).toBeGreaterThan(0);
     } finally {
       db.close();
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
     }
   },
   30_000,
@@ -200,7 +204,7 @@ test.skipIf(!existsSync(dist))(
       }
     } finally {
       db.close();
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
     }
   },
   30_000,
@@ -313,7 +317,7 @@ test.skipIf(!existsSync(dist))(
       expect(cells(store)).toEqual(cells(clean));
     } finally {
       db.close();
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
     }
   },
   60_000,
@@ -389,7 +393,7 @@ test.skipIf(!existsSync(dist))(
     } finally {
       tiles.close();
       db.close();
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
     }
   },
 );
@@ -423,7 +427,7 @@ test.skipIf(!existsSync(dist))(
     } finally {
       tiles.close();
       db.close();
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
     }
   },
 );
@@ -466,7 +470,7 @@ test.skipIf(!existsSync(dist))(
     } finally {
       tiles.close();
       db.close();
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
     }
   },
 );

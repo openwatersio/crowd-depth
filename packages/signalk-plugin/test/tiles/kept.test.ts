@@ -34,7 +34,7 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "crowd-depth-"));
   file = join(dir, "bathymetry.sqlite");
 });
-afterEach(() => rmSync(dir, { recursive: true, force: true }));
+afterEach(() => rmSync(dir, { recursive: true, force: true, maxRetries: 10 }));
 
 test("a tile built once is read back after a restart", async () => {
   const db = createDB(file);
