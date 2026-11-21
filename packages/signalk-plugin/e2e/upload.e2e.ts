@@ -133,6 +133,7 @@ interface ServerOptions {
   enableAtBoot: boolean;
   historyRows?: object[];
   gpsdPort?: number;
+  schedule?: string;
 }
 
 async function startSignalK({
@@ -140,6 +141,7 @@ async function startSignalK({
   enableAtBoot,
   historyRows,
   gpsdPort,
+  schedule,
 }: ServerOptions) {
   const configDir = await mkdtemp(join(tmpdir(), "crowd-depth-e2e-"));
   cleanups.push(() => rm(configDir, { recursive: true, force: true }));
@@ -207,7 +209,7 @@ async function startSignalK({
         PORT: String(port),
         BATHY_URL: trustedNodeUrl,
         // Report every few seconds rather than every six hours.
-        BATHY_DEFAULT_SCHEDULE: "*/3 * * * * *",
+        BATHY_DEFAULT_SCHEDULE: schedule ?? "*/3 * * * * *",
         // Leave reports only the moment a sounding takes to reach storage,
         // not the minutes a buffering history provider needs.
         BATHY_REPORT_DELAY: "1",
@@ -253,11 +255,11 @@ async function startSignalK({
         () => log,
       );
     },
-    async enable() {
+    async enable(configuration = config) {
       const res = await fetch(`${base}/skServer/plugins/crowd-depth/config`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ enabled: true, configuration: config }),
+        body: JSON.stringify({ enabled: true, configuration }),
       });
       expect(res.ok, await res.text()).toBe(true);
     },
@@ -387,6 +389,95 @@ describe.skipIf(!RUN)("uploads from a real Signal K server", () => {
     ).toEqual([3.7, 3.9, 4.1]);
     expectAtTransducer(uploads.flatMap((u) => u.features));
   });
+
+  test("a settings restart flushes queued soundings with the previous sensor settings", async () => {
+    const node = await startTrustedNode();
+    const sk = await startSignalK({
+      trustedNodeUrl: node.url,
+      enableAtBoot: true,
+      schedule: "0 0 1 1 *",
+    });
+    await sk.waitForStatus(/Next report at/);
+    const update = (values: object[]) => ({
+      context: "vessels.self",
+      updates: [{ source: { label: "e2e" }, values }],
+    });
+    await sk.sendDeltas([
+      update([
+        {
+          path: "navigation.position",
+          value: { latitude: -17.6, longitude: 177.43 },
+        },
+        { path: "navigation.headingTrue", value: HEADING },
+      ]),
+      update([{ path: "environment.depth.belowTransducer", value: 3.2 }]),
+    ]);
+    // Flush ends on a whole second; let this sounding's second finish.
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    expect(node.uploads).toHaveLength(0);
+    await sk.enable({
+      ...config,
+      sounder: { ...config.sounder, model: "Replacement", z: 5 },
+    });
+    const upload = await node.next();
+    expectValidCsb(upload);
+    expect(upload.features.map((feature) => feature.properties.depth)).toEqual([
+      3.7,
+    ]);
+    expect(upload.properties.platform.sensors).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "Sounder", model: "DST800" }),
+      ]),
+    );
+  });
+
+  test.each(["disable", "anonymous"])(
+    "changing sharing to %s does not flush an identified report",
+    async (action) => {
+      const node = await startTrustedNode();
+      const sk = await startSignalK({
+        trustedNodeUrl: node.url,
+        enableAtBoot: true,
+        schedule: "0 0 1 1 *",
+      });
+      await sk.waitForStatus(/Next report at/);
+      const update = (values: object[]) => ({
+        context: "vessels.self",
+        updates: [{ source: { label: "e2e" }, values }],
+      });
+      await sk.sendDeltas([
+        update([
+          {
+            path: "navigation.position",
+            value: { latitude: -17.6, longitude: 177.43 },
+          },
+          { path: "navigation.headingTrue", value: HEADING },
+        ]),
+        update([{ path: "environment.depth.belowTransducer", value: 3.2 }]),
+      ]);
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      const response = await fetch(
+        `${sk.base}/skServer/plugins/crowd-depth/config`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            enabled: action !== "disable",
+            configuration: {
+              ...config,
+              sharing: { anonymous: action === "anonymous" },
+            },
+          }),
+        },
+      );
+      expect(response.ok, await response.text()).toBe(true);
+      await sk.waitForStatus(
+        action === "disable" ? /Stopped/ : /Next report at/,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      expect(node.uploads).toHaveLength(0);
+    },
+  );
 
   test("soundings read through the History API arrive measured from the waterline", async () => {
     const node = await startTrustedNode();

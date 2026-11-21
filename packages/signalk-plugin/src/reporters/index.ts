@@ -40,16 +40,20 @@ export function createReporter({
   source,
   db,
   status,
-  signal,
+  signal: parentSignal,
   schedule = BATHY_DEFAULT_SCHEDULE,
   url = BATHY_URL,
 }: ReporterOptions) {
+  const lifetime = new AbortController();
+  const signal = AbortSignal.any([parentSignal, lifetime.signal]);
   const reportLog = createReportLogger(db);
   let catchingUp =
     !reportLog.lastReport ||
     reportLog.lastReport.epochMilliseconds <=
       Temporal.Now.instant().subtract(BATHY_WINDOW_SIZE).epochMilliseconds;
-  let running = false;
+  let active: Promise<void> | undefined;
+  let stopping = false;
+  let flushing: Promise<void> | undefined;
   let retry: ReturnType<typeof setTimeout> | undefined;
   let retryAt: Temporal.Instant | undefined;
   const job = new CronJob(schedule, sync);
@@ -226,9 +230,16 @@ export function createReporter({
     });
   }
 
-  async function sync() {
-    if (signal.aborted || running) return;
-    running = true;
+  function sync(): Promise<void> {
+    if (signal.aborted || stopping) return Promise.resolve();
+    if (!active)
+      active = synchronize().finally(() => {
+        active = undefined;
+      });
+    return active;
+  }
+
+  async function synchronize() {
     clearTimeout(retry);
     retryAt = undefined;
     try {
@@ -247,14 +258,16 @@ export function createReporter({
       if (!signal.aborted) {
         status.error(err as Error, "reporter");
         const cause = err instanceof Error && err.cause ? err.cause : err;
-        if (!(cause instanceof SubmissionError && cause.permanent)) {
+        if (
+          !stopping &&
+          !(cause instanceof SubmissionError && cause.permanent)
+        ) {
           retryAt = Temporal.Now.instant().add({ minutes: 5 });
           retry = setTimeout(() => void sync(), 5 * 60_000);
         }
       }
     } finally {
-      running = false;
-      if (!signal.aborted) updateStatus();
+      if (!signal.aborted && !stopping) updateStatus();
     }
   }
 
@@ -265,7 +278,7 @@ export function createReporter({
   }
 
   function start() {
-    if (signal.aborted) return;
+    if (signal.aborted || stopping) return;
     job.start();
     updateStatus();
   }
@@ -274,7 +287,51 @@ export function createReporter({
     void sync().then(start);
   } else start();
 
-  return { report, reportInBatches };
+  /** Best effort on stop: no buffer delay, no concurrent upload, and no retry timer. */
+  function flush(): Promise<void> {
+    if (flushing) return flushing;
+    stopping = true;
+    stop();
+    const to = Temporal.Now.instant().round({
+      smallestUnit: "second",
+      roundingMode: "floor",
+    });
+    const timer = setTimeout(
+      () =>
+        lifetime.abort(new Error("Final report timed out after 15 seconds")),
+      15_000,
+    );
+    let onAbort!: () => void;
+    const aborted = new Promise<never>((_resolve, reject) => {
+      onAbort = () => reject(signal.reason);
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
+    });
+    flushing = Promise.race([
+      (async () => {
+        await active;
+        signal.throwIfAborted();
+        const timeframe = new Timeframe(
+          reportLog.lastReport ?? BATHY_EPOCH,
+          to,
+        );
+        if (
+          timeframe.duration.total("milliseconds") >
+          BATHY_WINDOW_SIZE.total("milliseconds")
+        )
+          await reportInBatches(timeframe);
+        else await report(timeframe);
+      })(),
+      aborted,
+    ]).finally(() => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      lifetime.abort("Reporter stopped");
+    });
+    return flushing;
+  }
+
+  return { report, reportInBatches, flush };
 }
 
 export function createReportLogger(db: DatabaseSync) {

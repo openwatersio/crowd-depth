@@ -122,8 +122,8 @@ outside `node_modules` and reference it with a `file:` dependency instead.
 By default the plugin reports to `http://localhost:3001` unless
 `NODE_ENV=production`; set `BATHY_URL` to override, and
 `BATHY_DEFAULT_SCHEDULE` (cron syntax) to change the reporting schedule.
-Each report leaves out the last `BATHY_REPORT_DELAY` seconds (default 300);
-set it to `0` to report soundings as soon as they're recorded.
+Scheduled reports leave out the last `BATHY_REPORT_DELAY` seconds (default 300);
+set it to `0` to report soundings as soon as they're recorded. The final stop flush bypasses that delay and reports only data already available; history written later below its checkpoint is not retried.
 
 `BATHY_REPORT_TIMEOUT` sets the deadline in seconds for each availability scan, history read, identity lookup, or GeoJSON generation (default 1800). Source deadlines bound asynchronous waiting; they do not interrupt synchronous SQLite reads or cancel provider queries, so set the deadline above expected query time. Network uploads retain native fetch/TCP timeouts without a total-duration limit; a peer that keeps a stalled send alive can block reporting until restart. Failed reports retry every five minutes; recognized service authentication, size, version, or User-Agent rejections wait for the normal schedule and require correction, while truncated uploads, proxy errors, and other failures retry. Rejected windows retain their checkpoints and keep later data queued.
 

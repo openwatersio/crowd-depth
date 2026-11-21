@@ -41,14 +41,14 @@ export const BATHY_WINDOW_SIZE = Temporal.Duration.from({
 });
 
 /**
- * How far behind now each report window ends. A sounding is stamped before it
+ * How far behind now each scheduled report window ends. A sounding is stamped before it
  * reaches storage, so a window ending at now could close before the sounding
  * lands, and the next one would start after it. Live data lands a few ticks
  * later. signalk-to-influxdb2 by default buffers writes for up to 60 s and
  * retries a failed write for up to 180 s; raise this if its write options are
  * raised. A sounding that reaches storage later than this after its
  * timestamp, such as one stamped by a device with a slow clock, is never
- * reported.
+ * reported. The best-effort final stop flush deliberately bypasses this delay.
  */
 const reportDelay = Number(process.env.BATHY_REPORT_DELAY ?? 300);
 // A negative delay would end reports in the future, past soundings not yet

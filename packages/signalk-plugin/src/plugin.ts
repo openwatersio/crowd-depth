@@ -11,8 +11,16 @@ import { createCollector } from "./collector.js";
 import { createStatus, Status } from "./status.js";
 import { startChartSafely } from "./chart.js";
 
+interface Session {
+  controller: AbortController;
+  reporting: AbortController;
+  anonymous: boolean;
+  reporter?: ReturnType<typeof createReporter>;
+  stopping?: Promise<void>;
+}
+
 export default function createPlugin(app: ServerAPI): Plugin {
-  let abortController: AbortController | undefined = undefined;
+  let current: Session | undefined;
 
   return {
     id: "crowd-depth",
@@ -24,9 +32,16 @@ export default function createPlugin(app: ServerAPI): Plugin {
       app.debug("Starting (ENV=%s)", ENV);
       const status = createStatus(app);
 
-      // A restart can replace abortController while the source still settles.
+      // Each start owns its lifetime, including an outstanding final upload.
       const controller = new AbortController();
-      abortController = controller;
+      current?.controller.abort("Replaced crowd-depth instance");
+      current?.reporting.abort("Replaced crowd-depth instance");
+      const session: Session = {
+        controller,
+        reporting: new AbortController(),
+        anonymous: config.sharing?.anonymous === true,
+      };
+      current = session;
       const db = createDB(join(app.getDataDirPath(), `bathymetry.sqlite`));
       const chart = startChartSafely({
         app,
@@ -43,14 +58,47 @@ export default function createPlugin(app: ServerAPI): Plugin {
         db,
         chart,
         status,
-        controller,
+        session,
       }).catch((err: unknown) => {
         if (!controller.signal.aborted) status.error(err as Error);
       });
     },
 
-    stop() {
-      abortController?.abort("Stopping crowd-depth plugin");
+    stop(options) {
+      const session = current;
+      if (!session) return Promise.resolve();
+      session.controller.abort("Stopping crowd-depth collection");
+      try {
+        const saved = app.readPluginOptions?.() as
+          { enabled?: boolean; configuration?: Partial<Config> } | undefined;
+        // Recheck even during a flush: another settings request can withdraw sharing.
+        const morePrivate =
+          saved?.configuration?.sharing?.anonymous && !session.anonymous;
+        if (
+          options?.reason === "disable" ||
+          saved?.enabled === false ||
+          morePrivate
+        )
+          session.reporting.abort("Sharing disabled or made anonymous");
+      } catch (error) {
+        session.reporting.abort("Could not read sharing settings");
+        app.error(`Final report skipped: ${error}`);
+      }
+      if (session.stopping) return session.stopping;
+      session.stopping = (async () => {
+        try {
+          if (!session.reporting.signal.aborted)
+            await session.reporter?.flush();
+        } catch (error) {
+          if (!session.reporting.signal.aborted)
+            app.error(
+              `Final report failed; unreported data remains queued: ${error}`,
+            );
+        } finally {
+          session.reporting.abort("Stopping crowd-depth reporter");
+        }
+      })();
+      return session.stopping;
     },
 
     uiSchema() {
@@ -69,7 +117,7 @@ interface SettleAndReportOptions {
   db: ReturnType<typeof createDB>;
   chart: ReturnType<typeof startChartSafely>;
   status: Status;
-  controller: AbortController;
+  session: Session;
 }
 
 async function settleAndReport({
@@ -78,8 +126,9 @@ async function settleAndReport({
   db,
   chart,
   status,
-  controller,
+  session,
 }: SettleAndReportOptions) {
+  const { controller } = session;
   const sqlite = createSqliteSource(app, db);
   const source = await settleSource({
     findHistory: () => createHistorySource(app, config),
@@ -97,16 +146,16 @@ async function settleAndReport({
     wait: BATHY_HISTORY_WAIT,
     signal: controller.signal,
   });
-  if (!source) return;
+  if (!source || controller.signal.aborted) return;
 
   void chart?.backfill(source);
 
-  createReporter({
+  session.reporter = createReporter({
     app,
     config,
     source,
     db,
     status,
-    signal: controller.signal,
+    signal: session.reporting.signal,
   });
 }
