@@ -148,6 +148,7 @@ def test_leaves_build_what_whole_tiles_build(env, tmp_path, monkeypatch):  # noq
     whole = tmp_path / "whole"
     assert tiles.build(env.store, whole, cores=2, memory_mb=8192) == 0
     split = tmp_path / "split"
+    bounds = {k: getattr(leaves, k) for k in ("SPLIT", "LEAF", "MIN_STEPS")}
     monkeypatch.setattr(leaves, "SPLIT", 60)
     monkeypatch.setattr(leaves, "LEAF", 25)
     # Leaf edges down to a step, so the tracks cross them.
@@ -169,7 +170,8 @@ def test_leaves_build_what_whole_tiles_build(env, tmp_path, monkeypatch):  # noq
     rebuilt = {k.split("/")[1] for k in again["leaf_cells"] if k.startswith(f"{SOUTH}/")}
     assert rebuilt and rebuilt < set(tiles.partitions(split)[SOUTH])
     assert all(not k.startswith(f"{NORTH}/") for k in again["leaf_cells"])
-    monkeypatch.undo()
+    for k, v in bounds.items():
+        monkeypatch.setattr(leaves, k, v)
     assert tiles.build(env.store, whole, cores=2, memory_mb=8192) == 0
     same_outputs(whole, split, SOUTH)
 

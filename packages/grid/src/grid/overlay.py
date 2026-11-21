@@ -34,7 +34,7 @@ from scipy.ndimage import (
     label,
 )
 
-from . import cells, surface
+from . import cells, deep, surface
 from .catalog import MIN_DEPTH_M, TIDE_CELL
 from .cells import GRID_VERSION
 from .definitions import PORTRAYAL
@@ -880,9 +880,10 @@ def write(features, path):
 
 
 def attribution(con):
-    """The tiles' credit line: the soundings' sources, plus the tide stations and surveyed
-    references the corrections used, whose licenses ask for credit."""
-    credits = ["Crowd Depth, NOAA DCDB crowdsourced bathymetry"]
+    """The tiles' credit line: the soundings' sources and GEBCO, which every cells build
+    checks deep water against, plus the tide stations and surveyed references the
+    corrections used, whose licenses ask for credit."""
+    credits = ["Crowd Depth, NOAA DCDB crowdsourced bathymetry", f"deep water from {deep.CREDIT}"]
     if con.execute("SELECT count(*) FROM lake.tide_levels").fetchone()[0]:
         credits.append("tides from Slackwater (https://openwaters.io/tides/slackwater/)")
         credits += [
