@@ -127,8 +127,8 @@ test("missing, invalid, or stale selected position never falls back to another r
 });
 
 test("a selected receiver's fix in the full model stands in for a silent subscription", () => {
-  // Signal K doesn't deliver a sourcePolicy "all" subscription to a path whose
-  // preferred bus already existed, so the subscription may never fire.
+  // Signal K 2.28 to 2.34 don't deliver a sourcePolicy "all" subscription to a
+  // path whose meta arrived first (SignalK/signalk-server#3159).
   const fix = (longitude: number, time = "2026-01-01T00:00:00Z") => ({
     value: { longitude, latitude: 2 },
     timestamp: time,

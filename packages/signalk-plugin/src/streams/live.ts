@@ -114,10 +114,10 @@ export function createLiveStream(app: ServerAPI, config: Config) {
               return;
             const depth = (value as number) + offset;
 
-            // Signal K never attaches a sourcePolicy "all" subscription to a path
-            // whose preferred bus was created first, as when the plugin starts
-            // before the first fix, so read the full model when the
-            // subscription hasn't delivered a current fix.
+            // Signal K 2.28 to 2.34 never attach a sourcePolicy "all" subscription
+            // to a path whose meta arrived before its first value
+            // (SignalK/signalk-server#3159), as after a restart, so read the full
+            // model when the subscription hasn't delivered a current fix.
             if (!position || isStale(position, timestamp, ttl))
               position = cachedPosition() ?? position;
             if (!position)
