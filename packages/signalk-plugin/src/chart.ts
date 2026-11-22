@@ -99,6 +99,9 @@ export function cellConfig(config: Config) {
       history: historySetting(config),
     }),
     depth: JSON.stringify({
+      sourceSelection: 1,
+      sounderSource: config.sounder.source || "",
+      positionSource: config.gnss.source || "",
       depthPath: `environment.depth.${config.path}`,
       depthOffset: depthReference(config).offset,
     }),

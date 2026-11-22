@@ -1,4 +1,11 @@
-import { Context, Delta, Path, ServerAPI } from "@signalk/server-api";
+import { sameSource } from "../device-info.js";
+import {
+  Context,
+  Delta,
+  Path,
+  ServerAPI,
+  getSourceId,
+} from "@signalk/server-api";
 import { PassThrough } from "stream";
 import { Config, depthReference } from "../config.js";
 import { Temporal } from "@js-temporal/polyfill";
@@ -21,31 +28,98 @@ export function createLiveStream(app: ServerAPI, config: Config) {
     unsubscribes.forEach((f) => f());
   });
 
+  type Position = {
+    value: { longitude: number; latitude: number };
+    timestamp: string;
+  };
+  /** The selected receiver's latest fix in the full model. */
+  const cachedPosition = (): Position | undefined => {
+    const cached = app.getSelfPath("navigation.position") as
+      | (Position & {
+          $source?: string;
+          values?: Record<string, Position>;
+        })
+      | undefined;
+    if (!config.gnss.source) return cached;
+    return sameSource(app, cached?.$source, config.gnss.source)
+      ? cached
+      : Object.entries(cached?.values ?? {}).find(([source]) =>
+          sameSource(app, source, config.gnss.source),
+        )?.[1];
+  };
+  let position = cachedPosition();
+  const explicitDepth = config.sounder.source;
+  const explicitGps = config.gnss.source;
+  // Separate subscriptions preserve server preference independently for each path.
+  app.subscriptionmanager.subscribe(
+    {
+      context: "vessels.self" as Context,
+      subscribe: [{ path: "navigation.position" as Path, policy: "instant" }],
+      sourcePolicy: explicitGps ? "all" : "preferred",
+    },
+    unsubscribes,
+    (error) => app.error(error as string),
+    (delta: Delta) => {
+      for (const update of delta.updates) {
+        const source =
+          update.$source ??
+          (update.source ? getSourceId(update.source) : undefined);
+        if (explicitGps && !sameSource(app, source, explicitGps)) continue;
+        if (!("values" in update)) continue;
+        for (const item of update.values) {
+          if (item.path !== "navigation.position") continue;
+          const value = item.value as Position["value"] | null;
+          position =
+            value &&
+            Number.isFinite(value.longitude) &&
+            Number.isFinite(value.latitude)
+              ? {
+                  value,
+                  timestamp:
+                    update.timestamp ?? Temporal.Now.instant().toString(),
+                }
+              : undefined;
+        }
+      }
+    },
+  );
+
   // Subscribe to data updates
   app.subscriptionmanager.subscribe(
     {
       context: "vessels.self" as Context,
       subscribe: [{ path, policy: "instant" }],
+      sourcePolicy: explicitDepth ? "all" : "preferred",
     },
     unsubscribes,
     (error) => app.error(error as string),
     (delta: Delta) => {
       delta.updates.forEach((update) => {
+        const source =
+          update.$source ??
+          (update.source ? getSourceId(update.source) : undefined);
+        if (explicitDepth && !sameSource(app, source, explicitDepth)) return;
         const timestamp = Temporal.Instant.from(
           update.timestamp ?? Temporal.Now.instant(),
         );
-        const position = app.getSelfPath("navigation.position") as
-          | {
-              value: { longitude: number; latitude: number };
-              timestamp: string;
-            }
-          | undefined;
 
         if ("values" in update) {
-          update.values.forEach(({ value }) => {
-            if (!value) return;
+          update.values.forEach(({ path: valuePath, value }) => {
+            if (
+              valuePath !== path ||
+              typeof value !== "number" ||
+              value === 0 ||
+              !Number.isFinite(value)
+            )
+              return;
             const depth = (value as number) + offset;
 
+            // Signal K 2.28 to 2.34 never attach a sourcePolicy "all" subscription
+            // to a path whose meta arrived before its first value
+            // (SignalK/signalk-server#3159), as after a restart, so read the full
+            // model when the subscription hasn't delivered a current fix.
+            if (!position || isStale(position, timestamp, ttl))
+              position = cachedPosition() ?? position;
             if (!position)
               return app.debug("No position data, ignoring depth data");
             if (isStale(position, timestamp, ttl))

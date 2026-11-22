@@ -73,9 +73,8 @@ export function historySpan(config: Config): Temporal.Duration | undefined {
 
 /**
  * The source Signal K currently prioritizes for a path (its `$source`) plus the
- * full list of sources that have reported it. Used to default and populate the
- * source selectors so soundings stay pinned to one sensor rather than mixing
- * antenna offsets from multiple GPS sources.
+ * full list of sources that have reported it. Used for device choices and
+ * identity hints; an empty configured source follows server preference.
  */
 export function sourcesFor(app: ServerAPI, path: string) {
   const node = app.getSelfPath(path) as
@@ -113,9 +112,8 @@ function sourceLabel(app: ServerAPI, sourceRef: string): string {
 
 /**
  * Schema for a source selector. Always an enum, with friendly device names via
- * enumNames. When nothing has reported the path yet the enum is empty and the
- * description warns that no data is available so the empty dropdown isn't a
- * mystery.
+ * enumNames. Preferred source is always available, including before sensors
+ * have reported any data.
  */
 function sourceSchema(
   app: ServerAPI,
@@ -126,12 +124,13 @@ function sourceSchema(
   return {
     type: "string",
     title,
-    enum: sources.available,
-    enumNames: sources.available.map((source) => sourceLabel(app, source)),
-    default: sources.selected,
-    description: sources.available.length
-      ? `The ${noun} source to record. Defaults to the source Signal K prioritizes; choose one when the vessel has more than one.`
-      : `No ${noun} data available — reload this page once it is being received.`,
+    enum: ["", ...sources.available],
+    enumNames: [
+      "Preferred source",
+      ...sources.available.map((source) => sourceLabel(app, source)),
+    ],
+    default: sources.selected ?? "",
+    description: `Follow Signal K's preferred ${noun} source, or select a specific device. For recorded data, Preferred source uses the history provider's default series.`,
   };
 }
 
@@ -204,7 +203,12 @@ function buildSchema(app: ServerAPI) {
     const sources = sourcesFor(app, path);
     if (configured && !sources.available.includes(configured))
       sources.available.unshift(configured);
-    return { ...sources, selected: configured || sources.selected };
+    return {
+      available: sources.available.filter(
+        (source) => source !== "derived-data" || source === configured,
+      ),
+      selected: configured ?? "",
+    };
   }
   const positionSources = choices("navigation.position", saved?.gnss?.source);
   const depthSources = choices(
@@ -417,8 +421,16 @@ function buildSchema(app: ServerAPI) {
 /** Hints only: opening the form must not save detected values as overrides. */
 export function uiSchema(app: ServerAPI) {
   const defaults = schema(app).properties;
-  const sounderSource = defaults.sounder.properties.source.default;
-  const gpsSource = defaults.gnss.properties.source.default;
+  const sounderSource = resolveSource(
+    app,
+    defaults.sounder.properties.source.default,
+    `environment.depth.${defaults.path.default}`,
+  );
+  const gpsSource = resolveSource(
+    app,
+    defaults.gnss.properties.source.default,
+    "navigation.position",
+  );
   const sounder = detectSensor(app, sounderSource);
   const gnss = detectSensor(app, gpsSource);
   const gpsd = gnss.make || gnss.model ? {} : cachedGpsdSensor(app, gpsSource);

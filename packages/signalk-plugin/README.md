@@ -60,8 +60,7 @@ take a few minutes to measure them. Where your vessel already reports
 
 ### Depth Sounder
 
-- **Depth source** — The sensor to record when more than one reports depth,
-  so soundings stay pinned to a single transducer.
+- **Depth source** — Follow Signal K’s preferred source (the default), or pin a specific transducer even when another is preferred.
 - **Offsets** — Transducer distance from the bow and from the centerline
   (positive to starboard), in meters. Both are required.
 - **Below the waterline** (optional) — Transducer depth below the waterline,
@@ -77,8 +76,7 @@ take a few minutes to measure them. Where your vessel already reports
 
 ### GPS Receiver
 
-- **Position source** — The receiver to record when more than one reports
-  position, so all soundings share one antenna location.
+- **Position source** — Follow Signal K’s preferred source (the default), including failover, or pin a specific receiver. Explicit selection never substitutes another receiver when it is missing or stale.
 - **Offsets** (required) — Antenna distance from the bow, from the centerline
   (positive to starboard), and above the waterline, in meters.
 - **Details** (optional) — Make and model.
@@ -165,6 +163,18 @@ The final attempt does not wait for a history provider to finish buffering. Read
 
 Disabling the plugin or changing sharing to anonymous skips the final flush and cancels reporting, so that action cannot trigger one last identified upload. A process crash or power loss cannot guarantee a final report. There are no configuration-history tables, data migrations, or backlog resets.
 
+## Source selection and recorded data
+
+Explicit selection requires Signal K 2.33 or newer, which passes per-source subscription policies to plugins.
+
+An empty source setting means **Preferred source**. Live depth and position each follow Signal K’s priority decisions independently. Selecting a device pins that input even when Signal K prefers a different one. Saved explicit selections remain visible when offline; `derived-data` is omitted from new manual choices but retained if previously saved. Preferred mode still honors the server’s chosen source, including a derived source if you prioritize it there.
+
+For history, Preferred source requests the provider’s default recorded series; it does not apply today’s live source to past data. In-process history providers receive explicit source filters. Legacy HTTP history does not support those filters through this adapter, so explicit selections stop reporting with a configuration error. The reporting checkpoint and existing data are retained. The provider continues recording independently, and the live chart continues; report attempts show the configuration error until it is resolved. Choose Preferred source for both sensors or switch to a source-aware History API provider before restarting. Older versions automatically saved concrete source IDs, so existing installations may need this configuration change on upgrade.
+
+Changing selections rebuilds history-backed chart cells. SQLite rows have no source identity, so the local chart starts afresh rather than displaying old readings as if they came from the newly selected device.
+
+Offsets remain the values configured in Crowd Depth. This change does not introduce per-device geometry or configuration history: use an explicit device when receivers or sounders have different installation offsets. Source-specific geometry is separate follow-up work. Settings restarts attempt the final flush described above; failed queued SQLite readings retain their recorded depths and use the next configuration’s report metadata.
+
 ## For developers
 
 - Data is reported every 6 hours, at midnight, 06:00, noon and 18:00 local
@@ -190,3 +200,9 @@ Disabling the plugin or changing sharing to anonymous skips the final flush and 
 See [CONTRIBUTING.md](https://github.com/openwatersio/crowd-depth/blob/main/CONTRIBUTING.md)
 for repo layout, the local Signal K `npm link` workflow, testing, and
 releases.
+
+### Source-selection upgrade notes
+
+Previously saved source IDs remain explicit selections; older versions sometimes filled those IDs automatically and ignored them during live collection. Choose **Preferred source** to retain automatic failover. A pinned device does not fall back to a different receiver when absent. Use stable CAN-name IDs for devices whose bus addresses can change. Live matching accepts known address/CAN-name aliases; history filters use the exact stored source reference and cannot reconstruct old bus-address assignments.
+
+On first upgrade to these source-selection rules, the derived chart is rebuilt. History-backed layers refill from the provider; SQLite-backed layers start from the upgrade time because older rows have no source identity. Raw SQLite soundings and upload checkpoints are retained. Rolling back and forward also changes the chart fingerprint and can restart this local chart coverage. Preferred historical readings are the provider's default series, which may aggregate sources; use explicit selections with a source-aware provider when device-specific geometry is needed.

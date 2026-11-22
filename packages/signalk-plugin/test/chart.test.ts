@@ -853,3 +853,27 @@ test("cells a stopped backfill left without overviews get them on the next start
   });
   expect(store.cells(-76.3, 36.9, -76.1, 37.1, 6)).toHaveLength(1);
 });
+
+test("source-selection upgrade rebuilds derived cells and retains recorded soundings", () => {
+  const db = createDB(":memory:");
+  const store = createCellStore(db);
+  const previous = JSON.parse(cellConfig(config).depth);
+  delete previous.sourceSelection;
+  delete previous.sounderSource;
+  delete previous.positionSource;
+  store.setMeta("config_depth", JSON.stringify(previous));
+  store.addPasses([{ py: 1, px: 1, depth: 3, day: 1 }]);
+  db.prepare(
+    "INSERT INTO bathymetry(longitude, latitude, depth, timestamp) VALUES(0,0,3,1)",
+  ).run();
+  const { app: server } = serverApp();
+  const controller = new AbortController();
+  try {
+    startChart({ app: server, config, db, signal: controller.signal });
+    expect(store.cells(-1, -1, 1, 1)).toHaveLength(0);
+    expect(store.getMeta("depth_since")).toBeDefined();
+    expect(db.prepare("SELECT count(*) AS n FROM bathymetry").get()?.n).toBe(1);
+  } finally {
+    controller.abort();
+  }
+});
