@@ -12,6 +12,7 @@ type BathymetryRow = {
   depth: number;
   timestamp: number;
   heading: number | null;
+  position_origin: string | null;
 };
 
 export function createSqliteSource(
@@ -108,15 +109,27 @@ export function createSqliteReader(
         to: to.epochMilliseconds,
       }) as BathymetryRow[];
 
-      rows.forEach(({ longitude, latitude, depth, timestamp, heading }) => {
-        this.push({
+      rows.forEach(
+        ({
           longitude,
           latitude,
           depth,
-          timestamp: Temporal.Instant.fromEpochMilliseconds(timestamp),
+          timestamp,
           heading,
-        } as BathymetryData);
-      });
+          position_origin,
+        }) => {
+          this.push({
+            longitude,
+            latitude,
+            depth,
+            timestamp: Temporal.Instant.fromEpochMilliseconds(timestamp),
+            heading,
+            ...(position_origin === null
+              ? {}
+              : { positionOrigin: JSON.parse(position_origin) }),
+          } as BathymetryData);
+        },
+      );
 
       offset += rows.length;
 
@@ -133,8 +146,8 @@ export function createSqliteWriter(db: DatabaseSync) {
     construct(callback) {
       try {
         stmt = db.prepare(`
-          INSERT INTO bathymetry(longitude, latitude, depth, timestamp, heading)
-          VALUES(:longitude, :latitude, :depth, :timestamp, :heading)
+          INSERT INTO bathymetry(longitude, latitude, depth, timestamp, heading, position_origin)
+          VALUES(:longitude, :latitude, :depth, :timestamp, :heading, :position_origin)
         `);
 
         callback();
@@ -154,6 +167,10 @@ export function createSqliteWriter(db: DatabaseSync) {
             depth: data.depth,
             timestamp: data.timestamp.epochMilliseconds,
             heading: data.heading ?? null,
+            position_origin:
+              data.positionOrigin === undefined
+                ? null
+                : JSON.stringify(data.positionOrigin),
           });
           callback();
         } catch (err) {

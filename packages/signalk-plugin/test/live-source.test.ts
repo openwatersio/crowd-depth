@@ -48,7 +48,7 @@ function setup(depth = "", gps = "") {
       ],
     } as Delta);
   };
-  return { stream, subscriptions, send, unsubscribe };
+  return { app, stream, subscriptions, send, unsubscribe };
 }
 const position = "navigation.position";
 const depth = "environment.depth.belowTransducer";
@@ -147,4 +147,34 @@ test("source choices invalidate chart fingerprints including SQLite history cuto
       sounder: { ...config.sounder, source: "depth.other" },
     }).depth,
   ).not.toBe(before.depth);
+});
+
+test("missing GPS geometry remains an error until the actual receiver recovers", async () => {
+  const { createStatus } = await import("../src/status.js");
+  const s = setup();
+  const settings = {
+    gnssSensors: [
+      { sensorId: "one", $source: "gps.one", fromBow: 2, fromCenter: 1 },
+    ],
+  };
+  Object.assign(s.app, {
+    config: { settings },
+    setPluginError: vi.fn(),
+    setPluginStatus: vi.fn(),
+  });
+  const status = createStatus(s.app);
+  s.send(position, "gps.other", { longitude: 1, latitude: 2 });
+  s.send(depth, "depth.one", 3);
+  expect(s.stream.read()).toBeNull();
+  status.set({ collecting: true });
+  expect(s.app.setPluginError).toHaveBeenLastCalledWith(
+    expect.stringContaining("GPS geometry unavailable"),
+  );
+  s.send(position, "gps.one", { longitude: 1, latitude: 2 });
+  s.send(depth, "depth.one", 3);
+  expect(s.stream.read().positionOrigin).toEqual({ x: -1, y: 2 });
+  expect(s.app.setPluginStatus).toHaveBeenLastCalledWith(
+    "Collecting bathymetry",
+  );
+  s.stream.destroy();
 });

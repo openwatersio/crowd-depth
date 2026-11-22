@@ -87,10 +87,19 @@ let routesRegistered = false;
  * and how far back they're filled from.
  * The statistic's k and σs aren't among them: they're applied as tiles are drawn, and
  * the tide is the backfill's to check (`TIDE_CONFIG_KEY`), once signalk-tides answers. */
-export function cellConfig(config: Config) {
+export function cellConfig(config: Config, app?: ServerAPI) {
   const { distance, dx, dy } = getOffsets(config);
   return {
     position: JSON.stringify({
+      geometryVersion: 1,
+      vesselLength: app?.getSelfPath("design.length.value"),
+      legacyGps: [
+        app?.getSelfPath("sensors.gps.fromCenter.value"),
+        app?.getSelfPath("sensors.gps.fromBow.value"),
+      ],
+      sounder: { x: config.sounder.x, y: config.sounder.y },
+      serverGeometry: (app as any)?.config?.settings?.gnssSensors,
+      correctionMode: (app as any)?.config?.settings?.gnssCorrection,
       transducer: distance > 0 ? { forward: dy, starboard: dx } : null,
       layer: LAYER_VERSION,
       qc: DEFINITIONS.qc,
@@ -135,7 +144,7 @@ export function startChart({
     routesRegistered = true;
   }
 
-  syncConfig(store, cellConfig(config), startedAt);
+  syncConfig(store, cellConfig(config, app), startedAt);
   // Before the live writer starts, so its marker doesn't hide the gap.
   addPendingBackfill(store, startedAt, historySpan(config));
 
@@ -329,7 +338,7 @@ export function startChartSafely(options: Parameters<typeof startChart>[0]) {
     if (options.config.chart?.show === false) {
       syncConfig(
         createCellStore(options.db),
-        cellConfig(options.config),
+        cellConfig(options.config, options.app),
         Temporal.Now.instant(),
       );
       return undefined;

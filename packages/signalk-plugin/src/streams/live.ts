@@ -1,3 +1,5 @@
+import { getStatus } from "../status.js";
+import { gnssOrigin } from "../gnss-offsets.js";
 import { sameSource } from "../device-info.js";
 import {
   Context,
@@ -14,8 +16,10 @@ import { bowBearing } from "./transforms.js";
 
 /** Maximum age of last position fix for a depth to be saved */
 const ttl = 2000;
+let nextStream = 0;
 
 export function createLiveStream(app: ServerAPI, config: Config) {
+  const geometryError = `gps-geometry-${nextStream++}`;
   const path = `environment.depth.${config.path}` as Path;
   const { offset } = depthReference(config);
 
@@ -26,11 +30,13 @@ export function createLiveStream(app: ServerAPI, config: Config) {
   const stream = new PassThrough({ objectMode: true });
   stream.on("close", () => {
     unsubscribes.forEach((f) => f());
+    getStatus(app)?.clearError(geometryError);
   });
 
   type Position = {
     value: { longitude: number; latitude: number };
     timestamp: string;
+    source?: string;
   };
   const cached = app.getSelfPath("navigation.position") as
     | (Position & {
@@ -45,6 +51,9 @@ export function createLiveStream(app: ServerAPI, config: Config) {
           sameSource(app, source, config.gnss.source),
         )?.[1]
     : cached;
+  if (position)
+    position = { ...position, source: config.gnss.source || cached?.$source };
+  let missingGeometry = false;
   const explicitDepth = config.sounder.source;
   const explicitGps = config.gnss.source;
   // Separate subscriptions preserve server preference independently for each path.
@@ -72,6 +81,7 @@ export function createLiveStream(app: ServerAPI, config: Config) {
             Number.isFinite(value.latitude)
               ? {
                   value,
+                  source,
                   timestamp:
                     update.timestamp ?? Temporal.Now.instant().toString(),
                 }
@@ -128,12 +138,29 @@ export function createLiveStream(app: ServerAPI, config: Config) {
               ),
             });
 
+            const positionOrigin = gnssOrigin(app, config, position.source);
+            if (!positionOrigin) {
+              if (!missingGeometry) {
+                missingGeometry = true;
+                const message =
+                  "GPS geometry unavailable: configure this receiver in Signal K GNSS sensor settings. Use off/both correction mode; replace mode has no per-fix correction marker.";
+                const status = getStatus(app);
+                if (status) status.error(message, geometryError);
+                else app.setPluginError?.(message);
+              }
+              return;
+            }
+            if (missingGeometry) {
+              missingGeometry = false;
+              getStatus(app)?.clearError(geometryError);
+            }
             const data: BathymetryData = {
               longitude: position.value.longitude,
               latitude: position.value.latitude,
               depth,
               timestamp,
               heading,
+              positionOrigin,
             };
 
             app.debug(

@@ -24,7 +24,7 @@ export function toPrecision({ coordinates = 7, depth = 3, heading = 3 } = {}) {
 }
 
 export type SensorConfig = {
-  gnss: { x: number; y: number };
+  gnss: { x?: number; y?: number };
   sounder: { x: number; y: number };
 };
 
@@ -64,9 +64,17 @@ export function bowBearing({
  * that can't be corrected here is dropped rather than submitted as corrected.
  */
 export function correctForSensorPosition(config: SensorConfig) {
-  const { distance, bearing } = getOffsets(config);
-
-  return ({ heading, ...data }: BathymetryData): BathymetryData | null => {
+  return ({
+    heading,
+    positionOrigin,
+    ...data
+  }: BathymetryData): BathymetryData | null => {
+    if (positionOrigin === null) return null;
+    const { distance, bearing } = getOffsets({
+      ...config,
+      gnss: positionOrigin ?? config.gnss,
+    });
+    if (!Number.isFinite(distance)) return null;
     if (distance === 0) return data;
     if (!isFiniteNumber(heading)) return null;
 
@@ -89,11 +97,11 @@ function isFiniteNumber(value: unknown): value is number {
 export function getOffsets({ gnss, sounder }: SensorConfig) {
   // y offset is distance from bow as a positive number
   // e.g. gnss is 13m from bow, sounder is 3m from bow, so offset is 10m
-  const dy = gnss.y - sounder.y;
+  const dy = (gnss.y ?? NaN) - sounder.y;
 
   // x offset is distance from centerline, -ve to port, +ve to starboard
   // e.g. gnss is -1.5m, sounder is -0.5m, so offset is 1m
-  const dx = sounder.x - gnss.x;
+  const dx = sounder.x - (gnss.x ?? NaN);
 
   return {
     dx,
