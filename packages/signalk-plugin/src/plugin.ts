@@ -1,3 +1,4 @@
+import { resolveDepthConfig } from "./depth-path.js";
 import { ServerAPI, Plugin } from "@signalk/server-api";
 import { schema, uiSchema, Config } from "./config.js";
 import { createReporter } from "./reporters/index.js";
@@ -43,23 +44,30 @@ export default function createPlugin(app: ServerAPI): Plugin {
       };
       current = session;
       const db = createDB(join(app.getDataDirPath(), `bathymetry.sqlite`));
-      const chart = startChartSafely({
-        app,
-        config,
-        db,
-        signal: controller.signal,
-      });
-
-      // Settling can wait up to BATHY_HISTORY_WAIT for a history provider, so
-      // it runs in the background and start() doesn't hold up the server.
-      void settleAndReport({
-        app,
-        config,
-        db,
-        chart,
-        status,
-        session,
-      }).catch((err: unknown) => {
+      // Resolve the sounder's path before any reader or chart captures its reference.
+      void (async () => {
+        const resolved = await resolveDepthConfig(
+          app,
+          config,
+          controller.signal,
+          db,
+        );
+        if (!resolved || controller.signal.aborted) return;
+        const chart = startChartSafely({
+          app,
+          config: resolved,
+          db,
+          signal: controller.signal,
+        });
+        await settleAndReport({
+          app,
+          config: resolved,
+          db,
+          chart,
+          status,
+          session,
+        });
+      })().catch((err: unknown) => {
         if (!controller.signal.aborted) status.error(err as Error);
       });
     },

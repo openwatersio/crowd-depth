@@ -1,4 +1,4 @@
-import { detectSensor, sourceDevice } from "./device-info.js";
+import { detectSensor, sourceDevice, sameSource } from "./device-info.js";
 import { cachedGpsdSensor } from "./gpsd-info.js";
 import { ServerAPI } from "@signalk/server-api";
 import { Temporal } from "@js-temporal/polyfill";
@@ -6,6 +6,7 @@ import { DEFAULT_OWN_STYLE, TINTS, type Tint } from "./tiles/style.js";
 
 // Can this be inferred from the JSON schema?
 export type Config = {
+  /** Internal resolved path; older saved settings may still contain it. */
   path: (typeof DepthPaths)[number];
   sounder: {
     x: number;
@@ -136,8 +137,8 @@ function sourceSchema(
 }
 
 export const DepthPaths = [
-  "belowSurface",
   "belowTransducer",
+  "belowSurface",
   "belowKeel",
 ] as const;
 
@@ -195,12 +196,6 @@ function buildSchema(app: ServerAPI) {
   const saved = (
     app.readPluginOptions?.() as { configuration?: Partial<Config> } | undefined
   )?.configuration;
-  const defaultPath =
-    saved?.path ??
-    DepthPaths.find(
-      (path) =>
-        app.getSelfPath(`environment.depth.${path}.value`) !== undefined,
-    );
   function choices(path: string, configured?: string) {
     const sources = sourcesFor(app, path);
     if (configured && !sources.available.includes(configured))
@@ -213,23 +208,23 @@ function buildSchema(app: ServerAPI) {
     };
   }
   const positionSources = choices("navigation.position", saved?.gnss?.source);
-  const depthSources = choices(
-    `environment.depth.${defaultPath}`,
-    saved?.sounder?.source,
-  );
+  const depthSources = {
+    available: [
+      ...new Set(
+        DepthPaths.flatMap(
+          (path) =>
+            choices(`environment.depth.${path}`, saved?.sounder?.source)
+              .available,
+        ),
+      ),
+    ],
+    selected: saved?.sounder?.source ?? "",
+  };
   return {
     type: "object",
     description:
       "By enabling this plugin, you agree to share your soundings and your vessel and sensor details, and you dedicate them to the public domain under Creative Commons CC0 1.0 Universal.",
     properties: {
-      path: {
-        type: "string",
-        title: "Path",
-        description:
-          "The path to the depth data. (e.g. environment.depth.belowTransducer)",
-        enum: DepthPaths,
-        default: defaultPath,
-      },
       sounder: {
         type: "object",
         title: "Depth Sounder",
@@ -411,13 +406,29 @@ function buildSchema(app: ServerAPI) {
   };
 }
 
+export const resolvedDepthPaths = new WeakMap<
+  ServerAPI,
+  { source: string; path: Config["path"] }
+>();
+
 /** Hints only: opening the form must not save detected values as overrides. */
 export function uiSchema(app: ServerAPI) {
   const defaults = schema(app).properties;
+  const selected = defaults.sounder.properties.source.default || "";
+  const resolved = resolvedDepthPaths.get(app);
+  const saved = (
+    app.readPluginOptions?.() as { configuration?: Partial<Config> } | undefined
+  )?.configuration?.path;
+  const path =
+    resolved?.source === selected
+      ? resolved.path
+      : saved && DepthPaths.includes(saved)
+        ? saved
+        : selectDepthPath(app, selected);
   const sounderSource = resolveSource(
     app,
-    defaults.sounder.properties.source.default,
-    `environment.depth.${defaults.path.default}`,
+    selected,
+    `environment.depth.${path ?? "belowTransducer"}`,
   );
   const gpsSource = resolveSource(
     app,
@@ -437,4 +448,29 @@ export function uiSchema(app: ServerAPI) {
       model: { "ui:placeholder": gnss.model ?? "" },
     },
   };
+}
+
+/** Choose a path published by this sounder, without pinning Preferred source. */
+export function selectDepthPath(app: ServerAPI, source?: string) {
+  return DepthPaths.find((path) => {
+    type Sample = { value?: unknown; timestamp?: string };
+    const full = `environment.depth.${path}`;
+    const node = app.getSelfPath(full) as
+      | (Sample & { $source?: string; values?: Record<string, Sample> })
+      | undefined;
+    const sample =
+      !source || sameSource(app, node?.$source, source)
+        ? node
+        : Object.entries(node?.values ?? {}).find(([ref]) =>
+            sameSource(app, ref, source),
+          )?.[1];
+    const value = sample?.value;
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0)
+      return false;
+    if (sample?.timestamp) {
+      const age = Date.now() - Date.parse(sample.timestamp);
+      if (!Number.isFinite(age) || age < -2000 || age > 30_000) return false;
+    }
+    return true;
+  });
 }

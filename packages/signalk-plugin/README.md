@@ -52,13 +52,9 @@ Accurate offsets are what turn raw sounder readings into chart-quality data —
 take a few minutes to measure them. Where your vessel already reports
 `sensors.*` and `design.*` paths, the plugin pre-fills the defaults.
 
-### Depth
-
-- **Path** — Which depth path to report (`belowSurface`, `belowTransducer`,
-  or `belowKeel`), depending on what your instruments provide. Defaults to
-  the first one with data.
-
 ### Depth Sounder
+
+The depth path is detected for the selected source: `belowTransducer`, then `belowSurface`, then `belowKeel`. The resolved path is remembered locally for that selection, including across offline restarts, so conversion and report reference agree. Changing the selected source detects a new path. New offline setups can use paths recorded by a History API provider; otherwise collection waits for depth data. Existing saved paths are retained on upgrade to preserve the reference of queued data. The source list includes devices from all depth paths.
 
 - **Depth source** — Follow Signal K’s preferred source (the default), or pin a specific transducer even when another is preferred.
 - **Offsets** — Transducer distance from the bow and from the centerline
@@ -88,7 +84,7 @@ source. GPSD’s Garmin binary drivers can also identify Garmin receivers; a GPS
 name is not assumed to be a retail model or receiver manufacturer. In particular, a u-blox driver identifies a chipset, so its manufacturer hint stays blank. Unknown or ambiguous devices leave the
 hints blank. Detection uses the configured GPSD endpoint. Lookups run in the background with a two-second timeout; opening the plugin list never waits for GPSD. Results, including failures, are cached for one minute. The first load or a refresh can show blank hints; reload after the lookup completes. Concurrent requests share one lookup.
 
-These placeholders do not save an override or change existing settings. Reports use detected identities unless a manual entry identifies different equipment. Hints describe the saved source and depth path; unsaved edits do not refresh them. Save and reload the form to update hints. Report-time detection cannot reconstruct historical sensor changes.
+These placeholders do not save an override or change existing settings. Reports use detected identities unless a manual entry identifies different equipment. Hints describe the saved source and resolved depth path; unsaved edits do not refresh them. Save and reload the form to update hints. Report-time detection cannot reconstruct historical sensor changes.
 
 ### Data Sharing
 
@@ -141,7 +137,7 @@ The layer appears in the chartplotter's chart list as **My soundings**, with its
 - Changing your **depth sounder or GPS position** on the boat, or a plugin update that changes the quality checks, the tide reduction or the size of a spot, rebuilds the layer from recorded soundings as far back as **Fill the layer from** says, so old soundings don't sit beside new ones in the wrong place.
 - **Installing, removing or turning on or off signalk-tides**, or turning on Signal K's read-only access it needs, rebuilds the layer the same way at the next start, reduced for tide or not.
 - Changing **Fill the layer from** rebuilds it from the new span.
-- Changing the **depth path, transducer depth or, for depth below the keel, the draft** rebuilds it from a History API provider if you have one. Without one, the layer starts afresh from that point, because the plugin's own log stores depths with the old offset.
+- Changing the **source’s resolved depth path, transducer depth or, for depth below the keel, the draft** rebuilds it from a History API provider if you have one. Without one, the layer starts afresh from that point, because the plugin's own log stores depths with the old offset.
 
 ### Who can see it
 
@@ -228,3 +224,17 @@ Rollback requires restoring the previous plugin configuration and database backu
 Signal K `fromCenter` is positive to port; the plugin converts it to its starboard-positive coordinate convention. Unlinked GNSS rows allow saved plugin offsets as a fallback, but cannot revive stale server-wide GPS paths. When static antenna position is unknown the report omits that field while keeping `positionOffsetsDocumented` true because the submitted positions have been corrected, following the optional GNSS position in the [CSB 3.1 schema](../../docs/CSB-schema-3_1_0-2024-04.json). Legacy rows without a recorded origin require the old saved x/y; if those fields have already been removed, those rows cannot be positioned and are skipped.
 
 Upgrading changes the chart geometry fingerprint and rebuilds derived cells. With a history provider that omits receiver identity and configured server sensor rows, select an explicit receiver before relying on the refill; otherwise reports and backfill show a configuration error. Older servers without the GNSS sensor settings page need an upgrade to Signal K 2.33 for new multi-receiver configuration. A fresh installation cannot roll back to an older plugin without manually supplying the old x/y fields and an appropriate database.
+
+## Automatic depth path
+
+Automatic path selection stores its last source/path pair in the existing SQLite metadata table; it does not create configuration history. Discovery runs in the background, with at most one history query active per session, and accepts slow results. Startup waits for a path before starting the collector, reporter and chart. This also applies to an absent newly selected source; a stop during that wait has no resolved reporter to flush. The normal prior-session flush still runs before a settings restart. A valid path is kept for the selection rather than silently changing the reference of queued data. To redetect after changing an instrument’s published paths, select another available source, let its path resolve, then select the desired source again. If rolling back to a release with a Path field after creating a pathless configuration, reopen and save that older form before collecting. Explicit offline path discovery requires a source-aware history provider.
+
+The preference order applies to paths available at discovery, after a one-second settling window, not to paths that appear much later. Offline history detection cannot identify an unannounced hardware replacement; select its explicit source when old and new instruments have different paths. A failed final flush followed by a source/path change retains the existing documented limitation: queued SQLite depths keep their recorded values and the next report uses the new reference.
+
+When discovering a source with no saved path, history is ranked by its newest valid sounding, with transducer/surface/keel order only breaking ties. A coarse six-hour scan followed by a one-second scan of each newest bucket avoids reading every historic sounding. An explicit selection requires matching source identity in the response; providers that omit it must wait for live data. Failure for one path does not prevent checking the others. Saved paths remain stable for offline uploads. Rollback requires restoring the prior configuration and database together; switching sources can change the reference of any queued data left by a failed final flush.
+
+Unsuccessful history discovery retries with exponential backoff from one minute to six hours. A live result stops further discovery queries; an already-running provider query cannot be cancelled through the History API. Until a new source's path can be resolved, reporting and the chart wait as well as collection. An unchanged source with a saved path resumes queued offline reports immediately. Newly detected paths prefer belowTransducer, then belowSurface, then belowKeel; existing saved paths are preserved on initial upgrade.
+
+Preferred source is a per-path Signal K preference, not a boat-wide choice of transducer. On boats with several sounders publishing different paths, explicitly select the sounder whose installation offsets you entered. The history scan uses maximum depth to avoid one zero reading hiding an otherwise occupied bucket. Preferred-mode providers without column metadata use the requested single-column order; explicit-source discovery still requires source proof.
+
+A package-only downgrade followed by collecting more data and upgrading again is not supported: older releases cannot update the remembered depth reference. Restore the matching configuration and database backup when rolling back. History discovery expects start-labelled aggregation buckets; a provider with other bucket conventions may require live depth to complete initial setup. Repeated settings restarts can leave more than one uncancellable provider query running.
