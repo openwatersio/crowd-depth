@@ -6,7 +6,9 @@ import { ServerAPI } from "@signalk/server-api";
 import createPlugin from "../src/plugin.js";
 import { createReporter } from "../src/reporters/index.js";
 import { settleSource } from "../src/sources/settle.js";
-import { app as baseApp, config } from "./helper.js";
+import { app as baseApp, config as baseConfig } from "./helper.js";
+
+const config = { ...baseConfig, path: "belowTransducer" as const };
 
 vi.mock("../src/sources/settle.js", async (importOriginal) => {
   const original =
@@ -58,6 +60,24 @@ describe("plugin", () => {
     } catch {
       // Left in the OS temp directory.
     }
+  });
+
+  test("a pathless start can be stopped without creating a reporter", async () => {
+    const status = vi.fn();
+    app.setPluginStatus = status;
+    const before = vi.mocked(createReporter).mock.calls.length;
+    const plugin = createPlugin(app);
+    plugin.start(
+      { ...config, path: undefined } as unknown as typeof config,
+      () => {},
+    );
+    await vi.waitFor(() =>
+      expect(status).toHaveBeenCalledWith(
+        expect.stringContaining("Waiting for depth data"),
+      ),
+    );
+    await plugin.stop();
+    expect(vi.mocked(createReporter).mock.calls.length).toBe(before);
   });
 
   test("start() returns without waiting for a history provider", () => {
@@ -238,6 +258,7 @@ describe("plugin", () => {
     );
     const plugin = createPlugin(app);
     plugin.start(config, () => {});
+    await vi.waitFor(() => expect(vi.mocked(settleSource)).toHaveBeenCalled());
     plugin.stop();
     reject(new Error("boom"));
     await new Promise((resolve) => setTimeout(resolve, 10));

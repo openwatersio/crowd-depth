@@ -160,7 +160,7 @@ test("identity placeholders use saved selections and leave configuration fields 
   });
   expect(schema(app)).toEqual(before);
   expect(before.properties.gnss.required).toEqual(["z"]);
-  expect(before.properties).toHaveProperty("path");
+  expect(before.properties).not.toHaveProperty("path");
   expect(before.properties.gnss.properties.make).not.toHaveProperty("default");
 });
 
@@ -180,9 +180,9 @@ test("implicit sounder hints follow the saved depth path", async () => {
   const app = mockApp(
     {
       "environment.depth.belowSurface.value": 5,
-      "environment.depth.belowSurface": { $source: "bus.1" },
+      "environment.depth.belowSurface": { $source: "bus.1", value: 5 },
       "environment.depth.belowTransducer.value": 4,
-      "environment.depth.belowTransducer": { $source: "bus.2" },
+      "environment.depth.belowTransducer": { $source: "bus.2", value: 4 },
     },
     {
       bus: {
@@ -197,7 +197,7 @@ test("implicit sounder hints follow the saved depth path", async () => {
     >;
   expect(schema(app).properties.sounder.properties.source).toMatchObject({
     default: "",
-    enum: ["", "bus.2"],
+    enum: ["", "bus.2", "bus.1"],
   });
   expect((await uiSchema(app)).sounder).toEqual({
     make: { "ui:placeholder": "Transducer" },
@@ -240,7 +240,7 @@ test("saved sources remain selectable with no live data", async () => {
       },
     }) as ReturnType<ServerAPI["readPluginOptions"]>;
   const fields = schema(app).properties;
-  expect(fields.path.default).toBe("belowKeel");
+  expect(fields).not.toHaveProperty("path");
   expect(fields.sounder.properties.source).toMatchObject({
     default: "offline.depth",
     enum: ["", "offline.depth"],

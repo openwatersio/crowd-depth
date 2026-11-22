@@ -440,6 +440,43 @@ describe.skipIf(!RUN)("uploads from a real Signal K server", () => {
     expect(upload.features[0].geometry.coordinates[1]).toBeLessThan(-17.600005);
   });
 
+  test("detects the depth path when setup has no saved path", async () => {
+    const node = await startTrustedNode();
+    const { path: _path, ...settings } = config;
+    const sk = await startSignalK({
+      trustedNodeUrl: node.url,
+      enableAtBoot: true,
+      pluginConfig: settings as Config,
+    });
+    const deltas = [
+      {
+        context: "vessels.self",
+        updates: [
+          {
+            source: { label: "e2e" },
+            values: [
+              {
+                path: "navigation.position",
+                value: { latitude: -17.6, longitude: 177.43 },
+              },
+              { path: "navigation.headingTrue", value: HEADING },
+              { path: "environment.depth.belowSurface", value: 3.2 },
+            ],
+          },
+        ],
+      },
+    ];
+    await sk.sendDeltas(deltas);
+    await sk.waitForStatus(/Next report at/);
+    await sk.sendDeltas(deltas);
+    const upload = await node.next();
+    expectValidCsb(upload);
+    expect(upload.features[0].properties.depth).toBe(3.2);
+    expect(upload.properties.trustedNode.verticalReferenceOfDepth).toBe(
+      "Waterline",
+    );
+  });
+
   test("a settings restart flushes queued soundings with the previous sensor settings", async () => {
     const node = await startTrustedNode();
     const sk = await startSignalK({
