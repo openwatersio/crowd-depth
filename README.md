@@ -39,7 +39,7 @@ npm start      # run the API locally on http://localhost:3001
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the repo layout, per-package
 development workflows, testing, and how releases work.
 
-Sensor reports may include detected make, model, firmware and GPSD driver details. Identified sharing also includes reported NMEA device serial numbers and CAN NAMEs; anonymous sharing omits those identifiers. Manual identities override detection. See the [plugin documentation](packages/signalk-plugin/README.md#detected-sensor-details-in-reports).
+Sensor reports may include detected make, model, firmware and GPSD driver details. The NMEA serial-number and CAN NAME fields are omitted. Identified reports include free-form firmware strings, which can contain identifiers. Manual identities override detection. See the [plugin documentation](packages/signalk-plugin/README.md#detected-sensor-details-in-reports).
 
 ## Resources
 

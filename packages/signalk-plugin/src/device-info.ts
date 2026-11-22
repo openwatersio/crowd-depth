@@ -28,8 +28,6 @@ export type SensorInfo = {
     modelVersion?: string;
     softwareVersionCode?: string;
     productCode?: number;
-    modelSerialCode?: string;
-    canName?: string;
   };
   gpsd?: {
     driver?: string;
@@ -60,8 +58,6 @@ export function detectSensorDetails(
         : {
             modelVersion: text(device.modelVersion),
             softwareVersionCode: text(device.softwareVersionCode),
-            modelSerialCode: text(device.modelSerialCode),
-            canName: text(device.canName),
           }),
     },
   };

@@ -149,8 +149,6 @@ test("populated NMEA and GPSD extensions validate in serialized CSB reports", as
           modelVersion: "HW2",
           softwareVersionCode: "3.1",
           productCode: 42,
-          modelSerialCode: "serial",
-          canName: "name",
         },
       },
       gnss: {
