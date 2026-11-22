@@ -155,19 +155,29 @@ With Signal K security on, the layer needs a login or the server's read-only acc
 
 The plotter extension's provider and page serving are adapted from [signalk-livedepth-plugin](https://github.com/night199uk/signalk-livedepth-plugin) by Nick Roberts, under the MIT License. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
+## Final reports
+
+When a settings change restarts the plugin, it stops collecting and attempts a final report with the previous settings. It waits for any active upload, then flushes available data through the last complete second, with a 15-second timeout covering the active upload and final attempt. A failed or timed-out window retains its checkpoint and is retried after restart using the new settings. SQLite depths keep the offsets applied when collected, while report metadata uses the new settings; changing the depth reference can therefore mislabel that queued data. Completed batches keep their checkpoints. If the server accepted an upload but its response was lost or timed out, retrying can upload that batch again.
+
+The same attempt runs if the server calls the plugin’s stop hook during a graceful shutdown; Signal K 2.33 does not call that hook on shutdown. Correcting an erroneous offset also flushes with the previous value; the correction applies after restart. Disable the plugin before editing to skip that final upload, but this does not correct depths already stored in SQLite.
+
+The final attempt does not wait for a history provider to finish buffering. Readings that arrive later with timestamps before the successful flush checkpoint may be missed. Normal scheduled reports still use the history safety delay. If the plugin is still discovering its history source, it leaves the data queued rather than flushing an incomplete local fallback.
+
+Disabling the plugin or changing sharing to anonymous skips the final flush and cancels reporting, so that action cannot trigger one last identified upload. A process crash or power loss cannot guarantee a final report. There are no configuration-history tables, data migrations, or backlog resets.
+
 ## For developers
 
 - Data is reported every 6 hours, at midnight, 06:00, noon and 18:00 local
   time; set a cron-style schedule in the `BATHY_DEFAULT_SCHEDULE` environment
   variable to change it.
 - `BATHY_WINDOW_SIZE` sets the maximum hours in each batch (default 6, positive whole hours). It also sets the default cron hour step unless `BATHY_DEFAULT_SCHEDULE` is set; steps of 24 or more run daily. If an upload gets HTTP 413 (too large), lower it, for example to `1`, and restart the Signal K server to retry in smaller batches.
-- Failed reports retry every five minutes, resuming from the last successful report. Recognized service authentication, size, version, or User-Agent rejections wait for the normal schedule; other failures, including truncated uploads and proxy errors, retry. Rejected windows and later data stay queued until the underlying problem is corrected, such as an invalid identity or an oversized report; waiting for cron does not repair the cause. Reports that fit in one configured reporting window read their range directly; longer gaps, startup catch-up, and recovery after failure use batched reports, with availability scans covering at most a year at a time. Stopping the plugin cancels pending retries and in-flight uploads.
-- `BATHY_REPORT_TIMEOUT` sets the deadline in seconds for each availability scan, history read, identity lookup, or GeoJSON generation (default 1800). Raise it for slow history providers or storage. Network uploads retain native fetch/TCP timeout behavior without an additional total-duration limit. A peer that keeps a stalled send alive can block reporting until the plugin is restarted; stopping the plugin cancels the request. A timed-out operation retries from the saved checkpoint; if the server accepted an upload but its response was lost, retrying can submit duplicate data.
+- Failed reports retry every five minutes, resuming from the last successful report. Recognized service authentication, size, version, or User-Agent rejections wait for the normal schedule; other failures, including truncated uploads and proxy errors, retry. Rejected windows and later data stay queued until the underlying problem is corrected, such as an invalid identity or an oversized report; waiting for cron does not repair the cause. Reports that fit in one configured reporting window read their range directly; longer gaps, startup catch-up, and recovery after failure use batched reports, with availability scans covering at most a year at a time. Stopping cancels pending retries; a settings restart allows the final flush described above, while disabling sharing cancels reporting immediately.
+- `BATHY_REPORT_TIMEOUT` sets the deadline in seconds for each availability scan, history read, identity lookup, or GeoJSON generation (default 1800). Raise it for slow history providers or storage. Network uploads retain native fetch/TCP timeout behavior without an additional total-duration limit. A peer that keeps a stalled send alive can block reporting until the plugin is restarted; the stop flush cancels the request after its 15-second timeout. A timed-out operation retries from the saved checkpoint; if the server accepted an upload but its response was lost, retrying can submit duplicate data.
 - Source deadlines bound waiting for asynchronous history calls. They cannot interrupt synchronous SQLite reads or cancel in-process provider queries. Timed-out queries can continue in the background, including HTTP history fallback requests; late results are discarded. Set the deadline above the provider's expected query time to avoid overlapping retries of slow work.
 - For a persistent `Invalid token` or `Invalid uniqueID` rejection, stop Signal K, rename `identity.json` in Crowd Depth's data directory to an unused backup filename, and restart. The plugin creates a new vessel UUID and token; keep the backup as a record of the old identity.
 - `BATHY_HISTORY_WAIT` sets how many seconds to wait at startup for a History
   API provider (default 600).
-- `BATHY_REPORT_DELAY` sets how many seconds behind now each report ends, so
+- `BATHY_REPORT_DELAY` sets how many seconds behind now each scheduled report ends, so
   soundings still on their way to storage go in the next report (default 300).
   Soundings that reach storage later than this after their timestamp are not
   reported. The default covers signalk-to-influxdb2's default write buffering
