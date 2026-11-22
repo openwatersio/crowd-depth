@@ -49,7 +49,7 @@ function setup(depth = "", gps = "", model: () => unknown = () => undefined) {
       ],
     } as Delta);
   };
-  return { stream, subscriptions, send, unsubscribe };
+  return { app, stream, subscriptions, send, unsubscribe };
 }
 const position = "navigation.position";
 const depth = "environment.depth.belowTransducer";
@@ -173,3 +173,71 @@ test("source choices invalidate chart fingerprints including SQLite history cuto
     }).depth,
   ).not.toBe(before.depth);
 });
+
+test("missing GPS geometry remains an error until the actual receiver recovers", async () => {
+  const { createStatus } = await import("../src/status.js");
+  const s = setup();
+  const settings = {
+    gnssSensors: [
+      { sensorId: "one", $source: "gps.one", fromBow: 2, fromCenter: 1 },
+    ],
+  };
+  Object.assign(s.app, {
+    config: { settings },
+    setPluginError: vi.fn(),
+    setPluginStatus: vi.fn(),
+  });
+  const status = createStatus(s.app);
+  s.send(position, "gps.other", { longitude: 1, latitude: 2 });
+  s.send(depth, "depth.one", 3);
+  expect(s.stream.read()).toBeNull();
+  status.set({ collecting: true });
+  expect(s.app.setPluginError).toHaveBeenLastCalledWith(
+    expect.stringContaining("GPS geometry unavailable"),
+  );
+  s.send(position, "gps.one", { longitude: 1, latitude: 2 });
+  s.send(depth, "depth.one", 3);
+  expect(s.stream.read().positionOrigin).toEqual({ x: -1, y: 2 });
+  expect(s.app.setPluginStatus).toHaveBeenLastCalledWith(
+    "Collecting bathymetry",
+  );
+  s.stream.destroy();
+});
+
+test.each(["", "gps.chosen"])(
+  "model fallback retains receiver geometry for selection %s",
+  (selection) => {
+    let model: unknown;
+    const s = setup("", selection, () => model);
+    Object.assign(s.app, {
+      config: {
+        settings: {
+          gnssSensors: [
+            {
+              sensorId: "chosen",
+              $source: "gps.chosen",
+              fromBow: 4,
+              fromCenter: 1,
+            },
+            {
+              sensorId: "other",
+              $source: "gps.other",
+              fromBow: 8,
+              fromCenter: 2,
+            },
+          ],
+        },
+      },
+    });
+    const fix = {
+      value: { longitude: 1, latitude: 2 },
+      timestamp: "2026-01-01T00:00:00Z",
+    };
+    model = { ...fix, $source: "gps.other", values: { "gps.chosen": fix } };
+    s.send(depth, "depth.one", 3);
+    expect(s.stream.read().positionOrigin).toEqual(
+      selection ? { x: -1, y: 4 } : { x: -2, y: 8 },
+    );
+    s.stream.destroy();
+  },
+);

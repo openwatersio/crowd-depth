@@ -135,6 +135,12 @@ interface ServerOptions {
   gpsdPort?: number;
   schedule?: string;
   pluginConfig?: Config;
+  gnssSensors?: {
+    sensorId: string;
+    $source: string;
+    fromBow: number;
+    fromCenter: number;
+  }[];
   priorityOverrides?: Record<string, { sourceRef: string; timeout: number }[]>;
 }
 
@@ -145,6 +151,7 @@ async function startSignalK({
   gpsdPort,
   schedule,
   pluginConfig = config,
+  gnssSensors,
   priorityOverrides,
 }: ServerOptions) {
   const configDir = await mkdtemp(join(tmpdir(), "crowd-depth-e2e-"));
@@ -176,6 +183,7 @@ async function startSignalK({
     join(configDir, "settings.json"),
     JSON.stringify({
       interfaces: {},
+      gnssSensors,
       pipedProviders: gpsdPort ? [provider] : [],
     }),
   );
@@ -398,6 +406,38 @@ describe.skipIf(!RUN)("uploads from a real Signal K server", () => {
       uploads.flatMap((u) => u.features.map((f) => f.properties.depth)),
     ).toEqual([3.7, 3.9, 4.1]);
     expectAtTransducer(uploads.flatMap((u) => u.features));
+  });
+
+  test("uses Signal K receiver geometry without plugin horizontal fields", async () => {
+    const node = await startTrustedNode();
+    const sk = await startSignalK({
+      trustedNodeUrl: node.url,
+      enableAtBoot: true,
+      pluginConfig: { ...config, gnss: { z: 2 } },
+      gnssSensors: [
+        { sensorId: "gps", $source: "e2e.XX", fromBow: 9, fromCenter: 1 },
+      ],
+    });
+    await sk.waitForStatus(/Next report at/);
+    const update = (values: object[]) => ({
+      context: "vessels.self",
+      updates: [{ source: { label: "e2e" }, values }],
+    });
+    await sk.sendDeltas([
+      update([
+        {
+          path: "navigation.position",
+          value: { latitude: -17.6, longitude: 177.43 },
+        },
+        { path: "navigation.headingTrue", value: HEADING },
+      ]),
+      update([{ path: "environment.depth.belowTransducer", value: 3.2 }]),
+    ]);
+    const upload = await node.next();
+    expectValidCsb(upload);
+    expectAtTransducer(upload.features);
+    // Heading east: the antenna is 1 m to port (north), so move south to the transducer.
+    expect(upload.features[0].geometry.coordinates[1]).toBeLessThan(-17.600005);
   });
 
   test("a settings restart flushes queued soundings with the previous sensor settings", async () => {

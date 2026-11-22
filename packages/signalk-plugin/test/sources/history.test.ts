@@ -59,6 +59,7 @@ test("pairs position, depth and heading, dropping rows without a position or dep
   expect(reader).toBeDefined();
   expect(await reader!.toArray()).toEqual([
     {
+      positionOrigin: { x: 1, y: 2 },
       timestamp: Temporal.Instant.from("2025-01-01T12:00:00.000Z"),
       longitude: 1,
       latitude: 2,
@@ -66,6 +67,7 @@ test("pairs position, depth and heading, dropping rows without a position or dep
       heading: 90,
     },
     {
+      positionOrigin: { x: 1, y: 2 },
       timestamp: Temporal.Instant.from("2025-01-01T12:00:03.000Z"),
       longitude: 5,
       latitude: 6,
@@ -112,6 +114,7 @@ test("maps columns by path when the provider reorders them", async () => {
 
   expect(await reader!.toArray()).toEqual([
     {
+      positionOrigin: { x: 1, y: 2 },
       timestamp: Temporal.Instant.from("2025-01-01T12:00:00.000Z"),
       longitude: 1,
       latitude: 2,
@@ -133,6 +136,7 @@ test("falls back to requested column order when the response omits values", asyn
 
   expect(await reader!.toArray()).toEqual([
     {
+      positionOrigin: { x: 1, y: 2 },
       timestamp: Temporal.Instant.from("2025-01-01T12:00:00.000Z"),
       longitude: 1,
       latitude: 2,

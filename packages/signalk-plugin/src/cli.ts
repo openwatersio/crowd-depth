@@ -20,6 +20,13 @@ export async function xyzToGeoJSON({
   input = process.stdin,
   output = process.stdout,
 } = {}) {
+  if (
+    !Number.isFinite(configuration.gnss?.x) ||
+    !Number.isFinite(configuration.gnss?.y)
+  )
+    throw new Error(
+      "XYZ conversion requires explicit gnss.x/y in crowd-depth.json: XYZ has no receiver identity or coordinate origin.",
+    );
   const data = chain([
     input,
     fromXyz(),

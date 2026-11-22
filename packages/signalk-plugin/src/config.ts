@@ -20,8 +20,9 @@ export type Config = {
     source?: string;
   };
   gnss: {
-    x: number;
-    y: number;
+    /** Legacy saved geometry; new installations configure it in Signal K. */
+    x?: number;
+    y?: number;
     z: number;
     make?: string;
     model?: string;
@@ -190,6 +191,7 @@ function withoutUndefined<T>(value: T): T {
 }
 
 function buildSchema(app: ServerAPI) {
+  const depthFromCenter = app.getSelfPath("sensors.depth.fromCenter.value");
   const saved = (
     app.readPluginOptions?.() as { configuration?: Partial<Config> } | undefined
   )?.configuration;
@@ -246,7 +248,10 @@ function buildSchema(app: ServerAPI) {
             type: "number",
             title: "Distance of the transducer from the center (meters)",
             description: "+ve to starboard, -ve to port",
-            default: app.getSelfPath("sensors.depth.fromCenter.value"),
+            default:
+              typeof depthFromCenter === "number"
+                ? -depthFromCenter
+                : undefined,
           },
           z: {
             type: "number",
@@ -288,7 +293,7 @@ function buildSchema(app: ServerAPI) {
       gnss: {
         type: "object",
         title: "GPS Receiver",
-        required: ["x", "y", "z"],
+        required: ["z"],
         properties: {
           source: sourceSchema(
             app,
@@ -296,18 +301,6 @@ function buildSchema(app: ServerAPI) {
             "position",
             positionSources,
           ),
-          y: {
-            type: "number",
-            title: "Distance of the antenna from the bow (meters)",
-            minimum: 0,
-            default: app.getSelfPath("sensors.gps.fromBow.value"),
-          },
-          x: {
-            type: "number",
-            title: "Distance of the antenna from the center (meters)",
-            description: "+ve to starboard, -ve to port",
-            default: app.getSelfPath("sensors.gps.fromCenter.value"),
-          },
           z: {
             type: "number",
             title: "Distance of the antenna above the waterline (meters)",

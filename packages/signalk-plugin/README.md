@@ -77,8 +77,8 @@ take a few minutes to measure them. Where your vessel already reports
 ### GPS Receiver
 
 - **Position source** — Follow Signal K’s preferred source (the default), including failover, or pin a specific receiver. Explicit selection never substitutes another receiver when it is missing or stale.
-- **Offsets** (required) — Antenna distance from the bow, from the centerline
-  (positive to starboard), and above the waterline, in meters.
+- **Antenna height** (required) — Height above the waterline, in meters.
+- **Horizontal offsets** — Set distance from the bow and centerline in Signal K’s GNSS sensor settings. These two fields are no longer duplicated here. Previously saved plugin offsets remain a fallback when no linked server sensors exist.
 - **Details** (optional) — Make and model.
 
 ### Detected sensor identities
@@ -159,7 +159,7 @@ The same attempt runs if the server calls the plugin’s stop hook during a grac
 
 The final attempt does not wait for a history provider to finish buffering. Readings that arrive later with timestamps before the successful flush checkpoint may be missed. Normal scheduled reports still use the history safety delay. If the plugin is still discovering its history source, it leaves the data queued rather than flushing an incomplete local fallback.
 
-Disabling the plugin or changing sharing to anonymous skips the final flush and cancels reporting, so that action cannot trigger one last identified upload. A process crash or power loss cannot guarantee a final report. There are no configuration-history tables, data migrations, or backlog resets.
+Disabling the plugin or changing sharing to anonymous skips the final flush and cancels reporting, so that action cannot trigger one last identified upload. A process crash or power loss cannot guarantee a final report. There are no configuration-history tables or backlog resets.
 
 ## Source selection and recorded data
 
@@ -171,7 +171,7 @@ For history, Preferred source requests the provider’s default recorded series;
 
 Changing selections rebuilds history-backed chart cells. SQLite rows have no source identity, so the local chart starts afresh rather than displaying old readings as if they came from the newly selected device.
 
-Offsets remain the values configured in Crowd Depth. This change does not introduce per-device geometry or configuration history: use an explicit device when receivers or sounders have different installation offsets. Source-specific geometry is separate follow-up work. Settings restarts attempt the final flush described above; failed queued SQLite readings retain their recorded depths and use the next configuration’s report metadata.
+Sounder offsets remain configured in Crowd Depth. GPS horizontal offsets come from Signal K 2.33 GNSS sensor settings; see below. Settings restarts attempt the final flush described above; failed queued SQLite readings retain their recorded depths and use the next configuration’s report metadata.
 
 ## For developers
 
@@ -212,3 +212,19 @@ Reports include the selected device’s detected identity. If a manual make or m
 These details describe devices at report creation, not a reconstruction of which hardware produced every historical sounding. Failed queued reports use the next configuration, as described under Final reports. The NMEA serial-number and CAN NAME fields are omitted from reports; CAN NAMEs still identify sources locally. Identified reports include free-form firmware strings, which can contain identifiers. Anonymous reports also omit free-form NMEA firmware/GPSD subtype strings; local device paths are never reported.
 
 Detection identifies the network device publishing the data, which may be a gateway or chartplotter rather than the physical transducer. Fill both manual make and model to identify equipment behind a gateway. Filling only a missing field supplements detection; the plugin cannot infer whether that describes a separate physical sensor. A missing detected field can be filled manually without discarding other details; a conflicting identity suppresses them. Failed GPSD queries are cached for a minute and reports proceed without those optional details.
+
+## Signal K GPS geometry
+
+Each live sounding uses the geometry of the receiver that supplied its position, including preferred-source failover. The coordinate origin is stored with new SQLite readings so later changes do not move them using another antenna’s offsets. Historical reads use the selected or provider-reported source with current server geometry; old provider records cannot reconstruct earlier installation changes. Legacy single-receiver `sensors.gps` offsets and saved plugin offsets remain supported.
+
+With Signal K correction **off**, the origin is the physical antenna. With **both**, a `.ccrp` source represents the vessel center and is shifted only from that center to the transducer. **Replace** mode cannot distinguish uncorrected fixes when heading was unavailable; affected readings are rejected with an actionable error. Missing geometry is not assumed to be zero: live readings are skipped with a configuration error, and history reports retain their checkpoint until corrected. Set source-specific offsets and use off/both mode. A preferred historical series without source identity may require an explicit receiver selection.
+
+The SQLite change adds one nullable column for each reading’s coordinate origin. Existing rows and reports remain, and older builds ignore the column. No configuration-history tables are introduced. Historical rows without an origin retain the legacy saved plugin geometry behavior. GNSS position metadata is omitted when no single static antenna location is configured; reported sounding positions are still corrected to the transducer.
+
+GPS geometry requires Signal K 2.33 sensor settings for new multi-receiver installations. After changing those settings, restart Crowd Depth to rebuild chart cells. Preferred history without receiver identity cannot use per-receiver geometry: use a source-aware provider with explicit selection, or the local recorder. Legacy HTTP history cannot support that configuration. Legacy plugin offsets are used only when no server sensor rows exist. A historical `.ccrp` series remains vessel-centre coordinates even after correction mode changes.
+
+Rollback requires restoring the previous plugin configuration and database backup together: older versions ignore recorded origins and require the removed x/y fields. New rows cannot safely be reinterpreted by old releases. The XYZ converter requires explicit legacy x/y geometry because XYZ carries no receiver identity. GNSS report position is included for an explicitly selected raw receiver or a legacy static configuration; preferred-mode reports may span receivers and omit that static position.
+
+Signal K `fromCenter` is positive to port; the plugin converts it to its starboard-positive coordinate convention. Unlinked GNSS rows allow saved plugin offsets as a fallback, but cannot revive stale server-wide GPS paths. When static antenna position is unknown the report omits that field while keeping `positionOffsetsDocumented` true because the submitted positions have been corrected, following the optional GNSS position in the [CSB 3.1 schema](../../docs/CSB-schema-3_1_0-2024-04.json). Legacy rows without a recorded origin require the old saved x/y; if those fields have already been removed, those rows cannot be positioned and are skipped.
+
+Upgrading changes the chart geometry fingerprint and rebuilds derived cells. With a history provider that omits receiver identity and configured server sensor rows, select an explicit receiver before relying on the refill; otherwise reports and backfill show a configuration error. Older servers without the GNSS sensor settings page need an upgrade to Signal K 2.33 for new multi-receiver configuration. A fresh installation cannot roll back to an older plugin without manually supplying the old x/y fields and an appropriate database.
