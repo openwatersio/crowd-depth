@@ -334,7 +334,7 @@ function buildSchema(app: ServerAPI) {
             default: false,
             title: "Share data anonymously",
             description:
-              "Share with a unique UUID instead of vessel name and MMSI. Free-form firmware identifiers are omitted. The NMEA serial-number and CAN NAME fields are omitted. Identified reports include free-form firmware strings, which can contain identifiers.",
+              "Share with a unique UUID instead of vessel name and MMSI.",
           },
         },
       },
