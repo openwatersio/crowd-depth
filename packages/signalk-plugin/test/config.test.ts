@@ -18,7 +18,7 @@ function positionEnumNames(app: ServerAPI): string[] {
       gnss: { properties: { source: { enumNames: string[] } } };
     };
   };
-  return s.properties.gnss.properties.source.enumNames;
+  return s.properties.gnss.properties.source.enumNames.slice(1);
 }
 
 test("labels sources keyed by numeric address", () => {
@@ -196,8 +196,8 @@ test("implicit sounder hints follow the saved depth path", async () => {
       ServerAPI["readPluginOptions"]
     >;
   expect(schema(app).properties.sounder.properties.source).toMatchObject({
-    default: "bus.2",
-    enum: ["bus.2"],
+    default: "",
+    enum: ["", "bus.2"],
   });
   expect((await uiSchema(app)).sounder).toEqual({
     make: { "ui:placeholder": "Transducer" },
@@ -243,11 +243,44 @@ test("saved sources remain selectable with no live data", async () => {
   expect(fields.path.default).toBe("belowKeel");
   expect(fields.sounder.properties.source).toMatchObject({
     default: "offline.depth",
-    enum: ["offline.depth"],
+    enum: ["", "offline.depth"],
   });
   expect(fields.gnss.properties.source).toMatchObject({
     default: "offline.gps",
-    enum: ["offline.gps"],
+    enum: ["", "offline.gps"],
   });
   expect(uiSchema(app)).not.toBeInstanceOf(Promise);
+});
+
+test("preferred is the default with or without live data and derived-data is not offered", () => {
+  for (const paths of [
+    {},
+    {
+      "navigation.position": {
+        $source: "gps.one",
+        values: { "gps.one": {}, "derived-data": {} },
+      },
+    },
+  ]) {
+    const source = schema(mockApp(paths, {})).properties.gnss.properties.source;
+    expect(source.default).toBe("");
+    expect(source.enum[0]).toBe("");
+    expect(source.enumNames[0]).toBe("Preferred source");
+    expect(source.enum).not.toContain("derived-data");
+  }
+});
+
+test("preserves a saved derived-data pin even when offline", () => {
+  const app = mockApp({}, {});
+  app.readPluginOptions = () =>
+    ({
+      configuration: {
+        path: "belowSurface",
+        sounder: { source: "derived-data" },
+      },
+    }) as ReturnType<ServerAPI["readPluginOptions"]>;
+  expect(schema(app).properties.sounder.properties.source).toMatchObject({
+    default: "derived-data",
+    enum: ["", "derived-data"],
+  });
 });

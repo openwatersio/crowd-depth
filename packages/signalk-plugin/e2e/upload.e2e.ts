@@ -134,6 +134,8 @@ interface ServerOptions {
   historyRows?: object[];
   gpsdPort?: number;
   schedule?: string;
+  pluginConfig?: Config;
+  priorityOverrides?: Record<string, { sourceRef: string; timeout: number }[]>;
 }
 
 async function startSignalK({
@@ -142,6 +144,8 @@ async function startSignalK({
   historyRows,
   gpsdPort,
   schedule,
+  pluginConfig = config,
+  priorityOverrides,
 }: ServerOptions) {
   const configDir = await mkdtemp(join(tmpdir(), "crowd-depth-e2e-"));
   cleanups.push(() => rm(configDir, { recursive: true, force: true }));
@@ -175,6 +179,12 @@ async function startSignalK({
       pipedProviders: gpsdPort ? [provider] : [],
     }),
   );
+  if (priorityOverrides) {
+    await writeFile(
+      join(configDir, "priorities.json"),
+      JSON.stringify({ priorityOverrides }),
+    );
+  }
   await writeFile(
     join(configDir, "defaults.json"),
     JSON.stringify({
@@ -193,7 +203,7 @@ async function startSignalK({
         enabled: true,
         configuration: gpsdPort
           ? { ...config, gnss: { ...config.gnss, source: `${provider.id}.GP` } }
-          : config,
+          : pluginConfig,
       }),
     );
   }
@@ -566,6 +576,72 @@ describe.skipIf(!RUN)("identity hints through the real admin API", () => {
       }
       await waitFor(async () => requests === 1, sk.log);
       expect(requests).toBe(1);
+    },
+  );
+});
+
+describe.skipIf(!RUN)("source selection through Signal K subscriptions", () => {
+  test.each(["", "chosen.XX"])(
+    "selected source %j respects preferred or explicit delivery",
+    async (selected) => {
+      const node = await startTrustedNode();
+      const priorities = [
+        { sourceRef: "preferred.XX", timeout: 60000 },
+        { sourceRef: "chosen.XX", timeout: 60000 },
+      ];
+      const sk = await startSignalK({
+        trustedNodeUrl: node.url,
+        enableAtBoot: true,
+        pluginConfig: {
+          ...config,
+          sounder: { ...config.sounder, x: 0, y: 0, z: 0, source: selected },
+          gnss: { ...config.gnss, x: 0, y: 0, source: selected },
+        },
+        priorityOverrides: {
+          "navigation.position": priorities,
+          "environment.depth.belowTransducer": priorities,
+        },
+      });
+      await sk.waitForStatus(/Next report at/);
+      const context = (await (
+        await fetch(`${sk.base}/signalk/v1/api/self`)
+      ).json()) as string;
+      const delta = (label: string, values: object[]) => ({
+        context,
+        updates: [{ $source: `${label}.XX`, source: { label }, values }],
+      });
+      await sk.sendDeltas([
+        delta("preferred", [
+          { path: "navigation.position", value: { longitude: 1, latitude: 2 } },
+        ]),
+        delta("chosen", [
+          {
+            path: "navigation.position",
+            value: { longitude: 10, latitude: 20 },
+          },
+        ]),
+        delta("preferred", [
+          { path: "environment.depth.belowTransducer", value: 90 },
+        ]),
+        delta("chosen", [
+          { path: "environment.depth.belowTransducer", value: 3 },
+        ]),
+      ]);
+      const current = (await (
+        await fetch(
+          `${sk.base}/signalk/v1/api/vessels/self/environment/depth/belowTransducer`,
+        )
+      ).json()) as { $source: string };
+      expect(current.$source).toBe("preferred.XX");
+      const uploads = await node.collect(1);
+      expect(
+        uploads.flatMap((u) => u.features.map((f) => f.properties.depth)),
+      ).toEqual([selected ? 3 : 90]);
+      expect(
+        uploads.flatMap((u) =>
+          u.features.map((f) => f.geometry.coordinates.slice(0, 2)),
+        ),
+      ).toEqual([selected ? [10, 20] : [1, 2]]);
     },
   );
 });

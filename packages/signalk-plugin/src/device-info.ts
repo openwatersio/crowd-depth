@@ -33,3 +33,17 @@ export function detectSensor(
     ? { make: text(device.manufacturerCode), model: text(device.modelId) }
     : {};
 }
+
+/** Address and CAN-name refs are aliases only within the same connection. */
+export function sameSource(
+  app: ServerAPI,
+  a: string | undefined,
+  b: string | undefined,
+) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (a.split(".")[0] !== b.split(".")[0]) return false;
+  const left = sourceDevice(app, a)?.canName;
+  const right = sourceDevice(app, b)?.canName;
+  return typeof left === "string" && left.length > 0 && left === right;
+}

@@ -1,4 +1,4 @@
-import { Config, depthReference, resolveSource } from "../config.js";
+import { Config, depthReference } from "../config.js";
 import { Readable } from "stream";
 import { BathymetryData, BathymetrySource, Timeframe } from "../types.js";
 import { Path, ServerAPI, SourceRef } from "@signalk/server-api";
@@ -30,21 +30,26 @@ export async function createHistorySource(
   const history = await getHistoryAPI({ app, ...options });
 
   if (!history) return;
+  function checkSourceSelection() {
+    if (
+      history?.supportsSourceSelection === false &&
+      (config.gnss?.source || config.sounder?.source)
+    ) {
+      throw new Error(
+        "Legacy HTTP history cannot filter sensor sources. Select Preferred source for both sensors or use a source-aware History API provider. Reporting is paused; recorded data and the reporting checkpoint are unchanged.",
+      );
+    }
+  }
 
   async function createReader({ from, to }: Timeframe) {
+    checkSourceSelection();
     app.debug("Reading history from %s to %s", from, to);
 
-    // Pin position and depth each to a single source (the configured one, else
-    // the source Signal K prioritizes). A vessel can carry more than one GPS,
-    // and their antenna offsets differ, so mixing sources would smear the
-    // soundings' locations.
+    // An unspecified source uses the provider's recorded default series, not
+    // whichever device happens to be preferred on the boat at upload time.
     const depthPath = `environment.depth.${config.path}`;
-    const positionSource = resolveSource(
-      app,
-      config.gnss?.source,
-      "navigation.position",
-    );
-    const depthSource = resolveSource(app, config.sounder?.source, depthPath);
+    const positionSource = config.gnss?.source;
+    const depthSource = config.sounder?.source;
     // The provider stores the depth as Signal K received it; apply the same
     // offset the live stream applies before writing, so both sources report
     // depths measured from the same reference.
@@ -159,6 +164,7 @@ export async function createHistorySource(
     timeframe: Timeframe,
     windowSize: Temporal.Duration,
   ) {
+    checkSourceSelection();
     const pathSpecs = [
       {
         path: ("environment.depth." + config.path) as Path,
@@ -261,7 +267,9 @@ export async function getHistoryAPI({
   // @ts-expect-error: app.config is not a public API
   port = Number(process.env.PORT) || app.config?.settings?.port || 3000,
   host = process.env.SIGNALK_HOST ?? `http://localhost:${port}/`,
-}: HistoryAPIOptions): Promise<HistoryApi | undefined> {
+}: HistoryAPIOptions): Promise<
+  (HistoryApi & { supportsSourceSelection?: boolean }) | undefined
+> {
   try {
     // Try to get the built-in history provider API first. It either returns the API or throws
     // an error if no provider is configured. It will also throw if the API is not available.
@@ -283,7 +291,7 @@ export async function getHistoryAPI({
     return;
   }
 
-  return { getValues, getContexts, getPaths };
+  return { getValues, getContexts, getPaths, supportsSourceSelection: false };
 
   async function get(path: string, params: URLSearchParamsOptions = {}) {
     const url = new URL(path, new URL("/signalk/v1/history/", host));
