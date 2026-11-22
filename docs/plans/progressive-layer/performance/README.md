@@ -390,3 +390,78 @@ Further profiling of portrayal and contention is required before deployment.
 
 [Sanitized measurements](pi-render-candidate.json) omit locations and individual
 tile IDs; they retain view timings, worker counts and HTTP probe measurements.
+
+## Contour allocation follow-up (November 22)
+
+`isolines` no longer allocates a complete marching-squares case table at every
+crossing. It reuses the corner-index scratch array and skips the raster scan
+when no contour levels are requested. Segment order and geometry are unchanged.
+`bench-contours.mjs` checks all 16 masks, wet/dry boundaries, unequal slopes and
+clipped coverage before alternating baseline/candidate timing runs.
+
+The sequential Pi kernel comparison measured medians of 31.63 → 18.90 ms for
+three levels and 42.81 → 25.13 ms for nine levels. Empty levels fall from 11.03 ms
+to below 0.01 ms. These are kernel timings, not whole-view speedups; see
+[raw measurements](contours-pi.json). A preliminary comparison overlapped another
+benchmark and is excluded from these timing results.
+
+The isolated three-worker candidate (sparse search plus contour changes) produced
+byte-identical output for 27 real tiles, including worker output, and 64 synthetic
+tiles. Five sequential viewport rounds gave warmed-worker cold-view times of
+492–903 ms, first populated tiles in 102–457 ms, and concurrent Signal K HTTP p95
+201 ms (41 requests, all 200; maximum 347 ms). The first round took 1.18–1.20 s per
+view. These are server tile timings, not browser paint timings; startup still
+misses the target. See [sanitized viewport measurements](pi-contour-viewports.json).
+
+Open Waters rounds 16 and 17 completed with Opus and Sonnet on isolated source
+snapshots. Both found the contour refactor equivalent. Round 16 noted weak
+benchmark coverage; the additional fixtures above were added and reviewed in
+round 17. Reviews were static; tests and Pi measurements were run separately.
+
+Round 17 also reviewed an attempted fix for preview starvation: the current query
+limits to 1,200 recent points before removing refined points, which can hide older
+unrefined evidence from both the display and the viewport scheduler. A regression
+test reproduced it. Moving the refinement filter into SQL fixes the result but
+adds a lookup per visible cell before sorting; both reviewers flagged this, and a
+100,000-point desktop comparison measured about 21 ms versus 18 ms. That candidate
+was withdrawn, not deployed or committed. A bounded spatial/temporal query remains
+a release blocker. A time index alone did not change SQLite's selected latitude
+index or remove the sort in the measured fixture.
+
+The reviewers' dropped-table concern does not occur in the mapped lifecycle (the
+receipt table is never dropped). Empty-history receipts deliberately preserve
+preview evidence: viewport refinement passes `includeEmpty=false` so it can retry
+that evidence. Neither should be changed to hide valid observations.
+
+A subsequent run of the installed renderer under the same workload ranged from
+512–1,291 ms for warmed-worker cold views, with HTTP p95 106 ms (43 requests;
+maximum 623 ms). The runs were sequential against a live server, not a controlled
+interleaved experiment; the candidate is not uniformly faster and these numbers
+must not be attributed solely to the contour change. The installed package has
+not been switched.
+
+### Confirmed stationary-thinning requirement
+
+The user confirmed a configurable **maximum retained-sample gap**, nominally
+1–6 minutes, with additional points retained for significant changes. This is
+not a minimum-spacing throttle. Prototype bounded-window Douglas–Peucker-style
+simplification only within verified stationary segments, with independent
+horizontal and depth tolerances. Compare depth to the retained endpoints at the
+original timestamp, not just distance to a spatial polyline; a vertical excursion
+at an unchanged position must survive.
+
+Force interval anchors before simplification, retain segment endpoints, and
+split at acquisition gaps, movement, source/reference/calibration changes and
+quality discontinuities. The interval guarantee applies only where observations
+exist; do not interpolate across an acquisition outage. Preserve uncorrected,
+pre-tide depth and provenance in the owned store. Anchor swing over sloping bottom
+must remain distinguishable from water-level variation.
+
+Start with a derived retained-point view while originals remain recoverable.
+Measure reconstruction error, extrema, timing/phase changes in synthetic tides,
+anchor swing and steps, along with storage bytes, CPU, WAL and host writes.
+Do not wire this into the collector or NOAA submission path before validating the
+information loss and defining aggregation weights; fewer retained points must not
+change the time-weighted meaning of an estimate. The current live stream already
+applies the configured depth-reference offset, so its output alone is insufficient
+for the proposed original-reference archive. No permanent thinning is enabled.

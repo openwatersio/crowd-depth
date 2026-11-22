@@ -638,6 +638,7 @@ export function isolines(
   levels: number[],
   tolerance: number,
 ): Map<number, Point[][]> {
+  if (!levels.length) return new Map();
   const { m, extent, depth } = t;
   const sorted = [...levels].sort((a, b) => a - b);
   const segments = new Map<number, [Point, Point][]>(
@@ -666,10 +667,14 @@ export function isolines(
     ] as Point;
   };
   const f = [0, 0, 0, 0];
+  const c = [0, 0, 0, 0];
   for (let y = 0; y < m - 1; y++) {
     for (let x = 0; x < m - 1; x++) {
       const i = y * m + x;
-      const c = [i, i + 1, i + m + 1, i + m];
+      c[0] = i;
+      c[1] = i + 1;
+      c[2] = i + m + 1;
+      c[3] = i + m;
       if (!(
         extent[c[0]] >= 0 &&
         extent[c[1]] >= 0 &&
@@ -699,29 +704,51 @@ export function isolines(
         const right = mid(f, 1, 2, x + 1, y, x + 1, y + 1);
         const bottom = mid(f, 3, 2, x, y + 1, x + 1, y + 1);
         const left = mid(f, 0, 3, x, y, x, y + 1);
-        const cases: Record<number, [Point, Point][]> = {
-          1: [[left, top]],
-          2: [[top, right]],
-          3: [[left, right]],
-          4: [[right, bottom]],
-          5: [
-            [left, top],
-            [right, bottom],
-          ],
-          6: [[top, bottom]],
-          7: [[left, bottom]],
-          8: [[bottom, left]],
-          9: [[bottom, top]],
-          10: [
-            [top, right],
-            [bottom, left],
-          ],
-          11: [[bottom, right]],
-          12: [[right, left]],
-          13: [[right, top]],
-          14: [[top, left]],
-        };
-        segments.get(level)!.push(...cases[code]);
+        const output = segments.get(level)!;
+        switch (code) {
+          case 1:
+            output.push([left, top]);
+            break;
+          case 2:
+            output.push([top, right]);
+            break;
+          case 3:
+            output.push([left, right]);
+            break;
+          case 4:
+            output.push([right, bottom]);
+            break;
+          case 5:
+            output.push([left, top], [right, bottom]);
+            break;
+          case 6:
+            output.push([top, bottom]);
+            break;
+          case 7:
+            output.push([left, bottom]);
+            break;
+          case 8:
+            output.push([bottom, left]);
+            break;
+          case 9:
+            output.push([bottom, top]);
+            break;
+          case 10:
+            output.push([top, right], [bottom, left]);
+            break;
+          case 11:
+            output.push([bottom, right]);
+            break;
+          case 12:
+            output.push([right, left]);
+            break;
+          case 13:
+            output.push([right, top]);
+            break;
+          case 14:
+            output.push([top, left]);
+            break;
+        }
       }
     }
   }

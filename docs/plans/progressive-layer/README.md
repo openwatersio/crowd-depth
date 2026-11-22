@@ -677,3 +677,20 @@ improved concurrent Signal K HTTP latency but slowed some full viewports. The
 worktree and active plugin retain their three-worker limit. No new candidate was
 activated. SSH is no longer the blocker; rendering and resource contention need
 more work. The user requested a draft PR of this state before further changes.
+
+## Contour follow-up and query review
+
+The next renderer change removes per-crossing contour case allocations. It passes
+64 synthetic tile byte comparisons and 27 real Pi tile comparisons. The Pi contour
+kernel is about 40% faster in sequential alternating runs; whole-view timings are
+mixed against the live server, and fresh-worker views still exceed the target.
+Details and raw measurements are in the performance notes. No active Docker
+package switch was made.
+
+Open Waters rounds 16–17 completed with Opus and Sonnet. The contour change has no
+outstanding findings. A separate preview-starvation fix reproduced the correctness
+bug but increased wide-viewport query work; both reviewers identified that cost,
+and the attempted fix was withdrawn. The existing cap-before-filter starvation
+remains a release blocker requiring bounded query work. Review limits and the
+confirmed maximum-gap stationary-thinning requirement are recorded in the
+performance notes. SSH was restored again for these Pi measurements.
