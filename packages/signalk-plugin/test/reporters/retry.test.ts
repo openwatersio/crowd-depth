@@ -419,14 +419,14 @@ test.each([
   { stage: "identify", code: 0, expected: 2, edge: false },
   { stage: "upload", code: 400, expected: 2, edge: false },
   { stage: "upload", code: 401, expected: 1, edge: false },
-  { stage: "upload", code: 413, expected: 1, edge: false },
+  { stage: "upload", code: 413, expected: 12, edge: false },
   { stage: "upload", code: 426, expected: 1, edge: false },
   { stage: "upload", code: 403, expected: 1, edge: false },
   { stage: "upload", code: 503, expected: 2, edge: false },
   { stage: "upload", code: 0, expected: 1, edge: false },
   { stage: "upload", code: 403, expected: 2, edge: true },
   { stage: "upload", code: 404, expected: 2, edge: true },
-  { stage: "upload", code: 413, expected: 1, edge: true },
+  { stage: "upload", code: 413, expected: 12, edge: true },
   { stage: "upload", code: 408, expected: 2, edge: false },
   { stage: "upload", code: 429, expected: 2, edge: false },
 ])(
@@ -480,7 +480,7 @@ test.each([
     );
     try {
       await vi.advanceTimersByTimeAsync(1000);
-      await vi.waitFor(() => expect(requests).toBe(1));
+      await vi.waitFor(() => expect(requests).toBe(code === 413 ? 12 : 1));
       if (!code) {
         await vi.advanceTimersByTimeAsync(BATHY_REPORT_TIMEOUT);
         expect(aborted).toBe(stage === "identify" ? 1 : 0);

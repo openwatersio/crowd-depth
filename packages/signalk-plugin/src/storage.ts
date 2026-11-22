@@ -133,6 +133,10 @@ export function createDB(filename: string): DatabaseSync {
     () => {
       db.exec("ALTER TABLE bathymetry ADD COLUMN position_origin TEXT");
     },
+    () => {
+      db.exec(`ALTER TABLE bathymetry ADD COLUMN gnss_quality TEXT;
+        CREATE TABLE gnss_samples(timestamp INTEGER NOT NULL, longitude REAL NOT NULL, latitude REAL NOT NULL, source TEXT NOT NULL, quality TEXT NOT NULL, PRIMARY KEY(timestamp, source));`);
+    },
   ]);
 
   return db;

@@ -13,6 +13,7 @@ type BathymetryRow = {
   timestamp: number;
   heading: number | null;
   position_origin: string | null;
+  gnss_quality: string | null;
 };
 
 export function createSqliteSource(
@@ -117,6 +118,7 @@ export function createSqliteReader(
           timestamp,
           heading,
           position_origin,
+          gnss_quality,
         }) => {
           this.push({
             longitude,
@@ -124,6 +126,7 @@ export function createSqliteReader(
             depth,
             timestamp: Temporal.Instant.fromEpochMilliseconds(timestamp),
             heading,
+            ...(gnss_quality ? { gnss: JSON.parse(gnss_quality) } : {}),
             ...(position_origin === null
               ? {}
               : { positionOrigin: JSON.parse(position_origin) }),
@@ -146,8 +149,8 @@ export function createSqliteWriter(db: DatabaseSync) {
     construct(callback) {
       try {
         stmt = db.prepare(`
-          INSERT INTO bathymetry(longitude, latitude, depth, timestamp, heading, position_origin)
-          VALUES(:longitude, :latitude, :depth, :timestamp, :heading, :position_origin)
+          INSERT INTO bathymetry(longitude, latitude, depth, timestamp, heading, position_origin, gnss_quality)
+          VALUES(:longitude, :latitude, :depth, :timestamp, :heading, :position_origin, :gnss_quality)
         `);
 
         callback();
@@ -167,6 +170,7 @@ export function createSqliteWriter(db: DatabaseSync) {
             depth: data.depth,
             timestamp: data.timestamp.epochMilliseconds,
             heading: data.heading ?? null,
+            gnss_quality: data.gnss ? JSON.stringify(data.gnss) : null,
             position_origin:
               data.positionOrigin === undefined
                 ? null

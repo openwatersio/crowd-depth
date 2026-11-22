@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import nock from "nock";
 import { Temporal } from "@js-temporal/polyfill";
 import { createHistorySource } from "../../src/sources/history.js";
@@ -24,6 +24,7 @@ type Series = {
 function providerApp(response: Series) {
   const calls: { path: string; sourceRef?: string }[][] = [];
   const history = {
+    getPaths: async () => response.values?.map((value) => value.path) ?? [],
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     getValues: async (query: any) => {
       calls.push(query.pathSpecs);
@@ -329,4 +330,128 @@ test("explicit selection does not silently use unfiltered legacy HTTP history", 
       Temporal.Duration.from({ hours: 1 }),
     ),
   ).rejects.toThrow("Legacy HTTP history cannot filter sensor sources");
+});
+
+test("history quality follows an explicit receiver and omits ambiguous preferred series", async () => {
+  const response = {
+    values: [
+      { path: "navigation.position", method: "first" },
+      { path: "environment.depth.depthFromTransducer", method: "min" },
+      { path: "navigation.gnss.satellites", method: "first" },
+    ],
+    data: [["2025-01-01T12:00:00Z", [1, 2], 3.2, 8]],
+  } as Series;
+  const { app: testApp, calls } = providerApp(response);
+  const selected = await createHistorySource(testApp, {
+    ...config,
+    gnss: { ...config.gnss, source: "gps.one" },
+  });
+  const selectedRows = await (await selected!.createReader(
+    new Timeframe(from, to),
+  ))!.toArray();
+  expect(selectedRows[0].gnss).toEqual({ satellites: 8 });
+  expect(
+    calls.some((specs) =>
+      specs.some(
+        (spec) =>
+          spec.path === "navigation.gnss.satellites" &&
+          spec.sourceRef === "gps.one",
+      ),
+    ),
+  ).toBe(true);
+  const preferred = await createHistorySource(testApp, {
+    ...config,
+    gnss: { ...config.gnss, source: "" },
+  });
+  expect(
+    (
+      await (await preferred!.createReader(new Timeframe(from, to)))!.toArray()
+    )[0].gnss,
+  ).toBeUndefined();
+});
+
+test("unsupported optional quality aggregates do not prevent depth reporting", async () => {
+  const response = {
+    values: [
+      { path: "navigation.position", method: "first" },
+      { path: "environment.depth.depthFromTransducer", method: "min" },
+    ],
+    data: [["2025-01-01T12:00:00Z", [1, 2], 3.2]],
+  } as Series;
+  const { app: testApp } = providerApp(response);
+  const history = await testApp.getHistoryApi();
+  const original = history.getValues;
+  history.getPaths = async () => ["navigation.gnss.methodQuality"];
+  history.getValues = async (query) => {
+    if (
+      query.pathSpecs.some(
+        (spec) => spec.path === "navigation.gnss.methodQuality",
+      )
+    )
+      throw new Error("cannot aggregate strings");
+    return original(query);
+  };
+  const source = await createHistorySource(testApp, config);
+  const rows = await (await source!.createReader(
+    new Timeframe(from, to),
+  ))!.toArray();
+  expect(rows).toHaveLength(1);
+  expect(rows[0].depth).toBe(3.2);
+  expect(rows[0].gnss).toBeUndefined();
+});
+
+test("slow optional quality cannot block depth reads or overlap queries", async () => {
+  const response = {
+    values: [
+      { path: "navigation.position", method: "first" },
+      { path: "environment.depth.depthFromTransducer", method: "min" },
+    ],
+    data: [["2025-01-01T12:00:00Z", [1, 2], 3.2]],
+  } as Series;
+  const { app: testApp } = providerApp(response);
+  const history = await testApp.getHistoryApi();
+  const original = history.getValues;
+  let qualityCalls = 0;
+  history.getPaths = async () => ["navigation.gnss.satellites"];
+  history.getValues = async (query) => {
+    if (
+      query.pathSpecs.some((spec) => spec.path === "navigation.gnss.satellites")
+    ) {
+      qualityCalls++;
+      return await new Promise(() => {});
+    }
+    return original(query);
+  };
+  const source = await createHistorySource(testApp, config);
+  vi.useFakeTimers();
+  try {
+    const pending = source!.createReader(new Timeframe(from, to));
+    await vi.advanceTimersByTimeAsync(2001);
+    expect(await (await pending)!.toArray()).toHaveLength(1);
+    expect(
+      await (await source!.createReader(new Timeframe(from, to)))!.toArray(),
+    ).toHaveLength(1);
+    expect(qualityCalls).toBe(1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("chart readers skip optional quality queries", async () => {
+  const { app: testApp, calls } = providerApp({
+    values: [
+      { path: "navigation.position", method: "first" },
+      { path: "environment.depth.depthFromTransducer", method: "min" },
+      { path: "navigation.gnss.satellites", method: "first" },
+    ],
+    data: [["2025-01-01T12:00:00Z", [1, 2], 3, 8]],
+  });
+  const source = await createHistorySource(testApp, config, {
+    includeQuality: false,
+  });
+  await (await source!.createReader(new Timeframe(from, to))).toArray();
+  expect(calls).toHaveLength(1);
+  expect(
+    calls[0].some((spec) => spec.path.startsWith("navigation.gnss.")),
+  ).toBe(false);
 });

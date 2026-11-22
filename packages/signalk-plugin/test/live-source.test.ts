@@ -178,3 +178,19 @@ test("missing GPS geometry remains an error until the actual receiver recovers",
   );
   s.stream.destroy();
 });
+
+test("a later quality update is not attached to an earlier cached position", () => {
+  const s = setup();
+  s.app.getSelfPath = ((path: string) =>
+    path === "navigation.gnss.methodQuality"
+      ? {
+          $source: "gps.one",
+          value: "RTK Fixed",
+          timestamp: "2026-01-01T00:00:01Z",
+        }
+      : undefined) as typeof s.app.getSelfPath;
+  s.send(position, "gps.one", { longitude: 1, latitude: 2 });
+  s.send(depth, "depth.one", 3, "2026-01-01T00:00:01.500Z");
+  expect(s.stream.read().gnss).toBeUndefined();
+  s.stream.destroy();
+});

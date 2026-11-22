@@ -1,3 +1,4 @@
+import type { GnssQuality } from "./gnss-quality.js";
 import { Temporal } from "@js-temporal/polyfill";
 import { Readable, Writable } from "stream";
 import type { Tide } from "./tiles/tide.js";
@@ -31,6 +32,9 @@ export type BathymetryData = {
   depth: number;
   timestamp: Temporal.Instant;
   heading?: number;
+  gnss?: GnssQuality;
+  positionSource?: string;
+  positionTimestamp?: Temporal.Instant;
   /** Recorded coordinate origin; null means geometry could not be established. */
   positionOrigin?: { x: number; y: number } | null;
   /** The water level above chart datum at the sounding, for the chart layer. */

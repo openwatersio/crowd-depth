@@ -1,3 +1,9 @@
+import { sameSource } from "../device-info.js";
+import {
+  GNSS_FIELDS,
+  qualityValue,
+  type GnssQuality,
+} from "../gnss-quality.js";
 import { gnssOrigin } from "../gnss-offsets.js";
 import { Config, depthReference } from "../config.js";
 import { Readable } from "stream";
@@ -41,6 +47,8 @@ export async function createHistorySource(
       );
     }
   }
+
+  let qualityPending = false;
 
   async function createReader({ from, to }: Timeframe) {
     checkSourceSelection();
@@ -105,6 +113,61 @@ export async function createHistorySource(
       res = await history!.getValues({ ...req, pathSpecs });
     }
 
+    // Quality is optional: unsupported string aggregates must not block bathymetry.
+    let qualityResponse = res;
+    if (options.includeQuality !== false && !qualityPending) {
+      qualityPending = true;
+      const lookup = (async () => {
+        const recorded = await history!.getPaths({ from, to });
+        const specs = Object.keys(GNSS_FIELDS)
+          .map((field) => ({
+            path: `navigation.gnss.${field}` as Path,
+            aggregate: "first" as const,
+            parameter: [],
+            ...(positionSource
+              ? { sourceRef: positionSource as SourceRef }
+              : {}),
+          }))
+          .filter((spec) => recorded.includes(spec.path));
+        if (specs.length) {
+          try {
+            return await history!.getValues({ ...req, pathSpecs: specs });
+          } catch (error) {
+            const numeric = specs.filter(
+              (spec) =>
+                GNSS_FIELDS[
+                  spec.path.slice(
+                    "navigation.gnss.".length,
+                  ) as keyof typeof GNSS_FIELDS
+                ] === "number",
+            );
+            if (numeric.length && numeric.length < specs.length)
+              return await history!.getValues({ ...req, pathSpecs: numeric });
+            throw error;
+          }
+        }
+      })()
+        .catch((error) => {
+          app.debug("Historical GPS quality unavailable: %s", error);
+        })
+        .finally(() => {
+          qualityPending = false;
+        });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const response = await Promise.race([
+        lookup,
+        new Promise<undefined>((resolve) => {
+          timer = setTimeout(() => resolve(undefined), 2000);
+        }),
+      ]);
+      clearTimeout(timer);
+      if (response) qualityResponse = response;
+    }
+    const qualityColumns = columnsByPath(qualityResponse.values, []);
+    const qualityRows = new Map(
+      qualityResponse.data.map((row) => [row[0], row]),
+    );
+
     // Map columns by path rather than position: the provider may reorder them
     // or omit one entirely when a bucket has no data for it.
     const columns = columnsByPath(res.values, pathSpecs);
@@ -145,8 +208,45 @@ export async function createHistorySource(
           typeof latitude === "number" &&
           Number.isFinite(latitude)
         ) {
+          const timestamp = Temporal.Instant.from(row[0]);
+          const gnss: GnssQuality = {};
+          for (const field of Object.keys(
+            GNSS_FIELDS,
+          ) as (keyof typeof GNSS_FIELDS)[]) {
+            const qualityPath = `navigation.gnss.${field}`;
+            const qualitySource = qualityResponse.values?.find(
+              (value) => value.path === qualityPath,
+            )?.$source;
+            const receiver =
+              positionSource ||
+              res.values?.find((value) => value.path === "navigation.position")
+                ?.$source;
+            // An unfiltered default quality series can belong to another receiver.
+            if (
+              !positionSource &&
+              (!receiver ||
+                !qualitySource ||
+                !sameSource(app, receiver, qualitySource))
+            )
+              continue;
+            const index = qualityColumns.get(qualityPath);
+            const qualityRow = qualityRows.get(row[0]);
+            const value =
+              index === undefined || !qualityRow
+                ? undefined
+                : qualityValue(field, qualityRow[index]);
+            if (value !== undefined) gnss[field] = value;
+          }
+          const local = options.quality?.(
+            { timestamp, longitude, latitude, depth },
+            positionSource ||
+              res.values?.find((value) => value.path === "navigation.position")
+                ?.$source,
+          );
+          const quality = local ?? gnss;
           return {
-            timestamp: Temporal.Instant.from(row[0]),
+            timestamp,
+            ...(Object.keys(quality).length ? { gnss: quality } : {}),
             longitude,
             latitude,
             depth: depth + offset,
@@ -259,6 +359,8 @@ export async function waitForHistorySource(
 }
 
 export interface HistorySourceOptions {
+  includeQuality?: boolean;
+  quality?: (point: BathymetryData, source?: string) => GnssQuality | undefined;
   port?: number;
   host?: string;
 }

@@ -155,6 +155,30 @@ export function createReporter({
       checkpoint(timeframe);
     } catch (err) {
       if (signal.aborted) return;
+      const milliseconds =
+        timeframe.to.epochMilliseconds - timeframe.from.epochMilliseconds;
+      if (
+        err instanceof SubmissionError &&
+        err.status === 413 &&
+        milliseconds > 1000
+      ) {
+        data?.destroy();
+        const middle = Temporal.Instant.fromEpochMilliseconds(
+          Math.floor(
+            (timeframe.from.epochMilliseconds +
+              timeframe.to.epochMilliseconds) /
+              2000,
+          ) * 1000,
+        );
+        if (
+          Temporal.Instant.compare(middle, timeframe.from) > 0 &&
+          Temporal.Instant.compare(middle, timeframe.to) < 0
+        ) {
+          await report(new Timeframe(timeframe.from, middle));
+          await report(new Timeframe(middle, timeframe.to));
+          return;
+        }
+      }
       throw new Error(
         `Failed to report to ${url}: ${describeSubmissionError(err)}`,
         {
