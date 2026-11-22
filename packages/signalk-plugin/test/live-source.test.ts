@@ -3,7 +3,7 @@ import type { Delta, ServerAPI, SubscribeMessage } from "@signalk/server-api";
 import { createLiveStream } from "../src/streams/live.js";
 import { config } from "./helper.js";
 
-function setup(depth = "", gps = "") {
+function setup(depth = "", gps = "", model: () => unknown = () => undefined) {
   const subscriptions: {
     command: SubscribeMessage;
     callback: (d: Delta) => void;
@@ -12,7 +12,8 @@ function setup(depth = "", gps = "") {
   const app = {
     debug: vi.fn(),
     error: vi.fn(),
-    getSelfPath: () => undefined,
+    getSelfPath: (path: string) =>
+      path === "navigation.position" ? model() : undefined,
     getPath: () => ({ bus: { "35": { n2k: { canName: "stable" } } } }),
     subscriptionmanager: {
       subscribe(
@@ -121,6 +122,30 @@ test("missing, invalid, or stale selected position never falls back to another r
   expect(s.stream.read()).toBeNull();
   s.send(position, "gps.chosen", null);
   s.send(depth, "depth.one", 3);
+  expect(s.stream.read()).toBeNull();
+  s.stream.destroy();
+});
+
+test("a selected receiver's fix in the full model stands in for a silent subscription", () => {
+  // Signal K doesn't deliver a sourcePolicy "all" subscription to a path whose
+  // preferred bus already existed, so the subscription may never fire.
+  const fix = (longitude: number, time = "2026-01-01T00:00:00Z") => ({
+    value: { longitude, latitude: 2 },
+    timestamp: time,
+  });
+  // The plugin starts before the first fix.
+  let model: unknown;
+  const s = setup("", "gps.chosen", () => model);
+  model = {
+    ...fix(9),
+    $source: "gps.other",
+    values: { "gps.other": fix(9), "gps.chosen": fix(1) },
+  };
+  s.send(depth, "depth.one", 3, "2026-01-01T00:00:01Z");
+  expect(s.stream.read()).toMatchObject({ longitude: 1, depth: 3 });
+
+  // A stale fix in the model is still refused.
+  s.send(depth, "depth.one", 3, "2026-01-01T00:00:05Z");
   expect(s.stream.read()).toBeNull();
   s.stream.destroy();
 });

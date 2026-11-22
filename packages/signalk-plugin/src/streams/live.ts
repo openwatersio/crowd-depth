@@ -32,19 +32,22 @@ export function createLiveStream(app: ServerAPI, config: Config) {
     value: { longitude: number; latitude: number };
     timestamp: string;
   };
-  const cached = app.getSelfPath("navigation.position") as
-    | (Position & {
-        $source?: string;
-        values?: Record<string, Position>;
-      })
-    | undefined;
-  let position: Position | undefined = config.gnss.source
-    ? sameSource(app, cached?.$source, config.gnss.source)
+  /** The selected receiver's latest fix in the full model. */
+  const cachedPosition = (): Position | undefined => {
+    const cached = app.getSelfPath("navigation.position") as
+      | (Position & {
+          $source?: string;
+          values?: Record<string, Position>;
+        })
+      | undefined;
+    if (!config.gnss.source) return cached;
+    return sameSource(app, cached?.$source, config.gnss.source)
       ? cached
       : Object.entries(cached?.values ?? {}).find(([source]) =>
           sameSource(app, source, config.gnss.source),
-        )?.[1]
-    : cached;
+        )?.[1];
+  };
+  let position = cachedPosition();
   const explicitDepth = config.sounder.source;
   const explicitGps = config.gnss.source;
   // Separate subscriptions preserve server preference independently for each path.
@@ -111,6 +114,12 @@ export function createLiveStream(app: ServerAPI, config: Config) {
               return;
             const depth = (value as number) + offset;
 
+            // Signal K never attaches a sourcePolicy "all" subscription to a path
+            // whose preferred bus was created first, as when the plugin starts
+            // before the first fix, so read the full model when the
+            // subscription hasn't delivered a current fix.
+            if (!position || isStale(position, timestamp, ttl))
+              position = cachedPosition() ?? position;
             if (!position)
               return app.debug("No position data, ignoring depth data");
             if (isStale(position, timestamp, ttl))
