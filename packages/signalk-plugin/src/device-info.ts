@@ -21,7 +21,47 @@ function text(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
-export type SensorInfo = { make?: string; model?: string };
+export type SensorInfo = {
+  make?: string;
+  model?: string;
+  nmea2000?: {
+    modelVersion?: string;
+    softwareVersionCode?: string;
+    productCode?: number;
+  };
+  gpsd?: {
+    driver?: string;
+    subtype?: string;
+    subtype1?: string;
+    cycle?: number;
+  };
+};
+
+/** Additional device fields for reports; UI hints stay limited to make/model. */
+export function detectSensorDetails(
+  app: ServerAPI,
+  source: string | undefined,
+  anonymous: boolean,
+): SensorInfo {
+  const device = source ? sourceDevice(app, source) : undefined;
+  if (!device) return {};
+  return {
+    ...detectSensor(app, source),
+    nmea2000: {
+      productCode:
+        typeof device.productCode === "number" &&
+        Number.isFinite(device.productCode)
+          ? device.productCode
+          : undefined,
+      ...(anonymous
+        ? {}
+        : {
+            modelVersion: text(device.modelVersion),
+            softwareVersionCode: text(device.softwareVersionCode),
+          }),
+    },
+  };
+}
 
 /** Reported model IDs need not be retail model names. */
 export function detectSensor(

@@ -136,7 +136,7 @@ export function createReporter({
       }
 
       const vessel = await bounded("Identity lookup", (attempt) =>
-        getVesselInfo(app, attempt),
+        getVesselInfo(app, attempt, config),
       );
       app.debug(
         `Reporting data from ${vessel.name} (${vessel.mmsi}) to ${url}`,

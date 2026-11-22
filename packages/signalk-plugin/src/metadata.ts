@@ -1,3 +1,6 @@
+import { detectSensorDetails, type SensorInfo } from "./device-info.js";
+import { detectGpsdDetails } from "./gpsd-info.js";
+import { resolveSource, type Config } from "./config.js";
 import { ServerAPI } from "@signalk/server-api";
 import { readFile, writeFile } from "fs/promises";
 import { join } from "path";
@@ -11,6 +14,7 @@ export type Identity = {
 };
 
 export type VesselInfo = Identity & {
+  sensors?: { sounder: SensorInfo; gnss: SensorInfo };
   mmsi?: string;
   imo?: string;
   name?: string;
@@ -21,9 +25,11 @@ export type VesselInfo = Identity & {
 export async function getVesselInfo(
   app: ServerAPI,
   signal?: AbortSignal,
+  config?: Config,
 ): Promise<VesselInfo> {
   return {
     ...(await identify(app, BATHY_URL, signal)),
+    ...(config ? { sensors: await getSensorInfo(app, config) } : {}),
     // @ts-expect-error remove after next signalk release
     mmsi: app.config.vesselMMSI,
     imo: app.getSelfPath("registrations.imo") as string | undefined,
@@ -67,4 +73,26 @@ export async function identify(
   }
 
   return identity;
+}
+
+/** Metadata describes the selected devices at report time, not reconstructed history. */
+export async function getSensorInfo(app: ServerAPI, config: Config) {
+  const anonymous = Boolean(config.sharing?.anonymous);
+  const sounder = detectSensorDetails(
+    app,
+    resolveSource(
+      app,
+      config.sounder.source,
+      `environment.depth.${config.path}`,
+    ),
+    anonymous,
+  );
+  const gpsSource = resolveSource(
+    app,
+    config.gnss.source,
+    "navigation.position",
+  );
+  let gnss = detectSensorDetails(app, gpsSource, anonymous);
+  if (!gnss.nmea2000) gnss = await detectGpsdDetails(app, gpsSource, anonymous);
+  return { sounder, gnss };
 }

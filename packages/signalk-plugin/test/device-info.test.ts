@@ -47,3 +47,42 @@ test("ignores numeric manufacturer codes and malformed model names", () => {
     model: undefined,
   });
 });
+
+test("report metadata preserves firmware but never includes device identifiers", async () => {
+  const { detectSensorDetails } = await import("../src/device-info.js");
+  const detailed = {
+    getPath: () => ({
+      bus: {
+        "1": {
+          n2k: {
+            manufacturerCode: "Vendor",
+            modelId: "Model",
+            modelVersion: "HW2",
+            softwareVersionCode: "1.2",
+            productCode: 42,
+            modelSerialCode: "serial",
+            canName: "stable",
+          },
+        },
+      },
+    }),
+  } as unknown as ServerAPI;
+  const identified = detectSensorDetails(detailed, "bus.stable", false);
+  expect(identified).toMatchObject({
+    make: "Vendor",
+    model: "Model",
+    nmea2000: {
+      modelVersion: "HW2",
+      softwareVersionCode: "1.2",
+      productCode: 42,
+    },
+  });
+  expect(identified.nmea2000).not.toHaveProperty("modelSerialCode");
+  expect(identified.nmea2000).not.toHaveProperty("canName");
+  const anonymous = detectSensorDetails(detailed, "bus.1", true);
+  expect(anonymous.nmea2000).not.toHaveProperty("modelSerialCode");
+  expect(anonymous.nmea2000).not.toHaveProperty("canName");
+  expect(anonymous.nmea2000).not.toHaveProperty("modelVersion");
+  expect(anonymous.nmea2000).not.toHaveProperty("softwareVersionCode");
+  expect(detectSensorDetails(detailed, "bus.2", false)).toEqual({});
+});

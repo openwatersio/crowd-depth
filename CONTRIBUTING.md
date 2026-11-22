@@ -30,7 +30,7 @@ schedule to the trusted node API.
 | `src/storage.ts`     | SQLite database setup (`node:sqlite`)                                                                                                                              |
 | `src/streams/`       | Stream pipeline: `live.ts` (deltas → `BathymetryData`), `transforms.ts` (offset correction, precision), `geojson.ts` / `xyz.ts` (output formats)                   |
 | `src/reporters/`     | Submission to the trusted node API (`noaa.ts` builds and signs the upload)                                                                                         |
-| `src/metadata.ts`    | Vessel identity (name/MMSI or anonymous UUID) persistence                                                                                                          |
+| `src/metadata.ts`    | Vessel identity persistence and optional NMEA/GPSD sensor metadata                                                                                                 |
 | `src/status.ts`      | Plugin status messages shown in the Signal K admin UI                                                                                                              |
 | `src/fetch.ts`       | HTTP helpers shared with the API package                                                                                                                           |
 | `src/chart.ts`       | The "My soundings" chart layer: the live cell writer, backfill, layer routes, and the plotter extension                                                            |

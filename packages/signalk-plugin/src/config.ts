@@ -334,7 +334,7 @@ function buildSchema(app: ServerAPI) {
             default: false,
             title: "Share data anonymously",
             description:
-              "If you do not wish to share your vessel name and MMSI, you can share anonymously with a unique UUID instead.",
+              "Share with a unique UUID instead of vessel name and MMSI.",
           },
         },
       },
