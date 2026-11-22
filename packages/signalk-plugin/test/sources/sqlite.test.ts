@@ -191,6 +191,8 @@ test("the log keeps no index on position", () => {
     db.exec(`
       CREATE INDEX idx_bathymetry_location ON bathymetry(latitude, longitude);
       ALTER TABLE bathymetry DROP COLUMN position_origin;
+      ALTER TABLE bathymetry DROP COLUMN gnss_quality;
+      DROP TABLE gnss_samples;
       PRAGMA user_version = 6;
     `);
     db.close();
@@ -231,7 +233,7 @@ test("SQLite preserves per-reading origins and distinguishes unknown from legacy
   const source = createSqliteSource(app, db);
   await pipeline(
     Readable.from([
-      { ...data[0], positionOrigin: { x: -1, y: 8 } },
+      { ...data[0], positionOrigin: { x: -1, y: 8 }, gnss: { satellites: 8 } },
       { ...data[1], positionOrigin: null },
       data[2],
     ]),
@@ -244,6 +246,8 @@ test("SQLite preserves per-reading origins and distinguishes unknown from legacy
     ),
   );
   const points = await reader!.toArray();
+  expect(points[0].gnss).toEqual({ satellites: 8 });
+  expect(points[1].gnss).toBeUndefined();
   expect(points[0].positionOrigin).toEqual({ x: -1, y: 8 });
   expect(points[1].positionOrigin).toBeNull();
   expect(points[2].positionOrigin).toBeUndefined();

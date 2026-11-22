@@ -50,7 +50,7 @@ type Upload = {
   };
   features: {
     geometry: { coordinates: [number, number] };
-    properties: { depth: number; time: string };
+    properties: { depth: number; time: string; gnss?: Record<string, unknown> };
   }[];
 };
 
@@ -210,7 +210,10 @@ async function startSignalK({
       JSON.stringify({
         enabled: true,
         configuration: gpsdPort
-          ? { ...config, gnss: { ...config.gnss, source: `${provider.id}.GP` } }
+          ? {
+              ...pluginConfig,
+              gnss: { ...pluginConfig.gnss, source: `${provider.id}.GP` },
+            }
           : pluginConfig,
       }),
     );
@@ -407,6 +410,120 @@ describe.skipIf(!RUN)("uploads from a real Signal K server", () => {
     ).toEqual([3.7, 3.9, 4.1]);
     expectAtTransducer(uploads.flatMap((u) => u.features));
   });
+
+  test("GPSD NMEA quality reaches the report without extra GPSD configuration", async () => {
+    const sockets = new Set<Socket>();
+    const gpsd = createTcpServer((socket) => {
+      sockets.add(socket);
+      socket.on("close", () => sockets.delete(socket));
+      let timer: ReturnType<typeof setInterval> | undefined;
+      socket.on("data", (data) => {
+        if (!data.toString().includes("?WATCH")) return;
+        const send = () => {
+          const time = new Date()
+            .toISOString()
+            .slice(11, 19)
+            .replaceAll(":", "");
+          const body = `GPGGA,${time},1736.0000,S,17725.8000,E,2,08,0.9,10.0,M,2.0,M,,`;
+          const checksum = [...body]
+            .reduce((value, char) => value ^ char.charCodeAt(0), 0)
+            .toString(16)
+            .toUpperCase()
+            .padStart(2, "0");
+          socket.write(`$${body}*${checksum}\r\n`);
+        };
+        if (!timer) timer = setInterval(send, 250);
+        send();
+      });
+      socket.on("close", () => clearInterval(timer));
+    }).listen(0, "127.0.0.1");
+    await once(gpsd, "listening");
+    cleanups.push(async () => {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => gpsd.close(() => resolve()));
+    });
+    const node = await startTrustedNode();
+    const sk = await startSignalK({
+      trustedNodeUrl: node.url,
+      enableAtBoot: true,
+      gpsdPort: (gpsd.address() as AddressInfo).port,
+      pluginConfig: {
+        ...config,
+        sounder: { ...config.sounder, x: 0, y: 0 },
+        gnss: { ...config.gnss, x: 0, y: 0 },
+      },
+    });
+    await sk.waitForStatus(/Next report at/);
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    await sk.sendDeltas([
+      {
+        context: "vessels.self",
+        updates: [
+          {
+            source: { label: "e2e" },
+            values: [{ path: "navigation.headingTrue", value: HEADING }],
+          },
+          {
+            source: { label: "e2e" },
+            values: [{ path: "environment.depth.belowTransducer", value: 3.2 }],
+          },
+        ],
+      },
+    ]);
+    const upload = await node.next();
+    expectValidCsb(upload);
+    expect(upload.features[0].properties.gnss).toMatchObject({
+      satellites: 8,
+      horizontalDilution: 0.9,
+    });
+  });
+
+  test.each([false, true])(
+    "records GPS quality without provider quality paths (history=%s)",
+    async (history) => {
+      const node = await startTrustedNode();
+      const time = new Date(Date.now() + 10_000).toISOString();
+      const sk = await startSignalK({
+        trustedNodeUrl: node.url,
+        enableAtBoot: true,
+        pluginConfig: { ...config, gnss: { ...config.gnss, source: "e2e.XX" } },
+        historyRows: history
+          ? [
+              {
+                time,
+                latitude: -17.6,
+                longitude: 177.43,
+                depth: 3.2,
+                heading: HEADING,
+              },
+            ]
+          : undefined,
+      });
+      await sk.waitForStatus(/Next report at/);
+      const update = (values: object[]) => ({
+        context: "vessels.self",
+        updates: [{ timestamp: time, source: { label: "e2e" }, values }],
+      });
+      await sk.sendDeltas([
+        update([
+          { path: "navigation.gnss.satellites", value: 9 },
+          { path: "navigation.gnss.horizontalDilution", value: 0.8 },
+          {
+            path: "navigation.position",
+            value: { latitude: -17.6, longitude: 177.43 },
+          },
+          { path: "navigation.headingTrue", value: HEADING },
+        ]),
+        update([{ path: "environment.depth.belowTransducer", value: 3.2 }]),
+      ]);
+      const upload = await node.next();
+      expectValidCsb(upload);
+      expect(upload.features[0].properties.gnss).toEqual({
+        satellites: 9,
+        horizontalDilution: 0.8,
+      });
+    },
+  );
 
   test("uses Signal K receiver geometry without plugin horizontal fields", async () => {
     const node = await startTrustedNode();

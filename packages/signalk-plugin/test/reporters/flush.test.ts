@@ -186,3 +186,44 @@ test("privacy cancellation prevents a pending history read from uploading", asyn
   expect(submit).not.toHaveBeenCalled();
   expect(log.lastReport).toEqual(last);
 });
+
+test("oversized reports split time windows while retaining successful checkpoints", async () => {
+  const { SubmissionError } = await import("../../src/reporters/noaa.js");
+  submit.mockRejectedValueOnce(new SubmissionError("too large", 413, ""));
+  const { reporter, reads, log } = setup();
+  await reporter.flush();
+  expect(submit).toHaveBeenCalledTimes(3);
+  expect(reads).toHaveLength(3);
+  expect(
+    reads.every(
+      (span) =>
+        span.from.epochMilliseconds % 1000 === 0 &&
+        span.to.epochMilliseconds % 1000 === 0,
+    ),
+  ).toBe(true);
+  expect(reads[1].from.toString()).toBe(reads[0].from.toString());
+  expect(reads[1].to.toString()).toBe(reads[2].from.toString());
+  expect(reads[2].to.toString()).toBe(reads[0].to.toString());
+  expect(log.lastReport?.toString()).toBe(reads[0].to.toString());
+});
+
+test("fractional-second 413 windows stop when no interior second boundary exists", async () => {
+  const { SubmissionError } = await import("../../src/reporters/noaa.js");
+  submit.mockRejectedValue(new SubmissionError("too large", 413, ""));
+  const { reporter } = setup(
+    {
+      createReader: () => Readable.from([]),
+      getAvailableTimeframes: (span) => {
+        const start = span.from.round({
+          smallestUnit: "second",
+          roundingMode: "ceil",
+        });
+        return [new Timeframe(start, start.add({ milliseconds: 1437 }))];
+      },
+    },
+    false,
+  );
+  await expect(reporter.flush()).rejects.toThrow();
+  // Startup tries once; the explicit final flush retries once. Neither recurses.
+  expect(submit).toHaveBeenCalledTimes(2);
+});

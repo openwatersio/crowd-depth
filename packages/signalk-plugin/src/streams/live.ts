@@ -1,4 +1,6 @@
 import { getStatus } from "../status.js";
+
+import { liveGnssQuality } from "../gnss-quality.js";
 import { gnssOrigin } from "../gnss-offsets.js";
 import { sameSource } from "../device-info.js";
 import {
@@ -161,6 +163,13 @@ export function createLiveStream(app: ServerAPI, config: Config) {
               timestamp,
               heading,
               positionOrigin,
+              positionSource: position.source,
+              positionTimestamp: Temporal.Instant.from(position.timestamp),
+              gnss: liveGnssQuality(
+                app,
+                position.source,
+                Temporal.Instant.from(position.timestamp),
+              ),
             };
 
             app.debug(

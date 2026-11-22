@@ -1,4 +1,10 @@
 import { resolveDepthConfig } from "./depth-path.js";
+
+import {
+  recordQuality,
+  recordedQuality,
+  pruneQuality,
+} from "./quality-recorder.js";
 import { ServerAPI, Plugin } from "@signalk/server-api";
 import { schema, uiSchema, Config } from "./config.js";
 import { createReporter } from "./reporters/index.js";
@@ -44,6 +50,11 @@ export default function createPlugin(app: ServerAPI): Plugin {
       };
       current = session;
       const db = createDB(join(app.getDataDirPath(), `bathymetry.sqlite`));
+      try {
+        pruneQuality(db);
+      } catch (error) {
+        app.error(`GPS quality cleanup unavailable: ${error}`);
+      }
       // Resolve the sounder's path before any reader or chart captures its reference.
       void (async () => {
         const resolved = await resolveDepthConfig(
@@ -139,7 +150,10 @@ async function settleAndReport({
   const { controller } = session;
   const sqlite = createSqliteSource(app, db);
   const source = await settleSource({
-    findHistory: () => createHistorySource(app, config),
+    findHistory: () =>
+      createHistorySource(app, config, {
+        quality: (point, source) => recordedQuality(app, db, point, source),
+      }),
     sqlite,
     record: (signal) =>
       createCollector({
@@ -156,7 +170,21 @@ async function settleAndReport({
   });
   if (!source || controller.signal.aborted) return;
 
-  void chart?.backfill(source);
+  if (source !== sqlite) {
+    try {
+      recordQuality(app, config, db, controller.signal);
+    } catch (error) {
+      app.error(`GPS quality capture unavailable: ${error}`);
+    }
+  }
+  if (chart) {
+    const chartSource =
+      source === sqlite
+        ? sqlite
+        : await createHistorySource(app, config, { includeQuality: false });
+    if (chartSource && !controller.signal.aborted)
+      void chart.backfill(chartSource);
+  }
 
   session.reporter = createReporter({
     app,
