@@ -218,7 +218,7 @@ function buildSchema(app: ServerAPI) {
   return {
     type: "object",
     description:
-      "By enabling this plugin, you agree to share your soundings and your vessel and sensor details, and you dedicate them to the public domain under Creative Commons CC0 1.0 Universal.",
+      "By enabling this plugin, you agree to share your soundings and your vessel and sensor details (including reported device serial numbers when not anonymous), and you dedicate them to the public domain under Creative Commons CC0 1.0 Universal.",
     properties: {
       path: {
         type: "string",
@@ -334,7 +334,7 @@ function buildSchema(app: ServerAPI) {
             default: false,
             title: "Share data anonymously",
             description:
-              "If you do not wish to share your vessel name and MMSI, you can share anonymously with a unique UUID instead.",
+              "Share with a unique UUID instead of vessel name and MMSI. Device serial numbers, CAN NAMEs and free-form firmware identifiers are omitted.",
           },
         },
       },

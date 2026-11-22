@@ -265,3 +265,89 @@ test("cached hints return immediately, share refreshes, expire, and retry failur
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
+
+test("GPSD reports driver and firmware without guessing retail identity or leaking paths", async () => {
+  const { gpsdReportInfo } = await import("../src/gpsd-info.js");
+  const devices = [
+    {
+      driver: "u-blox",
+      subtype: "Firmware serial=private",
+      subtype1: "HW1",
+      cycle: 1,
+      path: "/dev/private",
+      serial: "private",
+    },
+  ];
+  expect(gpsdReportInfo(devices, false)).toMatchObject({
+    gpsd: {
+      driver: "u-blox",
+      subtype: devices[0].subtype,
+      subtype1: "HW1",
+      cycle: 1,
+    },
+  });
+  expect(gpsdReportInfo(devices, false).make).toBeUndefined();
+  const anonymous = gpsdReportInfo(devices, true);
+  expect(JSON.stringify(anonymous)).not.toContain("private");
+  expect(anonymous.gpsd).toEqual({ driver: "u-blox", cycle: 1 });
+  expect(gpsdReportInfo([...devices, ...devices], false)).toEqual({});
+});
+
+test("report lookups share the GPSD query and apply anonymous filtering per caller", async () => {
+  const { getSensorInfo } = await import("../src/metadata.js");
+  const { config } = await import("./helper.js");
+  let queries = 0;
+  const server = createServer((socket) =>
+    socket.on("data", () => {
+      queries++;
+      socket.end(
+        JSON.stringify({
+          class: "DEVICES",
+          devices: [
+            {
+              driver: "Garmin USB binary",
+              subtype: "serial=private",
+              cycle: 1,
+            },
+          ],
+        }) + "\n",
+      );
+    }),
+  );
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  try {
+    const port = (server.address() as AddressInfo).port;
+    const app = {
+      getPath: () => ({}),
+      getSelfPath: () => ({ $source: "gps.GP" }),
+      config: {
+        settings: {
+          pipedProviders: [
+            {
+              id: "gps",
+              pipeElements: [
+                {
+                  type: "providers/gpsd",
+                  options: { hostname: "127.0.0.1", port },
+                },
+              ],
+            },
+          ],
+        },
+      },
+    } as unknown as ServerAPI;
+    const [identified, anonymous] = await Promise.all([
+      getSensorInfo(app, config),
+      getSensorInfo(app, { ...config, sharing: { anonymous: true } }),
+    ]);
+    expect(identified.gnss.gpsd?.subtype).toBe("serial=private");
+    expect(anonymous.gnss.gpsd?.subtype).toBeUndefined();
+    expect(anonymous.gnss.make).toBe("Garmin");
+    await getSensorInfo(app, config);
+    expect(queries).toBe(1);
+  } finally {
+    server.close();
+    await once(server, "close");
+  }
+});

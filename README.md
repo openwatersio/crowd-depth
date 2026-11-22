@@ -39,6 +39,8 @@ npm start      # run the API locally on http://localhost:3001
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the repo layout, per-package
 development workflows, testing, and how releases work.
 
+Sensor reports may include detected make, model, firmware and GPSD driver details. Identified sharing also includes reported NMEA device serial numbers and CAN NAMEs; anonymous sharing omits those identifiers. Manual identities override detection. See the [plugin documentation](packages/signalk-plugin/README.md#detected-sensor-details-in-reports).
+
 ## Resources
 
 - [IHO Guidance to Crowdsourced Bathymetry](https://iho.int/uploads/user/pubs/bathy/B_12_CSB-Guidance_Document-Edition_3.0.0_Final.pdf)

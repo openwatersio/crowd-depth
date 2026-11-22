@@ -150,3 +150,66 @@ export function cachedGpsdSensor(
     });
   return entry.value;
 }
+
+/** DEVICE fields are descriptive, not proof of a retail model. */
+export function gpsdReportInfo(
+  devices: unknown,
+  anonymous: boolean,
+): SensorInfo {
+  if (!Array.isArray(devices) || devices.length !== 1) return {};
+  const d = devices[0];
+  if (!d || typeof d !== "object") return {};
+  const text = (v: unknown) =>
+    typeof v === "string" && v.trim() ? v.trim() : undefined;
+  return {
+    ...gpsdDeviceInfo(devices),
+    gpsd: {
+      driver: text(d.driver),
+      cycle:
+        typeof d.cycle === "number" && Number.isFinite(d.cycle) && d.cycle > 0
+          ? d.cycle
+          : undefined,
+      // Subtype strings are free-form and can contain device serial numbers.
+      ...(anonymous
+        ? {}
+        : { subtype: text(d.subtype), subtype1: text(d.subtype1) }),
+    },
+  };
+}
+
+const reportDevices = new WeakMap<
+  ServerAPI,
+  { key: string; expires: number; pending: boolean; value: Promise<unknown> }
+>();
+
+export async function detectGpsdDetails(
+  app: ServerAPI,
+  source: string | undefined,
+  anonymous: boolean,
+): Promise<SensorInfo> {
+  const endpoint = gpsdEndpoint(app, source);
+  if (!endpoint) return {};
+  const key = JSON.stringify([source, endpoint.host, endpoint.port]);
+  let cached = reportDevices.get(app);
+  if (
+    !cached ||
+    cached.key !== key ||
+    (!cached.pending && cached.expires <= Date.now())
+  ) {
+    const entry = {
+      key,
+      expires: 0,
+      pending: true,
+      value: gpsdDevices(endpoint.host, endpoint.port),
+    };
+    reportDevices.set(app, entry);
+    entry.value = entry.value
+      .catch(() => undefined)
+      .finally(() => {
+        entry.pending = false;
+        entry.expires = Date.now() + 60_000;
+      });
+    cached = entry;
+  }
+  return gpsdReportInfo(await cached.value, anonymous);
+}

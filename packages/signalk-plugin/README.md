@@ -88,9 +88,7 @@ source. GPSD’s Garmin binary drivers can also identify Garmin receivers; a GPS
 name is not assumed to be a retail model or receiver manufacturer. In particular, a u-blox driver identifies a chipset, so its manufacturer hint stays blank. Unknown or ambiguous devices leave the
 hints blank. Detection uses the configured GPSD endpoint. Lookups run in the background with a two-second timeout; opening the plugin list never waits for GPSD. Results, including failures, are cached for one minute. The first load or a refresh can show blank hints; reload after the lookup completes. Concurrent requests share one lookup.
 
-These placeholders are informational: enter a value to include it in reports.
-They do not save an override or change existing settings. Hints describe the saved source and depth path. Unsaved edits do not refresh them; save and reload the form to update the hints. Automatically attaching detected
-identities to historical reports requires configuration history and is deferred.
+These placeholders do not save an override or change existing settings. Reports use detected identities unless a manual entry identifies different equipment. Hints describe the saved source and depth path; unsaved edits do not refresh them. Save and reload the form to update hints. Report-time detection cannot reconstruct historical sensor changes.
 
 ### Data Sharing
 
@@ -206,3 +204,11 @@ releases.
 Previously saved source IDs remain explicit selections; older versions sometimes filled those IDs automatically and ignored them during live collection. Choose **Preferred source** to retain automatic failover. A pinned device does not fall back to a different receiver when absent. Use stable CAN-name IDs for devices whose bus addresses can change. Live matching accepts known address/CAN-name aliases; history filters use the exact stored source reference and cannot reconstruct old bus-address assignments.
 
 On first upgrade to these source-selection rules, the derived chart is rebuilt. History-backed layers refill from the provider; SQLite-backed layers start from the upgrade time because older rows have no source identity. Raw SQLite soundings and upload checkpoints are retained. Rolling back and forward also changes the chart fingerprint and can restart this local chart coverage. Preferred historical readings are the provider's default series, which may aggregate sources; use explicit selections with a source-aware provider when device-specific geometry is needed.
+
+## Detected sensor details in reports
+
+Reports include the selected device’s detected identity. If a manual make or model differs from detection, the report uses only the manual identity (missing fields become Unknown), so a known conflicting identity is not combined with the detected device. With Preferred source, detection uses Signal K's current preferred device. NMEA 2000 model, product and firmware fields and GPSD driver, subtype and cycle information are included when available; no retail model or transducer frequency is guessed. GPSD is queried only through the selected enabled connection, with a two-second deadline and a one-minute cache shared across report windows. Missing or ambiguous device information is omitted.
+
+These details describe devices at report creation, not a reconstruction of which hardware produced every historical sounding. Failed queued reports use the next configuration, as described under Final reports. Identified reports also include the device’s reported serial number and CAN NAME. These are public sensor details in the CC0 report. Anonymous reports omit NMEA serial/CAN identifiers and free-form NMEA firmware/GPSD subtype strings; local device paths are never reported.
+
+Detection identifies the network device publishing the data, which may be a gateway or chartplotter rather than the physical transducer. Fill both manual make and model to identify equipment behind a gateway. Filling only a missing field supplements detection; the plugin cannot infer whether that describes a separate physical sensor. A missing detected field can be filled manually without discarding other details; a conflicting identity suppresses them. Failed GPSD queries are cached for a minute and reports proceed without those optional details.
