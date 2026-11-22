@@ -1,4 +1,12 @@
-import { Context, Delta, Path, ServerAPI } from "@signalk/server-api";
+import { sameSource } from "../device-info.js";
+import { liveGnssQuality } from "../gnss-quality.js";
+import {
+  Context,
+  Delta,
+  Path,
+  ServerAPI,
+  getSourceId,
+} from "@signalk/server-api";
 import { PassThrough } from "stream";
 import { Config, depthReference } from "../config.js";
 import { Temporal } from "@js-temporal/polyfill";
@@ -25,25 +33,48 @@ export function createLiveStream(app: ServerAPI, config: Config) {
   app.subscriptionmanager.subscribe(
     {
       context: "vessels.self" as Context,
+      sourcePolicy: "all",
       subscribe: [{ path, policy: "instant" }],
     },
     unsubscribes,
     (error) => app.error(error as string),
     (delta: Delta) => {
       delta.updates.forEach((update) => {
+        const source =
+          update.$source ??
+          (update.source ? getSourceId(update.source) : undefined);
+        if (
+          config.sounder.source &&
+          !sameSource(app, source, config.sounder.source)
+        )
+          return;
         const timestamp = Temporal.Instant.from(
           update.timestamp ?? Temporal.Now.instant(),
         );
-        const position = app.getSelfPath("navigation.position") as
-          | {
-              value: { longitude: number; latitude: number };
-              timestamp: string;
-            }
+        type Position = {
+          value: { longitude: number; latitude: number };
+          timestamp: string;
+        };
+        const positions = app.getSelfPath("navigation.position") as
+          | (Position & { $source?: string; values?: Record<string, Position> })
           | undefined;
+        const position =
+          !config.gnss.source ||
+          sameSource(app, positions?.$source, config.gnss.source)
+            ? positions
+            : Object.entries(positions?.values ?? {}).find(([ref]) =>
+                sameSource(app, ref, config.gnss.source),
+              )?.[1];
 
         if ("values" in update) {
-          update.values.forEach(({ value }) => {
-            if (!value) return;
+          update.values.forEach(({ path: valuePath, value }) => {
+            if (
+              valuePath !== path ||
+              typeof value !== "number" ||
+              !Number.isFinite(value) ||
+              value <= 0
+            )
+              return;
             const depth = (value as number) + offset;
 
             if (!position)
@@ -69,6 +100,11 @@ export function createLiveStream(app: ServerAPI, config: Config) {
               depth,
               timestamp,
               heading,
+              gnss: liveGnssQuality(
+                app,
+                config.gnss.source ?? positions?.$source,
+                timestamp,
+              ),
             };
 
             app.debug(

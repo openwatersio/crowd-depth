@@ -151,6 +151,92 @@ describe("submitGeoJSON", () => {
 });
 
 describe("getMetadata", () => {
+  test("allows manual overrides and sends detected transducer metadata", async () => {
+    const detected = {
+      ...vessel,
+      sensors: {
+        sounder: {
+          make: "Airmar",
+          model: "DT200",
+          nmea2000: {
+            modelVersion: "IDTP65-40-1,HW2:3,OEM0",
+            softwareVersionCode: "4.003,4.004",
+          },
+        },
+        gnss: {
+          make: "Garmin",
+          model: "GPS",
+          gpsd: { driver: "Garmin", subtype: "firmware 1.0" },
+        },
+      },
+    };
+    const settings = {
+      ...config,
+      sounder: {
+        x: 0,
+        y: 0,
+        model: "P65",
+        transducer: "P65",
+        frequency: 235000,
+      },
+      gnss: { x: 0, y: 0, z: 0, make: " " },
+    };
+    const sensors = getMetadata(detected, settings).properties.platform.sensors;
+    expect(sensors[0]).toMatchObject({
+      make: "Airmar",
+      model: "P65",
+      transducer: "P65",
+      frequency: 235000,
+      nmea2000: detected.sensors.sounder.nmea2000,
+    });
+    expect(sensors[1]).toMatchObject({ make: "Garmin", model: "GPS" });
+    const json = JSON.parse(
+      await text(
+        createGeoJSON(
+          settings,
+          detected,
+          Readable.from(
+            data.map((point) => ({
+              ...point,
+              gnss: {
+                satellites: 12,
+                methodQuality: "DGNSS fix",
+                horizontalDilution: 0.7,
+              },
+            })),
+          ),
+        ),
+      ),
+    );
+    const validate = new Ajv({ allErrors: true }).compile(schema);
+    expect(validate(json), JSON.stringify(validate.errors)).toBe(true);
+    expect(json.features[0].properties.gnss).toEqual({
+      satellites: 12,
+      methodQuality: "DGNSS fix",
+      horizontalDilution: 0.7,
+    });
+    expect(json.properties.platform.sensors[1].gpsd.driver).toBe("Garmin");
+    expect(json.properties.platform.sensors[0].nmea2000).toEqual(
+      detected.sensors.sounder.nmea2000,
+    );
+  });
+
+  test("manual values override detection and blank values fall back", () => {
+    const info = {
+      ...vessel,
+      sensors: { sounder: { make: "Airmar" }, gnss: {} },
+    };
+    const settings = {
+      ...config,
+      sounder: { x: 0, y: 0, make: "Manual make", model: " P65 " },
+      gnss: { x: 0, y: 0, z: 0, make: "Manual GPS", model: " " },
+    };
+    const [sounder, gnss] = getMetadata(info, settings).properties.platform
+      .sensors;
+    expect(sounder).toMatchObject({ make: "Manual make", model: "P65" });
+    expect(gnss).toMatchObject({ make: "Manual GPS", model: "Unknown" });
+  });
+
   test("includes platform data", () => {
     const metadata = getMetadata(vessel, config);
     expect(metadata.properties.platform.uniqueID).toEqual(

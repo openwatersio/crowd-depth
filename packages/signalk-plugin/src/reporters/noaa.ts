@@ -235,16 +235,29 @@ export function getMetadata(info: VesselInfo, config: Config) {
         sensors: [
           {
             type: "Sounder",
-            make: config.sounder.make ?? "Unknown",
-            model: config.sounder.model ?? "Unknown",
+            ...info.sensors?.sounder,
+            make:
+              config.sounder.make?.trim() ||
+              info.sensors?.sounder.make ||
+              "Unknown",
+            model:
+              config.sounder.model?.trim() ||
+              info.sensors?.sounder.model ||
+              "Unknown",
             position: sensorPosition(sounderLocation(config), reference),
             draft: config.sounder.draft,
             frequency: config.sounder.frequency,
+            transducer: config.sounder.transducer,
           },
           {
             type: "GNSS",
-            make: config.gnss.make ?? "Unknown",
-            model: config.gnss.model ?? "Unknown",
+            ...info.sensors?.gnss,
+            make:
+              config.gnss.make?.trim() || info.sensors?.gnss.make || "Unknown",
+            model:
+              config.gnss.model?.trim() ||
+              info.sensors?.gnss.model ||
+              "Unknown",
             position: sensorPosition(gnssLocation(config), reference),
           },
         ],

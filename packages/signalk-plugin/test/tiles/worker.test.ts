@@ -105,7 +105,6 @@ test.skipIf(!existsSync(dist))(
     const { createCellStore } = await import("../../dist/tiles/cells.js");
     const { addPendingBackfill, backfillCells } =
       await import("../../dist/tiles/backfill.js");
-    const { historySpan } = await import("../../dist/config.js");
     const { app, config } = await import("../helper.js");
     const dir = mkdtempSync(join(tmpdir(), "crowd-depth-"));
     const file = join(dir, "bathymetry.sqlite");
@@ -126,7 +125,7 @@ test.skipIf(!existsSync(dist))(
         source.createWriter!(),
       );
       const store = createCellStore(db);
-      addPendingBackfill(store, start.add({ hours: 12 }), historySpan(config));
+      addPendingBackfill(store, start.add({ hours: 12 }));
       await backfillCells({
         app,
         config,
@@ -157,7 +156,6 @@ test.skipIf(!existsSync(dist))(
     const { createCellStore } = await import("../../dist/tiles/cells.js");
     const { addPendingBackfill, backfillCells } =
       await import("../../dist/tiles/backfill.js");
-    const { historySpan } = await import("../../dist/config.js");
     const { app, config } = await import("../helper.js");
     const dir = mkdtempSync(join(tmpdir(), "crowd-depth-"));
     const file = join(dir, "bathymetry.sqlite");
@@ -178,7 +176,7 @@ test.skipIf(!existsSync(dist))(
         source.createWriter!(),
       );
       const store = createCellStore(db);
-      addPendingBackfill(store, start.add({ hours: 12 }), historySpan(config));
+      addPendingBackfill(store, start.add({ hours: 12 }));
       const tides = {
         at: async () => ({ level: 1, sigma: 0.3 }),
         ready: async () => true,
@@ -248,7 +246,6 @@ test.skipIf(!existsSync(dist))(
       getPendingBackfill,
       startRebuild,
     } = await import("../../dist/tiles/backfill.js");
-    const { historySpan } = await import("../../dist/config.js");
     const { app, config } = await import("../helper.js");
     const dir = mkdtempSync(join(tmpdir(), "crowd-depth-"));
     const file = join(dir, "bathymetry.sqlite");
@@ -283,12 +280,12 @@ test.skipIf(!existsSync(dist))(
 
       const clean = createCellStore(createDB(":memory:"));
       startRebuild(clean);
-      addPendingBackfill(clean, until, historySpan(config));
+      addPendingBackfill(clean, until);
       await fill(clean, source);
 
       const store = createCellStore(db);
       startRebuild(store);
-      addPendingBackfill(store, until, historySpan(config));
+      addPendingBackfill(store, until);
       const failing = {
         ...source,
         getAvailableTimeframes: async () => [new Timeframe(start, until)],
@@ -305,7 +302,7 @@ test.skipIf(!existsSync(dist))(
       expect(Temporal.Instant.compare(left.from, track[1000].timestamp)).toBe(
         1,
       );
-      addPendingBackfill(store, until, historySpan(config));
+      addPendingBackfill(store, until);
       await fill(store, source, file);
       const cells = (s: ReturnType<typeof createCellStore>) =>
         s.cells(-76.3, 36.9, -76.1, 39);
@@ -422,6 +419,174 @@ test.skipIf(!existsSync(dist))(
       expect(() => tiles.changed([{ lon: -76.2, lat: 36.98 }])).not.toThrow();
     } finally {
       tiles.close();
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+test.skipIf(!existsSync(dist))(
+  "backfill publishes cells and overviews before its source finishes",
+  async () => {
+    const { Readable } = await import("node:stream");
+    const { Temporal } = await import("@js-temporal/polyfill");
+    const { createDB } = await import("../../dist/storage.js");
+    const { createCellStore } = await import("../../dist/tiles/cells.js");
+    const { addPendingBackfill, backfillCells } =
+      await import("../../dist/tiles/backfill.js");
+    const { Timeframe } = await import("../../dist/types.js");
+    const { app, config } = await import("../helper.js");
+    const dir = mkdtempSync(join(tmpdir(), "crowd-depth-progressive-"));
+    const file = join(dir, "b.sqlite"),
+      db = createDB(file),
+      store = createCellStore(db);
+    const from = Temporal.Instant.from("2026-10-16T00:00:00Z"),
+      to = from.add({ hours: 1 });
+    store.setMeta("backfill", `${from}/${to}`);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let finished = false,
+      published = false,
+      sawOverview = false;
+    const source = {
+      getAvailableTimeframes: () => [new Timeframe(from, to)],
+      createReader: () =>
+        Readable.from(
+          (async function* () {
+            for (let i = 0; i < 3000; i++)
+              yield {
+                longitude: -80 + i * 0.0001,
+                latitude: 26,
+                depth: 6 + (i % 3) * 0.1,
+                timestamp: from.add({ seconds: i }),
+              };
+            await gate;
+            finished = true;
+          })(),
+        ),
+    };
+    try {
+      addPendingBackfill(store, to);
+      await backfillCells({
+        app,
+        config,
+        source,
+        store,
+        file,
+        signal: new AbortController().signal,
+        onChange: (positions) => {
+          expect(positions.length).toBeGreaterThan(0);
+          expect(positions[0]).toEqual({
+            lon: expect.any(Number),
+            lat: expect.any(Number),
+          });
+          if (!finished) {
+            published = true;
+            sawOverview ||= store.cells(-81, 25, -79, 27, 2).length > 0;
+            release();
+          }
+        },
+      });
+      expect(published).toBe(true);
+      expect(sawOverview).toBe(true);
+      expect(finished).toBe(true);
+    } finally {
+      release();
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+test.skipIf(!existsSync(dist))(
+  "recent-first refinement commits on its worker before discovering old history",
+  async () => {
+    const { createDB } = await import("../../dist/storage.js");
+    const { createCellStore } = await import("../../dist/tiles/cells.js");
+    const { refineHistory } = await import("../../dist/tiles/refine.js");
+    const { Temporal } = await import("@js-temporal/polyfill");
+    const { Readable } = await import("node:stream");
+    const { config } = await import("../helper.js");
+    const dir = mkdtempSync(join(tmpdir(), "crowd-depth-recent-"));
+    const file = join(dir, "b.sqlite"),
+      db = createDB(file),
+      store = createCellStore(db);
+    const from = Temporal.Instant.from("2026-10-01T00:00Z"),
+      to = from.add({ hours: 2 });
+    store.setMeta("backfill", `${from}/${to}`);
+    let published = false;
+    try {
+      await refineHistory({
+        store,
+        config,
+        file,
+        signal: new AbortController().signal,
+        source: {
+          createReader: (window) =>
+            Readable.from(
+              Array.from({ length: 600 }, (_, i) => ({
+                longitude: -80 + i * 0.00001,
+                latitude: 26,
+                depth: 5 + (i % 3) * 0.1,
+                timestamp: window.from.add({ seconds: i }),
+              })),
+            ),
+          getAvailableTimeframes: () => {
+            expect(published).toBe(true);
+            return [];
+          },
+        },
+        onChange: (changed) => {
+          expect(changed.length).toBeGreaterThan(0);
+          expect(store.cells(-81, 25, -79, 27).length).toBeGreaterThan(0);
+          expect(store.cells(-81, 25, -79, 27, 6).length).toBeGreaterThan(0);
+          published = true;
+        },
+      });
+      expect(published).toBe(true);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+test.skipIf(!existsSync(dist))(
+  "starting a stored chart queues no speculative tile builds",
+  async () => {
+    const { createDB } = await import("../../dist/storage.js");
+    const { createCellStore } = await import("../../dist/tiles/cells.js");
+    const { cellAt } = await import("../../dist/tiles/geometry.js");
+    const { startChart, cellConfig } = await import("../../dist/chart.js");
+    const { app, config } = await import("../helper.js");
+    const dir = mkdtempSync(join(tmpdir(), "crowd-depth-demand-"));
+    const db = createDB(join(dir, "chart.sqlite"));
+    const controller = new AbortController();
+    const store = createCellStore(db),
+      settings = cellConfig(config);
+    store.setMeta("config_position", settings.position);
+    store.setMeta("config_depth", settings.depth);
+    store.setMeta("config_weight", settings.weight);
+    store.addPasses([{ ...cellAt(-80, 26), depth: 5, day: 20000 }]);
+    try {
+      startChart({
+        app: {
+          ...app,
+          subscriptionmanager: { subscribe: () => {} },
+          getSelfPath: () => undefined,
+          get: () => {},
+          use: () => {},
+          registerResourceProvider: () => {},
+        } as typeof app,
+        config,
+        db,
+        signal: controller.signal,
+      });
+      expect(db.prepare("SELECT count(*) n FROM kept_tiles").get()).toEqual({
+        n: 0,
+      });
+    } finally {
+      controller.abort();
       db.close();
       rmSync(dir, { recursive: true, force: true });
     }

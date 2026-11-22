@@ -158,7 +158,18 @@ async function startSignalK({
   );
   await writeFile(
     join(configDir, "settings.json"),
-    JSON.stringify({ interfaces: {}, pipedProviders: [] }),
+    JSON.stringify({
+      interfaces: {},
+      pipedProviders: [],
+      gnssSensors: [
+        {
+          sensorId: "e2e",
+          $source: "e2e",
+          fromBow: config.gnss.y,
+          fromCenter: config.gnss.x,
+        },
+      ],
+    }),
   );
   await writeFile(
     join(configDir, "defaults.json"),
@@ -308,7 +319,6 @@ describe.skipIf(!RUN)("uploads from a real Signal K server", () => {
       enableAtBoot: true,
     });
     // Soundings sent before the plugin subscribes would be lost.
-    await sk.waitForStatus(/Next report at/);
 
     const fix = (i: number) => ({
       path: "navigation.position",
@@ -318,7 +328,7 @@ describe.skipIf(!RUN)("uploads from a real Signal K server", () => {
       context: "vessels.self",
       updates: [
         {
-          source: { label: "e2e" },
+          source: { label: "e2e", type: "plugin" },
           // No timestamp: the server stamps each delta as it arrives. One
           // stamped before it's sent could predate a report that ran while it
           // was in flight, and that report's successor would skip it.
@@ -326,6 +336,15 @@ describe.skipIf(!RUN)("uploads from a real Signal K server", () => {
         },
       ],
     });
+    // Discovery must see instruments before collection starts. A depth alone
+    // must not permanently fail initialization when the first GPS fix is late.
+    await sk.sendDeltas([
+      update([{ path: "environment.depth.belowTransducer", value: 3.2 }]),
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    await sk.sendDeltas([update([fix(0)])]);
+    await sk.waitForStatus(/Next report at/);
+
     // A depth is only kept with a fresh position fix and heading, which moves
     // it from the antenna to the transducer, so those speak first, as they
     // would on board.

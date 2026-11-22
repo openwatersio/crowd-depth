@@ -46,6 +46,17 @@ export function cellCenter(
   };
 }
 
+/** Geographic footprint of one sampled cell, clipped at the antimeridian. */
+export function cellBounds(py: number, px: number) {
+  const width = cellWidth(py);
+  return {
+    west: Math.max(-180, px * width),
+    east: Math.min(180, (px + 1) * width),
+    south: py / ROWS_PER_DEGREE,
+    north: (py + 1) / ROWS_PER_DEGREE,
+  };
+}
+
 /** The 3×3 cells around a cell, itself included. Neighbours across a band edge are
  * found by position, since the column width changes there. */
 export function neighbours(

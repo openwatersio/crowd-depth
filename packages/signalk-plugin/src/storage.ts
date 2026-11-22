@@ -130,6 +130,9 @@ export function createDB(filename: string): DatabaseSync {
       // Once the kept tiles' tables, made since by keptTileSchema, outside the
       // migrations: they're optional, and a build that can't make them must still start.
     },
+    () => {
+      db.exec("ALTER TABLE bathymetry ADD COLUMN gnss TEXT");
+    },
   ]);
 
   return db;

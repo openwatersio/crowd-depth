@@ -1,3 +1,4 @@
+import type { GnssQuality } from "./gnss-quality.js";
 import { Temporal } from "@js-temporal/polyfill";
 import { Readable, Writable } from "stream";
 import type { Tide } from "./tiles/tide.js";
@@ -31,11 +32,26 @@ export type BathymetryData = {
   depth: number;
   timestamp: Temporal.Instant;
   heading?: number;
+  gnss?: GnssQuality;
   /** The water level above chart datum at the sounding, for the chart layer. */
   tide?: Tide;
 };
 
 export interface BathymetrySource {
+  /** Bounded spatial lookup over already acquired local chunks; never calls a provider. */
+  getStoredTimeframes?: (
+    timeframe: Timeframe,
+    bounds: readonly [number, number, number, number],
+  ) => Timeframe[];
+  /** Optional spatial hints for preview acquisition, never a completeness claim. */
+  getPreviewTimeframes?: (
+    timeframe: Timeframe,
+    bounds: readonly [number, number, number, number],
+  ) => Promise<Timeframe[]>;
+  /** Same paired/corrected samples, without optional reporting-only metadata reads. */
+  createPreviewReader?: (
+    options: Timeframe,
+  ) => MaybePromise<Readable | undefined>;
   createWriter?: () => Writable;
   createReader: (options: Timeframe) => MaybePromise<Readable | undefined>;
   getAvailableTimeframes(

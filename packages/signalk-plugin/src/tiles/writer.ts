@@ -103,14 +103,19 @@ const RANK: Record<string, number> = {
 /** Meta key for the time the cells hold every sounding through. */
 export const THROUGH_KEY = "through";
 
-export function getThrough(store: CellStore): Temporal.Instant | undefined {
+export function getThrough(
+  store: Pick<CellStore, "getMeta">,
+): Temporal.Instant | undefined {
   const value = store.getMeta(THROUGH_KEY);
   return value ? Temporal.Instant.from(value) : undefined;
 }
 
 /** Advance the marker, never past now, so a sounding from a clock set in the future
  * can't make later backfills skip real time. */
-export function setThrough(store: CellStore, micros: number) {
+export function setThrough(
+  store: Pick<CellStore, "getMeta" | "setMeta">,
+  micros: number,
+) {
   const now = Temporal.Now.instant();
   let instant = Temporal.Instant.fromEpochMilliseconds(
     Math.floor(micros / 1000),
@@ -172,7 +177,10 @@ interface OpenPass {
  * {@link HOLD_MAX_MS} they're written anyway.
  */
 export function createCellWriter(
-  store: CellStore,
+  store: Pick<
+    CellStore,
+    "transaction" | "addPasses" | "addShoals" | "getMeta" | "setMeta"
+  >,
   {
     flushIntervalMs = DEFAULT_FLUSH_MS,
     bulk = false,
@@ -181,10 +189,13 @@ export function createCellWriter(
     qc: runQC,
     onError = () => {},
     progress,
+    range,
   }: {
+    /** Judge context, but fold only this half-open microsecond interval. */
+    range?: readonly [number, number];
     flushIntervalMs?: number;
     bulk?: boolean;
-    /** Keep the overviews up as passes are written; a backfill rebuilds them after. */
+    /** Keep the overviews up as passes are written, including during backfill. */
     overviews?: boolean;
     onChange?: (changed: Changed) => void;
     /** Where track QC runs, as on a thread of its own; without it, here. */
@@ -230,6 +241,8 @@ export function createCellWriter(
         py: pass.py,
         px: pass.px,
         day: Math.floor(pass.last / 86_400_000_000),
+        time: pass.last,
+        start: pass.first,
         ...(pass.depths.length
           ? { depth: median(pass.depths), tide: pass.tide }
           : { depth: median(pass.raw) }),
@@ -329,6 +342,7 @@ export function createCellWriter(
     // bad data or the deep side, which drawn would show water deeper than it is.
     for (let k = 0; k < count; k++) {
       const s = buffer[judged + k];
+      if (range && (s.time < range[0] || s.time >= range[1])) continue;
       const flag = ruled.flags[offset + k];
       if (flag === undefined || flag === "review") accept(s);
       else if (flag === "unconfirmed") {
@@ -411,44 +425,54 @@ export function createCellWriter(
   };
 
   /** The oldest sounding not yet written, or Infinity. */
-  const oldestHeld = () => {
+  const oldestHeld = (writing = false) => {
     let oldest = Infinity;
     for (let i = judged; i < buffer.length; i++) {
       oldest = Math.min(oldest, buffer[i].time);
     }
-    for (const s of unwritten) oldest = Math.min(oldest, s.time);
+    if (!writing) for (const s of unwritten) oldest = Math.min(oldest, s.time);
     for (const p of open.values()) {
       for (const s of p.soundings) oldest = Math.min(oldest, s.time);
     }
     return oldest;
   };
 
+  let lastCheckpoint: number | undefined;
   const flush = () => {
     if (held) return;
-    if (passes.length || shoals.length) {
-      const batch = passes;
-      const found = shoals;
-      // Taken only once written, so a write that fails is tried again whole. Shoals
-      // first: writing one again changes nothing, where a pass would count twice.
-      if (found.length) store.addShoals(found);
-      const cells = store.addPasses(batch, overviews);
-      passes = passes.slice(batch.length);
-      shoals = shoals.slice(found.length);
-      if (!bulk) {
-        const at = Date.now();
-        stored = stored.filter((s) => s.at >= at - STORED_MS);
-        for (const s of [...unwritten, ...found])
-          stored.push({ id: s.time, at });
+    const oldest = oldestHeld(true);
+    const checkpoint = latest
+      ? Number.isFinite(oldest)
+        ? oldest - (bulk ? 0 : 1)
+        : latest + (bulk ? 1000 : 0)
+      : undefined;
+    if (!passes.length && !shoals.length && checkpoint === lastCheckpoint)
+      return;
+    let changed: Changed = [];
+    const batch = passes,
+      found = shoals;
+    store.transaction(() => {
+      if (batch.length || found.length) {
+        if (found.length) store.addShoals(found);
+        const cells = store.addPasses(batch, overviews);
+        changed = [...cells.map((c) => cellCenter(c.py, c.px)), ...found];
       }
-      unwritten = [];
-      onChange([...cells.map((c) => cellCenter(c.py, c.px)), ...found]);
+      if (checkpoint !== undefined) {
+        if (!bulk) setThrough(store, checkpoint);
+        else progress?.(checkpoint);
+      }
+    });
+    // Mutate buffers only after COMMIT; a failed commit must retry the same data.
+    passes = passes.slice(batch.length);
+    shoals = shoals.slice(found.length);
+    if (!bulk && (batch.length || found.length)) {
+      const at = Date.now();
+      stored = stored.filter((s) => s.at >= at - STORED_MS);
+      for (const s of [...unwritten, ...found]) stored.push({ id: s.time, at });
     }
-    if (latest) {
-      const oldest = oldestHeld();
-      if (!bulk) {
-        setThrough(store, Number.isFinite(oldest) ? oldest - 1 : latest);
-      } else progress?.(Number.isFinite(oldest) ? oldest : latest + 1000);
-    }
+    unwritten = [];
+    lastCheckpoint = checkpoint;
+    if (changed.length) onChange(changed);
   };
 
   const writer = new Writable({

@@ -292,3 +292,135 @@ test("retries with the orientation paths the provider has recorded", async () =>
   ]);
   expect(points[0].heading).toBe(1.5);
 });
+
+test("historical GNSS quality matches source and bucket, with no present-day fallback", async () => {
+  const time = "2025-01-01T12:00:00Z";
+  const testApp = {
+    ...app,
+    getSelfPath: () => undefined,
+    getHistoryApi: async () => ({
+      getPaths: async () => [
+        "navigation.gnss.satellites",
+        "navigation.gnss.methodQuality",
+      ],
+      getValues: async (req: { pathSpecs: { path: string }[] }) =>
+        req.pathSpecs[0].path.startsWith("navigation.gnss")
+          ? {
+              values: [
+                { path: "navigation.gnss.satellites", $source: "gps" },
+                { path: "navigation.gnss.methodQuality", $source: "other" },
+              ],
+              data: [[time, 12, "RTK fixed integer"]],
+            }
+          : {
+              values: [
+                { path: "navigation.position" },
+                { path: "environment.depth.belowTransducer" },
+              ],
+              data: [
+                [time, [1, 2], 3],
+                ["2025-01-01T12:00:01Z", [1, 2], 4],
+              ],
+            },
+    }),
+  } as unknown as typeof app;
+  const source = await createHistorySource(testApp, {
+    ...config,
+    path: "belowTransducer",
+    gnss: { ...config.gnss, source: "gps" },
+  });
+  const rows = await (await source!.createReader(
+    new Timeframe(from, to),
+  ))!.toArray();
+  expect(rows[0].gnss).toEqual({ satellites: 12 });
+  expect(rows[1].gnss).toBeUndefined();
+});
+
+test("spatial preview hints query only own tracks and return clamped unique hours", async () => {
+  const { app: testApp } = providerApp({ data: [] });
+  const requests: unknown[] = [];
+  Object.assign(testApp, {
+    selfId: "urn:mrn:imo:mmsi:123",
+    getTrackApi: async () => ({
+      getTracks: async (query: unknown) => {
+        requests.push(query);
+        return {
+          features: [
+            {
+              properties: {
+                context: "vessels.urn:mrn:imo:mmsi:123",
+                coordTimes: [
+                  [
+                    "2025-01-01T12:05:00Z",
+                    "2025-01-01T12:45:00Z",
+                    "2025-01-01T13:00:00Z",
+                    "invalid",
+                  ],
+                ],
+              },
+            },
+            {
+              properties: {
+                context: "vessels.other",
+                coordTimes: [["2025-01-01T16:00:00Z"]],
+              },
+            },
+          ],
+        };
+      },
+    }),
+  });
+  const source = await createHistorySource(testApp, config);
+  const windows = await source!.getPreviewTimeframes!(
+    new Timeframe(from, to),
+    [-81, 25, -79, 27],
+  );
+  expect(windows.map((w) => w.from.toString())).toEqual([
+    "2025-01-01T13:00:00Z",
+    "2025-01-01T12:00:00Z",
+  ]);
+  expect(requests[0]).toMatchObject({
+    contexts: ["vessels.urn:mrn:imo:mmsi:123"],
+    bbox: [-81, 25, -79, 27],
+    times: true,
+    clip: true,
+  });
+});
+
+test("preview reader skips optional GNSS metadata while preserving paired depth and position", async () => {
+  const { app: testApp } = providerApp({
+    data: [["2025-01-01T12:00:00Z", [1, 2], 3.2, null, null, null]],
+  });
+  let paths = 0;
+  const api = await testApp.getHistoryApi!();
+  api.getPaths = async () => {
+    paths++;
+    return [];
+  };
+  const source = await createHistorySource(testApp, {
+    ...config,
+    gnss: { ...config.gnss, source: "gps" },
+  });
+  const reader = await source!.createPreviewReader!(new Timeframe(from, to));
+  expect((await reader!.toArray())[0]).toMatchObject({
+    longitude: 1,
+    latitude: 2,
+    depth: 3.2,
+  });
+  expect(paths).toBe(0);
+  await source!.createReader(new Timeframe(from, to));
+  expect(paths).toBe(1);
+});
+
+test("availability uses the same selected sounder as detailed history reads", async () => {
+  const { app: testApp, calls } = providerApp({ values: [], data: [] });
+  const source = await createHistorySource(testApp, {
+    ...config,
+    sounder: { ...config.sounder, source: "chosen" },
+  });
+  await source!.getAvailableTimeframes(
+    new Timeframe(from, to),
+    Temporal.Duration.from({ hours: 1 }),
+  );
+  expect(calls[0][0].sourceRef).toBe("chosen");
+});

@@ -3,7 +3,7 @@ import { setImmediate } from "node:timers/promises";
 import { Temporal } from "@js-temporal/polyfill";
 import { transform } from "stream-transform";
 import { ServerAPI } from "@signalk/server-api";
-import { Config, historySpan } from "../config.js";
+import { Config } from "../config.js";
 import { BATHY_EPOCH } from "../constants.js";
 import { BathymetryData, BathymetrySource, Timeframe } from "../types.js";
 import { correctForSensorPosition } from "../streams/index.js";
@@ -11,6 +11,7 @@ import { CellStore } from "./cells.js";
 import { Writable } from "stream";
 import { Worker } from "node:worker_threads";
 import {
+  type Changed,
   THROUGH_KEY,
   createCellWriter,
   getThrough,
@@ -76,7 +77,7 @@ export function getPendingBackfill(store: CellStore): Timeframe | undefined {
 export function addPendingBackfill(
   store: CellStore,
   until: Temporal.Instant,
-  span: Temporal.Duration | undefined,
+  span: Temporal.Duration | undefined = undefined,
 ) {
   const pending = getPendingBackfill(store);
   // Never more than the span back, however long the layer was off.
@@ -100,7 +101,7 @@ export function clearPendingBackfill(store: CellStore) {
 /** Move the pending span's start up to `micros`, the oldest sounding a backfill has
  * yet to write, so one that is stopped goes on from there rather than folding in
  * again what it wrote. A backfill getting somewhere starts its failures afresh: only
- * starts in a row that get nowhere give the span up. */
+ * starts in a row that get nowhere are recorded for diagnostics. */
 export function advancePendingBackfill(store: CellStore, micros: number) {
   const pending = getPendingBackfill(store);
   if (!pending) return;
@@ -126,23 +127,12 @@ export function startRebuild(store: CellStore) {
 /** Meta key for how many starts in a row the pending span has failed. */
 const FAILURES_KEY = "backfill_failures";
 
-/** Starts a pending span may fail before it is given up on. A source that is
- * slow to come up (an InfluxDB still starting at boot) gets a few chances; one
- * that fails on the same data every time doesn't cost every start forever. */
-export const MAX_BACKFILL_FAILURES = 3;
-
-/** Record a failed backfill, giving up on the span after
- * {@link MAX_BACKFILL_FAILURES} in a row. Returns whether it will be retried. */
+/** Failures remain retryable; an unavailable provider must never erase coverage debt. */
 export function recordBackfillFailure(store: CellStore): boolean {
-  const failures = Number(store.getMeta(FAILURES_KEY) || 0) + 1;
-  if (failures >= MAX_BACKFILL_FAILURES) {
-    // Past the span, or the next start would add the same gap again.
-    const pending = getPendingBackfill(store);
-    if (pending) setThrough(store, pending.to.epochMilliseconds * 1000);
-    clearPendingBackfill(store);
-    return false;
-  }
-  store.setMeta(FAILURES_KEY, String(failures));
+  store.setMeta(
+    FAILURES_KEY,
+    String(Number(store.getMeta(FAILURES_KEY) || 0) + 1),
+  );
   return true;
 }
 
@@ -162,8 +152,13 @@ export async function backfillCells({
   file,
   tides,
   until = Temporal.Now.instant(),
+  onChange = () => {},
+  availableThrough,
 }: {
   app: ServerAPI;
+  onChange?: (changed: Changed) => void;
+  /** Process settled history now; preserve the mutable tail as pending. */
+  availableThrough?: Temporal.Instant;
   config: Config;
   source: BathymetrySource;
   store: CellStore;
@@ -188,11 +183,11 @@ export async function backfillCells({
   if (tideChanged(store, tided)) {
     app.debug("Tide changed: rebuilding the chart layer");
     startRebuild(store);
-    addPendingBackfill(store, until, historySpan(config));
+    addPendingBackfill(store, until);
   }
   store.setMeta(TIDE_CONFIG_KEY, tideConfig(tided));
   const rebuild = async () => {
-    if (file) await rebuildOverviewsOnWorker(file, signal);
+    if (file) await rebuildOverviewsOnWorker(file, signal, store.generation);
     else store.rebuildOverviews();
     store.setMeta(OVERVIEWS_STALE_KEY, "");
   };
@@ -208,6 +203,14 @@ export async function backfillCells({
 
   let pending = getPendingBackfill(store);
   if (!pending) return;
+  const pendingEnd = pending.to;
+  if (
+    availableThrough &&
+    Temporal.Instant.compare(availableThrough, pending.to) < 0
+  ) {
+    if (Temporal.Instant.compare(availableThrough, pending.from) <= 0) return;
+    pending = new Timeframe(pending.from, availableThrough);
+  }
   // The SQLite log is the source that can write; its depths from before a
   // depth reference change were recorded with the old offset.
   const depthSince = store.getMeta(DEPTH_SINCE_KEY);
@@ -226,33 +229,39 @@ export async function backfillCells({
   // provider. Sources round windows out to whole hours, so each is clamped to its
   // year: one crossing into the next is read once. Soundings past the span were
   // already written live.
-  const windows: Timeframe[] = [];
-  for (
-    let from = pending.from;
-    Temporal.Instant.compare(from, pending.to) < 0;
-  ) {
-    const next = from.add(AVAILABILITY_SPAN);
-    const year = new Timeframe(
-      from,
-      Temporal.Instant.compare(next, pending.to) < 0 ? next : pending.to,
-    );
-    for (const window of await source.getAvailableTimeframes(year, WINDOW)) {
-      windows.push(window.clamp(year));
+  const span = pending;
+  async function* windows() {
+    for (let from = span.from; Temporal.Instant.compare(from, span.to) < 0;) {
+      if (signal.aborted) return;
+      const next = from.add(AVAILABILITY_SPAN);
+      const year = new Timeframe(
+        from,
+        Temporal.Instant.compare(next, span.to) < 0 ? next : span.to,
+      );
+      const available = await source.getAvailableTimeframes(year, WINDOW);
+      for (const window of available.sort((a, b) =>
+        Temporal.Instant.compare(a.from, b.from),
+      )) {
+        const clamped = window.clamp(year);
+        if (Temporal.Instant.compare(clamped.from, clamped.to) < 0)
+          yield clamped;
+      }
+      from = year.to;
     }
-    from = year.to;
   }
-  if (windows.length > 0) {
-    app.debug(`Backfilling chart cells from ${windows.length} windows`);
-    // Its cells get their overviews at the end; until then they're marked missing,
-    // so a backfill that doesn't get there is made good by the next.
+  {
+    app.debug("Backfilling chart cells incrementally");
+    // Retain the repair marker until the whole run finishes, including old-build recovery.
     store.setMeta(OVERVIEWS_STALE_KEY, "1");
     try {
       await pipeline(
         async function* () {
           let read = 0;
-          for (const window of windows) {
+          for await (const window of windows()) {
             if (signal.aborted) return;
-            const reader = await source.createReader(window);
+            const reader = await (
+              source.createPreviewReader ?? source.createReader
+            )(window);
             if (!reader) continue;
             for await (const sounding of reader) {
               yield sounding;
@@ -264,15 +273,16 @@ export async function backfillCells({
         // On this thread, so the worker never waits on the server it would ask.
         ...(tided && tides ? [withTide(tides)] : []),
         file
-          ? createWorkerSink(file)
+          ? createWorkerSink(file, onChange, store.generation)
           : createCellWriter(store, {
               bulk: true,
-              overviews: false,
+              overviews: true,
+              onChange,
               progress: (micros) => advancePendingBackfill(store, micros),
             }),
         { signal },
       );
-      // The worker rebuilt them as it finished.
+      // The worker maintained overviews with each commit.
       if (file) store.setMeta(OVERVIEWS_STALE_KEY, "");
       else await rebuild();
     } catch (err) {
@@ -286,7 +296,9 @@ export async function backfillCells({
   // Done through the span's end, where the live writer took over, so a later start
   // doesn't fold the same passes in again even if the live writer has written nothing.
   setThrough(store, pending.to.epochMilliseconds * 1000);
-  clearPendingBackfill(store);
+  if (Temporal.Instant.compare(pending.to, pendingEnd) < 0)
+    store.setMeta(PENDING_KEY, `${pending.to}/${pendingEnd}`);
+  else clearPendingBackfill(store);
 }
 
 /** Soundings sent to the backfill worker at a time. Each batch waits for the worker to
@@ -294,10 +306,14 @@ export async function backfillCells({
 const WORKER_BATCH = 2000;
 
 /** A Writable that hands soundings to the backfill worker and finishes once the worker
- * has written them all and rebuilt the overviews. */
-export function createWorkerSink(file: string): Writable {
+ * has written all cells and their overviews. */
+export function createWorkerSink(
+  file: string,
+  onChange: (changed: Changed) => void = () => {},
+  generation?: string,
+): Writable {
   const worker = new Worker(new URL("./backfill-worker.js", import.meta.url), {
-    workerData: { file },
+    workerData: { file, generation },
   });
   let batch: object[] = [];
   let waiting: ((err?: Error | null) => void) | undefined;
@@ -312,10 +328,17 @@ export function createWorkerSink(file: string): Writable {
     waiting = undefined;
     w?.(err ?? undefined);
   };
-  worker.on("message", (msg: { ack?: true; done?: true; error?: string }) => {
-    if (msg.done) finished = true;
-    settle(msg.error ? new Error(msg.error) : undefined);
-  });
+  worker.on(
+    "message",
+    (msg: { ack?: true; done?: true; error?: string; changed?: Changed }) => {
+      if (msg.changed) {
+        onChange(msg.changed);
+        return;
+      }
+      if (msg.done) finished = true;
+      settle(msg.error ? new Error(msg.error) : undefined);
+    },
+  );
   worker.on("error", (err) => settle(err as Error));
   worker.on("exit", (code) => {
     if (!finished) settle(new Error(`backfill worker exited (${code})`));
@@ -363,10 +386,11 @@ export function createWorkerSink(file: string): Writable {
 function rebuildOverviewsOnWorker(
   file: string,
   signal: AbortSignal,
+  generation?: string,
 ): Promise<void> {
   if (signal.aborted) return Promise.reject(new Error("aborted"));
   const worker = new Worker(new URL("./backfill-worker.js", import.meta.url), {
-    workerData: { file },
+    workerData: { file, generation },
   });
   let abort = () => {};
   return new Promise<void>((resolve, reject) => {

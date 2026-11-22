@@ -244,3 +244,32 @@ test("a rebuild over a stale block row keeps a cell the live writer added meanwh
     expect(pick.px).toBe(x.px);
   }
 });
+
+test("superseded chart workers cannot commit cells or overviews", () => {
+  const db = createDB(":memory:");
+  const old = createCellStore(db, "old");
+  old.setMeta("build_generation", "old");
+  old.addPasses([{ py: 1, px: 1, depth: 3, day: 1 }]);
+  const current = createCellStore(db, "current");
+  current.setMeta("build_generation", "current");
+  expect(() => old.addPasses([{ py: 2, px: 2, depth: 6, day: 2 }])).toThrow(
+    "superseded",
+  );
+  expect(current.cells(-1, -1, 1, 1)).toHaveLength(1);
+  expect(() => old.rebuildOverviews()).toThrow("superseded");
+  current.setMeta("backfill", "new checkpoint");
+  expect(() => old.setMeta("backfill", "obsolete checkpoint")).toThrow(
+    "superseded",
+  );
+  expect(current.getMeta("backfill")).toBe("new checkpoint");
+  expect(() =>
+    current.transaction(() => {
+      current.addPasses([{ py: 2, px: 2, depth: 6, day: 2 }]);
+      current.setMeta("backfill", "uncommitted checkpoint");
+      throw new Error("interrupted");
+    }),
+  ).toThrow("interrupted");
+  expect(current.getMeta("backfill")).toBe("new checkpoint");
+  expect(current.cells(-1, -1, 1, 1)).toHaveLength(1);
+  db.close();
+});

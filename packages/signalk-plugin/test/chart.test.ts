@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Temporal } from "@js-temporal/polyfill";
 import { app, config } from "./helper.js";
-import { Config, History, historySpan } from "../src/config.js";
+import { Config } from "../src/config.js";
 import {
   cellConfig,
   ownStyle,
@@ -44,6 +44,39 @@ const offsetConfig: Config = {
 };
 
 const at = (s: string) => Temporal.Instant.from(s);
+
+test("a failed half-life update cannot lose its pending reweight", () => {
+  const db = createDB(":memory:");
+  const store = createCellStore(db);
+  const next = { ...config, chart: { show: false, halfLifeDays: 730 } };
+  const keys = cellConfig(next);
+  store.setMeta("config_position", keys.position);
+  store.setMeta("config_depth", keys.depth);
+  store.setMeta("config_weight", "365");
+  db.exec(`CREATE TRIGGER interrupt_reweight BEFORE INSERT ON tile_meta
+    WHEN NEW.key='reweight_pending'
+    BEGIN SELECT RAISE(ABORT, 'simulated interrupted configuration'); END`);
+  const errors = vi.fn();
+  const options = {
+    app: { ...app, error: errors },
+    config: next,
+    db,
+    signal: new AbortController().signal,
+  };
+  try {
+    startChartSafely(options);
+    expect(errors).toHaveBeenCalled();
+    expect(store.getMeta("config_weight")).toBe("365");
+    expect(store.getMeta("reweight_pending")).toBeUndefined();
+    db.exec("DROP TRIGGER interrupt_reweight");
+    startChartSafely(options);
+    expect(store.getMeta("config_weight")).toBe("730");
+    expect(store.getMeta("reweight_pending")).toBe("1");
+    expect(store.getMeta("reweight_after")).toBe("");
+  } finally {
+    db.close();
+  }
+});
 
 test("the layer's own style falls back to the default for hand-edited values", () => {
   const chart = {
@@ -82,7 +115,7 @@ test("backfills the tiles from the plugin's source with its correction", async (
   await pipeline(Readable.from(soundings), source.createWriter!());
 
   const store = createCellStore(db);
-  addPendingBackfill(store, at("2026-10-16T12:00:00Z"), historySpan(config));
+  addPendingBackfill(store, at("2026-10-16T12:00:00Z"));
   await backfillCells({
     app,
     config: offsetConfig,
@@ -119,7 +152,7 @@ test("backfill starts where the tiles left off", async () => {
   );
   const store = createCellStore(db);
   store.setMeta("through", "2026-10-16T09:00:00Z");
-  addPendingBackfill(store, at("2026-10-16T12:00:00Z"), historySpan(config));
+  addPendingBackfill(store, at("2026-10-16T12:00:00Z"));
 
   await backfillCells({
     app,
@@ -186,7 +219,7 @@ test("the backfill still runs after the live writer has moved the marker on", as
     source.createWriter!(),
   );
   const store = createCellStore(db);
-  addPendingBackfill(store, at("2026-10-16T12:00:00Z"), historySpan(config));
+  addPendingBackfill(store, at("2026-10-16T12:00:00Z"));
 
   const live = createCellWriter(store, { flushIntervalMs: 100000 });
   live.write(
@@ -214,12 +247,12 @@ test("the backfill still runs after the live writer has moved the marker on", as
 test("an interrupted backfill is widened, not lost, on the next start", () => {
   const store = createCellStore(createDB(":memory:"));
   store.setMeta("through", "2026-10-16T10:00:00Z");
-  addPendingBackfill(store, at("2026-10-16T12:00:00Z"), historySpan(config));
+  addPendingBackfill(store, at("2026-10-16T12:00:00Z"));
   const first = getPendingBackfill(store)!;
   expect(first.from.toString()).toBe("2026-10-16T10:00:00Z");
   // The live writer ran for a while before the plugin restarted.
   store.setMeta("through", "2026-10-16T13:00:00Z");
-  addPendingBackfill(store, at("2026-10-16T14:00:00Z"), historySpan(config));
+  addPendingBackfill(store, at("2026-10-16T14:00:00Z"));
   const second = getPendingBackfill(store)!;
   expect(second.from.toString()).toBe(first.from.toString());
   expect(second.to.toString()).toBe("2026-10-16T14:00:00Z");
@@ -380,7 +413,7 @@ test("after a depth reference change, the SQLite log only backfills newer soundi
     source.createWriter!(),
   );
   const store = createCellStore(db);
-  addPendingBackfill(store, at("2026-10-16T12:00:00Z"), historySpan(config));
+  addPendingBackfill(store, at("2026-10-16T12:00:00Z"));
   store.setMeta("depth_since", "2026-10-16T10:00:00Z");
 
   await backfillCells({
@@ -425,7 +458,7 @@ test("the backfill doesn't merge soundings past its span again", async () => {
   );
   const store = createCellStore(db);
   store.setMeta("through", "2026-10-16T11:00:00Z");
-  addPendingBackfill(store, at("2026-10-16T11:30:00Z"), historySpan(config));
+  addPendingBackfill(store, at("2026-10-16T11:30:00Z"));
 
   await backfillCells({
     app,
@@ -438,9 +471,8 @@ test("the backfill doesn't merge soundings past its span again", async () => {
   expect(cellAt(store, 0, 0)).toBeUndefined();
 });
 
-test("a failing backfill is retried on later starts, then given up", async () => {
-  // A source slow to come up at boot gets another chance; one that always
-  // fails doesn't cost every start forever.
+test("a failing backfill remains pending across repeated starts", async () => {
+  // A failed attempt stays pending and a stopped retry loop can restart.
   const db = createDB(":memory:");
   const { app: server } = serverApp();
   // A log the plugin writes itself, so the backfill doesn't wait out History's delay.
@@ -458,43 +490,29 @@ test("a failing backfill is retried on later starts, then given up", async () =>
       db,
       signal: signal.signal,
     });
-    await chart.backfill(failing);
-    if (start < 3) expect(getPendingBackfill(store)).toBeDefined();
-    else expect(getPendingBackfill(store)).toBeUndefined();
+    const errors = vi.spyOn(server, "error");
+    const running = chart.backfill(failing);
+    await vi.waitFor(() =>
+      expect(errors).toHaveBeenCalledWith(
+        expect.stringContaining("will retry"),
+      ),
+    );
+    expect(getPendingBackfill(store)).toBeDefined();
     signal.abort();
+    await running;
+    errors.mockRestore();
   }
 });
 
-test("the backfill reaches back as far as the settings say, however long the layer was off", () => {
-  const backfillFrom = (history: History | undefined, through?: string) => {
-    const store = createCellStore(createDB(":memory:"));
-    if (through) store.setMeta("through", through);
-    const settings = { ...config, chart: { history } };
-    addPendingBackfill(
-      store,
-      at("2026-10-16T00:00:00Z"),
-      historySpan(settings),
-    );
-    return getPendingBackfill(store)!.from.toString();
-  };
-  // The layer was off for two years.
-  const through = "2024-10-16T00:00:00Z";
-  expect(backfillFrom("month", through)).toBe("2026-09-16T00:00:00Z");
-  expect(backfillFrom("year", through)).toBe("2025-10-16T00:00:00Z");
-  expect(backfillFrom(undefined, through)).toBe("2025-10-16T00:00:00Z");
-  expect(backfillFrom("all", through)).toBe(through);
-  // A new layer, from as far back as any source goes.
-  expect(backfillFrom("all")).toBe("2017-06-28T00:00:00Z");
-});
-
-test("changing how far back the layer fills rebuilds it", () => {
-  const position = (history?: string) =>
+test("the backfill uses all history and legacy range settings do not rebuild cells", () => {
+  const store = createCellStore(createDB(":memory:"));
+  addPendingBackfill(store, at("2026-10-16T00:00:00Z"));
+  expect(getPendingBackfill(store)!.from.toString()).toBe(
+    "2017-06-28T00:00:00Z",
+  );
+  const position = (history: string) =>
     cellConfig({ ...config, chart: { history } } as Config).position;
-  expect(position("all")).not.toBe(position("year"));
-  expect(position("month")).not.toBe(position("year"));
-  // Unset, or hand-edited to something else, is the default.
-  expect(position()).toBe(position("year"));
-  expect(position("forever")).toBe(position("year"));
+  expect(position("year")).toBe(position("all"));
 });
 
 test("a chart that fails to start doesn't stop the plugin", () => {
@@ -565,7 +583,7 @@ test("a long SQLite backfill lets the server's event loop run", async () => {
     source.createWriter!(),
   );
   const store = createCellStore(db);
-  addPendingBackfill(store, at("2026-10-17T00:00:00Z"), historySpan(config));
+  addPendingBackfill(store, at("2026-10-17T00:00:00Z"));
 
   // Count turns of the event loop between the first and last sounding read,
   // which is before the writer's own pauses at the end.
@@ -652,7 +670,7 @@ test("a finished backfill isn't folded in again on the next start", async () => 
   );
   const store = createCellStore(db);
   const backfill = async (until: string) => {
-    addPendingBackfill(store, at(until), historySpan(config));
+    addPendingBackfill(store, at(until));
     await backfillCells({
       app,
       config,
@@ -691,12 +709,12 @@ test("a fill stopped partway goes on from where it got to", async () => {
   await pipeline(Readable.from(track), source.createWriter!());
   const clean = createCellStore(createDB(":memory:"));
   startRebuild(clean);
-  addPendingBackfill(clean, at("2026-10-16T12:00:00Z"), historySpan(config));
+  addPendingBackfill(clean, at("2026-10-16T12:00:00Z"));
   await fill(source, clean);
 
   const store = createCellStore(db);
   startRebuild(store);
-  addPendingBackfill(store, at("2026-10-16T12:00:00Z"), historySpan(config));
+  addPendingBackfill(store, at("2026-10-16T12:00:00Z"));
   // Stopped two thirds of the way through.
   const failing: BathymetrySource = {
     ...source,
@@ -717,7 +735,7 @@ test("a fill stopped partway goes on from where it got to", async () => {
   expect(recordBackfillFailure(store)).toBe(true);
   expect(store.getMeta("backfill_failures")).toBe("1");
   // The next start finds the span where it got to.
-  addPendingBackfill(store, at("2026-10-16T12:00:00Z"), historySpan(config));
+  addPendingBackfill(store, at("2026-10-16T12:00:00Z"));
   expect(getPendingBackfill(store)).toEqual(left);
   await fill(source, store);
   const cells = (s: CellStore) => s.cells(-76.3, 36.9, -76.1, 37.4);
@@ -784,6 +802,7 @@ test("a database from a preview build moves to cells", () => {
       DROP TABLE cells; DROP TABLE overviews; DROP TABLE shoals;
       CREATE TABLE tiles(z INTEGER, x INTEGER, y INTEGER, cells BLOB, updated INTEGER);
       INSERT INTO tile_meta(key, value) VALUES ('through', '2026-10-16T09:00:00Z');
+      ALTER TABLE bathymetry DROP COLUMN gnss;
       PRAGMA user_version = 3;
     `);
     old.close();
@@ -801,7 +820,7 @@ test("a database from a preview build moves to cells", () => {
 
 test("a backfill that fails partway still leaves its cells drawn zoomed out", async () => {
   const store = createCellStore(createDB(":memory:"));
-  addPendingBackfill(store, at("2026-10-16T12:00:00Z"), historySpan(config));
+  addPendingBackfill(store, at("2026-10-16T12:00:00Z"));
   const start = at("2026-10-16T08:00:00Z");
   const failing = {
     createWriter: () => undefined as never,
@@ -852,4 +871,90 @@ test("cells a stopped backfill left without overviews get them on the next start
     signal: new AbortController().signal,
   });
   expect(store.cells(-76.3, 36.9, -76.1, 37.1, 6)).toHaveLength(1);
+});
+
+test("local preview appears before a history provider is selected", async () => {
+  const db = createDB(":memory:");
+  const recent = Date.now() - 60_000;
+  db.prepare(
+    "INSERT INTO bathymetry(longitude, latitude, depth, timestamp) VALUES(?,?,?,?)",
+  ).run(-80, 26, 6, recent);
+  const signal = new AbortController();
+  const { app: server } = serverApp();
+  startChart({ app: server, config, db, signal: signal.signal });
+  try {
+    await vi.waitFor(() => {
+      const row = db
+        .prepare("SELECT count(*) AS n FROM preview_cells")
+        .get() as { n: number };
+      expect(row.n).toBe(1);
+    });
+  } finally {
+    signal.abort();
+    db.close();
+  }
+});
+
+test("local preview excludes soundings recorded before the depth reference changed", async () => {
+  const db = createDB(":memory:");
+  const recent = Date.now() - 60_000;
+  db.prepare(
+    "INSERT INTO bathymetry(longitude, latitude, depth, timestamp) VALUES(?,?,?,?)",
+  ).run(-80, 26, 6, recent);
+  const store = createCellStore(db);
+  const previous = cellConfig(config);
+  store.setMeta("config_depth", previous.depth);
+  store.setMeta("config_position", previous.position);
+  const signal = new AbortController();
+  const { app: server } = serverApp();
+  startChart({ app: server, config: offsetConfig, db, signal: signal.signal });
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(
+      (
+        db.prepare("SELECT count(*) AS n FROM preview_cells").get() as {
+          n: number;
+        }
+      ).n,
+    ).toBe(0);
+  } finally {
+    signal.abort();
+    db.close();
+  }
+});
+
+test("settled history is processed immediately while its mutable tail remains pending", async () => {
+  const db = createDB(":memory:");
+  const store = createCellStore(db);
+  const from = at("2026-10-16T00:00Z"),
+    cutoff = from.add({ hours: 1 }),
+    to = from.add({ hours: 2 });
+  store.setMeta("backfill", `${from}/${to}`);
+  const windows: Timeframe[] = [];
+  const source: BathymetrySource = {
+    getAvailableTimeframes: (span) => {
+      windows.push(span);
+      return [];
+    },
+    createReader: () => undefined,
+  };
+  await backfillCells({
+    app,
+    config,
+    source,
+    store,
+    signal: new AbortController().signal,
+    availableThrough: cutoff,
+  });
+  expect(windows.at(-1)?.to).toEqual(cutoff);
+  expect(getPendingBackfill(store)).toEqual(new Timeframe(cutoff, to));
+  await backfillCells({
+    app,
+    config,
+    source,
+    store,
+    signal: new AbortController().signal,
+  });
+  expect(getPendingBackfill(store)).toBeUndefined();
+  db.close();
 });

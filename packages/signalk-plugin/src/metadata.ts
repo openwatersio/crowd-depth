@@ -1,3 +1,4 @@
+import type { SensorInfo } from "./device-info.js";
 import { ServerAPI } from "@signalk/server-api";
 import { readFile, writeFile } from "fs/promises";
 import { join } from "path";
@@ -14,6 +15,7 @@ export type VesselInfo = Identity & {
   mmsi?: string;
   imo?: string;
   name?: string;
+  sensors?: { sounder: SensorInfo; gnss: SensorInfo };
   loa?: number;
   type?: string;
 };

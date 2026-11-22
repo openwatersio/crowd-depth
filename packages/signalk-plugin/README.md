@@ -52,16 +52,22 @@ Accurate offsets are what turn raw sounder readings into chart-quality data —
 take a few minutes to measure them. Where your vessel already reports
 `sensors.*` and `design.*` paths, the plugin pre-fills the defaults.
 
-### Depth
+### Automatic depth path
 
-- **Path** — Which depth path to report (`belowSurface`, `belowTransducer`,
-  or `belowKeel`), depending on what your instruments provide. Defaults to
-  the first one with data.
+The plugin chooses a depth path for the selected sounder at startup, using live
+source information and recorded history. It prefers `belowTransducer`, then
+`belowSurface`, then `belowKeel`. An existing saved Path is preserved to keep previously recorded depths and report references consistent; if that path is unavailable, startup waits rather than changing reference. Only paths
+reported by that source qualify; `derived-data` is excluded. If the source is
+not known yet, the plugin waits until it appears rather than guessing a path.
+The chosen path stays fixed until the plugin restarts so recording, corrections,
+and report references remain consistent.
 
 ### Depth Sounder
 
 - **Depth source** — The sensor to record when more than one reports depth,
-  so soundings stay pinned to a single transducer.
+  so soundings stay pinned to a single transducer. Sources are discovered from
+  live data and the History API, so setup also works after a reboot without
+  new soundings (requires a provider that returns source metadata).
 - **Offsets** — Transducer distance from the bow and from the centerline
   (positive to starboard), in meters. Both are required.
 - **Below the waterline** (optional) — Transducer depth below the waterline,
@@ -71,26 +77,88 @@ take a few minutes to measure them. Where your vessel already reports
 - **Draft** (optional) — The vessel's draft in meters. With the `belowKeel`
   path, it is added to each depth so soundings are reported from the
   waterline. Without it, depths are reported with an unknown reference.
-- **Details** (optional) — Make, model, frequency, and transducer type.
-  Included in report metadata to help downstream processors assess data
-  quality.
+- **Details** (optional) — Make and model show detected values as placeholders. Leave
+  them blank for automatic detection, or enter a value to override it.
+  Frequency (Hz) and transducer type remain manual; standard device information
+  does not provide them. All are included in report metadata.
 
 ### GPS Receiver
 
 - **Position source** — The receiver to record when more than one reports
   position, so all soundings share one antenna location.
-- **Offsets** (required) — Antenna distance from the bow, from the centerline
-  (positive to starboard), and above the waterline, in meters.
-- **Details** (optional) — Make and model.
+- **Horizontal offsets** — Read from Signal K's per-source GNSS sensor settings
+  for the selected receiver (centerline offsets are positive to starboard).
+  Set them there and restart Crowd Depth after changes. Server settings take precedence. If the server has no configured GNSS sensors and correction is off, valid previously saved plugin horizontal offsets are retained for the same selected receiver. Missing offsets are never assumed zero.
+- **Height** (required) — Antenna height above the waterline, in meters.
+
+With Signal K correction off, positions are at the antenna. In `both` mode,
+choose either the raw source or its `<sensorId>.ccrp` source; the plugin uses
+midships as the origin of corrected coordinates, avoiding a second antenna
+correction. Physical antenna offsets still appear in report metadata. `replace`
+mode is not supported for reporting: that source can contain raw positions when
+heading is unavailable and corrected positions otherwise, without a flag in
+history to distinguish them. Use `both` mode instead. Geometry is read at plugin
+startup, not recovered historically; keep source geometry consistent over each
+reporting period.
+
+- **Details** (optional) — Make and model show detected values as placeholders and
+  accept manual overrides.
 
 ### Data Sharing
 
 - **Share data anonymously** — Withhold your vessel name and MMSI and report
-  under a randomly generated UUID instead.
+  under a randomly generated UUID instead. Hardware serial numbers and CAN
+  identities are also omitted.
 
 By enabling the plugin, you agree to share your soundings and your vessel and
 sensor details, and you dedicate them to the public domain under [CC0 1.0
 Universal](https://creativecommons.org/publicdomain/zero/1.0/).
+
+### Detected sensor metadata
+
+At report time, the plugin reads device information for each selected source
+from Signal K. Alongside the CSB 3.1 sensor make and model, a `nmea2000`
+extension includes the reported `modelId`, `modelVersion`,
+`softwareVersionCode`, `productCode`, and (unless anonymous) `modelSerialCode`
+and `canName`. These are device-reported values, not retail model guesses:
+an Airmar P65 may report model ID `DT200` and model version `IDTP65-40-1`.
+Manual make/model overrides do not erase these original fields. Reload the
+settings form after changing sources to refresh detected placeholders.
+
+The sensor descriptions follow the [CSB 3.1 schema](../../docs/CSB-schema-3_1_0-2024-04.json);
+`nmea2000` and `transducer` are additional metadata preserved in the uploaded
+GeoJSON. Device details must still be available in Signal K; discovering a
+source in history does not recover its historical hardware identity. For
+historical reports, these details describe the currently known device at that
+source, not a snapshot taken with each sounding. Use stable CAN-name source
+references where supported, especially when devices are replaced.
+
+### GPS identity and fix quality in reports
+
+For a GPSD-backed source, the plugin queries its configured daemon with the
+read-only [`?DEVICES` command](https://gpsd.io/gpsd_json.html). A `gpsd` sensor
+extension preserves the driver, subtype/hardware/firmware strings, and update
+cycle. Recognized u-blox and Garmin drivers also supply a manufacturer
+placeholder; no retail model is guessed. A daemon with multiple devices is
+ambiguous and supplies no identity. Queries time out after two seconds and
+never include local device paths or serial identifiers in reports.
+
+Each GeoJSON feature can contain a `gnss` quality extension with Signal K's
+`type`, `methodQuality`, `integrity`, `satellites`, `antennaAltitude`,
+`horizontalDilution`, `positionDilution`, `geoidalSeparation`,
+`differentialAge`, and `differentialReference`. Values retain Signal K names
+and units; altitude is not antenna mounting height. Missing values are omitted.
+Live values must match the selected GPS and be no more than two seconds old.
+History values must have matching source metadata and the same one-second
+bucket as the sounding. Unsupported quality queries do not prevent reporting
+positions and depths, and current GPS values never fill historical gaps.
+
+Configure your history provider to record these `navigation.gnss.*` paths.
+Without a history provider, the plugin preserves quality alongside each
+sounding in SQLite. The added nullable `gnss` column migrates existing logs
+without changing their readings. Back up the database before testing this
+preview: an older build does not know the new migration version. Raw GPSD
+error estimates and satellite sky-view arrays are not collected by this path.
 
 ### Chart
 
@@ -100,7 +168,6 @@ Universal](https://creativecommons.org/publicdomain/zero/1.0/).
 - **Colour of my shoal soundings** — The colour of soundings shoaler than the safety depth (dark violet by default).
 - **Tint over sounded water** — Off, faint, normal or strong (normal by default).
 - **Draw depth contours** — Draw the layer's depth contours (on by default).
-- **Fill the layer from** — The last 30 days, the last year or all recorded history (the last year by default): how far back the layer fills in from recorded soundings when it starts or rebuilds. Changing it rebuilds the layer.
 - **Contour detail** — High draws a contour every metre, or every foot, from zoom 13 in, with every fifth one bold and labelled, and the rest labelled too once you zoom in close (the default). Standard draws the chart's depth contours. Zoomed out, both draw the chart's.
 
 ## My soundings on the chart
@@ -117,7 +184,7 @@ On a chartplotter that supports Signal K plotter extensions, Crowd Depth draws t
 
 ### Using it
 
-The layer appears in the chartplotter's chart list as **My soundings**, with its own show and hide and opacity controls. Its depth areas shade from the deep blue of shallow water to the pale blue of deep water, through the colours Open Waters' charts use for their depth bands, and its soundings, contours and a faint tint over the water are violet, strongest where the boat sounded itself, so it stands out over a chart drawn in those colours. Soundings shoaler than the safety depth are a darker violet. In the plugin's settings you can pick other colours if your chart uses violet, make the tint fainter or stronger or turn it off, and leave out the contours. The chartplotter's opacity control applies on top. Saving the settings restarts the plugin, and the change shows the next time the chartplotter loads the layer. Depths are labelled in metres or feet, as you've chosen in the chartplotter. Soundings the boat has just recorded show as orange dots, labelled with the depth the sounder read, less the tide where there is one, before the quality checks have judged them and before the safety margin the layer's areas and soundings carry, until they're folded into the layer: usually within a minute of leaving a spot. While the layer first fills in a long stretch of history, new soundings stay orange until it's done, for up to 3 hours, so older passes go in first. At a mooring, where the depth holds steady, they can stay orange for up to an hour, until the checks can tell a steady depth from a stuck sounder. A sounder reading one depth for a long way is held until it has covered a kilometre, as the checks need to judge it, or until about an hour of soundings at 10 a second is waiting. Over water the layer hasn't drawn yet, a line along the boat's latest pass, as wide as the layer's cells, shows the colour of the depth area its soundings will make, less the same safety margin, until the layer redraws there. Where the chartplotter shows few of your soundings the layer redraws every 5 seconds; where it shows many, as rarely as every 30 seconds, as the chartplotter pauses while it redraws. The plugin builds the layer ahead in the background, nearest the boat first, and keeps it, so panning and zooming read it at once.
+The layer appears in the chartplotter's chart list as **My soundings**, with its own show and hide and opacity controls. Its depth areas shade from the deep blue of shallow water to the pale blue of deep water, through the colours Open Waters' charts use for their depth bands, and its soundings, contours and a faint tint over the water are violet, strongest where the boat sounded itself, so it stands out over a chart drawn in those colours. Soundings shoaler than the safety depth are a darker violet. In the plugin's settings you can pick other colours if your chart uses violet, make the tint fainter or stronger or turn it off, and leave out the contours. The chartplotter's opacity control applies on top. Saving the settings restarts the plugin, and the change shows the next time the chartplotter loads the layer. Depths are labelled in metres or feet, as you've chosen in the chartplotter. Soundings the boat has just recorded show as orange dots, labelled with the depth the sounder read, less the tide where there is one, before the quality checks have judged them and before the safety margin the layer's areas and soundings carry, until they're folded into the layer: usually within a minute of leaving a spot. Historical refinement no longer holds live soundings until the full backfill finishes. At a mooring, where the depth holds steady, they can stay orange for up to an hour, until the checks can tell a steady depth from a stuck sounder. A sounder reading one depth for a long way is held until it has covered a kilometre, as the checks need to judge it, or until about an hour of soundings at 10 a second is waiting. Over water the layer hasn't drawn yet, a line along the boat's latest pass, as wide as the layer's cells, shows the colour of the depth area its soundings will make, less the same safety margin, until the layer redraws there. Where the chartplotter shows few of your soundings the layer redraws every 5 seconds; where it shows many, as rarely as every 30 seconds, as the chartplotter pauses while it redraws. The plugin builds requested tiles in worker threads and caches them for reuse. Whole-history pre-rendering is disabled to limit background CPU and storage work; an uncached view can take longer to draw.
 
 ### What it shows
 
@@ -126,14 +193,13 @@ The layer appears in the chartplotter's chart list as **My soundings**, with its
 - **A shoal-biased depth.** Each spot about 20 m across keeps a running average of your passes over it, and shows that depth less a safety margin for its uncertainty, as the Open Waters overlay does. Until your boat is calibrated against the grid the margin is about 2 m, so the layer reads shallower than your sounder; tide takes about 0.15 m off it near a station.
 - **Soundings, then areas.** Soundings are thinned as the overlay thins them, keeping the shoalest in each area, so zooming in shows more. Depth areas follow every track you've sounded, and fill in between tracks less than 200 m apart, never past the ends of a track.
 - **Suspect readings shown, not drawn.** The same checks the Open Waters grid runs on every boat's track run on yours. A reading they doubt on the shallow side, such as a spike or a stuck sounder in shallow water, stays out of the depth areas, except that the areas never reach past your track any deeper than it, and shows as a faint unconfirmed sounding, so you see the shoals the checks doubt rather than losing them. A stretch where the sounder zig-zags too much to trust is left out on both sides, as the Open Waters grid leaves it out. Readings that would show water deeper than it is, and bad data such as a position that jumped, are left out.
-- **History when it starts.** The first time the layer starts, it fills in your recorded soundings (a History API provider such as signalk-to-influxdb2, or the plugin's own log) from as far back as **Fill the layer from** says: the last year by default, or the last 30 days or all of it. After that, it fills in whatever was recorded while it wasn't running, as far back as the same setting. A long history takes a while: about an hour for each year of soundings recorded around the clock, on a Raspberry Pi 5. A fill stopped by a restart goes on from where it got to at the next start. If that source fails at three starts in a row without getting any further, the layer gives up on what is left of that span and leaves it empty. Spots already in the layer stay, however long ago they were sounded, until something below rebuilds it.
+- **Sounding weight half-life (days).** Defaults to 365 days. An hourly contribution this old has half the weight of a new one; larger values retain more historical influence. This setting changes the rendered estimate, not retention, and changing it rebuilds derived summaries. Each cell receives at most one unit of weight per UTC hour, so a higher sampling rate does not automatically outweigh other hours. The estimate and weighted spread are independent of the order history is acquired. The estimator remains experimental and needs field validation.
+- **History when it starts.** The layer considers all available recorded history. A separate recent-first preview draws orange, translucent observations in your viewport before track checks, tide reduction and contours are ready. It keeps the latest observation per roughly 20 m cell and at most 1,200 in a view; these are untided observations, not the refined depth estimate. Existing local history starts loading even while the plugin waits for a History API provider. Panning displays cached observations for the new view. Where the provider exposes spatial Track API queries, matching visits in the viewport are prioritized. Other providers are scanned backward from recent history; older visits may take longer to discover. Refined cells and zoomed-out overviews publish after independent hourly QC jobs, newest first, with already acquired tracks in the viewport prioritized. Preview and refined history share spatially indexed, compressed settled-hour input chunks. Completed jobs have persistent receipts and are not counted twice after a restart; failed jobs remain pending.
 
 ### When it rebuilds
 
-- The plugin update that adds **Fill the layer from** rebuilds every layer once, from the last year of recorded soundings. Spots older than your recorded soundings go back are lost with it.
-- Changing your **depth sounder or GPS position** on the boat, or a plugin update that changes the quality checks, the tide reduction or the size of a spot, rebuilds the layer from recorded soundings as far back as **Fill the layer from** says, so old soundings don't sit beside new ones in the wrong place.
+- Changing your **depth sounder or GPS position** on the boat, or a plugin update that changes the quality checks, the tide reduction or the size of a spot, rebuilds the layer from all available recorded soundings, so old soundings don't sit beside new ones in the wrong place.
 - **Installing, removing or turning on or off signalk-tides**, or turning on Signal K's read-only access it needs, rebuilds the layer the same way at the next start, reduced for tide or not.
-- Changing **Fill the layer from** rebuilds it from the new span.
 - Changing the **depth path, transducer depth or, for depth below the keel, the draft** rebuilds it from a History API provider if you have one. Without one, the layer starts afresh from that point, because the plugin's own log stores depths with the old offset.
 
 ### Who can see it

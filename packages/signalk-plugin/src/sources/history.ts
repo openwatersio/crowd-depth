@@ -1,7 +1,12 @@
+import {
+  GNSS_FIELDS,
+  qualityValue,
+  type GnssQuality,
+} from "../gnss-quality.js";
 import { Config, depthReference, resolveSource } from "../config.js";
 import { Readable } from "stream";
 import { BathymetryData, BathymetrySource, Timeframe } from "../types.js";
-import { Path, ServerAPI, SourceRef } from "@signalk/server-api";
+import { Context, Path, ServerAPI, SourceRef } from "@signalk/server-api";
 import {
   ContextsRequest,
   ContextsResponse,
@@ -31,7 +36,7 @@ export async function createHistorySource(
 
   if (!history) return;
 
-  async function createReader({ from, to }: Timeframe) {
+  async function createReader({ from, to }: Timeframe, includeQuality = true) {
     app.debug("Reading history from %s to %s", from, to);
 
     // Pin position and depth each to a single source (the configured one, else
@@ -110,6 +115,49 @@ export async function createHistorySource(
       return typeof value === "number" ? value : undefined;
     };
 
+    // Query optional quality separately: an unsupported path must not lose soundings.
+    const quality = new Map<string, GnssQuality>();
+    if (positionSource && includeQuality) {
+      try {
+        const available = await history!.getPaths({ from, to });
+        const fields = (
+          Object.keys(GNSS_FIELDS) as (keyof typeof GNSS_FIELDS)[]
+        ).filter((field) =>
+          available.includes(`navigation.gnss.${field}` as Path),
+        );
+        if (fields.length) {
+          const samples = await history!.getValues({
+            from,
+            to,
+            resolution: 1,
+            sourcePolicy: "all",
+            pathSpecs: fields.map((field) => ({
+              path: `navigation.gnss.${field}` as Path,
+              aggregate: "first",
+              parameter: [],
+              sourceRef: positionSource as SourceRef,
+            })),
+          });
+          for (const row of samples.data) {
+            const values: GnssQuality = {};
+            samples.values?.forEach((column, i) => {
+              if (column.$source !== positionSource) return;
+              const field = fields.find(
+                (f) => column.path === `navigation.gnss.${f}`,
+              );
+              if (!field) return;
+              const value = qualityValue(field, row[i + 1]);
+              if (value !== undefined) values[field] = value;
+            });
+            if (Object.keys(values).length)
+              quality.set(Temporal.Instant.from(row[0]).toString(), values);
+          }
+        }
+      } catch (error) {
+        app.debug("GNSS quality unavailable from history: %s", error);
+      }
+    }
+
     const data = res.data
       .map((row): BathymetryData | undefined => {
         const depth = depthColumn === undefined ? undefined : row[depthColumn];
@@ -132,6 +180,9 @@ export async function createHistorySource(
             longitude,
             latitude,
             depth: depth + offset,
+            ...(quality.has(Temporal.Instant.from(row[0]).toString())
+              ? { gnss: quality.get(Temporal.Instant.from(row[0]).toString()) }
+              : {}),
             heading: bowBearing({
               heading: column(row, HEADING),
               courseOverGround: column(row, COG),
@@ -159,9 +210,15 @@ export async function createHistorySource(
     timeframe: Timeframe,
     windowSize: Temporal.Duration,
   ) {
+    const depthSource = resolveSource(
+      app,
+      config.sounder?.source,
+      `environment.depth.${config.path}`,
+    );
     const pathSpecs = [
       {
         path: ("environment.depth." + config.path) as Path,
+        ...(depthSource ? { sourceRef: depthSource as SourceRef } : {}),
         // signalk-to-influxdb returns null when requesting `first`, so using `min` instead
         aggregate: "min" as const,
         parameter: [],
@@ -193,6 +250,63 @@ export async function createHistorySource(
   return {
     // History providers handle the recording of data themselves
     createWriter: undefined,
+    createPreviewReader: (window: Timeframe) => createReader(window, false),
+    ...(app.getTrackApi && app.selfId
+      ? {
+          getPreviewTimeframes: async (
+            span: Timeframe,
+            bounds: readonly [number, number, number, number],
+          ) => {
+            const tracks = await app.getTrackApi!();
+            const context = (
+              app.selfId.startsWith("vessels.")
+                ? app.selfId
+                : `vessels.${app.selfId}`
+            ) as Context;
+            const result = await tracks.getTracks({
+              contexts: [context],
+              from: span.from,
+              to: span.to,
+              bbox: [...bounds],
+              times: true,
+              clip: true,
+              maxPoints: 128,
+            });
+            const hours = new Set<number>();
+            // Hints only: sampled timestamps may omit visits; normal discovery still runs.
+            for (const feature of result.features.slice(0, 128)) {
+              if (
+                feature.properties.context !== context &&
+                feature.properties.isSelf !== true
+              )
+                continue;
+              for (const segment of (feature.properties.coordTimes ?? []).slice(
+                0,
+                128,
+              )) {
+                for (const time of segment.slice(0, 128)) {
+                  const ms = Date.parse(time);
+                  if (
+                    Number.isFinite(ms) &&
+                    ms >= span.from.epochMilliseconds &&
+                    ms < span.to.epochMilliseconds
+                  )
+                    hours.add(Math.floor(ms / 3600000) * 3600000);
+                }
+              }
+            }
+            return [...hours]
+              .sort((a, b) => b - a)
+              .slice(0, 64)
+              .map((ms) =>
+                new Timeframe(
+                  Temporal.Instant.fromEpochMilliseconds(ms),
+                  Temporal.Instant.fromEpochMilliseconds(ms + 3600000),
+                ).clamp(span),
+              );
+          },
+        }
+      : {}),
     createReader,
     getAvailableTimeframes,
   };

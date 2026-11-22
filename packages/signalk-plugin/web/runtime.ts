@@ -32,34 +32,81 @@ const M_PER_FT = 0.3048;
 const client = await connectExtension();
 
 let drawn = true;
+let loadingUnits = false;
 /** The host's view, for the plugin to batch refreshes by what it holds. */
 let view: MapView | undefined;
 let busy = false;
 let timer: ReturnType<typeof setInterval> | undefined;
+let depthUnit: string | undefined;
+let previewShown: string | undefined;
+let previewRevision: string | undefined;
+let previewView: string | undefined;
+let previewHeld = new Map<string | number, { id: string | number }>();
 const batch = createBatch(REFRESH_MS);
 
 async function poll(): Promise<void> {
   if (busy) return;
   busy = true;
+  // The host has no units-changed event. Recheck while drawn, without redrawing
+  // the overlay unless the preference changed.
+  void loadUnits();
   // Not `AbortSignal.timeout`, which Safari before 16 lacks.
   const abort = new AbortController();
   const timeout = setTimeout(() => abort.abort(), TIMEOUT_MS);
   try {
     const at = view ? `&view=${[view.zoom, ...view.bounds].join(",")}` : "";
-    const res = await fetch(`${LIVE_URL}?since=${batch.rev}${at}`, {
+    const previewAt = previewRevision
+      ? `&previewRevision=${encodeURIComponent(previewRevision)}`
+      : "";
+    const res = await fetch(`${LIVE_URL}?since=${batch.rev}${at}${previewAt}`, {
       credentials: "include",
       signal: abort.signal,
     });
     if (!res.ok) return;
-    const { refresh, data, upsert, remove } = batch.next(
-      (await res.json()) as Live,
-    );
+    const live = (await res.json()) as Live & {
+      preview?: { type: string; features: unknown[] };
+      previewRevision?: string;
+    };
+    // QC can retire a preview without producing cells. Still schedule its handoff.
+    if (live.preview && previewView === JSON.stringify(view?.bounds)) {
+      const ids = new Set(
+        (live.preview.features as { id: string | number }[]).map((f) => f.id),
+      );
+      if ([...previewHeld.keys()].some((id) => !ids.has(id))) live.all = true;
+    }
+    const { refresh, data, upsert, remove } = batch.next(live);
     if (refresh) {
       await client.call("overlay.refresh", {
         overlayId,
         source: "cells",
         ...refresh,
       });
+    }
+    if (live.preview) {
+      const currentView = JSON.stringify(view?.bounds);
+      const next = new Map(
+        (live.preview.features as { id: string | number }[]).map((f) => [
+          f.id,
+          f,
+        ]),
+      );
+      // Don't remove the old preview while its tile refresh is still batched or failed.
+      // The host acknowledges refresh requests, not individual tile generations.
+      if (!refresh && previewView === currentView)
+        for (const [id, feature] of previewHeld)
+          if (!next.has(id) && next.size < 2400) next.set(id, feature);
+      const shown = { type: "FeatureCollection", features: [...next.values()] };
+      const encoded = JSON.stringify(shown);
+      if (encoded !== previewShown) {
+        await client.call("overlay.setData", {
+          overlayId,
+          source: "preview",
+          data: shown,
+        });
+        previewShown = encoded;
+        previewView = currentView;
+        previewHeld = next;
+      }
     }
     if (data) {
       await client.call("overlay.setData", {
@@ -75,6 +122,11 @@ async function poll(): Promise<void> {
         ...(remove ? { remove } : {}),
       });
     }
+    // Request the payload again until its retained old features have been cleared
+    // after a successful tile refresh. A failed host update must also retry it.
+    if (!live.preview || previewHeld.size === live.preview.features.length)
+      previewRevision = live.previewRevision;
+    else previewRevision = undefined;
     batch.taken();
   } catch {
     // The server is restarting, a call timed out, or the overlay isn't drawn; the next
@@ -93,6 +145,10 @@ function schedule(): void {
   if (active && !timer) {
     // The host may have dropped the soundings while the overlay was off.
     batch.resend();
+    previewShown = undefined;
+    previewRevision = undefined;
+    previewView = undefined;
+    previewHeld.clear();
     timer = setInterval(() => void poll(), POLL_MS);
     void poll();
   } else if (!active && timer) {
@@ -102,11 +158,15 @@ function schedule(): void {
 }
 
 async function loadUnits(): Promise<void> {
+  if (loadingUnits || !client.hasCapability("units")) return;
+  loadingUnits = true;
   try {
     const res = (await client.call("units.get")) as {
       units?: { depth?: string };
     };
     const feet = res?.units?.depth === "foot";
+    const unit = feet ? "ft" : "m";
+    if (unit === depthUnit) return;
     await client.call("overlay.setState", {
       overlayId,
       values: {
@@ -115,8 +175,11 @@ async function loadUnits(): Promise<void> {
         contourUnit: feet ? "ft" : "m",
       },
     });
+    depthUnit = unit;
   } catch {
     // No units capability: the labels stay in metres.
+  } finally {
+    loadingUnits = false;
   }
 }
 
@@ -133,6 +196,7 @@ if (client.hasCapability("map")) {
   await client
     .subscribe(["map.view"], (_name, payload) => {
       view = payload as MapView;
+      if (drawn && document.visibilityState === "visible") void poll();
     })
     .catch(() => {});
   // Not awaited, nor over a view the host has sent since.
@@ -142,5 +206,5 @@ if (client.hasCapability("map")) {
     .catch(() => {});
 }
 
-await loadUnits();
+void loadUnits();
 schedule();

@@ -190,6 +190,7 @@ test("the log keeps no index on position", () => {
     // Back to a log from user_version 6, with the index.
     db.exec(`
       CREATE INDEX idx_bathymetry_location ON bathymetry(latitude, longitude);
+      ALTER TABLE bathymetry DROP COLUMN gnss;
       PRAGMA user_version = 6;
     `);
     db.close();
@@ -223,4 +224,36 @@ test("getAvailableTimeframes counts windows from the span's start, up to its end
     "2025-01-01T00:10:00Z/2025-01-01T01:10:00Z",
     "2025-01-01T03:10:00Z/2025-01-01T04:10:00Z",
   ]);
+});
+
+test("GNSS quality survives SQLite storage and restart", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "crowd-depth-quality-"));
+  try {
+    const file = join(dir, "data.sqlite");
+    const db = createDB(file);
+    const point = {
+      ...data[0],
+      gnss: {
+        satellites: 12,
+        methodQuality: "DGNSS fix",
+        horizontalDilution: 0.7,
+      },
+    };
+    await pipeline(
+      Readable.from([point]),
+      createSqliteSource(app, db).createWriter!(),
+    );
+    db.close();
+    const reopened = createDB(file);
+    const rows = await (await createSqliteSource(app, reopened).createReader(
+      new Timeframe(
+        Temporal.Instant.fromEpochMilliseconds(0),
+        Temporal.Now.instant(),
+      ),
+    ))!.toArray();
+    expect(rows[0].gnss).toEqual(point.gnss);
+    reopened.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

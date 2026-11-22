@@ -1,0 +1,39 @@
+{
+  "layout": "rows",
+  "scene": "anchored",
+  "count": 100000,
+  "sync": "NORMAL",
+  "batchPoints": 256,
+  "node": "v24.22.2",
+  "sqlite": "3.53.4",
+  "platform": "linux",
+  "cpu": "Cortex-A76",
+  "ingestMs": 28521.432515,
+  "transactionMs": {
+    "p50": 10.512628000000404,
+    "p95": 401.95273200000156,
+    "p99": 448.9443769999998,
+    "max": 499.14052900000024
+  },
+  "rawViewportMs": {
+    "p50": 344.4123829999953,
+    "p95": 397.32740399999966,
+    "p99": 397.32740399999966,
+    "max": 397.32740399999966
+  },
+  "summaryViewportMs": {
+    "p50": 0.09492600000521634,
+    "p95": 0.24773999999888474,
+    "p99": 0.24773999999888474,
+    "max": 0.24773999999888474
+  },
+  "matchingPoints": 100000,
+  "databaseBytes": 12304384,
+  "peakWalBytes": 5178872,
+  "checkpointMs": 370.30627000000095,
+  "numericInputBytes": 4000000,
+  "kernelWriteBytes": 626130944,
+  "maxRssKiB": 62064,
+  "eventLoopMaxMs": 507.510783,
+  "cacheState": "warm; includes writes, not an OS-cold read benchmark"
+}

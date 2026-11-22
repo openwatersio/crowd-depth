@@ -1,9 +1,10 @@
+import { detectSensor, sourceDevice, sameSource } from "./device-info.js";
 import { ServerAPI } from "@signalk/server-api";
-import { Temporal } from "@js-temporal/polyfill";
 import { DEFAULT_OWN_STYLE, TINTS, type Tint } from "./tiles/style.js";
 
 // Can this be inferred from the JSON schema?
 export type Config = {
+  /** Resolved internally at startup; not a user setting. */
   path: (typeof DepthPaths)[number];
   sounder: {
     x: number;
@@ -25,6 +26,8 @@ export type Config = {
     model?: string;
     source?: string;
   };
+  /** Origin of server-corrected positions, distinct from the physical antenna. */
+  positionOrigin?: { x: number; y: number };
   sharing: {
     anonymous: boolean;
   };
@@ -33,6 +36,8 @@ export type Config = {
     show?: boolean;
     /** Depth areas and soundings shoaler than this, in metres, draw as unsafe. */
     safetyDepth?: number;
+    /** Recency weighting of the rendered layer, independent of data retention. */
+    halfLifeDays?: number;
     /** The colour of the boat's own soundings, contours and tint, as `#rrggbb`. */
     color?: string;
     /** The colour of soundings shoaler than the safety depth, as `#rrggbb`. */
@@ -41,33 +46,10 @@ export type Config = {
     tint?: Tint;
     /** Draw depth contours; on unless turned off. */
     contours?: boolean;
-    /** How far back the layer fills from the plugin's source. */
-    history?: History;
     /** Contours every metre and every foot zoomed in, or the chart's isobaths. */
     contourDetail?: "high" | "standard";
   };
 };
-
-/** The spans the layer can fill from, in days; all of the source's history for "all". */
-export const HISTORY_DAYS = { month: 30, year: 365, all: undefined };
-export type History = keyof typeof HISTORY_DAYS;
-export const DEFAULT_HISTORY: History = "year";
-
-/** The history setting, a hand-edited value that isn't one falling back to the default. */
-export function historySetting(config: Config): History {
-  const history = config.chart?.history;
-  return history && Object.hasOwn(HISTORY_DAYS, history)
-    ? history
-    : DEFAULT_HISTORY;
-}
-
-/** How far back the layer fills; undefined for all of it. */
-export function historySpan(config: Config): Temporal.Duration | undefined {
-  const days = HISTORY_DAYS[historySetting(config)];
-  return days === undefined
-    ? undefined
-    : Temporal.Duration.from({ hours: days * 24 });
-}
 
 /**
  * The source Signal K currently prioritizes for a path (its `$source`) plus the
@@ -76,7 +58,7 @@ export function historySpan(config: Config): Temporal.Duration | undefined {
  * antenna offsets from multiple GPS sources.
  */
 export function sourcesFor(app: ServerAPI, path: string) {
-  const node = app.getSelfPath(path) as
+  const node = app.getSelfPath?.(path) as
     { $source?: string; values?: Record<string, unknown> } | undefined;
   const selected = node?.$source;
   // Multi-source paths carry a `values` map keyed by sourceRef; single-source
@@ -86,6 +68,9 @@ export function sourcesFor(app: ServerAPI, path: string) {
   if (selected && !available.includes(selected)) available.unshift(selected);
   return { selected, available };
 }
+
+/** Source refs returned by the History API, indexed by Signal K path. */
+export type RecordedSources = Record<string, string[]>;
 
 /** Configured source if set, else the server's prioritized source, else undefined. */
 export function resolveSource(
@@ -102,22 +87,7 @@ export function resolveSource(
  * the raw sourceRef when no device details are known.
  */
 function sourceLabel(app: ServerAPI, sourceRef: string): string {
-  const dot = sourceRef.indexOf(".");
-  const label = dot === -1 ? sourceRef : sourceRef.slice(0, dot);
-  const instance = dot === -1 ? "" : sourceRef.slice(dot + 1);
-  const sources = app.getPath("sources") as
-    | Record<string, Record<string, { n2k?: Record<string, unknown> }>>
-    | undefined;
-  const connection = sources?.[label];
-  // The sources tree keys devices by numeric bus address, but with
-  // useCanName the sourceRef carries the hex CAN name instead, so fall
-  // back to matching each device's n2k.canName (mirrors the admin UI's
-  // getDeviceInfo in signalk-server's sourceLabels.ts).
-  const n2k =
-    connection?.[instance]?.n2k ??
-    Object.values(connection ?? {}).find(
-      (device) => device?.n2k?.canName === instance,
-    )?.n2k;
+  const n2k = sourceDevice(app, sourceRef);
   const name = [n2k?.manufacturerCode, n2k?.modelId]
     .filter((p): p is string => typeof p === "string" && p.length > 0)
     .join(" ");
@@ -127,8 +97,7 @@ function sourceLabel(app: ServerAPI, sourceRef: string): string {
 /**
  * Schema for a source selector. Always an enum, with friendly device names via
  * enumNames. When nothing has reported the path yet the enum is empty and the
- * description warns that no data is available so the empty dropdown isn't a
- * mystery.
+ * description explains when neither live nor recorded sources are available.
  */
 function sourceSchema(
   app: ServerAPI,
@@ -144,15 +113,45 @@ function sourceSchema(
     default: sources.selected,
     description: sources.available.length
       ? `The ${noun} source to record. Defaults to the source Signal K prioritizes; choose one when the vessel has more than one.`
-      : `No ${noun} data available — reload this page once it is being received.`,
+      : `No live or recorded ${noun} sources found. Check the history provider or reload this page once data is being received.`,
   };
 }
 
 export const DepthPaths = [
-  "belowSurface",
   "belowTransducer",
+  "belowSurface",
   "belowKeel",
 ] as const;
+
+/** Pick one path for one source; never borrow availability from another sensor. */
+export function selectDepth(
+  app: ServerAPI,
+  source: string | undefined,
+  recorded: RecordedSources = {},
+  savedPath?: Config["path"],
+) {
+  const candidates = savedPath ? [savedPath] : DepthPaths;
+  const paths = candidates.map((path) => ({
+    path,
+    ...sourcesFor(app, `environment.depth.${path}`),
+    recorded: recorded[`environment.depth.${path}`] ?? [],
+  }));
+  const available = [
+    ...new Set(paths.flatMap((p) => [...p.available, ...p.recorded])),
+  ].filter((s) => s !== "derived-data");
+  const selected =
+    source && source !== "derived-data"
+      ? source
+      : (paths.find((p) => p.selected && p.selected !== "derived-data")
+          ?.selected ?? (available.length === 1 ? available[0] : undefined));
+  if (!selected) return;
+  const path = paths.find((p) =>
+    [...p.available, ...p.recorded].some((ref) =>
+      sameSource(app, ref, selected),
+    ),
+  )?.path;
+  return path ? { path, source: selected } : undefined;
+}
 
 /** The CSB `verticalReferenceOfDepth` values (IHO B-12 Table 1). */
 export type VerticalReference = "Waterline" | "Transducer" | "Unknown";
@@ -184,27 +183,41 @@ export function depthReference(config: Pick<Config, "path" | "sounder">): {
   }
 }
 
-export function schema(app: ServerAPI) {
-  const defaultPath = DepthPaths.find((path) =>
-    app.getSelfPath(`environment.depth.${path}.value`),
-  );
-  const positionSources = sourcesFor(app, "navigation.position");
-  const depthSources = defaultPath
-    ? sourcesFor(app, `environment.depth.${defaultPath}`)
-    : { selected: undefined, available: [] };
+export function schema(app: ServerAPI, recorded: RecordedSources = {}) {
+  const saved = (
+    app.readPluginOptions?.() as { configuration?: Partial<Config> }
+  )?.configuration;
+  function choices(paths: string[], configured?: string) {
+    const live = paths.map((path) => sourcesFor(app, path));
+    const available = [
+      ...new Set([
+        ...(configured ? [configured] : []),
+        ...live.flatMap((source) => source.available),
+        ...paths.flatMap((path) => recorded[path] ?? []),
+      ]),
+    ].filter((source) => source !== "derived-data");
+    return {
+      available,
+      selected:
+        (configured && available.includes(configured)
+          ? configured
+          : undefined) ||
+        (live[0]?.selected && available.includes(live[0].selected)
+          ? live[0].selected
+          : undefined) ||
+        (available.length === 1 ? available[0] : undefined),
+    };
+  }
+  const positionSources = choices(["navigation.position"], saved?.gnss?.source);
+  // Include every depth path: changing Path in the form doesn't regenerate
+  // its schema, and a derived path can have a different source from the sounder.
+  const depthPaths = DepthPaths.map((path) => `environment.depth.${path}`);
+  const depthSources = choices(depthPaths, saved?.sounder?.source);
   return {
     type: "object",
     description:
       "By enabling this plugin, you agree to share your soundings and your vessel and sensor details, and you dedicate them to the public domain under Creative Commons CC0 1.0 Universal.",
     properties: {
-      path: {
-        type: "string",
-        title: "Path",
-        description:
-          "The path to the depth data. (e.g. environment.depth.belowTransducer)",
-        enum: DepthPaths,
-        default: defaultPath,
-      },
       sounder: {
         type: "object",
         title: "Depth Sounder",
@@ -213,6 +226,14 @@ export function schema(app: ServerAPI) {
         required: ["x", "y"],
         properties: {
           source: sourceSchema(app, "Depth source", "depth", depthSources),
+          make: {
+            type: "string",
+            title: "Make",
+          },
+          model: {
+            type: "string",
+            title: "Model",
+          },
           y: {
             type: "number",
             title: "Distance of the transducer from the bow (meters)",
@@ -240,20 +261,11 @@ export function schema(app: ServerAPI) {
             description: "The draft of the vessel in meters.",
             default: app.getSelfPath("design.draft.value"),
           },
-          make: {
-            type: "string",
-            title: "Make",
-            description: "The manufacturer of the sounder. (e.g. Raymarine)",
-          },
-          model: {
-            type: "string",
-            title: "Model",
-            description: "The model of the sounder. (e.g. ST60+)",
-          },
           frequency: {
             type: "number",
             title: "Frequency",
-            description: "The frequency of the sounder in Hz.",
+            description:
+              "The frequency of the sounder in Hz. Standard NMEA device information does not provide this; leave blank if unknown.",
           },
           transducer: {
             type: "string",
@@ -265,7 +277,9 @@ export function schema(app: ServerAPI) {
       gnss: {
         type: "object",
         title: "GPS Receiver",
-        required: ["x", "y", "z"],
+        required: ["z"],
+        description:
+          "Horizontal antenna offsets come from Signal K’s per-source GNSS sensor settings. Restart this plugin after changing them.",
         properties: {
           source: sourceSchema(
             app,
@@ -273,32 +287,17 @@ export function schema(app: ServerAPI) {
             "position",
             positionSources,
           ),
-          y: {
-            type: "number",
-            title: "Distance of the antenna from the bow (meters)",
-            minimum: 0,
-            default: app.getSelfPath("sensors.gps.fromBow.value"),
-          },
-          x: {
-            type: "number",
-            title: "Distance of the antenna from the center (meters)",
-            description: "+ve to starboard, -ve to port",
-            default: app.getSelfPath("sensors.gps.fromCenter.value"),
-          },
-          z: {
-            type: "number",
-            title: "Distance of the antenna above the waterline (meters)",
-          },
           make: {
             type: "string",
             title: "Make",
-            description:
-              "The manufacturer of the GPS receiver. (e.g. Kongsberg Maritime)",
           },
           model: {
             type: "string",
             title: "Model",
-            description: "The model of the GPS Receiver. (e.g. Seapath 330+)",
+          },
+          z: {
+            type: "number",
+            title: "Distance of the antenna above the waterline (meters)",
           },
         },
       },
@@ -325,6 +324,15 @@ export function schema(app: ServerAPI) {
             title: "Show my soundings on the chart",
             description:
               "Draw the depths this boat records as a layer in chartplotters that support Signal K plotter extensions, such as Freeboard-SK 3.4 or later. With signalk-tides installed, depths are reduced to chart datum by predicted tides where a station is in reach. Not for navigation.",
+          },
+          halfLifeDays: {
+            type: "number",
+            default: 365,
+            minimum: 1,
+            maximum: 36500,
+            title: "Sounding weight half-life (days)",
+            description:
+              "An observation this old has half the weight of a new one. Larger values retain more historical influence. This does not delete observations.",
           },
           safetyDepth: {
             type: "number",
@@ -364,19 +372,6 @@ export function schema(app: ServerAPI) {
             default: DEFAULT_OWN_STYLE.contours,
             title: "Draw depth contours",
           },
-          history: {
-            type: "string",
-            enum: Object.keys(HISTORY_DAYS),
-            enumNames: [
-              "The last 30 days",
-              "The last year",
-              "All recorded history",
-            ],
-            default: DEFAULT_HISTORY,
-            title: "Fill the layer from",
-            description:
-              "How far back the layer fills in from recorded soundings when it starts or rebuilds. A longer span takes longer to fill in, and new soundings wait for it, for up to 3 hours. Changing it rebuilds the layer.",
-          },
           contourDetail: {
             type: "string",
             enum: ["high", "standard"],
@@ -391,6 +386,27 @@ export function schema(app: ServerAPI) {
           },
         },
       },
+    },
+  };
+}
+
+/** Placeholders are hints, not defaults saved as manual overrides. */
+export function uiSchema(app: ServerAPI, recorded: RecordedSources = {}) {
+  const settings = schema(app, recorded).properties;
+  const sounder = detectSensor(
+    app,
+    settings.sounder.properties.source.default,
+    true,
+  );
+  const gnss = detectSensor(app, settings.gnss.properties.source.default, true);
+  return {
+    sounder: {
+      make: { "ui:placeholder": sounder.make ?? "" },
+      model: { "ui:placeholder": sounder.model ?? "" },
+    },
+    gnss: {
+      make: { "ui:placeholder": gnss.make ?? "" },
+      model: { "ui:placeholder": gnss.model ?? "" },
     },
   };
 }

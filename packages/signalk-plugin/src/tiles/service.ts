@@ -686,7 +686,7 @@ export function createTileService(
       rev++;
       oldest = rev + 1;
       changes.length = 0;
-      scan();
+      if (sharing) scan();
     },
 
     /** A plotter polled for changes, showing `view` (zoom and box) where it said: tiles

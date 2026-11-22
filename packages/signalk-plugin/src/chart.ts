@@ -1,4 +1,17 @@
+import { halfLifeDays } from "./tiles/decay.js";
+import { refineHistory, refineVisible, reweightCells } from "./tiles/refine.js";
+import { TIDE_CONFIG_KEY, tideConfig } from "./tiles/backfill.js";
+import { cacheChartInputs } from "./tiles/inputs.js";
+import type { PreviewView } from "./tiles/preview.js";
+import { randomUUID } from "node:crypto";
 import { pipeline } from "stream/promises";
+import {
+  createPreviewStore,
+  scanPreview,
+  observation,
+} from "./tiles/preview.js";
+import { createSqliteSource } from "./sources/sqlite.js";
+import type { BathymetryData } from "./types.js";
 import { setTimeout } from "node:timers/promises";
 import { BATHY_REPORT_DELAY } from "./constants.js";
 import { DatabaseSync } from "node:sqlite";
@@ -6,12 +19,7 @@ import type { Detail } from "./tiles/surface.js";
 import { Temporal } from "@js-temporal/polyfill";
 import { transform } from "stream-transform";
 import { ServerAPI } from "@signalk/server-api";
-import {
-  Config,
-  depthReference,
-  historySetting,
-  historySpan,
-} from "./config.js";
+import { Config, depthReference } from "./config.js";
 import { BathymetrySource } from "./types.js";
 import {
   correctForSensorPosition,
@@ -22,10 +30,8 @@ import {
   CellStore,
   Layer,
   addPendingBackfill,
-  backfillCells,
   tideChanged,
   TIDES_WAIT_MS,
-  getPendingBackfill,
   createCellStore,
   createCellWriter,
   createTileService,
@@ -54,10 +60,7 @@ const DEPTH_CONFIG_KEY = "config_depth";
 
 /** How the plugin turns soundings into cells. Bump it when that changes, so cells built
  * the old way are rebuilt. */
-const LAYER_VERSION = 5;
-
-/** A backfill span longer than this holds live passes back until it's done. */
-const HOLD_FOR_HOURS = 1;
+const LAYER_VERSION = 6;
 
 /** The safety depth the layer draws with until the owner sets one, in metres. */
 export const DEFAULT_SAFETY_DEPTH_M = 3;
@@ -83,7 +86,7 @@ let routesRegistered = false;
 
 /** The settings the cells depend on: the depth path and offset, and the antenna to
  * transducer offset, QC and the cells' resolution, which place and judge each sounding,
- * and how far back they're filled from.
+ * and the selected sensors.
  * The statistic's k and σs aren't among them: they're applied as tiles are drawn, and
  * the tide is the backfill's to check (`TIDE_CONFIG_KEY`), once signalk-tides answers. */
 export function cellConfig(config: Config) {
@@ -95,8 +98,10 @@ export function cellConfig(config: Config) {
       qc: DEFINITIONS.qc,
       rows: DEFINITIONS.cells.rows_per_degree,
       columns: DEFINITIONS.cells.column_steps_divide,
-      history: historySetting(config),
+      sounderSource: config.sounder.source,
+      gnssSource: config.gnss.source,
     }),
+    weight: String(halfLifeDays(config.chart?.halfLifeDays)),
     depth: JSON.stringify({
       depthPath: `environment.depth.${config.path}`,
       depthOffset: depthReference(config).offset,
@@ -121,7 +126,8 @@ export function startChart({
   db: DatabaseSync;
   signal: AbortSignal;
 }) {
-  const store = createCellStore(db);
+  const generation = randomUUID();
+  const store = createCellStore(db, generation);
   const startedAt = Temporal.Now.instant();
 
   // First, so a refused provider stops the start before anything runs.
@@ -131,29 +137,75 @@ export function startChart({
     routesRegistered = true;
   }
 
+  store.setMeta("build_generation", generation);
   syncConfig(store, cellConfig(config), startedAt);
   // Before the live writer starts, so its marker doesn't hide the gap.
-  addPendingBackfill(store, startedAt, historySpan(config));
+  addPendingBackfill(store, startedAt);
+  const preview = createPreviewStore(
+    db,
+    JSON.stringify({
+      version: 1,
+      position: getOffsets(config),
+      path: config.path,
+      offset: depthReference(config).offset,
+      sounder: config.sounder.source,
+      gnss: config.gnss.source,
+    }),
+  );
+  let previewRun: AbortController | undefined;
+  let previewView: PreviewView | undefined;
+  const boatView = (): PreviewView | undefined => {
+    const p = app.getSelfPath("navigation.position.value") as
+      { longitude?: number; latitude?: number } | undefined;
+    if (!Number.isFinite(p?.longitude) || !Number.isFinite(p?.latitude)) return;
+    const lon = p!.longitude!,
+      lat = p!.latitude!;
+    return [
+      14,
+      Math.max(-180, lon - 0.05),
+      Math.max(-85.05, lat - 0.05),
+      Math.min(180, lon + 0.05),
+      Math.min(85.05, lat + 0.05),
+    ];
+  };
+  const startPreview = (source: BathymetrySource) => {
+    previewRun?.abort();
+    previewRun = new AbortController();
+    const since = source.createWriter
+      ? store.getMeta(DEPTH_SINCE_KEY)
+      : undefined;
+    void scanPreview({
+      source,
+      store: preview,
+      config,
+      signal: previewRun.signal,
+      until: startedAt.epochMilliseconds,
+      view: () => previewView ?? boatView(),
+      ...(since
+        ? { since: Temporal.Instant.from(since).epochMilliseconds }
+        : {}),
+      onError: (err) => app.debug(`Chart preview source error: ${err}`),
+    }).catch((err) => {
+      if (!signal.aborted) app.debug(`Chart preview stopped: ${err}`);
+    });
+  };
+  const waitingForTide = new Map<number, BathymetryData>();
+  const changed = new Map<string, { lon: number; lat: number }>();
+  const publishChanges = () => {
+    if (!changed.size || signal.aborted) return;
+    tiles.changed([...changed.values()]);
+    changed.clear();
+  };
 
   const detail =
     config.chart?.contourDetail === "standard" ? "standard" : "high";
   const file = db.location() ?? undefined;
+  // Build requested tiles only: eager all-history warming saturated the Pi for 36 minutes.
   const tiles = createTileService(
     store,
     file,
     detail,
     file ? keepTiles(db, detail, app) : undefined,
-    {
-      position: () => {
-        const p = app.getSelfPath("navigation.position.value") as
-          { latitude?: number; longitude?: number } | undefined;
-        return typeof p?.latitude === "number" &&
-          typeof p.longitude === "number"
-          ? { lon: p.longitude, lat: p.latitude }
-          : undefined;
-      },
-      log: (message) => app.debug(`Chart layer ${message}`),
-    },
   );
   // Off the main thread, given a database file to say the plugin is built and running.
   const qc = db.location() ? createQCThread() : undefined;
@@ -188,33 +240,40 @@ export function startChart({
       }
       return false;
     });
-  // Until the backfill has run, so its older passes go into the cells first; only for
-  // a span long enough for the order to matter, so a restart's short gap doesn't
-  // freeze the layer while the source is found.
-  const gap = getPendingBackfill(store);
-  const long =
-    gap !== undefined && gap.to.since(gap.from).total("hours") > HOLD_FOR_HOURS;
-  // A tide change rebuilds every cell from the backfill, so live passes wait for the
-  // start's tide check, a moment where signalk-tides answers, and through the rebuild
-  // if it finds one; nothing written meanwhile is cleared with the cells.
-  if (long || tides || tideChanged(store, false)) writer.hold(true);
+  // The contribution ledger replays each cell in time order, so historical
+  // acquisition no longer holds live passes. Only a possible tide rebuild does.
+  if (tides || tideChanged(store, false)) writer.hold(true);
   void tided.then((answered) => {
-    if (!long && !tideChanged(store, answered) && !signal.aborted) {
-      writer.hold(false);
-    }
+    if (!signal.aborted && !tideChanged(store, answered)) writer.hold(false);
   });
   const started: Layer = {
     tiles,
-    provisional: writer.provisional,
+    provisional: () => [
+      ...writer.provisional(),
+      ...[...waitingForTide.values()].flatMap((data) => {
+        const s = observation(data);
+        return s ? [{ ...s, time: s.time * 1000 }] : [];
+      }),
+    ],
+    preview: (view) => {
+      previewView = view;
+      return preview.features(view ?? boatView(), 0);
+    },
     stored: writer.stored,
     safetyDepth: config.chart?.safetyDepth ?? DEFAULT_SAFETY_DEPTH_M,
     own: ownStyle(config),
     detail,
   };
+  const publish = setInterval(publishChanges, 5000);
+  publish.unref?.();
   current = started;
   // Only this start's own state: an older start can end after a newer one
   // replaced it.
   const stop = () => {
+    clearInterval(publish);
+    previewRun?.abort();
+    preview.close();
+    waitingForTide.clear();
     tiles.close();
     qc?.close();
     if (current === started) current = undefined;
@@ -224,7 +283,18 @@ export function startChart({
   pipeline(
     createLiveStream(app, config),
     transform(correctForSensorPosition(config)),
+    transform((data: BathymetryData) => {
+      if (observation(data))
+        waitingForTide.set(data.timestamp.epochMilliseconds, data);
+      while (waitingForTide.size > 1000)
+        waitingForTide.delete(waitingForTide.keys().next().value!);
+      return data;
+    }),
     ...(tides ? [withTide(tides)] : []),
+    transform((data: BathymetryData) => {
+      waitingForTide.delete(data.timestamp.epochMilliseconds);
+      return data;
+    }),
     writer,
     { signal },
   ).catch((err: unknown) => {
@@ -234,45 +304,127 @@ export function startChart({
     stop();
   });
 
+  const reweighted = reweightCells({
+    store,
+    signal,
+    file,
+    onChange: tiles.changed,
+  }).catch((err) => {
+    if (!signal.aborted) app.error(`Chart reweight remains pending: ${err}`);
+  });
+
+  // Existing local history is useful even while plugin startup waits for a provider.
+  startPreview(createSqliteSource(app, db));
   return {
     backfill: async (source: BathymetrySource) => {
-      // A History provider such as signalk-to-influxdb2 writes a minute or more late,
-      // so the soundings just before this start aren't there to read yet. Wait as the
-      // reporter does; the plugin's own log is written as soundings arrive.
+      await reweighted;
+      if (signal.aborted) return;
       if (!source.createWriter) {
-        const wait =
-          startedAt.add(BATHY_REPORT_DELAY).epochMilliseconds - Date.now();
-        if (wait > 0)
-          await setTimeout(wait, undefined, { signal }).catch(() => {});
-        if (signal.aborted) return;
+        source = cacheChartInputs(
+          db,
+          source,
+          JSON.stringify({
+            version: 1,
+            path: config.path,
+            offset: depthReference(config).offset,
+            sounder: config.sounder.source,
+            gnss: config.gnss.source,
+          }),
+          signal,
+        );
       }
-      // Its cells reach the tiles only when it ends, so meanwhile tiles share no
-      // surface built before them.
+      startPreview(source);
+      // Worker commits publish periodically; do not retain shared surfaces between them.
       tiles.share(false);
-      return backfillCells({
-        app,
-        config,
+      const run = async (availableThrough?: Temporal.Instant) => {
+        let retryMs = 30_000;
+        while (!signal.aborted) {
+          try {
+            await refineHistory({
+              config,
+              source,
+              store,
+              signal,
+              file: db.location() ?? undefined,
+              tides: useTides ? tides : undefined,
+              availableThrough,
+              view: () => previewView ?? boatView(),
+              onError: (err) =>
+                app.error(`Chart refinement window remains pending: ${err}`),
+              onChange: (positions) => {
+                for (const point of positions)
+                  changed.set(`${point.lon}/${point.lat}`, point);
+                publishChanges();
+              },
+            });
+            return;
+          } catch (err) {
+            if (signal.aborted) return;
+            app.error(`Chart refinement will retry: ${err}`);
+            await setTimeout(retryMs, undefined, { signal }).catch(() => {});
+            retryMs = Math.min(retryMs * 2, 15 * 60_000);
+          }
+        }
+      };
+      const useTides = await tided;
+      if (signal.aborted) return;
+      if (tideChanged(store, useTides)) {
+        startRebuild(store);
+        addPendingBackfill(store, startedAt);
+      }
+      store.setMeta(TIDE_CONFIG_KEY, tideConfig(useTides));
+      writer.hold(false);
+      void refineVisible({
         source,
         store,
+        config,
         signal,
-        file: db.location() ?? undefined,
-        tides,
-        until: startedAt,
-      })
+        file,
+        tides: useTides ? tides : undefined,
+        availableThrough: source.createWriter
+          ? startedAt
+          : startedAt.subtract(BATHY_REPORT_DELAY),
+        timestamps: () =>
+          preview
+            .features(previewView ?? boatView(), 0)
+            .map((f) => f.properties.time),
+        onChange: tiles.changed,
+        onError: (err) =>
+          app.error(`Visible chart refinement will retry: ${err}`),
+      }).catch((err) => {
+        if (!signal.aborted)
+          app.error(`Visible chart refinement stopped: ${err}`);
+      });
+      return (async () => {
+        // Old history is already settled. Only the final provider tail needs
+        // its buffering delay; it must not delay the entire historical build.
+        await run(
+          source.createWriter
+            ? undefined
+            : startedAt.subtract(BATHY_REPORT_DELAY),
+        );
+        if (!source.createWriter && !signal.aborted) {
+          const wait =
+            startedAt.add(BATHY_REPORT_DELAY).epochMilliseconds - Date.now();
+          if (wait > 0) await setTimeout(wait, undefined, { signal });
+          if (!signal.aborted) await run();
+        }
+      })()
         .then(() => {
           // Stopped meanwhile: the writer is gone, and its held passes with it.
           if (signal.aborted) return;
           writer.hold(false);
-          tiles.reset();
           tiles.share(true);
+          tiles.reset();
+          changed.clear();
         })
         .catch((err: unknown) => {
           if (signal.aborted) return;
           writer.hold(false);
-          tiles.reset();
           tiles.share(true);
-          // The span stays for the next start, a few times at most; the live
-          // layer goes on either way.
+          tiles.reset();
+          changed.clear();
+          // Keep failed coverage pending for the next start; the live layer goes on.
           const retry = recordBackfillFailure(store);
           app.error(
             `Chart backfill failed${retry ? ", will retry on restart" : ""}: ${err}`,
@@ -290,7 +442,7 @@ export function startChart({
  */
 function syncConfig(
   store: CellStore,
-  { position, depth }: ReturnType<typeof cellConfig>,
+  { position, depth, weight }: ReturnType<typeof cellConfig>,
   startedAt: Temporal.Instant,
 ) {
   // A first start has nothing recorded under another depth reference.
@@ -300,6 +452,13 @@ function syncConfig(
     startRebuild(store);
     if (depthChanged) store.setMeta(DEPTH_SINCE_KEY, startedAt.toString());
     store.setMeta(POSITION_CONFIG_KEY, position);
+  }
+  if (store.getMeta("config_weight") !== weight) {
+    store.transaction(() => {
+      store.setMeta("config_weight", weight);
+      store.setMeta("reweight_pending", "1");
+      store.setMeta("reweight_after", "");
+    });
   }
   store.setMeta(DEPTH_CONFIG_KEY, depth);
 }
@@ -322,6 +481,7 @@ function keepTiles(db: DatabaseSync, detail: Detail, app: ServerAPI) {
 export function startChartSafely(options: Parameters<typeof startChart>[0]) {
   try {
     if (options.config.chart?.show === false) {
+      createCellStore(options.db).setMeta("build_generation", randomUUID());
       syncConfig(
         createCellStore(options.db),
         cellConfig(options.config),

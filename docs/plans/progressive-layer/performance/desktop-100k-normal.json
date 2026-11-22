@@ -1,0 +1,239 @@
+{
+  "prototype": true,
+  "results": [
+    {
+      "layout": "rows",
+      "scene": "underway",
+      "count": 100000,
+      "sync": "NORMAL",
+      "batchPoints": 256,
+      "node": "v24.21.0",
+      "sqlite": "3.53.4",
+      "platform": "darwin",
+      "cpu": "Apple M5",
+      "ingestMs": 548.5482499999999,
+      "transactionMs": {
+        "p50": 1.2172909999999888,
+        "p95": 1.746500000000026,
+        "p99": 5.9306250000000205,
+        "max": 7.402833999999984
+      },
+      "rawViewportMs": {
+        "p50": 0.02879100000006929,
+        "p95": 0.23649999999997817,
+        "p99": 0.23649999999997817,
+        "max": 0.23649999999997817
+      },
+      "summaryViewportMs": {
+        "p50": 0.0272499999999809,
+        "p95": 0.11229200000002493,
+        "p99": 0.11229200000002493,
+        "max": 0.11229200000002493
+      },
+      "matchingPoints": 216,
+      "databaseBytes": 16429056,
+      "peakWalBytes": 4268352,
+      "checkpointMs": 3.430250000000001,
+      "numericInputBytes": 4000000,
+      "kernelWriteBytes": null,
+      "maxRssKiB": 70608,
+      "eventLoopMaxMs": 14.008319,
+      "cacheState": "warm; includes writes, not an OS-cold read benchmark"
+    },
+    {
+      "layout": "rows",
+      "scene": "anchored",
+      "count": 100000,
+      "sync": "NORMAL",
+      "batchPoints": 256,
+      "node": "v24.21.0",
+      "sqlite": "3.53.4",
+      "platform": "darwin",
+      "cpu": "Apple M5",
+      "ingestMs": 808.777333,
+      "transactionMs": {
+        "p50": 1.379083000000037,
+        "p95": 5.697332999999958,
+        "p99": 7.95474999999999,
+        "max": 11.461500000000001
+      },
+      "rawViewportMs": {
+        "p50": 40.206500000000005,
+        "p95": 80.56991700000003,
+        "p99": 80.56991700000003,
+        "max": 80.56991700000003
+      },
+      "summaryViewportMs": {
+        "p50": 0.015041999999994005,
+        "p95": 0.037624999999934516,
+        "p99": 0.037624999999934516,
+        "max": 0.037624999999934516
+      },
+      "matchingPoints": 100000,
+      "databaseBytes": 12304384,
+      "peakWalBytes": 5178872,
+      "checkpointMs": 6.127250000000004,
+      "numericInputBytes": 4000000,
+      "kernelWriteBytes": null,
+      "maxRssKiB": 61440,
+      "eventLoopMaxMs": 80.674815,
+      "cacheState": "warm; includes writes, not an OS-cold read benchmark"
+    },
+    {
+      "layout": "rows",
+      "scene": "mixed",
+      "count": 100000,
+      "sync": "NORMAL",
+      "batchPoints": 256,
+      "node": "v24.21.0",
+      "sqlite": "3.53.4",
+      "platform": "darwin",
+      "cpu": "Apple M5",
+      "ingestMs": 801.628458,
+      "transactionMs": {
+        "p50": 1.3477080000000115,
+        "p95": 5.86058399999996,
+        "p99": 8.401499999999999,
+        "max": 11.712749999999971
+      },
+      "rawViewportMs": {
+        "p50": 29.0162499999999,
+        "p95": 37.001750000000015,
+        "p99": 37.001750000000015,
+        "max": 37.001750000000015
+      },
+      "summaryViewportMs": {
+        "p50": 0.030082999999876847,
+        "p95": 0.07379100000002836,
+        "p99": 0.07379100000002836,
+        "max": 0.07379100000002836
+      },
+      "matchingPoints": 80072,
+      "databaseBytes": 13463552,
+      "peakWalBytes": 5294232,
+      "checkpointMs": 5.337541000000101,
+      "numericInputBytes": 4000000,
+      "kernelWriteBytes": null,
+      "maxRssKiB": 67712,
+      "eventLoopMaxMs": 39.092223,
+      "cacheState": "warm; includes writes, not an OS-cold read benchmark"
+    },
+    {
+      "layout": "chunks",
+      "scene": "underway",
+      "count": 100000,
+      "sync": "NORMAL",
+      "batchPoints": 256,
+      "node": "v24.21.0",
+      "sqlite": "3.53.4",
+      "platform": "darwin",
+      "cpu": "Apple M5",
+      "ingestMs": 337.043667,
+      "transactionMs": {
+        "p50": 0.7505409999999983,
+        "p95": 0.993583000000001,
+        "p99": 4.163499999999999,
+        "max": 5.4681659999999965
+      },
+      "rawViewportMs": {
+        "p50": 0.27604199999996126,
+        "p95": 0.7634580000000142,
+        "p99": 0.7634580000000142,
+        "max": 0.7634580000000142
+      },
+      "summaryViewportMs": {
+        "p50": 0.023957999999993262,
+        "p95": 0.06174999999996089,
+        "p99": 0.06174999999996089,
+        "max": 0.06174999999996089
+      },
+      "matchingPoints": 216,
+      "databaseBytes": 6717440,
+      "peakWalBytes": 4218912,
+      "checkpointMs": 2.000583000000006,
+      "numericInputBytes": 4000000,
+      "kernelWriteBytes": null,
+      "maxRssKiB": 80496,
+      "eventLoopMaxMs": 12.681215,
+      "cacheState": "warm; includes writes, not an OS-cold read benchmark"
+    },
+    {
+      "layout": "chunks",
+      "scene": "anchored",
+      "count": 100000,
+      "sync": "NORMAL",
+      "batchPoints": 256,
+      "node": "v24.21.0",
+      "sqlite": "3.53.4",
+      "platform": "darwin",
+      "cpu": "Apple M5",
+      "ingestMs": 178.260667,
+      "transactionMs": {
+        "p50": 0.3504170000000073,
+        "p95": 0.5640829999999966,
+        "p99": 1.5267079999999993,
+        "max": 7.290166999999997
+      },
+      "rawViewportMs": {
+        "p50": 25.960749999999962,
+        "p95": 31.408957999999984,
+        "p99": 31.408957999999984,
+        "max": 31.408957999999984
+      },
+      "summaryViewportMs": {
+        "p50": 0.011875000000031832,
+        "p95": 0.03537499999998772,
+        "p99": 0.03537499999998772,
+        "max": 0.03537499999998772
+      },
+      "matchingPoints": 100000,
+      "databaseBytes": 2650112,
+      "peakWalBytes": 4132392,
+      "checkpointMs": 0.74025000000006,
+      "numericInputBytes": 4000000,
+      "kernelWriteBytes": null,
+      "maxRssKiB": 223632,
+      "eventLoopMaxMs": 31.457279,
+      "cacheState": "warm; includes writes, not an OS-cold read benchmark"
+    },
+    {
+      "layout": "chunks",
+      "scene": "mixed",
+      "count": 100000,
+      "sync": "NORMAL",
+      "batchPoints": 256,
+      "node": "v24.21.0",
+      "sqlite": "3.53.4",
+      "platform": "darwin",
+      "cpu": "Apple M5",
+      "ingestMs": 206.77125,
+      "transactionMs": {
+        "p50": 0.3630420000000072,
+        "p95": 0.885583000000004,
+        "p99": 2.590457999999984,
+        "max": 5.313749999999999
+      },
+      "rawViewportMs": {
+        "p50": 21.76095799999996,
+        "p95": 24.786540999999943,
+        "p99": 24.786540999999943,
+        "max": 24.786540999999943
+      },
+      "summaryViewportMs": {
+        "p50": 0.02354099999996606,
+        "p95": 0.05412499999999909,
+        "p99": 0.05412499999999909,
+        "max": 0.05412499999999909
+      },
+      "matchingPoints": 80072,
+      "databaseBytes": 3743744,
+      "peakWalBytes": 4173592,
+      "checkpointMs": 1.0602079999999887,
+      "numericInputBytes": 4000000,
+      "kernelWriteBytes": null,
+      "maxRssKiB": 175744,
+      "eventLoopMaxMs": 31.342591,
+      "cacheState": "warm; includes writes, not an OS-cold read benchmark"
+    }
+  ]
+}

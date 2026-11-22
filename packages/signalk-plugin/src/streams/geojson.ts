@@ -27,6 +27,7 @@ export function toFeature({
   longitude,
   depth,
   timestamp,
+  gnss,
 }: BathymetryData): GeoJSON.Feature {
   return {
     type: "Feature",
@@ -36,6 +37,7 @@ export function toFeature({
     },
     properties: {
       depth: depth,
+      ...(gnss ? { gnss } : {}),
       time: timestamp.toString({ smallestUnit: "millisecond" }),
     },
   };

@@ -45,7 +45,10 @@ const response = (): Res => {
 
 type Req = { params?: Record<string, string>; query?: Record<string, string> };
 
-function serve(own = DEFAULT_OWN_STYLE) {
+function serve(
+  own = DEFAULT_OWN_STYLE,
+  preview?: import("../../src/tiles/api.js").Layer["preview"],
+) {
   const handlers = new Map<string, (req: Req, res: Res) => unknown>();
   const app = {
     get: (path: string, handler: (req: Req, res: Res) => void) =>
@@ -55,6 +58,7 @@ function serve(own = DEFAULT_OWN_STYLE) {
   const tiles = createTileService(store);
   registerLayerRoutes(app, () => ({
     tiles,
+    preview,
     provisional: () => [{ time: 1, lon: -76.2, lat: 36.98, depth: 4.37 }],
     stored: () => [],
     safetyDepth: 3,
@@ -262,4 +266,50 @@ test("refreshes are batched by how much the plotter's view holds", async () => {
   expect((await live()).refreshMs).toBeUndefined();
   expect((await live("13,-80,30,-70,40")).refreshMs).toBeUndefined();
   expect((await live("13,-1e18,40,1e18,30")).refreshMs).toBeUndefined();
+});
+
+test("unchanged preview payloads are omitted using the client's revision", async () => {
+  const preview = () => [
+    {
+      type: "Feature",
+      id: "history:1:2",
+      geometry: { type: "Point", coordinates: [-80, 26] },
+      properties: {
+        depth_m: 5,
+        provisional: true,
+        reference: "untided",
+        time: 1,
+      },
+    },
+  ];
+  const { get } = serve(DEFAULT_OWN_STYLE, preview as never);
+  const first = (await get(LIVE_PATH, { query: {} })).body as {
+    previewRevision: string;
+    preview: { features: unknown[] };
+  };
+  expect(first.preview.features).toHaveLength(2);
+  expect(first.previewRevision).toMatch(/^[a-f0-9]{24}$/);
+  const next = (
+    await get(LIVE_PATH, { query: { previewRevision: first.previewRevision } })
+  ).body as typeof first;
+  expect(next.preview).toBeUndefined();
+  expect(next.previewRevision).toBe(first.previewRevision);
+});
+
+test("a stationary high-rate stream sends only its newest and shoalest values without thinning storage", async () => {
+  const { spatialProvisional } = await import("../../src/tiles/api.js");
+  const pings = Array.from({ length: 40000 }, (_, i) => ({
+    lon: -80,
+    lat: 26,
+    time: 1000000 + i * 200000,
+    depth: i === 100 ? 2 : 5,
+  }));
+  expect(spatialProvisional(pings).map((s) => s.time)).toEqual([
+    pings[100].time,
+    pings.at(-1)!.time,
+  ]);
+  expect(pings).toHaveLength(40000);
+  expect(
+    provisionalFeatures(spatialProvisional(pings)).length,
+  ).toBeLessThanOrEqual(3);
 });

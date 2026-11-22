@@ -1,10 +1,12 @@
+import { detectGpsdSensor } from "../gpsd-info.js";
 import {
   submitGeoJSON,
   describeSubmissionError,
   SubmissionError,
 } from "./noaa.js";
 import { Readable } from "node:stream";
-import { Config } from "../config.js";
+import { detectSensor } from "../device-info.js";
+import { Config, resolveSource } from "../config.js";
 import { ServerAPI } from "@signalk/server-api";
 import { CronJob } from "cron";
 import { getVesselInfo } from "../metadata.js";
@@ -134,6 +136,27 @@ export function createReporter({
       const vessel = await bounded("Identity lookup", (attempt) =>
         getVesselInfo(app, attempt),
       );
+      const gpsSource = resolveSource(
+        app,
+        config.gnss.source,
+        "navigation.position",
+      );
+      const gpsd = await detectGpsdSensor(app, gpsSource);
+      vessel.sensors = {
+        sounder: detectSensor(
+          app,
+          resolveSource(
+            app,
+            config.sounder.source,
+            `environment.depth.${config.path}`,
+          ),
+          config.sharing.anonymous,
+        ),
+        gnss: {
+          ...gpsd,
+          ...detectSensor(app, gpsSource, config.sharing.anonymous),
+        },
+      };
       app.debug(
         `Reporting data from ${vessel.name} (${vessel.mmsi}) to ${url}`,
       );

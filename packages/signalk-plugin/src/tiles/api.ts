@@ -1,3 +1,6 @@
+import { createHash } from "node:crypto";
+import { cellAt as previewCellAt } from "./geometry.js";
+import { cellBounds } from "./geometry.js";
 import type { Request, Response } from "express";
 import type { ServerAPI } from "@signalk/server-api";
 import { ASSET_BASE } from "../plotterext/manifest.js";
@@ -12,6 +15,7 @@ import {
   depthLabels,
   type Detail,
 } from "./surface.js";
+import type { PreviewView, PreviewStore } from "./preview.js";
 import type { TileService } from "./service.js";
 import { buildStyle, type OwnStyle } from "./style.js";
 
@@ -57,6 +61,7 @@ export function parseView(view: unknown) {
   const lon = (l: number) => l >= -180 && l <= 180;
   const lat = (l: number) => l >= -85.06 && l <= 85.06;
   if (
+    fields.length !== 5 ||
     !(zoom >= 0 && zoom <= 30) ||
     !lon(west) ||
     !lon(east) ||
@@ -124,6 +129,34 @@ export function provisionalFeatures(
   return [...points, ...ribbon];
 }
 
+/** Rendering alone is thinned: retain the newest and shoalest provisional value
+ * per cell/reference. Thousands of stationary pings must not become Wi-Fi payloads. */
+export function spatialProvisional(soundings: Sounding[]) {
+  const cells = new Map<string, { latest: Sounding; shoal: Sounding }>();
+  for (const s of soundings) {
+    if (
+      ![s.lon, s.lat, s.depth, s.time].every(Number.isFinite) ||
+      Math.abs(s.lon) > 180 ||
+      Math.abs(s.lat) > 85.0511 ||
+      s.depth <= 0
+    )
+      continue;
+    const { py, px } = previewCellAt(s.lon, s.lat);
+    const key = `${py}/${px}/${s.tide ? 1 : 0}`;
+    const cell = cells.get(key);
+    if (!cell) cells.set(key, { latest: s, shoal: s });
+    else {
+      if (s.time > cell.latest.time) cell.latest = s;
+      if (charted(s) < charted(cell.shoal)) cell.shoal = s;
+    }
+  }
+  return [...cells.values()]
+    .flatMap(({ latest, shoal }) =>
+      latest.time === shoal.time ? [latest] : [latest, shoal],
+    )
+    .sort((a, b) => a.time - b.time);
+}
+
 /** Keep the newest soundings of `n`, in time order, and an even share of the rest. */
 export function thin(n: number) {
   const older = n - NEWEST_PROVISIONAL;
@@ -134,6 +167,9 @@ export function thin(n: number) {
 /** What the routes read; replaced on each start. */
 export interface Layer {
   tiles: TileService;
+  preview?: (
+    view: PreviewView | undefined,
+  ) => ReturnType<PreviewStore["features"]>;
   provisional: () => Sounding[];
   stored: () => number[];
   safetyDepth: number;
@@ -254,12 +290,51 @@ export function registerLayerRoutes(
     LIVE_PATH,
     guard((req, res, layer) => {
       const since = Number(req.query.since ?? -1);
-      const provisional = layer.provisional();
+      const provisional = spatialProvisional(layer.provisional());
       const view = parseView(req.query.view);
       layer.tiles.watched(view);
       const held = view && layer.tiles.held(...view);
+      const previewPoints = layer.preview?.(view);
+      const previewRevision =
+        previewPoints &&
+        createHash("sha256")
+          .update(JSON.stringify(previewPoints))
+          .digest("hex")
+          .slice(0, 24);
       res.set("Cache-Control", "no-store").json({
         ...layer.tiles.since(Number.isInteger(since) ? since : -1),
+        ...(previewRevision ? { previewRevision } : {}),
+        ...(previewPoints && previewRevision !== req.query.previewRevision
+          ? {
+              preview: {
+                type: "FeatureCollection",
+                features: previewPoints.flatMap((point) => {
+                  const [lon, lat] = point.geometry.coordinates;
+                  const { py, px } = previewCellAt(lon, lat);
+                  const { west, east, south, north } = cellBounds(py, px);
+                  return [
+                    point,
+                    {
+                      ...point,
+                      id: `${point.id}:area`,
+                      geometry: {
+                        type: "Polygon",
+                        coordinates: [
+                          [
+                            [west, south],
+                            [east, south],
+                            [east, north],
+                            [west, north],
+                            [west, south],
+                          ],
+                        ],
+                      },
+                    },
+                  ];
+                }),
+              },
+            }
+          : {}),
         ...(held !== undefined ? { refreshMs: refreshMs(held) } : {}),
         // Ids of soundings just written to cells, and of the ribbon from each, which the
         // runtime keeps drawing until their tiles are refreshed; any other feature that
@@ -268,9 +343,7 @@ export function registerLayerRoutes(
         provisional: {
           type: "FeatureCollection",
           features: provisionalFeatures(
-            provisional
-              .sort((a, b) => a.time - b.time)
-              .filter(thin(provisional.length)),
+            provisional.filter(thin(provisional.length)),
             layer.detail,
           ),
         },

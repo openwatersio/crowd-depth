@@ -57,9 +57,9 @@ test("each crossing of a cell is one pass, and only sounded cells get one", asyn
   expect(cells).toHaveLength(30);
   for (const c of cells) {
     expect(c.passes).toBe(2);
-    // Second pass 1 m deeper: m moves a fifth of the way.
-    expect(c.m).toBeGreaterThan(5.1);
-    expect(c.m).toBeLessThan(5.5);
+    // Similar-age passes share weight; the fixture adds up to 0.2 m of variation.
+    expect(c.m).toBeGreaterThanOrEqual(5.5);
+    expect(c.m).toBeLessThanOrEqual(5.7);
   }
 });
 
@@ -231,7 +231,8 @@ test("a long steady run at anchor reaches the cells, then QC picks up again", as
   expect(cells.length).toBeGreaterThan(0);
   // Both depths reached the cells: the run wasn't taken for a stuck sounder.
   expect(Math.min(...cells.map((c) => c.m))).toBeLessThan(5.2);
-  expect(Math.max(...cells.map((c) => c.m))).toBeGreaterThan(5.2);
+  // Short deeper segment contributes without the old per-pass EMA exaggerating it.
+  expect(Math.max(...cells.map((c) => c.m))).toBeGreaterThan(5.05);
   expect(store.shoals(-76.3, 36, -76.1, 37.1)).toEqual([]);
 }, 30_000);
 
@@ -461,4 +462,30 @@ test("under way, a sounding is stored within about 25 s: QC's look-ahead, the pa
   } finally {
     vi.useRealTimers();
   }
+});
+
+test("change listeners run after commit and can start their own transaction", async () => {
+  const db = createDB(":memory:");
+  const store = createCellStore(db);
+  let notifications = 0;
+  const writer = createCellWriter(store, {
+    bulk: true,
+    onChange: () => {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        expect(db.prepare("SELECT count(*) n FROM cells").get()).toMatchObject({
+          n: expect.any(Number),
+        });
+        notifications++;
+      } finally {
+        db.exec("COMMIT");
+      }
+    },
+  });
+  for (const sounding of track(100)) writer.write(sounding);
+  await new Promise<void>((resolve, reject) =>
+    writer.end((error?: Error | null) => (error ? reject(error) : resolve())),
+  );
+  expect(notifications).toBeGreaterThan(0);
+  db.close();
 });
