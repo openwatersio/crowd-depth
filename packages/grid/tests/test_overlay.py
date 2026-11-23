@@ -87,23 +87,6 @@ def test_a_shoal_survives_every_zoom_at_its_own_position(lake):
     assert counts == sorted(counts) and counts[0] == 1 and counts[-1] == 101
 
 
-def test_deep_water_thins(lake):
-    lake.executemany(
-        "INSERT INTO lake.cells (depth_lon, depth_lat, depth, kind) VALUES (?, ?, ?, ?)",
-        [(-70.0, 33.0, 250.0, "multi"), (-60.0, 33.0, 1500.0, "single")],
-    )
-    feats = features(lake)
-    first = {f["properties"]["depth_m"]: f["tippecanoe"]["minzoom"] for f in feats}
-    # One coarser level at 200 m and two at 1000 m: the coarsest level shows them one
-    # and two zooms later than a shallow sounding's would be.
-    assert min(m for d, m in first.items() if d == 250) == overlay.MIN_ZOOM
-    assert len([f for f in feats if f["properties"]["depth_m"] == 250]) == (
-        overlay.MAX_ZOOM - overlay.MIN_ZOOM + 1
-    )
-    finest = {f["properties"]["depth_m"] for f in at_zoom(feats, overlay.MAX_ZOOM)}
-    assert finest == {250, 1500}
-
-
 def test_unconfirmed_shoals_publish_flagged(lake):
     lake.execute(
         "INSERT INTO lake.cells (depth_lon, depth_lat, depth, kind) VALUES (-78.0, 33.0, 10.0, 'single')"
@@ -114,21 +97,6 @@ def test_unconfirmed_shoals_publish_flagged(lake):
     assert props == [(1.5, 1), (10, None)]
     shoal = next(f for f in shown if f["properties"].get("unconfirmed"))
     assert shoal["properties"]["QUASOU"] == 9 and shoal["properties"]["TECSOU"] == 1
-
-
-def test_deep_soundings_show_from_a_coarser_level(lake):
-    # Two pairs of soundings in neighboring finest pyramid cells that share a parent: a
-    # shallow pair both show at the finest zoom, a 250 m pair only its shoaler one.
-    step = 360 / (2**overlay.MAX_ZOOM * overlay.CELLS_PER_TILE)
-    lon = -180 + 2 * round(100 / step / 2) * step  # the west edge of an even pyramid cell
-    rows = []
-    for lat, d in ((33.0, 10.0), (-33.0, 250.0)):
-        rows += [(lon + step * 0.5, lat, d, "multi"), (lon + step * 1.5, lat, d + 1, "multi")]
-    lake.executemany(
-        "INSERT INTO lake.cells (depth_lon, depth_lat, depth, kind) VALUES (?, ?, ?, ?)", rows
-    )
-    finest = sorted(f["properties"]["depth_m"] for f in at_zoom(features(lake), overlay.MAX_ZOOM))
-    assert finest == [10, 11, 250]
 
 
 def box(x0, y0, x1, y1):
@@ -196,9 +164,7 @@ def test_a_tie_for_prime_goes_to_the_westmost_whatever_order_the_store_holds():
         con.executemany(
             "INSERT INTO lake.cells VALUES (1, 2, ?, ?, 3.4)", [(x, y) for x, y in order]
         )
-        got = con.execute(
-            overlay.PRIME_CANDIDATES, {"partition": 1, "tile": 2, "max": 200}
-        ).fetchnumpy()
+        got = con.execute(overlay.PRIME_CANDIDATES, {"partition": 1, "tile": 2}).fetchnumpy()
         [prime] = by_layer(
             overlay.tile_areas(
                 (got["lon"], got["lat"], got["depth"]), PROPERTIES, bands, box(0, 0, 3, 3)
@@ -274,8 +240,9 @@ def write_surface(path, lon0, lat0, depth, distance, count, sigma=None, near=Non
         # neighbor's sounding a pixel past it, capping the depths carried there.
         ((300, 380), (40, 120), [(121.5, 340.5, 0.5)]),
         # Depths a row short of the tile's south edge, which bounds the window: a sounding
-        # just past the tile caps that row, and one far from any depth is outside the window.
-        ((340, 399), (200, 280), [(240.5, 400.5, 0.5), (40.5, 40.5, 0.5)]),
+        # just past the tile caps that row, and a neighbor's far from any depth is outside
+        # the window.
+        ((340, 399), (200, 280), [(240.5, 400.5, 0.5), (40.5, -40.5, 0.5)]),
     ],
 )
 def test_surface_bands_worked_on_their_window_match_the_whole_tile(
@@ -400,6 +367,18 @@ def test_a_one_pixel_diagonal_track_stays_one_piece(tmp_path):
     # A smooth strip, wider than the track's own pixels and never wider than them grown.
     grown = binary_dilation(depth != surface.NODATA, structure=np.ones((3, 3), bool)).sum()
     assert 30 < surfaced.area * 40**2 < grown
+
+
+def test_a_published_sounding_is_covered_where_the_surface_has_nothing(tmp_path):
+    # A cell whose depth publishes, under the limit, though every one of its soundings
+    # reads deeper, and so does the surface: none of them counts, the sounding still does.
+    depth = np.full((100, 100), surface.NODATA, dtype=np.float32)
+    write_surface(tmp_path / "t.tif", -78, 33, depth, np.zeros_like(depth), depth.copy())
+    published = ([-78 + 50.5 / 100], [34 - 50.5 / 100], [197.5])
+    _, footprint, *_ = overlay.surface_bands(tmp_path / "t.tif", published)
+    assert footprint.contains(box(-78 + 0.5, 34 - 0.51, -78 + 0.51, 34 - 0.5))
+    _, footprint, *_ = overlay.surface_bands(tmp_path / "t.tif")
+    assert footprint.is_empty
 
 
 def test_the_grown_edge_is_never_deeper_than_a_sounding_beside_it(tmp_path):
@@ -759,6 +738,24 @@ def parallel(depth=10.0, rows=(5000, 5012), length=60):
     return [(v, [(i, r, i, depth) for i in range(length)]) for v, r in zip("AB", rows)]
 
 
+def test_centimeters_round_toward_shoal_and_keep_whole_ones():
+    # A hair under 10 m that isn't 10 m's float32 stays under it, in the 5 to 10 m band.
+    depths = [0.29, 199.99, 12.347, -0.123, 10.0, 9.99999]
+    got = surface.centimeters(np.array(depths, dtype=np.float32))
+    assert got.tolist() == np.array([0.29, 199.99, 12.34, -0.13, 10.0, 9.99], np.float32).tolist()
+
+
+def test_surface_depths_are_whole_centimeters(env):  # noqa: F811
+    depth = surface_from(env, [("A", varied(5000))])
+    valid = depth != surface.NODATA
+    assert valid.any()
+    # Each the float32 nearest a whole centimeter.
+    cm = np.round(depth[valid].astype(np.float64) * 100)
+    assert ((cm / 100).astype(np.float32) == depth[valid]).all()
+    # Rounded toward shoal: no deeper than the shallowest the track reads, less the margin.
+    assert depth[valid].max() <= 11.2 - statistic.K * CSIG + 1e-6
+
+
 def test_surface_fills_between_tracks_but_not_past_their_ends(env, monkeypatch):  # noqa: F811
     monkeypatch.setattr(statistic, "SIGMA_PER_M", 0.0)  # σ without widening
     depth = surface_from(env, parallel())
@@ -768,6 +765,84 @@ def test_surface_fills_between_tracks_but_not_past_their_ends(env, monkeypatch):
     # sounding on every side, so the surface doesn't run on beyond them past the band.
     assert at_pixel(depth, 5006, 70) == surface.NODATA
     assert at_pixel(depth, 5300, 30) == surface.NODATA  # far from both
+
+
+def test_nothing_deeper_than_the_limit_publishes(env):  # noqa: F811
+    limit = cells.MAX_PUBLISHED_DEPTH_M
+    tracks = parallel(limit - 50.0) + [
+        (v.lower(), rows) for v, rows in parallel(limit + 100.0, rows=(6000, 6012))
+    ]
+    depth = surface_from(env, tracks)
+    with rasterio.open(
+        env.store.root / "surface" / f"{tile_of(test_grid.LAT0, test_grid.LON0)}.tif"
+    ) as src:
+        count = src.read(3)
+    assert at_pixel(depth, 5006, 30) != surface.NODATA
+    assert at_pixel(depth, 6006, 30) == surface.NODATA
+    assert at_pixel(count, 6000, 30) == surface.NODATA
+    assert depth.max() < limit
+    with open_store(env.store, write=False) as con:
+        got = con.execute("SELECT count(*), max(depth) FROM lake.cells").fetchone()
+    assert got[0] > 0 and got[1] < limit
+
+
+def test_a_published_shoal_in_deep_water_keeps_its_coverage(env, tmp_path):  # noqa: F811
+    limit = cells.MAX_PUBLISHED_DEPTH_M
+    # A third vessel's soundings under the limit, on a deep track, as unconfirmed shoals:
+    # they publish, though no cell or surface pixel there is shallow enough to.
+    shoal = [(i, 5000, i, limit - 10.0) for i in range(28, 32)]
+    put_tracks(env, parallel(limit + 100.0) + [("C", shoal)])
+    test_grid.build(env)
+    tile = tile_of(test_grid.LAT0, test_grid.LON0)
+    with open_store(env.store) as con:
+        shallow = f"SELECT {POINT_ID} FROM lake.points p WHERE depth_raw < {limit}"
+        con.execute(f"DELETE FROM lake.qc_flags WHERE point_id IN ({shallow})")
+        con.execute(
+            f"INSERT INTO lake.qc_flags SELECT {POINT_ID}, 'unconfirmed', 'spike', ?, cell_id,"
+            f" tile_id FROM lake.points p WHERE depth_raw < {limit}",
+            [qc.QC_VERSION],
+        )
+        cells.build(con)
+        assert con.execute("SELECT count(*) FROM lake.cells").fetchone()[0] == 0
+        assert con.execute("SELECT count(*) FROM lake.shoals").fetchone()[0] == len(shoal)
+        assert [t for t, _ in surface.tiles(con)] == [tile]
+        [(partition,)] = con.execute("SELECT DISTINCT cell_id FROM lake.shoals").fetchall()
+        # Its coverage counts the shoals, at the tolerance for their depth; no dates.
+        params = {"partition": partition, "tile": tile}
+        first, last, n, tvu = con.execute(overlay.TILE_QUALITY, params).fetchone()
+        assert (first, n) == (None, len(shoal))
+        assert "SURSTA" not in overlay.quality(first, last, n, tvu)
+        assert tvu == pytest.approx(cells.TOLERANCE_M + cells.TOLERANCE_PER_M * (limit - 10.0))
+        path = surface.build_tile(con, tile, partition, tmp_path)
+        with rasterio.open(path) as src:
+            depth, count = src.read(1), src.read(3)
+            nearby = overlay.nearby_soundings(con, tile, src.transform)
+    # The surface there is too deep to publish, so it counts none of its soundings: the
+    # overlay covers the shoals' own pixels.
+    assert (depth == surface.NODATA).all() and (count == surface.NODATA).all()
+    _, footprint, *_ = overlay.surface_bands(path, nearby)
+    lon, lat = test_grid.at(5000, 30)
+    assert footprint.covers(shapely.Point(lon, lat))
+    assert not footprint.covers(shapely.Point(*test_grid.at(5000, 10)))
+
+
+def test_a_tiles_shoals_count_toward_its_quality():
+    # A harbor cell and, offshore, a shoal under the limit in water too deep to publish:
+    # the shoal's tolerance, not the harbor cell's, is the tile's uncertainty.
+    con = duckdb.connect()
+    con.execute("ATTACH ':memory:' AS lake")
+    con.execute(
+        "CREATE TABLE lake.cells AS SELECT 1 AS tile_id, 2::SMALLINT AS cell_id, 5.0 AS depth,"
+        " DATE '2025-03-01' AS first, DATE '2025-03-01' AS last, 'multi' AS kind, 7 AS count,"
+        " 2.3 AS tvu"
+    )
+    con.execute(
+        "CREATE TABLE lake.shoals AS SELECT 1 AS tile_id, 2::SMALLINT AS cell_id, 190.0 AS depth"
+    )
+    params = {"partition": 2, "tile": 1}
+    first, _, n, tvu = con.execute(overlay.TILE_QUALITY, params).fetchone()
+    assert (first, n) == (date(2025, 3, 1), 8)
+    assert tvu == pytest.approx(cells.TOLERANCE_M + cells.TOLERANCE_PER_M * 190)
 
 
 def varied(row, length=300):
@@ -954,13 +1029,17 @@ def test_a_windows_sounded_rasters_match_the_whole_tiles():
     shoal = np.where(rng.random(n) < 0.3, rng.uniform(0, 10, n), np.nan).astype(np.float32)
     count = np.zeros(shape, dtype=np.float32)
     np.add.at(count, (rows, cols), counts)
+    shallows = counts // 2
+    shallow = np.zeros(shape, dtype=np.float32)
+    np.add.at(shallow, (rows, cols), shallows)
     confirmed = np.full(shape, np.inf, dtype=np.float32)
     has = ~np.isnan(shoal)
     np.minimum.at(confirmed, (rows[has], cols[has]), shoal[has])
-    sounded = surface.Sounded(rows, cols, counts, shoal)
+    sounded = surface.Sounded(rows, cols, counts, shallows, shoal)
     for r0, c0, r1, c1 in [(0, 0, 40, 30), (5, 7, 13, 30), (39, 0, 40, 1), (10, 10, 11, 29)]:
-        got_count, got_confirmed = sounded.rasters(r0, c0, r1, c1)
+        got_count, got_shallow, got_confirmed = sounded.rasters(r0, c0, r1, c1)
         assert np.array_equal(got_count, count[r0:r1, c0:c1])
+        assert np.array_equal(got_shallow, shallow[r0:r1, c0:c1])
         assert np.array_equal(got_confirmed, confirmed[r0:r1, c0:c1])
 
 

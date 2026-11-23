@@ -288,6 +288,7 @@ def prepare(store, run: Path) -> dict:
         for path in (
             f"web/{key}.pmtiles",
             f"lowsnd/{key}.geojsons",
+            # Written by builds that thinned deep soundings; it holds sounding positions.
             f"lowsnd/{key}.level4.jsonl",
             f"done/web/{key}",
         ):
@@ -727,29 +728,30 @@ def do_cells(run: Path, tile: int, threads):
     splice_files(run, tile, threads)
 
 
-def has_cells(con, run: Path, tile: int) -> bool:
-    return bool(
-        con.execute(
-            "SELECT count(*) FROM read_parquet(?)", [str(run / TILE_FILES["cells"].format(tile))]
-        ).fetchone()[0]
+def publishes(con, run: Path, tile: int) -> bool:
+    """Whether a tile publishes a cell or a shoal: a tile whose cells are all too deep to
+    publish can still hold shoals, which its surface draws coverage for."""
+    files = [run / TILE_FILES[kind].format(tile) for kind in ("cells", "shoals")]
+    return any(
+        f.exists() and con.execute("SELECT count(*) FROM read_parquet(?)", [str(f)]).fetchone()[0]
+        for f in files
     )
 
 
 def do_leaf_surface(run: Path, key: str, threads):
     """A leaf's surface from its and its neighbors' points within the surface's reach of it,
     into leaves/{tile}/{quadkey}/surface.tif: a tile's raster, of which only the leaf's own
-    pixels are its; none for a tile with no cells, as `overlay.areas` builds none."""
+    pixels are its; none for a tile that publishes nothing, as `overlay.areas` builds none."""
     tile, leaf, box = leaf_of(run, key)
     around = neighbors(tile)
     out = leaf_dir(run, tile, leaf)
     path = out / "surface.tif"
     # What it was last built from: its fingerprint, the code, which Snakemake reruns on, and
-    # whether its tile has cells, which a change out of its reach can turn.
-    cells_file = run / TILE_FILES["cells"].format(tile)
+    # whether its tile publishes anything, which a change out of its reach can turn.
     # A connection of its own: the module's default one may be the warm worker's, from before
     # the fork, and hangs.
     with duckdb.connect() as con:
-        has = cells_file.exists() and has_cells(con, run, tile)
+        has = publishes(con, run, tile)
     stamp = f"{(run / 'fp' / str(tile) / f'{leaf}.surface').read_text()}{code()} {has}"
     built = out / "surface.fp"
     if built.exists() and built.read_text() == stamp:
@@ -762,7 +764,7 @@ def do_leaf_surface(run: Path, key: str, threads):
     near = within(tile, box, "surface")
     with open_job(run, around, threads, box=near) as con:
         load(con, run, around, kinds=("flags",), box=near)
-        got = has_cells(con, run, tile) and surface.tile_entries(
+        got = publishes(con, run, tile) and surface.tile_entries(
             con, tile, partition(tile), alone=leaf == leaves.ROOT
         )
     # Gridded with the job's DuckDB closed, so what it held is free for the rasters.
@@ -823,9 +825,7 @@ def do_overlay(run: Path, tile: int, threads):
         attach(con, run, around, kinds=("cells", "shoals"))
         params = {"partition": partition(tile), "tile": tile}
         first, last, count, tvu = con.execute(overlay.TILE_QUALITY, params).fetchone()
-        got = con.execute(
-            overlay.PRIME_CANDIDATES, params | {"max": overlay.PRIME_MAX_DEPTH_M}
-        ).fetchnumpy()
+        got = con.execute(overlay.PRIME_CANDIDATES, params).fetchnumpy()
         candidates = got["lon"], got["lat"], got["depth"]
         with rasterio.open(path) as src:
             nearby = overlay.nearby_soundings(con, tile, src.transform)
@@ -880,6 +880,8 @@ def do_web(run: Path, key: str, threads):
     out.parent.mkdir(exist_ok=True)
     (run / "lowsnd").mkdir(exist_ok=True)
     out.unlink(missing_ok=True)
+    # Written by builds that thinned deep soundings; nothing reads it, and it holds positions.
+    (run / "lowsnd" / f"{key}.level4.jsonl").unlink(missing_ok=True)
     n = 2**Z
     with scratch(run, threads) as con:
         load(con, run, mine, kinds=("cells", "shoals"))
@@ -906,12 +908,11 @@ def do_web(run: Path, key: str, threads):
         sounds = run / "web" / f"{key}.soundings.geojsons"
         count = 0
         with open(sounds, "w") as hi, open(run / "lowsnd" / f"{key}.geojsons", "w") as lo:
-            for high, feat in web_soundings(con, primes):
-                line = json.dumps(feat, separators=(",", ":")) + "\n"
-                (hi if high else lo).write(line)
+            # Every pyramid level shown, from z6 on, nests in one z8 tile.
+            for feat in overlay.soundings(con, primes):
+                high = feat["tippecanoe"]["minzoom"] >= Z
+                (hi if high else lo).write(json.dumps(feat, separators=(",", ":")) + "\n")
                 count += high
-        with open(run / "lowsnd" / f"{key}.level4.jsonl", "w") as f:
-            f.writelines(json.dumps(row) + "\n" for row in level4_candidates(con))
     w, s, e, nn = z8_bounds(key)
     # Clipped to the z8 tile plus tippecanoe's buffer at z8, 5/256 of a tile.
     bx, by = (e - w) * 5 / 256, (nn - s) * 5 / 256
@@ -928,55 +929,8 @@ def do_web(run: Path, key: str, threads):
     sounds.unlink()
 
 
-# The one pyramid level that shows below z8 and whose cells are wider than a z8 tile:
-# zoom 4, shown at z6 past 1,000 m. Every finer level nests in one z8 tile.
-LEVEL4 = 4
-
-
-def web_soundings(con, primes):
-    """Yield a web job's soundings as (shown at z8 or past it, feature): all of them but
-    those from level 4, which the low job reduces across web jobs (level4_candidates)."""
-    for feat in overlay.soundings(con, primes):
-        display = feat["tippecanoe"]["minzoom"]
-        if display - overlay.thin_shift(feat["properties"]["VALSOU"]) > LEVEL4:
-            yield display >= Z, feat
-
-
-def level4_candidates(con):
-    """Every level-4 pyramid cell's shoalest sounding in `lake`, as [cx, cy, depth, lon,
-    lat, unconfirmed], whatever depth: a shallow one that shows at no zoom still keeps a
-    deeper one in another web job's part of the cell from showing, as in the pyramid."""
-    n = 2**overlay.MAX_ZOOM * overlay.CELLS_PER_TILE
-    step = 2 ** (overlay.MAX_ZOOM - LEVEL4)
-    rows = con.execute(
-        f"""SELECT cx, cy, s.d, s.lon, s.lat, s.unconfirmed FROM (
-          SELECT floor(mx * {n})::BIGINT // {step} AS cx, floor(my * {n})::BIGINT // {step} AS cy,
-            min(struct_pack(d := d, lon := lon, lat := lat, unconfirmed := unconfirmed)) AS s
-          FROM (SELECT *, {overlay.MERCATOR} FROM ({overlay.SOURCES}))
-          GROUP BY ALL
-        ) ORDER BY cx, cy"""
-    ).fetchall()
-    return [list(r) for r in rows]
-
-
-def reduce_level4(candidates):
-    """Level 4's soundings from every web job's candidates: each cell's shoalest, ties
-    broken on position as the pyramid breaks them, shown where its depth shows at level 4.
-    None is a prime: those are 200 m or shallower, and level 4 shows only past 1,000 m."""
-    best = {}
-    for cx, cy, d, lon, lat, unconfirmed in candidates:
-        if (cx, cy) not in best or (d, lon, lat, unconfirmed) < best[cx, cy]:
-            best[cx, cy] = (d, lon, lat, unconfirmed)
-    for (cx, cy), (d, lon, lat, unconfirmed) in sorted(best.items()):
-        display = LEVEL4 + overlay.thin_shift(d)
-        if overlay.MIN_ZOOM <= display <= overlay.MAX_ZOOM:
-            yield overlay.feature(lon, lat, d, unconfirmed, display)
-
-
 def do_low(run: Path, threads):
-    """z0–7: every tile's areas shown below z8, and the web jobs' soundings shown below it,
-    with the pyramid's zoom-4 level (shown at z6, past 1,000 m) reduced across them, as a
-    whole-region pyramid would."""
+    """z0–7: every tile's areas shown below z8, and the web jobs' soundings shown below it."""
     tiles = counts(run)
     keys = web_keys(tiles)
     feats = run / "low.areas.geojsons"
@@ -988,19 +942,10 @@ def do_low(run: Path, threads):
                     if json.loads(line)["tippecanoe"].get("minzoom", 0) < Z:
                         out.write(line)
     sounds = run / "low.soundings.geojsons"
-
-    def candidates():
-        for key in sorted(keys):
-            with open(run / "lowsnd" / f"{key}.level4.jsonl") as fh:
-                yield from map(json.loads, fh)
-
     with open(sounds, "w") as out:
         for key in sorted(keys):
             with open(run / "lowsnd" / f"{key}.geojsons") as fh:
                 shutil.copyfileobj(fh, out)
-        out.writelines(
-            json.dumps(feat, separators=(",", ":")) + "\n" for feat in reduce_level4(candidates())
-        )
     mbtiles = run / "low.mbtiles"
     if tippecanoe(mbtiles, [sounds, feats], (0, Z - 1), threads):
         to_pmtiles(mbtiles, run / "low.pmtiles")

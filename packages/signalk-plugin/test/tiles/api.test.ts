@@ -11,7 +11,8 @@ import {
   createTileService,
   registerLayerRoutes,
 } from "../../src/tiles/index.js";
-import { parseView, refreshMs, thin } from "../../src/tiles/api.js";
+import { parseView, drawn, refreshMs, thin } from "../../src/tiles/api.js";
+import { MAX_PUBLISHED_DEPTH_M } from "../../src/tiles/surface.js";
 import { DEFAULT_OWN_STYLE } from "../../src/tiles/style.js";
 import type { Layer } from "../../src/tiles/api.js";
 import type { GeoFeature } from "../../src/tiles/preview.js";
@@ -275,4 +276,14 @@ test("a live poll that fails is answered, not left hanging", async () => {
   });
   const res = await get(LIVE_PATH, { query: { since: "-1", preview: "0" } });
   expect(res.code).toBe(500);
+});
+
+test("provisional soundings past the published limit aren't drawn", () => {
+  const at = { lon: -76.2, lat: 36.98 };
+  const got = [
+    { time: 1, ...at, depth: MAX_PUBLISHED_DEPTH_M - 1 },
+    { time: 2, ...at, depth: MAX_PUBLISHED_DEPTH_M },
+    { time: 3, ...at, depth: 900 },
+  ].filter(drawn);
+  expect(got.map((s) => s.time)).toEqual([1]);
 });

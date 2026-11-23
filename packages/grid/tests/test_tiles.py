@@ -559,9 +559,9 @@ def sounding_lake(rows):
 
 
 def test_split_soundings_match_the_whole_pyramid_across_web_tiles():
-    # 500 m and 1,500 m in two z8 tiles of one level-4 pyramid cell, and deep water
-    # elsewhere: the shallower one keeps the deeper from showing at z6, as in the pyramid.
-    rows = [(0.1, 0.1, 500.0), (1.5, 0.1, 1500.0), (4.1, 0.2, 1200.0), (5.6, 0.3, 30.0)]
+    # Soundings in four z8 tiles: every level shown nests in one, so the web jobs' parts
+    # add up to the whole pyramid.
+    rows = [(0.1, 0.1, 50.0), (1.5, 0.1, 150.0), (4.1, 0.2, 120.0), (5.6, 0.3, 30.0)]
     whole = {json.dumps(f, sort_keys=True) for f in overlay.soundings(sounding_lake(rows))}
     keys = {}
     for lon, lat, d in rows:
@@ -569,15 +569,10 @@ def test_split_soundings_match_the_whole_pyramid_across_web_tiles():
         y = int(tiles.mercator_y(lat) * 2**tiles.Z)
         keys.setdefault((x, y), []).append((lon, lat, d))
     assert len(keys) == 4
-    split, candidates = set(), []
+    split = set()
     for part in keys.values():
-        con = sounding_lake(part)
-        split |= {json.dumps(f, sort_keys=True) for _, f in tiles.web_soundings(con, {})}
-        candidates += tiles.level4_candidates(con)
-    split |= {json.dumps(f, sort_keys=True) for f in tiles.reduce_level4(candidates)}
+        split |= {json.dumps(f, sort_keys=True) for f in overlay.soundings(sounding_lake(part))}
     assert split == whole
-    at_z6 = [json.loads(f) for f in whole if json.loads(f)["tippecanoe"]["minzoom"] == 6]
-    assert 1500 not in {f["properties"]["VALSOU"] for f in at_z6}
 
 
 def test_a_run_whose_tiles_are_all_withdrawn_publishes_nothing(env, tmp_path):  # noqa: F811

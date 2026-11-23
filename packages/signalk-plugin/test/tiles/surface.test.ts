@@ -17,6 +17,7 @@ import {
   readTile,
 } from "../../src/tiles/service.js";
 import {
+  MAX_PUBLISHED_DEPTH_M,
   buildTile,
   contourLevels,
   nearestSearch,
@@ -71,6 +72,26 @@ test("a lone track draws its own ribbon of areas, measured, never past it", () =
     CATZOC: 5,
     SURSTA: "20241004",
   });
+});
+
+test("nothing deeper than the published limit is drawn", () => {
+  const deep = lane(LON, () => MAX_PUBLISHED_DEPTH_M + 100);
+  expect(buildTile(Z, tile.x, tile.y, deep, [])).toBeUndefined();
+  // A median just past the limit, though its margin takes the cell's depth under it: the
+  // surface interpolates medians, so it would draw past the limit.
+  const edge = lane(LON, () => MAX_PUBLISHED_DEPTH_M + 1);
+  expect(cellDepth(edge[0])).toBeLessThan(MAX_PUBLISHED_DEPTH_M);
+  expect(buildTile(Z, tile.x, tile.y, edge, [])).toBeUndefined();
+  // Beside a shallower track, only the shallower track draws.
+  const t = decode(
+    buildTile(Z, tile.x, tile.y, [...deep, ...lane(LON + 0.001, () => 8)], [])!,
+  );
+  for (const f of features(t, "SOUNDG")) {
+    expect(f.properties.VALSOU).toBeLessThan(MAX_PUBLISHED_DEPTH_M);
+  }
+  expect(features(t, "M_QUAL").map((f) => f.properties.kind)).toEqual([
+    "measured",
+  ]);
 });
 
 test("water between two tracks within 200 m is interpolated, never past them", () => {
