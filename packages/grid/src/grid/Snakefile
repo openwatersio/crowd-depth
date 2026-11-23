@@ -30,11 +30,13 @@ CLIENT = shlex.quote(str(Path(tiles.__file__).with_name("worker_client.py")))
 
 
 def run_job(stage, keys):
-    """The shell command for a job; Snakemake fills in {log} and {threads}."""
+    """The shell command for a job; Snakemake fills in {log}, {threads} and the memory it was
+    given past its first try's."""
+    args = f"{stage} . {{threads}} {{resources.extra_mb}} {keys}"
     if config.get("socket"):
         sock = shlex.quote(config["socket"])
-        return f"{PYTHON} -S {CLIENT} {sock} {{log:q}} {stage} . {{threads}} {keys}"
-    return f"{PYTHON} -m grid.tiles {stage} . {{threads}} {keys} 2> {{log:q}}"
+        return f"{PYTHON} -S {CLIENT} {sock} {{log:q}} {args}"
+    return f"{PYTHON} -m grid.tiles {args} 2> {{log:q}}"
 
 
 def around(tile, stage):
@@ -49,8 +51,21 @@ def soundings(wc):
     return COUNTS[int(wc.tile)]
 
 
-def mem(stage):
-    return lambda wc: min(tiles.resources(stage, soundings(wc))[0], BUDGET)
+def grows(mb):
+    """A job's memory: `mb`, or what `mb(wildcards)` gives, doubled on each retry, within the
+    budget."""
+    return lambda wc, attempt: min((mb(wc) if callable(mb) else mb) * 2 ** (attempt - 1), BUDGET)
+
+
+def extra(mb):
+    """The memory a job is given past its first try's, all of which goes to its DuckDB
+    (tiles.limit)."""
+    given = grows(mb)
+    return lambda wc, attempt: given(wc, attempt) - given(wc, 1)
+
+
+def estimate(stage):
+    return lambda wc: tiles.resources(stage, soundings(wc))[0]
 
 
 def threads(stage):
@@ -88,8 +103,10 @@ rule leaf_cells:
         code=CODE,
     threads: threads("cells")
     priority: weight
+    retries: tiles.RETRIES
     resources:
-        mem_mb=mem("cells"),
+        mem_mb=grows(estimate("cells")),
+        extra_mb=extra(estimate("cells")),
     log:
         "logs/leaf_cells/{tile}/{leaf}.log",
     shell:
@@ -105,8 +122,10 @@ rule cells:
         code=CODE,
     threads: 1
     priority: weight
+    retries: tiles.RETRIES
     resources:
-        mem_mb=min(tiles.SPLICE_MEMORY_MB, BUDGET),
+        mem_mb=grows(tiles.SPLICE_MEMORY_MB),
+        extra_mb=extra(tiles.SPLICE_MEMORY_MB),
     log:
         "logs/cells/{tile}.log",
     shell:
@@ -128,8 +147,10 @@ rule leaf_surface:
         code=CODE,
     threads: threads("surface")
     priority: weight
+    retries: tiles.RETRIES
     resources:
-        mem_mb=mem("surface"),
+        mem_mb=grows(estimate("surface")),
+        extra_mb=extra(estimate("surface")),
     log:
         "logs/leaf_surface/{tile}/{leaf}.log",
     shell:
@@ -145,8 +166,10 @@ rule surface:
         code=CODE,
     threads: 1
     priority: weight
+    retries: tiles.RETRIES
     resources:
-        mem_mb=min(tiles.SPLICE_MEMORY_MB, BUDGET),
+        mem_mb=grows(tiles.SPLICE_MEMORY_MB),
+        extra_mb=extra(tiles.SPLICE_MEMORY_MB),
     log:
         "logs/surface/{tile}.log",
     shell:
@@ -164,8 +187,10 @@ rule overlay:
         code=CODE,
     threads: threads("overlay")
     priority: weight
+    retries: tiles.RETRIES
     resources:
-        mem_mb=mem("overlay"),
+        mem_mb=grows(estimate("overlay")),
+        extra_mb=extra(estimate("overlay")),
     log:
         "logs/overlay/{tile}.log",
     shell:
@@ -180,8 +205,10 @@ rule web:
     params:
         code=CODE,
     threads: 1
+    retries: tiles.RETRIES
     resources:
-        mem_mb=min(tiles.WEB_MEMORY_MB, BUDGET),
+        mem_mb=grows(tiles.WEB_MEMORY_MB),
+        extra_mb=extra(tiles.WEB_MEMORY_MB),
     log:
         "logs/web/{key}.log",
     shell:
@@ -199,6 +226,7 @@ rule low:
     threads: workflow.cores
     resources:
         mem_mb=min(tiles.WEB_MEMORY_MB, BUDGET),
+        extra_mb=0,
     log:
         "logs/low.log",
     shell:
@@ -216,6 +244,7 @@ rule assemble:
         code=CODE,
     resources:
         mem_mb=min(tiles.WEB_MEMORY_MB, BUDGET),
+        extra_mb=0,
     log:
         "logs/assemble.log",
     shell:

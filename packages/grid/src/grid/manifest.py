@@ -124,22 +124,30 @@ copies AS (
     AND date_trunc('second', o.time_max) + INTERVAL 1 SECOND > ft.time_min
   GROUP BY ALL
 ),
-days AS (
+spans AS (
   -- The days each active file covers, by the stations its tile's tide cells take levels from.
-  SELECT DISTINCT d.tile_id, d.file_id, s.station_id, d.day FROM (
-    SELECT tile_id, file_id,
-      unnest(generate_series(time_min::DATE, time_max::DATE, INTERVAL 1 DAY))::DATE AS day
-    FROM ft WHERE status = 'active' AND time_min IS NOT NULL AND time_max IS NOT NULL
-  ) d JOIN (SELECT DISTINCT tile_id, station_id FROM lake.tide_cells WHERE station_id IS NOT NULL) s
-    USING (tile_id)
+  SELECT ft.tile_id, ft.file_id, s.station_id, ft.time_min::DATE AS d0, ft.time_max::DATE AS d1
+  FROM ft JOIN (
+    SELECT DISTINCT tile_id, station_id FROM lake.tide_cells WHERE station_id IS NOT NULL
+  ) s USING (tile_id)
+  WHERE ft.status = 'active' AND ft.time_min::DATE <= ft.time_max::DATE
 ),
 levels AS (
-  SELECT station_id, slot::DATE AS day,
-    sum(hash(station_id, slot, level, slope, sigma)::HUGEINT) AS h
-  FROM lake.tide_levels GROUP BY ALL
+  -- Each station's levels by day, summed through that day: a span's are the sum through its
+  -- last day less the sum before its first. One row per file a day, by its tile's stations,
+  -- came to 193M on the planet and ran out of memory at 1 GB.
+  SELECT station_id, day, sum(h) OVER (PARTITION BY station_id ORDER BY day) AS through
+  FROM (
+    SELECT station_id, slot::DATE AS day,
+      sum(hash(station_id, slot, level, slope, sigma)::HUGEINT) AS h
+    FROM lake.tide_levels GROUP BY ALL
+  )
 ),
 tide AS (
-  SELECT d.tile_id, d.file_id, sum(l.h) AS h FROM days d JOIN levels l USING (station_id, day)
+  SELECT s.tile_id, s.file_id, sum(coalesce(l.through, 0) - coalesce(b.through, 0)) AS h
+  FROM spans s
+  ASOF LEFT JOIN levels l ON l.station_id = s.station_id AND l.day <= s.d1
+  ASOF LEFT JOIN levels b ON b.station_id = s.station_id AND b.day < s.d0
   GROUP BY ALL
 )
 SELECT ft.tile_id, ft.file_id, CASE WHEN ft.status = 'active' THEN ft.n ELSE 0 END AS active,
