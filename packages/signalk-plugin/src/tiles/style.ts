@@ -214,7 +214,7 @@ export function buildStyle({
         minzoom: MIN_ZOOM,
         maxzoom: MAX_ZOOM,
       },
-      preview: {
+      historyPreview: {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
       },
@@ -227,7 +227,7 @@ export function buildStyle({
       {
         id: "history-preview-area",
         type: "fill",
-        source: "preview",
+        source: "historyPreview",
         filter: ["==", ["geometry-type"], "Polygon"],
         paint: {
           "fill-color": DAY.provisional,
@@ -237,7 +237,7 @@ export function buildStyle({
       {
         id: "history-preview",
         type: "circle",
-        source: "preview",
+        source: "historyPreview",
         filter: isPoint,
         paint: {
           "circle-color": DAY.provisional,
@@ -251,7 +251,7 @@ export function buildStyle({
       {
         id: "history-preview-label",
         type: "symbol",
-        source: "preview",
+        source: "historyPreview",
         filter: isPoint,
         minzoom: 14,
         layout: {

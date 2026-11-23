@@ -6,7 +6,10 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { Temporal } from "@js-temporal/polyfill";
 import { createDB } from "../dist/storage.js";
-import { createPreviewStore, scanPreview } from "../dist/tiles/preview.js";
+import {
+  createPreviewStore,
+  scanPreview,
+} from "../dist/tiles/history-preview.js";
 import { createCellStore } from "../dist/tiles/cells.js";
 import { createCellWriter } from "../dist/tiles/writer.js";
 

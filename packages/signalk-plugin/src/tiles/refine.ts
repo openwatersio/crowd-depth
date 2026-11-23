@@ -16,7 +16,7 @@ import {
   clearPendingBackfill,
   DEPTH_SINCE_KEY,
 } from "./backfill.js";
-import type { PreviewView } from "./preview.js";
+import type { PreviewView } from "./history-preview.js";
 
 const HOUR = 3600_000;
 const DAY = 24 * HOUR;

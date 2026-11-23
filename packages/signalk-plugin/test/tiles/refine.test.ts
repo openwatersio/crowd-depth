@@ -308,7 +308,8 @@ test("an extended hour preserves imported evidence that predates a live pass", (
 });
 
 test("visible legacy previews refine without discovery or advancing global coverage", async () => {
-  const { createPreviewStore } = await import("../../src/tiles/preview.js");
+  const { createPreviewStore } =
+    await import("../../src/tiles/history-preview.js");
   const { refineVisible } = await import("../../src/tiles/refine.js");
   const db = createDB(":memory:"),
     store = createCellStore(db);

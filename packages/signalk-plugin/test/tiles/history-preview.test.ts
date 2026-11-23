@@ -6,7 +6,7 @@ import {
   createPreviewStore,
   observation,
   scanPreview,
-} from "../../src/tiles/preview.js";
+} from "../../src/tiles/history-preview.js";
 import { Timeframe, type BathymetrySource } from "../../src/types.js";
 import { config } from "../helper.js";
 

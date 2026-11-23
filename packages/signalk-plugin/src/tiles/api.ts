@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { cellAt as previewCellAt } from "./geometry.js";
+import { cellAt as historyPreviewCellAt } from "./geometry.js";
 import { cellBounds } from "./geometry.js";
 import type { Request, Response } from "express";
 import type { ServerAPI } from "@signalk/server-api";
@@ -15,7 +15,7 @@ import {
   depthLabels,
   type Detail,
 } from "./surface.js";
-import type { PreviewView, PreviewStore } from "./preview.js";
+import type { PreviewView, PreviewStore } from "./history-preview.js";
 import type { TileService } from "./service.js";
 import { buildStyle, type OwnStyle } from "./style.js";
 
@@ -141,7 +141,7 @@ export function spatialProvisional(soundings: Sounding[]) {
       s.depth <= 0
     )
       continue;
-    const { py, px } = previewCellAt(s.lon, s.lat);
+    const { py, px } = historyPreviewCellAt(s.lon, s.lat);
     const key = `${py}/${px}/${s.tide ? 1 : 0}`;
     const cell = cells.get(key);
     if (!cell) cells.set(key, { latest: s, shoal: s });
@@ -167,7 +167,7 @@ export function thin(n: number) {
 /** What the routes read; replaced on each start. */
 export interface Layer {
   tiles: TileService;
-  preview?: (
+  historyPreview?: (
     view: PreviewView | undefined,
   ) => ReturnType<PreviewStore["features"]>;
   provisional: () => Sounding[];
@@ -294,23 +294,24 @@ export function registerLayerRoutes(
       const view = parseView(req.query.view);
       layer.tiles.watched(view);
       const held = view && layer.tiles.held(...view);
-      const previewPoints = layer.preview?.(view);
-      const previewRevision =
-        previewPoints &&
+      const historyPreviewPoints = layer.historyPreview?.(view);
+      const historyPreviewRevision =
+        historyPreviewPoints &&
         createHash("sha256")
-          .update(JSON.stringify(previewPoints))
+          .update(JSON.stringify(historyPreviewPoints))
           .digest("hex")
           .slice(0, 24);
       res.set("Cache-Control", "no-store").json({
         ...layer.tiles.since(Number.isInteger(since) ? since : -1),
-        ...(previewRevision ? { previewRevision } : {}),
-        ...(previewPoints && previewRevision !== req.query.previewRevision
+        ...(historyPreviewRevision ? { historyPreviewRevision } : {}),
+        ...(historyPreviewPoints &&
+        historyPreviewRevision !== req.query.historyPreviewRevision
           ? {
-              preview: {
+              historyPreview: {
                 type: "FeatureCollection",
-                features: previewPoints.flatMap((point) => {
+                features: historyPreviewPoints.flatMap((point) => {
                   const [lon, lat] = point.geometry.coordinates;
-                  const { py, px } = previewCellAt(lon, lat);
+                  const { py, px } = historyPreviewCellAt(lon, lat);
                   const { west, east, south, north } = cellBounds(py, px);
                   return [
                     point,

@@ -47,7 +47,7 @@ type Req = { params?: Record<string, string>; query?: Record<string, string> };
 
 function serve(
   own = DEFAULT_OWN_STYLE,
-  preview?: import("../../src/tiles/api.js").Layer["preview"],
+  historyPreview?: import("../../src/tiles/api.js").Layer["historyPreview"],
 ) {
   const handlers = new Map<string, (req: Req, res: Res) => unknown>();
   const app = {
@@ -58,7 +58,7 @@ function serve(
   const tiles = createTileService(store);
   registerLayerRoutes(app, () => ({
     tiles,
-    preview,
+    historyPreview,
     provisional: () => [{ time: 1, lon: -76.2, lat: 36.98, depth: 4.37 }],
     stored: () => [],
     safetyDepth: 3,
@@ -268,8 +268,8 @@ test("refreshes are batched by how much the plotter's view holds", async () => {
   expect((await live("13,-1e18,40,1e18,30")).refreshMs).toBeUndefined();
 });
 
-test("unchanged preview payloads are omitted using the client's revision", async () => {
-  const preview = () => [
+test("unchanged historyPreview payloads are omitted using the client's revision", async () => {
+  const historyPreview = () => [
     {
       type: "Feature",
       id: "history:1:2",
@@ -282,18 +282,20 @@ test("unchanged preview payloads are omitted using the client's revision", async
       },
     },
   ];
-  const { get } = serve(DEFAULT_OWN_STYLE, preview as never);
+  const { get } = serve(DEFAULT_OWN_STYLE, historyPreview as never);
   const first = (await get(LIVE_PATH, { query: {} })).body as {
-    previewRevision: string;
-    preview: { features: unknown[] };
+    historyPreviewRevision: string;
+    historyPreview: { features: unknown[] };
   };
-  expect(first.preview.features).toHaveLength(2);
-  expect(first.previewRevision).toMatch(/^[a-f0-9]{24}$/);
+  expect(first.historyPreview.features).toHaveLength(2);
+  expect(first.historyPreviewRevision).toMatch(/^[a-f0-9]{24}$/);
   const next = (
-    await get(LIVE_PATH, { query: { previewRevision: first.previewRevision } })
+    await get(LIVE_PATH, {
+      query: { historyPreviewRevision: first.historyPreviewRevision },
+    })
   ).body as typeof first;
-  expect(next.preview).toBeUndefined();
-  expect(next.previewRevision).toBe(first.previewRevision);
+  expect(next.historyPreview).toBeUndefined();
+  expect(next.historyPreviewRevision).toBe(first.historyPreviewRevision);
 });
 
 test("a stationary high-rate stream sends only its newest and shoalest values without thinning storage", async () => {

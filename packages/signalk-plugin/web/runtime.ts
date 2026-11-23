@@ -38,10 +38,10 @@ let view: MapView | undefined;
 let busy = false;
 let timer: ReturnType<typeof setInterval> | undefined;
 let depthUnit: string | undefined;
-let previewShown: string | undefined;
-let previewRevision: string | undefined;
-let previewView: string | undefined;
-let previewHeld = new Map<string | number, { id: string | number }>();
+let historyPreviewShown: string | undefined;
+let historyPreviewRevision: string | undefined;
+let historyPreviewView: string | undefined;
+let historyPreviewHeld = new Map<string | number, { id: string | number }>();
 const batch = createBatch(REFRESH_MS);
 
 async function poll(): Promise<void> {
@@ -55,24 +55,33 @@ async function poll(): Promise<void> {
   const timeout = setTimeout(() => abort.abort(), TIMEOUT_MS);
   try {
     const at = view ? `&view=${[view.zoom, ...view.bounds].join(",")}` : "";
-    const previewAt = previewRevision
-      ? `&previewRevision=${encodeURIComponent(previewRevision)}`
+    const historyPreviewAt = historyPreviewRevision
+      ? `&historyPreviewRevision=${encodeURIComponent(historyPreviewRevision)}`
       : "";
-    const res = await fetch(`${LIVE_URL}?since=${batch.rev}${at}${previewAt}`, {
-      credentials: "include",
-      signal: abort.signal,
-    });
+    const res = await fetch(
+      `${LIVE_URL}?since=${batch.rev}${at}${historyPreviewAt}`,
+      {
+        credentials: "include",
+        signal: abort.signal,
+      },
+    );
     if (!res.ok) return;
     const live = (await res.json()) as Live & {
-      preview?: { type: string; features: unknown[] };
-      previewRevision?: string;
+      historyPreview?: { type: string; features: unknown[] };
+      historyPreviewRevision?: string;
     };
-    // QC can retire a preview without producing cells. Still schedule its handoff.
-    if (live.preview && previewView === JSON.stringify(view?.bounds)) {
+    // QC can retire a historyPreview without producing cells. Still schedule its handoff.
+    if (
+      live.historyPreview &&
+      historyPreviewView === JSON.stringify(view?.bounds)
+    ) {
       const ids = new Set(
-        (live.preview.features as { id: string | number }[]).map((f) => f.id),
+        (live.historyPreview.features as { id: string | number }[]).map(
+          (f) => f.id,
+        ),
       );
-      if ([...previewHeld.keys()].some((id) => !ids.has(id))) live.all = true;
+      if ([...historyPreviewHeld.keys()].some((id) => !ids.has(id)))
+        live.all = true;
     }
     const { refresh, data, upsert, remove } = batch.next(live);
     if (refresh) {
@@ -82,30 +91,30 @@ async function poll(): Promise<void> {
         ...refresh,
       });
     }
-    if (live.preview) {
+    if (live.historyPreview) {
       const currentView = JSON.stringify(view?.bounds);
       const next = new Map(
-        (live.preview.features as { id: string | number }[]).map((f) => [
+        (live.historyPreview.features as { id: string | number }[]).map((f) => [
           f.id,
           f,
         ]),
       );
-      // Don't remove the old preview while its tile refresh is still batched or failed.
+      // Don't remove the old historyPreview while its tile refresh is still batched or failed.
       // The host acknowledges refresh requests, not individual tile generations.
-      if (!refresh && previewView === currentView)
-        for (const [id, feature] of previewHeld)
+      if (!refresh && historyPreviewView === currentView)
+        for (const [id, feature] of historyPreviewHeld)
           if (!next.has(id) && next.size < 2400) next.set(id, feature);
       const shown = { type: "FeatureCollection", features: [...next.values()] };
       const encoded = JSON.stringify(shown);
-      if (encoded !== previewShown) {
+      if (encoded !== historyPreviewShown) {
         await client.call("overlay.setData", {
           overlayId,
-          source: "preview",
+          source: "historyPreview",
           data: shown,
         });
-        previewShown = encoded;
-        previewView = currentView;
-        previewHeld = next;
+        historyPreviewShown = encoded;
+        historyPreviewView = currentView;
+        historyPreviewHeld = next;
       }
     }
     if (data) {
@@ -124,9 +133,12 @@ async function poll(): Promise<void> {
     }
     // Request the payload again until its retained old features have been cleared
     // after a successful tile refresh. A failed host update must also retry it.
-    if (!live.preview || previewHeld.size === live.preview.features.length)
-      previewRevision = live.previewRevision;
-    else previewRevision = undefined;
+    if (
+      !live.historyPreview ||
+      historyPreviewHeld.size === live.historyPreview.features.length
+    )
+      historyPreviewRevision = live.historyPreviewRevision;
+    else historyPreviewRevision = undefined;
     batch.taken();
   } catch {
     // The server is restarting, a call timed out, or the overlay isn't drawn; the next
@@ -145,10 +157,10 @@ function schedule(): void {
   if (active && !timer) {
     // The host may have dropped the soundings while the overlay was off.
     batch.resend();
-    previewShown = undefined;
-    previewRevision = undefined;
-    previewView = undefined;
-    previewHeld.clear();
+    historyPreviewShown = undefined;
+    historyPreviewRevision = undefined;
+    historyPreviewView = undefined;
+    historyPreviewHeld.clear();
     timer = setInterval(() => void poll(), POLL_MS);
     void poll();
   } else if (!active && timer) {

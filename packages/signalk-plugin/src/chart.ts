@@ -2,14 +2,14 @@ import { halfLifeDays } from "./tiles/decay.js";
 import { refineHistory, refineVisible, reweightCells } from "./tiles/refine.js";
 import { TIDE_CONFIG_KEY, tideConfig } from "./tiles/backfill.js";
 import { cacheChartInputs } from "./tiles/inputs.js";
-import type { PreviewView } from "./tiles/preview.js";
+import type { PreviewView } from "./tiles/history-preview.js";
 import { randomUUID } from "node:crypto";
 import { pipeline } from "stream/promises";
 import {
   createPreviewStore,
   scanPreview,
   observation,
-} from "./tiles/preview.js";
+} from "./tiles/history-preview.js";
 import { createSqliteSource } from "./sources/sqlite.js";
 import type { BathymetryData } from "./types.js";
 import { setTimeout } from "node:timers/promises";
@@ -255,7 +255,7 @@ export function startChart({
         return s ? [{ ...s, time: s.time * 1000 }] : [];
       }),
     ],
-    preview: (view) => {
+    historyPreview: (view) => {
       previewView = view;
       return preview.features(view ?? boatView(), 0);
     },

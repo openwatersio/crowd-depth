@@ -79,10 +79,10 @@ test("retries a failed unit update on the next poll", async () => {
   expect(attempts).toBe(3);
 });
 
-test("history preview publishes on the first poll without waiting for tile refresh", async () => {
+test("history historyPreview publishes on the first poll without waiting for tile refresh", async () => {
   host.call.mockResolvedValue({});
   await start();
-  const preview = {
+  const historyPreview = {
     type: "FeatureCollection",
     features: [
       {
@@ -98,29 +98,29 @@ test("history preview publishes on the first poll without waiting for tile refre
     json: async () => ({
       rev: 1,
       tiles: [],
-      preview,
+      historyPreview,
       provisional: { features: [] },
     }),
   } as Response);
   await vi.advanceTimersByTimeAsync(2000);
   expect(host.call).toHaveBeenCalledWith("overlay.setData", {
     overlayId: "depth",
-    source: "preview",
-    data: preview,
+    source: "historyPreview",
+    data: historyPreview,
   });
   expect(
     host.call.mock.calls.filter(([m]) => m === "overlay.refresh"),
   ).toHaveLength(0);
   const writes = () =>
     host.call.mock.calls.filter(
-      ([m, p]) => m === "overlay.setData" && p.source === "preview",
+      ([m, p]) => m === "overlay.setData" && p.source === "historyPreview",
     );
   expect(writes()).toHaveLength(1);
   await vi.advanceTimersByTimeAsync(2000);
   expect(writes()).toHaveLength(1);
 });
 
-test("history preview survives a batched or failed replacement refresh", async () => {
+test("history historyPreview survives a batched or failed replacement refresh", async () => {
   host.call.mockResolvedValue({});
   await start();
   const feature = {
@@ -134,7 +134,7 @@ test("history preview survives a batched or failed replacement refresh", async (
     tiles: [] as number[][],
     all: false,
     refreshMs: 5000,
-    preview: { type: "FeatureCollection", features: [feature] },
+    historyPreview: { type: "FeatureCollection", features: [feature] },
     provisional: { features: [] },
   };
   vi.mocked(fetch).mockImplementation(
@@ -145,12 +145,12 @@ test("history preview survives a batched or failed replacement refresh", async (
     ...reply,
     rev: 2,
     all: true,
-    preview: { type: "FeatureCollection", features: [] },
+    historyPreview: { type: "FeatureCollection", features: [] },
   };
   await vi.advanceTimersByTimeAsync(2000);
   const writes = () =>
     host.call.mock.calls.filter(
-      ([m, p]) => m === "overlay.setData" && p.source === "preview",
+      ([m, p]) => m === "overlay.setData" && p.source === "historyPreview",
     );
   expect(writes().at(-1)![1].data.features).toEqual([feature]);
   host.call.mockImplementation(async (method) => {
@@ -177,7 +177,7 @@ test("an unanswered units request cannot block startup or live polling", async (
   ).toHaveLength(1);
 });
 
-test("QC rejection retires history preview even without a tile revision change", async () => {
+test("QC rejection retires history historyPreview even without a tile revision change", async () => {
   host.call.mockResolvedValue({});
   await start();
   const feature = { id: "history:1:2" };
@@ -190,8 +190,8 @@ test("QC rejection retires history preview even without a tile revision change",
           rev: 1,
           tiles: [],
           refreshMs: 5000,
-          previewRevision: features.length ? "before" : "after",
-          preview: { type: "FeatureCollection", features },
+          historyPreviewRevision: features.length ? "before" : "after",
+          historyPreview: { type: "FeatureCollection", features },
           provisional: { features: [] },
         }),
       }) as Response,
@@ -204,10 +204,10 @@ test("QC rejection retires history preview even without a tile revision change",
     source: "cells",
   });
   const writes = host.call.mock.calls.filter(
-    ([m, p]) => m === "overlay.setData" && p.source === "preview",
+    ([m, p]) => m === "overlay.setData" && p.source === "historyPreview",
   );
   expect(writes.at(-1)![1].data.features).toEqual([]);
   expect(String(vi.mocked(fetch).mock.calls.at(-1)![0])).toContain(
-    "previewRevision=after",
+    "historyPreviewRevision=after",
   );
 });
