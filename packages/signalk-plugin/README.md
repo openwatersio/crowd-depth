@@ -64,10 +64,7 @@ and report references remain consistent.
 
 ### Depth Sounder
 
-- **Depth source** — The sensor to record when more than one reports depth,
-  so soundings stay pinned to a single transducer. Sources are discovered from
-  live data and the History API, so setup also works after a reboot without
-  new soundings (requires a provider that returns source metadata).
+- **Depth source** — Follow Signal K’s preferred source (the default), or pin a specific transducer even when another is preferred.
 - **Offsets** — Transducer distance from the bow and from the centerline
   (positive to starboard), in meters. Both are required.
 - **Below the waterline** (optional) — Transducer depth below the waterline,
@@ -84,25 +81,19 @@ and report references remain consistent.
 
 ### GPS Receiver
 
-- **Position source** — The receiver to record when more than one reports
-  position, so all soundings share one antenna location.
-- **Horizontal offsets** — Read from Signal K's per-source GNSS sensor settings
-  for the selected receiver (centerline offsets are positive to starboard).
-  Set them there and restart Crowd Depth after changes. Server settings take precedence. If the server has no configured GNSS sensors and correction is off, valid previously saved plugin horizontal offsets are retained for the same selected receiver. Missing offsets are never assumed zero.
-- **Height** (required) — Antenna height above the waterline, in meters.
+- **Position source** — Follow Signal K’s preferred source (the default), including failover, or pin a specific receiver. Explicit selection never substitutes another receiver when it is missing or stale.
+- **Offsets** (required) — Antenna distance from the bow, from the centerline
+  (positive to starboard), and above the waterline, in meters.
+- **Details** (optional) — Make and model.
 
-With Signal K correction off, positions are at the antenna. In `both` mode,
-choose either the raw source or its `<sensorId>.ccrp` source; the plugin uses
-midships as the origin of corrected coordinates, avoiding a second antenna
-correction. Physical antenna offsets still appear in report metadata. `replace`
-mode is not supported for reporting: that source can contain raw positions when
-heading is unavailable and corrected positions otherwise, without a flag in
-history to distinguish them. Use `both` mode instead. Geometry is read at plugin
-startup, not recovered historically; keep source geometry consistent over each
-reporting period.
+### Detected sensor identities
 
-- **Details** (optional) — Make and model show detected values as placeholders and
-  accept manual overrides.
+The Make and Model fields show optional hints from the selected NMEA 2000
+source. GPSD’s Garmin binary drivers can also identify Garmin receivers; a GPSD driver
+name is not assumed to be a retail model or receiver manufacturer. In particular, a u-blox driver identifies a chipset, so its manufacturer hint stays blank. Unknown or ambiguous devices leave the
+hints blank. Detection uses the configured GPSD endpoint. Lookups run in the background with a two-second timeout; opening the plugin list never waits for GPSD. Results, including failures, are cached for one minute. The first load or a refresh can show blank hints; reload after the lookup completes. Concurrent requests share one lookup.
+
+These placeholders do not save an override or change existing settings. Reports use detected identities unless a manual entry identifies different equipment. Hints describe the saved source and depth path; unsaved edits do not refresh them. Save and reload the form to update hints. Report-time detection cannot reconstruct historical sensor changes.
 
 ### Data Sharing
 
@@ -118,12 +109,10 @@ Universal](https://creativecommons.org/publicdomain/zero/1.0/).
 
 At report time, the plugin reads device information for each selected source
 from Signal K. Alongside the CSB 3.1 sensor make and model, a `nmea2000`
-extension includes the reported `modelId`, `modelVersion`,
-`softwareVersionCode`, `productCode`, and (unless anonymous) `modelSerialCode`
-and `canName`. These are device-reported values, not retail model guesses:
-an Airmar P65 may report model ID `DT200` and model version `IDTP65-40-1`.
-Manual make/model overrides do not erase these original fields. Reload the
-settings form after changing sources to refresh detected placeholders.
+extension includes product code and, for identified reports, model and software
+versions. Hardware serial fields and CAN identities are omitted. Manual entries
+that identify different equipment replace the detected identity and its extensions.
+Reload the settings form after changing sources to refresh detected placeholders.
 
 The sensor descriptions follow the [CSB 3.1 schema](../../docs/CSB-schema-3_1_0-2024-04.json);
 `nmea2000` and `transducer` are additional metadata preserved in the uploaded
@@ -137,11 +126,12 @@ references where supported, especially when devices are replaced.
 
 For a GPSD-backed source, the plugin queries its configured daemon with the
 read-only [`?DEVICES` command](https://gpsd.io/gpsd_json.html). A `gpsd` sensor
-extension preserves the driver, subtype/hardware/firmware strings, and update
-cycle. Recognized u-blox and Garmin drivers also supply a manufacturer
-placeholder; no retail model is guessed. A daemon with multiple devices is
-ambiguous and supplies no identity. Queries time out after two seconds and
-never include local device paths or serial identifiers in reports.
+extension preserves driver and update cycle. Identified reports may also include
+free-form subtype/hardware/firmware strings, which can contain serial identifiers;
+anonymous reports omit these strings. Local device paths are never included.
+Only Garmin binary drivers identify a receiver manufacturer; u-blox identifies a
+chipset, not necessarily the receiver maker. A daemon with multiple devices is
+ambiguous and supplies no identity. Queries time out after two seconds.
 
 Each GeoJSON feature can contain a `gnss` quality extension with Signal K's
 `type`, `methodQuality`, `integrity`, `satellites`, `antennaAltitude`,
@@ -190,7 +180,7 @@ The layer appears in the chartplotter's chart list as **My soundings**, with its
 
 - **Your own soundings**, placed and offset the same way as the soundings the plugin shares, so the layer shows what you contribute.
 - **Depths on chart datum, where there's a tide station.** With the [signalk-tides](https://github.com/openwatersio/signalk-tides) plugin installed, each sounding is reduced by the predicted tide at its own time and place, from the nearest tide station within 50 km, the same station and predictions the Open Waters grid uses. Depths are then below the chart's datum (mean lower low water in the US), as on a paper chart. Without signalk-tides, or more than 50 km from a station, depths stay below your waterline at the moment you sounded them, and the tiles' coverage data marks that water as not reduced for tide. With Signal K security on, the layer reads signalk-tides only with the server's read-only access turned on.
-- **A shoal-biased depth.** Each spot about 20 m across keeps a running average of your passes over it, and shows that depth less a safety margin for its uncertainty, as the Open Waters overlay does. Until your boat is calibrated against the grid the margin is about 2 m, so the layer reads shallower than your sounder; tide takes about 0.15 m off it near a station.
+- **A shoal-biased depth.** Each spot about 20 m across keeps a timestamp-weighted mean with a configurable half-life and at most one unit of weight per UTC hour, and shows that depth less a safety margin for its uncertainty, as the Open Waters overlay does. Until your boat is calibrated against the grid the margin is about 2 m, so the layer reads shallower than your sounder; tide takes about 0.15 m off it near a station.
 - **Soundings, then areas.** Soundings are thinned as the overlay thins them, keeping the shoalest in each area, so zooming in shows more. Depth areas follow every track you've sounded, and fill in between tracks less than 200 m apart, never past the ends of a track.
 - **Suspect readings shown, not drawn.** The same checks the Open Waters grid runs on every boat's track run on yours. A reading they doubt on the shallow side, such as a spike or a stuck sounder in shallow water, stays out of the depth areas, except that the areas never reach past your track any deeper than it, and shows as a faint unconfirmed sounding, so you see the shoals the checks doubt rather than losing them. A stretch where the sounder zig-zags too much to trust is left out on both sides, as the Open Waters grid leaves it out. Readings that would show water deeper than it is, and bad data such as a position that jumped, are left out.
 - **Sounding weight half-life (days).** Defaults to 365 days. An hourly contribution this old has half the weight of a new one; larger values retain more historical influence. This setting changes the rendered estimate, not retention, and changing it rebuilds derived summaries. Each cell receives at most one unit of weight per UTC hour, so a higher sampling rate does not automatically outweigh other hours. The estimate and weighted spread are independent of the order history is acquired. The estimator remains experimental and needs field validation.
@@ -210,19 +200,41 @@ With Signal K security on, the layer needs a login or the server's read-only acc
 
 The plotter extension's provider and page serving are adapted from [signalk-livedepth-plugin](https://github.com/night199uk/signalk-livedepth-plugin) by Nick Roberts, under the MIT License. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
+## Final reports
+
+When a settings change restarts the plugin, it stops collecting and attempts a final report with the previous settings. It waits for any active upload, then flushes available data through the last complete second, with a 15-second timeout covering the active upload and final attempt. A failed or timed-out window retains its checkpoint and is retried after restart using the new settings. SQLite depths keep the offsets applied when collected, while report metadata uses the new settings; changing the depth reference can therefore mislabel that queued data. Completed batches keep their checkpoints. If the server accepted an upload but its response was lost or timed out, retrying can upload that batch again.
+
+The same attempt runs if the server calls the plugin’s stop hook during a graceful shutdown; Signal K 2.33 does not call that hook on shutdown. Correcting an erroneous offset also flushes with the previous value; the correction applies after restart. Disable the plugin before editing to skip that final upload, but this does not correct depths already stored in SQLite.
+
+The final attempt does not wait for a history provider to finish buffering. Readings that arrive later with timestamps before the successful flush checkpoint may be missed. Normal scheduled reports still use the history safety delay. If the plugin is still discovering its history source, it leaves the data queued rather than flushing an incomplete local fallback.
+
+Disabling the plugin or changing sharing to anonymous skips the final flush and cancels reporting, so that action cannot trigger one last identified upload. A process crash or power loss cannot guarantee a final report. There are no configuration-history tables, data migrations, or backlog resets.
+
+## Source selection and recorded data
+
+Explicit selection requires Signal K 2.33 or newer, which passes per-source subscription policies to plugins.
+
+An empty source setting means **Preferred source**. Live depth and position each follow Signal K’s priority decisions independently. Selecting a device pins that input even when Signal K prefers a different one. Saved explicit selections remain visible when offline; `derived-data` is omitted from new manual choices but retained if previously saved. Preferred mode still honors the server’s chosen source, including a derived source if you prioritize it there.
+
+For history, Preferred source requests the provider’s default recorded series; it does not apply today’s live source to past data. In-process history providers receive explicit source filters. Legacy HTTP history does not support those filters through this adapter, so explicit selections stop reporting with a configuration error. The reporting checkpoint and existing data are retained. The provider continues recording independently, and the live chart continues; report attempts show the configuration error until it is resolved. Choose Preferred source for both sensors or switch to a source-aware History API provider before restarting. Older versions automatically saved concrete source IDs, so existing installations may need this configuration change on upgrade.
+
+Changing selections rebuilds history-backed chart cells. SQLite rows have no source identity, so the local chart starts afresh rather than displaying old readings as if they came from the newly selected device.
+
+Offsets remain the values configured in Crowd Depth. This change does not introduce per-device geometry or configuration history: use an explicit device when receivers or sounders have different installation offsets. Source-specific geometry is separate follow-up work. Settings restarts attempt the final flush described above; failed queued SQLite readings retain their recorded depths and use the next configuration’s report metadata.
+
 ## For developers
 
 - Data is reported every 6 hours, at midnight, 06:00, noon and 18:00 local
   time; set a cron-style schedule in the `BATHY_DEFAULT_SCHEDULE` environment
   variable to change it.
 - `BATHY_WINDOW_SIZE` sets the maximum hours in each batch (default 6, positive whole hours). It also sets the default cron hour step unless `BATHY_DEFAULT_SCHEDULE` is set; steps of 24 or more run daily. If an upload gets HTTP 413 (too large), lower it, for example to `1`, and restart the Signal K server to retry in smaller batches.
-- Failed reports retry every five minutes, resuming from the last successful report. Recognized service authentication, size, version, or User-Agent rejections wait for the normal schedule; other failures, including truncated uploads and proxy errors, retry. Rejected windows and later data stay queued until the underlying problem is corrected, such as an invalid identity or an oversized report; waiting for cron does not repair the cause. Reports that fit in one configured reporting window read their range directly; longer gaps, startup catch-up, and recovery after failure use batched reports, with availability scans covering at most a year at a time. Stopping the plugin cancels pending retries and in-flight uploads.
-- `BATHY_REPORT_TIMEOUT` sets the deadline in seconds for each availability scan, history read, identity lookup, or GeoJSON generation (default 1800). Raise it for slow history providers or storage. Network uploads retain native fetch/TCP timeout behavior without an additional total-duration limit. A peer that keeps a stalled send alive can block reporting until the plugin is restarted; stopping the plugin cancels the request. A timed-out operation retries from the saved checkpoint; if the server accepted an upload but its response was lost, retrying can submit duplicate data.
+- Failed reports retry every five minutes, resuming from the last successful report. Recognized service authentication, size, version, or User-Agent rejections wait for the normal schedule; other failures, including truncated uploads and proxy errors, retry. Rejected windows and later data stay queued until the underlying problem is corrected, such as an invalid identity or an oversized report; waiting for cron does not repair the cause. Reports that fit in one configured reporting window read their range directly; longer gaps, startup catch-up, and recovery after failure use batched reports, with availability scans covering at most a year at a time. Stopping cancels pending retries; a settings restart allows the final flush described above, while disabling sharing cancels reporting immediately.
+- `BATHY_REPORT_TIMEOUT` sets the deadline in seconds for each availability scan, history read, identity lookup, or GeoJSON generation (default 1800). Raise it for slow history providers or storage. Network uploads retain native fetch/TCP timeout behavior without an additional total-duration limit. A peer that keeps a stalled send alive can block reporting until the plugin is restarted; the stop flush cancels the request after its 15-second timeout. A timed-out operation retries from the saved checkpoint; if the server accepted an upload but its response was lost, retrying can submit duplicate data.
 - Source deadlines bound waiting for asynchronous history calls. They cannot interrupt synchronous SQLite reads or cancel in-process provider queries. Timed-out queries can continue in the background, including HTTP history fallback requests; late results are discarded. Set the deadline above the provider's expected query time to avoid overlapping retries of slow work.
 - For a persistent `Invalid token` or `Invalid uniqueID` rejection, stop Signal K, rename `identity.json` in Crowd Depth's data directory to an unused backup filename, and restart. The plugin creates a new vessel UUID and token; keep the backup as a record of the old identity.
 - `BATHY_HISTORY_WAIT` sets how many seconds to wait at startup for a History
   API provider (default 600).
-- `BATHY_REPORT_DELAY` sets how many seconds behind now each report ends, so
+- `BATHY_REPORT_DELAY` sets how many seconds behind now each scheduled report ends, so
   soundings still on their way to storage go in the next report (default 300).
   Soundings that reach storage later than this after their timestamp are not
   reported. The default covers signalk-to-influxdb2's default write buffering
@@ -235,3 +247,17 @@ The plotter extension's provider and page serving are adapted from [signalk-live
 See [CONTRIBUTING.md](https://github.com/openwatersio/crowd-depth/blob/main/CONTRIBUTING.md)
 for repo layout, the local Signal K `npm link` workflow, testing, and
 releases.
+
+### Source-selection upgrade notes
+
+Previously saved source IDs remain explicit selections; older versions sometimes filled those IDs automatically and ignored them during live collection. Choose **Preferred source** to retain automatic failover. A pinned device does not fall back to a different receiver when absent. Use stable CAN-name IDs for devices whose bus addresses can change. Live matching accepts known address/CAN-name aliases; history filters use the exact stored source reference and cannot reconstruct old bus-address assignments.
+
+On first upgrade to these source-selection rules, the derived chart is rebuilt. History-backed layers refill from the provider; SQLite-backed layers start from the upgrade time because older rows have no source identity. Raw SQLite soundings and upload checkpoints are retained. Rolling back and forward also changes the chart fingerprint and can restart this local chart coverage. Preferred historical readings are the provider's default series, which may aggregate sources; use explicit selections with a source-aware provider when device-specific geometry is needed.
+
+## Detected sensor details in reports
+
+Reports include the selected device’s detected identity. If a manual make or model differs from detection, the report uses only the manual identity (missing fields become Unknown), so a known conflicting identity is not combined with the detected device. With Preferred source, detection uses Signal K's current preferred device. NMEA 2000 model, product and firmware fields and GPSD driver, subtype and cycle information are included when available; no retail model or transducer frequency is guessed. GPSD is queried only through the selected enabled connection, with a two-second deadline and a one-minute cache shared across report windows. Missing or ambiguous device information is omitted.
+
+These details describe devices at report creation, not a reconstruction of which hardware produced every historical sounding. Failed queued reports use the next configuration, as described under Final reports. The NMEA serial-number and CAN NAME fields are omitted from reports; CAN NAMEs still identify sources locally. Identified reports include free-form firmware strings, which can contain identifiers. Anonymous reports also omit free-form NMEA firmware/GPSD subtype strings; local device paths are never reported.
+
+Detection identifies the network device publishing the data, which may be a gateway or chartplotter rather than the physical transducer. Fill both manual make and model to identify equipment behind a gateway. Filling only a missing field supplements detection; the plugin cannot infer whether that describes a separate physical sensor. A missing detected field can be filled manually without discarding other details; a conflicting identity suppresses them. Failed GPSD queries are cached for a minute and reports proceed without those optional details.

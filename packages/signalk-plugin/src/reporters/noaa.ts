@@ -1,3 +1,4 @@
+import type { SensorInfo } from "../device-info.js";
 import { text } from "stream/consumers";
 import type { VesselInfo } from "../metadata.js";
 import { Readable, addAbortSignal } from "stream";
@@ -235,15 +236,7 @@ export function getMetadata(info: VesselInfo, config: Config) {
         sensors: [
           {
             type: "Sounder",
-            ...info.sensors?.sounder,
-            make:
-              config.sounder.make?.trim() ||
-              info.sensors?.sounder.make ||
-              "Unknown",
-            model:
-              config.sounder.model?.trim() ||
-              info.sensors?.sounder.model ||
-              "Unknown",
+            ...sensorIdentity(config.sounder, info.sensors?.sounder),
             position: sensorPosition(sounderLocation(config), reference),
             draft: config.sounder.draft,
             frequency: config.sounder.frequency,
@@ -251,13 +244,7 @@ export function getMetadata(info: VesselInfo, config: Config) {
           },
           {
             type: "GNSS",
-            ...info.sensors?.gnss,
-            make:
-              config.gnss.make?.trim() || info.sensors?.gnss.make || "Unknown",
-            model:
-              config.gnss.model?.trim() ||
-              info.sensors?.gnss.model ||
-              "Unknown",
+            ...sensorIdentity(config.gnss, info.sensors?.gnss),
             position: sensorPosition(gnssLocation(config), reference),
           },
         ],
@@ -324,4 +311,21 @@ export function sensorPosition(
 
 export function toUniqueID(info: VesselInfo) {
   return `SIGNALK-${info.uuid}`;
+}
+
+function sensorIdentity(manual: SensorInfo, detected: SensorInfo = {}) {
+  const text = (value: unknown) =>
+    typeof value === "string" ? value.trim() : "";
+  const make = text(manual.make);
+  const model = text(manual.model);
+  // A different manually identified sensor may sit behind the detected gateway.
+  const conflicts = (manual: string, value: unknown) =>
+    manual && text(value) && manual.toLowerCase() !== text(value).toLowerCase();
+  if (conflicts(make, detected.make) || conflicts(model, detected.model))
+    return { make: make || "Unknown", model: model || "Unknown" };
+  return {
+    ...detected,
+    make: make || detected.make || "Unknown",
+    model: model || detected.model || "Unknown",
+  };
 }

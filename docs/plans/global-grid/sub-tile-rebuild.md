@@ -2,7 +2,7 @@
 
 How a daily `grid tiles` run rebuilds only the parts of a dense 1° tile that new data touched, and how the same design can close the seams between tiles. Measured on the Chesapeake store by replaying its last 30 arrival days, by rebuilding tiles 45824 and 46183 whole and in windows for the last of them (2026-10-15, 365 files), and by building the whole store in leaves and in whole tiles with the same code.
 
-Short answer: dense tiles are rebuilt in quadtree leaves, each reading the reach around it, and the leaves' rows and pixels are spliced into the tile files the overlay reads. With σ's fallback bounded and its ties settled by value, leaves build what whole tiles build: on the Chesapeake all 212 tiles' cells, shoals and flags match row for row, and their surfaces pixel for pixel. But leaves don't make a day as cheap as [rebuild-cost.md](rebuild-cost.md) assumed. Each leaf's jobs read its reach again, about 0.7 km for cells and 1.1 km for surfaces, so small leaves in a busy harbour reread their neighbours many times over. Leaves no smaller than 1/8° read the least: a day's leaf jobs read a median 50% of all soundings for cells and 56% for surfaces, against 76% and 90% at 1°. Counted once however many jobs read it, the dirty leaves and their reach hold 37–45%, the 38–40% this design first measured. New data lands where the data already is at every scale down to 400 m: in Norfolk's tile one vessel logged half the soundings, crossing the same harbour daily. A planet day comes to about 18 worker-hours instead of 23, and more on days when tide or calibration moves. Getting further needs the hot spots handled differently, which is a separate change.
+Short answer: dense tiles are rebuilt in quadtree leaves, each reading the reach around it, and the leaves' rows and pixels are spliced into the tile files the overlay reads. With σ's fallback bounded and its ties settled by value, leaves build what whole tiles build: on the Chesapeake all 212 tiles' cells, shoals and flags match row for row, and their surfaces pixel for pixel. But leaves don't make a day as cheap as [rebuild-cost.md](rebuild-cost.md) assumed. Each leaf's jobs read its reach again, about 0.7 km for cells and 1.1 km for surfaces, so small leaves in a busy harbour reread their neighbours many times over. Leaves no smaller than 1/8° read the least: a day's leaf jobs read a median 50% of all soundings for cells and 56% for surfaces, against 76% and 90% at 1°. Counted once however many jobs read it, the dirty leaves and their reach hold 37–45%, the 38–40% this design first measured. New data lands where the data already is at every scale down to 400 m: in Norfolk's tile one vessel logged half the soundings, crossing the same harbour daily. A planet day comes to about 29 worker-hours instead of 39, and more on days when tide or calibration moves. Getting further needs the hot spots handled differently, which is a separate change.
 
 ## What a sounding reaches
 
@@ -127,7 +127,7 @@ The fallback spread comes only from a pixel closer than 25 pixels, otherwise non
 
 On tile 45824 the two together change 1,040 of its 304,360 cells, σ in 15% of its 2.9M surface pixels, and depth by more than 0.1 m in 40,344 pixels: 38,447 shoaler, 1,897 deeper, and up to 30 m where a pixel's only spread lay out of reach. Most of that is the tie rule, which takes the largest of the tied spreads where the k-d tree took any one; the bound alone moves depth by more than 0.1 m in 1,911 pixels. A neutral rule, the pixel with the least row and then column, moves 27,061: 12,601 shoaler, 14,460 deeper.
 
-Against the benchmark, over the Chesapeake's 8.2M reference pixels ([variant.py](../../../packages/grid/spikes/subtile/variant.py) rebuilds every tile under each rule):
+Against the benchmark, over the Chesapeake's 8.2M reference pixels ([variant.py](../../../packages/grid/spikes/subtile/variant.py) rebuilds every tile under each rule). The surface covers 99.6% of them, the band beside lone tracks included, so the shares sit above those of builds before it ([README.md](README.md#benchmark)):
 
 | Rule                                    | Overall: >1 m too deep | Overall: >2 m false shoal | Interpolated: >1 m too deep | Interpolated: >2 m false shoal | No vessel: >1 m too deep | No vessel: >2 m false shoal |
 | --------------------------------------- | ---------------------: | ------------------------: | --------------------------: | -----------------------------: | -----------------------: | --------------------------: |
@@ -185,18 +185,18 @@ What's left after leaves is mostly a few harbours where the same vessels cross t
 
 ## Planet estimate
 
-From [rebuild-cost.md](rebuild-cost.md)'s model, the soundings of a full rebuild cost about 12 worker-hours in cells, 10.5 in surfaces and overlays and 4.2 in web tiles. A day at 1° rebuilds 65% for cells and 84% for the rest ([planet-size.md](planet-size.md)). Applying the Chesapeake's ratios of what a day's jobs read with leaves of at least 1/8° (50% against 76% for cells, 56% against 90% for surfaces), and keeping overlays (23% of the surface stage's time) and web jobs per tile:
+From [rebuild-cost.md](rebuild-cost.md)'s model, the soundings of a full rebuild cost about 12 worker-hours in cells, 32 in surfaces and overlays and 1.4 in web tiles. A day at 1° rebuilds 65% for cells and 84% for the rest ([planet-size.md](planet-size.md)). Applying the Chesapeake's ratios of what a day's jobs read with leaves of at least 1/8° (50% against 76% for cells, 56% against 90% for surfaces), and keeping overlays (32% of the per-sounding cost of surfaces and overlays) and web jobs per tile:
 
 | Worker-hours          | Today at 1° | With leaves |
 | --------------------- | ----------: | ----------: |
-| Cells                 |           8 |         5.3 |
-| Surfaces and overlays |           9 |         6.4 |
-| Web                   |         3.5 |         3.5 |
-| Fixed per-tile cost   |       2–2.5 |       2–2.5 |
+| Cells                 |           8 |         5.2 |
+| Surfaces and overlays |          27 |          20 |
+| Web                   |         1.2 |         1.2 |
+| Fixed per-tile cost   |         2.3 |         2.3 |
 | Leaf jobs' own cost   |             |   about 0.5 |
-| A day                 |    about 23 |    about 18 |
+| A day                 |    about 39 |    about 29 |
 
-A leaf job costs about what its share of the tile does: on the Chesapeake the whole store in leaves took 1,720 job-seconds for cells against 1,829 in whole tiles, and 3,711 for surfaces against 4,630. The leaf jobs' own cost is the extra jobs, 2.3 a dense tile on the Chesapeake, each a fork, a DuckDB start and a catalog attach, plus the splices, about 0.3 s a tile. [rebuild-cost.md](rebuild-cost.md) gives 23–27 for today over its 30-day range. On 8 cheap cores (1.5× slower, 6× from 8 workers) about 18 worker-hours is about 4.5 h of wall time, against 6–7 h. It counts arrivals only, and rests on the Chesapeake's hot-spot share holding for the planet, which the Gulf's ports and rivers may well exceed.
+A leaf job costs about what its share of the tile does: on the Chesapeake the whole store in leaves took 1,720 job-seconds for cells against 1,829 in whole tiles, and 3,711 for surfaces against 4,630. The leaf jobs' own cost is the extra jobs, 2.3 a dense tile on the Chesapeake, each a fork, a DuckDB start and a catalog attach, plus the splices, about 0.3 s a tile. On 8 cheap cores (1.5× slower, 6× from 8 workers) about 29 worker-hours is about 7.4 h of wall time, against 9.7 h. It counts arrivals only, and rests on the Chesapeake's hot-spot share holding for the planet, which the Gulf's ports and rivers may well exceed.
 
 ## Not measured
 

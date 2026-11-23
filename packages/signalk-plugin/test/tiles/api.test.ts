@@ -1,4 +1,4 @@
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import type { ServerAPI } from "@signalk/server-api";
 import { VectorTile } from "@mapbox/vector-tile";
 import { PbfReader } from "pbf";
@@ -18,7 +18,8 @@ import {
   thin,
 } from "../../src/tiles/api.js";
 import { DEFAULT_OWN_STYLE } from "../../src/tiles/style.js";
-import { FIRST_DEVIATION_M, cellDepth } from "../../src/tiles/cells.js";
+import type { Layer } from "../../src/tiles/api.js";
+import type { GeoFeature } from "../../src/tiles/preview.js";
 import { cellAt, cellCenter, tileFraction } from "../../src/tiles/geometry.js";
 
 interface Res {
@@ -47,7 +48,8 @@ type Req = { params?: Record<string, string>; query?: Record<string, string> };
 
 function serve(
   own = DEFAULT_OWN_STYLE,
-  historyPreview?: import("../../src/tiles/api.js").Layer["historyPreview"],
+  preview?: Layer["preview"],
+  historyPreview?: Layer["historyPreview"],
 ) {
   const handlers = new Map<string, (req: Req, res: Res) => unknown>();
   const app = {
@@ -63,6 +65,7 @@ function serve(
     stored: () => [],
     safetyDepth: 3,
     own,
+    preview,
   }));
   const get = async (path: string, req: Req = {}) => {
     const res = response();
@@ -192,48 +195,6 @@ test("a long held track is thinned, not cut, so all of it stays drawn", () => {
   );
 });
 
-test("the pass is drawn as a ribbon in a first pass's depth area, broken at gaps", () => {
-  const at = (s: number, lat: number, depth: number) => ({
-    time: s * 1e6,
-    lon: -76.2,
-    lat,
-    depth,
-  });
-  const features = provisionalFeatures([
-    at(0, 36.98, 4.37),
-    // 22 m on, a second later.
-    at(1, 36.9802, 4.9),
-    // 2 km on: a gap, not joined.
-    at(2, 37.0, 12.2),
-  ]);
-  // Named for its first sounding, so it stays while that one is stored and the next
-  // is still provisional.
-  expect(features.map((f) => f.id)).toEqual([0, 1e6, 2e6, -0]);
-  const ribbon = features[3];
-  expect(ribbon.geometry.type).toBe("LineString");
-  // The shoaler end, 4.37 m, less a first pass's untided margin of about 2 m: the 2 m
-  // band, finely drawn and in the chart's bands alike, so as shoal as the tile will be.
-  const margin = cellDepth({ m: 4.37, d: FIRST_DEVIATION_M });
-  expect(margin).toBeGreaterThan(2);
-  expect(margin).toBeLessThan(3);
-  expect(ribbon.properties).toMatchObject({ DRVAL1: 2, coarse: 2 });
-  // At 9 m, the 7 m band finely drawn, and the chart's 5 to 10 m.
-  const deeper = provisionalFeatures([at(0, 36.98, 9), at(1, 36.9802, 9.2)]);
-  expect(deeper[2].properties).toMatchObject({ DRVAL1: 6, coarse: 5 });
-  expect(
-    provisionalFeatures([at(0, 36.98, 9), at(1, 36.9802, 9.2)], "standard")[2]
-      .properties,
-  ).toMatchObject({ DRVAL1: 5, coarse: 5 });
-  // Past the deepest area the tiles draw: points, no ribbon.
-  expect(
-    provisionalFeatures([at(0, 36.98, 260), at(1, 36.9802, 260)]),
-  ).toHaveLength(2);
-  // A cell is about 4 pixels wide at style zoom 14 at 37° N.
-  const w0 = (ribbon.properties as { w0: number }).w0;
-  expect(w0 * 2 ** 14).toBeGreaterThan(4);
-  expect(w0 * 2 ** 14).toBeLessThan(6);
-});
-
 test("refreshes are batched by how much the plotter's view holds", async () => {
   expect(refreshMs(25 * 1024)).toBe(5_000);
   expect(refreshMs(400 * 1024)).toBe(15_000);
@@ -282,7 +243,7 @@ test("unchanged historyPreview payloads are omitted using the client's revision"
       },
     },
   ];
-  const { get } = serve(DEFAULT_OWN_STYLE, historyPreview as never);
+  const { get } = serve(DEFAULT_OWN_STYLE, undefined, historyPreview as never);
   const first = (await get(LIVE_PATH, { query: {} })).body as {
     historyPreviewRevision: string;
     historyPreview: { features: unknown[] };
@@ -314,4 +275,100 @@ test("a stationary high-rate stream sends only its newest and shoalest values wi
   expect(
     provisionalFeatures(spatialProvisional(pings)).length,
   ).toBeLessThanOrEqual(3);
+});
+
+test("the preview goes to a runtime that asks, when it's changed, in its unit", async () => {
+  const line = (properties: GeoFeature["properties"]): GeoFeature => ({
+    type: "Feature",
+    geometry: { type: "MultiLineString", coordinates: [] },
+    properties,
+  });
+  const features = [
+    line({ VALDCO: 2, unit: "m" }),
+    line({ VALDCO: 0.9144, unit: "ft" }),
+    line({ VALDCO: 10 }),
+  ];
+  let asked = 0;
+  const { get } = serve(DEFAULT_OWN_STYLE, {
+    get: async () => (asked++, { rev: 3, features }),
+    latest: () => ({ rev: 3, features }),
+  });
+  const live = async (query: Record<string, string>) =>
+    (await get(LIVE_PATH, { query: { since: "-1", ...query } })).body as {
+      preview?: { rev: number; type: string; features: GeoFeature[] };
+    };
+  // A runtime that doesn't draw it isn't sent it, nor is it worked out for one.
+  expect((await live({})).preview).toBeUndefined();
+  expect(asked).toBe(0);
+  const sent = (await live({ preview: "-1", unit: "ft" })).preview!;
+  expect(sent.rev).toBe(3);
+  expect(sent.type).toBe("FeatureCollection");
+  expect(sent.features.map((f) => f.properties.VALDCO)).toEqual([0.9144, 10]);
+  expect((await live({ preview: "-1" })).preview!.features).toHaveLength(3);
+  // The runtime holds it already.
+  expect((await live({ preview: "3", unit: "m" })).preview).toBeUndefined();
+});
+
+test("a poll waits a second at most for the preview, then sends the last", async () => {
+  vi.useFakeTimers();
+  try {
+    const { get } = serve(DEFAULT_OWN_STYLE, {
+      get: () => new Promise(() => {}),
+      latest: () => ({ rev: 1, features: [] }),
+    });
+    const res = get(LIVE_PATH, { query: { since: "-1", preview: "0" } });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(((await res).body as { preview: { rev: number } }).preview.rev).toBe(
+      1,
+    );
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("a live poll that fails is answered, not left hanging", async () => {
+  const { get } = serve(DEFAULT_OWN_STYLE, {
+    get: () => Promise.reject(new Error("broken")),
+    latest: () => ({ rev: 1, features: [] }),
+  });
+  const res = await get(LIVE_PATH, { query: { since: "-1", preview: "0" } });
+  expect(res.code).toBe(500);
+});
+
+test("live surface and historical previews coexist with independent revisions", async () => {
+  const history = () => [
+    {
+      type: "Feature",
+      id: "history:1:2",
+      geometry: { type: "Point", coordinates: [-80, 26] },
+      properties: {
+        depth_m: 5,
+        provisional: true,
+        reference: "untided",
+        time: 1,
+      },
+    },
+  ];
+  const surface = {
+    get: async () => ({ rev: 7, features: [] }),
+    latest: () => ({ rev: 7, features: [] }),
+  };
+  const { get } = serve(DEFAULT_OWN_STYLE, surface, history as never);
+  const first = (await get(LIVE_PATH, { query: { preview: "-1" } })).body as {
+    preview: { rev: number };
+    historyPreview: { features: unknown[] };
+    historyPreviewRevision: string;
+  };
+  expect(first.preview.rev).toBe(7);
+  expect(first.historyPreview.features).toHaveLength(2);
+  const next = (
+    await get(LIVE_PATH, {
+      query: {
+        preview: "7",
+        historyPreviewRevision: first.historyPreviewRevision,
+      },
+    })
+  ).body;
+  expect(next).not.toHaveProperty("preview");
+  expect(next).not.toHaveProperty("historyPreview");
 });

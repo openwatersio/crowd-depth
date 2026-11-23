@@ -45,11 +45,11 @@ test("does not guess geometry for ambiguous replace streams or missing vessel le
   );
 });
 
-test("GPS schema retains height but removes horizontal offset fields and requirements", () => {
+test("GPS schema retains upstream manual offsets for existing installations", () => {
   const gps = schema(app()).properties.gnss;
-  expect(gps.required).toEqual(["z"]);
-  expect(gps.properties).not.toHaveProperty("x");
-  expect(gps.properties).not.toHaveProperty("y");
+  expect(gps.required).toEqual(["x", "y", "z"]);
+  expect(gps.properties).toHaveProperty("x");
+  expect(gps.properties).toHaveProperty("y");
   expect(gps.properties).toHaveProperty("z");
 });
 

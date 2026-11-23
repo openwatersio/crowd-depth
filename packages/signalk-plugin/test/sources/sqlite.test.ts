@@ -198,7 +198,7 @@ test("the log keeps no index on position", () => {
     expect(indexes(reopened)).toEqual(["idx_bathymetry_timestamp"]);
     reopened.close();
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
   }
 });
 

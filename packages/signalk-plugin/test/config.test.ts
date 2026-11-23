@@ -1,11 +1,6 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { ServerAPI } from "@signalk/server-api";
-import {
-  depthReference,
-  schema,
-  uiSchema,
-  selectDepth,
-} from "../src/config.js";
+import { depthReference, schema } from "../src/config.js";
 
 // The server's sources tree keys devices by numeric bus address and uses
 // camelCase n2k fields (see signalk-server's admin UI sourceLabels.ts).
@@ -23,7 +18,7 @@ function positionEnumNames(app: ServerAPI): string[] {
       gnss: { properties: { source: { enumNames: string[] } } };
     };
   };
-  return s.properties.gnss.properties.source.enumNames;
+  return s.properties.gnss.properties.source.enumNames.slice(1);
 }
 
 test("labels sources keyed by numeric address", () => {
@@ -93,6 +88,13 @@ test("does not require the transducer depth", () => {
   expect(s.properties.sounder.required).not.toContain("z");
 });
 
+test("survives a JSON round trip before the vessel reports any data", () => {
+  // The server stores the schema as JSON, which drops undefined values.
+  const s = schema(mockApp({}, {}));
+  expect(JSON.parse(JSON.stringify(s))).toEqual(s);
+  expect(s.properties.sounder.properties.x).not.toHaveProperty("default");
+});
+
 describe("depthReference", () => {
   const sounder = { x: 0, y: 0, z: 0.5, draft: 1.8 };
 
@@ -136,164 +138,149 @@ describe("depthReference", () => {
   });
 });
 
-test("offers recorded sources after reboot without live depth data", () => {
-  const s = schema(mockApp({}, {}), {
-    "environment.depth.belowTransducer": ["canhat.35"],
-    "navigation.position": ["gpsd.GP"],
-  });
-  expect(s.properties).not.toHaveProperty("path");
-  expect(s.properties.sounder.properties.source.enum).toEqual(["canhat.35"]);
-  expect(s.properties.gnss.properties.source.default).toBe("gpsd.GP");
-});
-
-test("preserves saved source choices even when absent from live data and history", () => {
-  const app = mockApp({}, {});
-  app.readPluginOptions = () => ({
-    configuration: {
-      path: "belowKeel",
-      sounder: { source: "old.35" },
-      gnss: { source: "old.GP" },
-    },
-  });
-  const s = schema(app);
-  expect(s.properties).not.toHaveProperty("path");
-  expect(s.properties.sounder.properties.source.enum).toEqual(["old.35"]);
-  expect(s.properties.gnss.properties.source.default).toBe("old.GP");
-});
-
-test("placeholders show only detected values and do not become saved defaults", () => {
+test("identity placeholders use saved selections and leave configuration fields intact", async () => {
+  const { uiSchema } = await import("../src/config.js");
   const app = mockApp(
-    { "environment.depth.belowTransducer": { $source: "can.1" } },
+    { "navigation.position": { $source: "bus.1" } },
     {
-      can: { "1": { n2k: { manufacturerCode: "Airmar", modelId: "DT200" } } },
-    },
-  );
-  expect(uiSchema(app).sounder).toEqual({
-    make: { "ui:placeholder": "Airmar" },
-    model: { "ui:placeholder": "DT200" },
-  });
-  expect(schema(app).properties.sounder.properties.make).not.toHaveProperty(
-    "default",
-  );
-  expect(uiSchema(app).gnss.make["ui:placeholder"]).toBe("");
-});
-
-test("placeholders use the saved source, including sources discovered in history", () => {
-  const app = mockApp(
-    {},
-    {
-      can: {
-        "1": { n2k: { manufacturerCode: "Airmar", modelId: "DT200" } },
-        "2": { n2k: { manufacturerCode: "Garmin", modelId: "Other" } },
+      bus: {
+        "1": { n2k: { manufacturerCode: "First", modelId: "GPS 1" } },
+        "2": { n2k: { manufacturerCode: "Second", modelId: "GPS 2" } },
       },
     },
   );
-  app.readPluginOptions = () => ({
-    configuration: { sounder: { source: "can.2" } },
+  app.readPluginOptions = () =>
+    ({ configuration: { gnss: { source: "bus.2" } } }) as ReturnType<
+      ServerAPI["readPluginOptions"]
+    >;
+  const before = schema(app);
+  expect((await uiSchema(app)).gnss).toEqual({
+    make: { "ui:placeholder": "Second" },
+    model: { "ui:placeholder": "GPS 2" },
   });
-  expect(
-    uiSchema(app, { "environment.depth.belowTransducer": ["can.1"] }).sounder
-      .model["ui:placeholder"],
-  ).toBe("Other");
+  expect(schema(app)).toEqual(before);
+  expect(before.properties.gnss.required).toEqual(["x", "y", "z"]);
+  expect(before.properties).toHaveProperty("path");
+  expect(before.properties.gnss.properties.make).not.toHaveProperty("default");
 });
 
-test("excludes derived-data from live, recorded and saved source choices", () => {
-  const app = mockApp(
-    {
-      "environment.depth.belowSurface": {
-        $source: "derived-data",
-        values: { "derived-data": {}, "can.35": {} },
-      },
+test("identity placeholders are optional when no devices or server settings are available", async () => {
+  const { uiSchema } = await import("../src/config.js");
+  expect(await uiSchema(mockApp({}, undefined))).toEqual({
+    sounder: {
+      make: { "ui:placeholder": "" },
+      model: { "ui:placeholder": "" },
     },
-    {},
-  );
-  app.readPluginOptions = () => ({
-    configuration: { sounder: { source: "derived-data" } },
+    gnss: { make: { "ui:placeholder": "" }, model: { "ui:placeholder": "" } },
   });
-  const result = schema(app, {
-    "environment.depth.belowSurface": ["derived-data", "can.35"],
-    "navigation.position": ["derived-data", "gpsd.GP"],
-  }).properties;
-  expect(result.sounder.properties.source.enum).toEqual(["can.35"]);
-  expect(result.sounder.properties.source.default).toBe("can.35");
-  expect(result.gnss.properties.source.enum).toEqual(["gpsd.GP"]);
 });
 
-test("prefers transducer depth for the selected source across live data and history", () => {
+test("implicit sounder hints follow the saved depth path", async () => {
+  const { uiSchema } = await import("../src/config.js");
   const app = mockApp(
-    { "environment.depth.belowSurface": { $source: "can.2" } },
-    {},
-  );
-  expect(
-    selectDepth(app, "can.1", {
-      "environment.depth.belowTransducer": ["can.1"],
-      "environment.depth.belowSurface": ["can.1"],
-    }),
-  ).toEqual({ path: "belowTransducer", source: "can.1" });
-  expect(selectDepth(app, "can.2")).toEqual({
-    path: "belowSurface",
-    source: "can.2",
-  });
-  expect(selectDepth(app, "can.3")).toBeUndefined();
-});
-
-test("falls back to surface then keel only when supplied by the selected source", () => {
-  const app = mockApp({}, {});
-  expect(
-    selectDepth(app, "can.1", {
-      "environment.depth.belowSurface": ["can.1"],
-      "environment.depth.belowKeel": ["can.1"],
-    })?.path,
-  ).toBe("belowSurface");
-  expect(
-    selectDepth(app, "can.1", {
-      "environment.depth.belowTransducer": ["derived-data"],
-      "environment.depth.belowKeel": ["can.1"],
-    })?.path,
-  ).toBe("belowKeel");
-  expect(
-    selectDepth(app, undefined, {
-      "environment.depth.belowTransducer": ["can.1", "can.2"],
-    }),
-  ).toBeUndefined();
-});
-
-test("GPS starts with source and shows selected receiver metadata as plain placeholders", () => {
-  const app = mockApp(
-    { "navigation.position": { $source: "can.10" } },
     {
-      can: {
-        "10": { n2k: { manufacturerCode: "Garmin", modelId: "GPS 19x" } },
+      "environment.depth.belowSurface.value": 5,
+      "environment.depth.belowSurface": { $source: "bus.1" },
+      "environment.depth.belowTransducer.value": 4,
+      "environment.depth.belowTransducer": { $source: "bus.2" },
+    },
+    {
+      bus: {
+        "1": { n2k: { manufacturerCode: "Surface", modelId: "One" } },
+        "2": { n2k: { manufacturerCode: "Transducer", modelId: "Two" } },
       },
     },
   );
-  expect(Object.keys(schema(app).properties.gnss.properties)[0]).toBe("source");
-  expect(uiSchema(app).gnss).toEqual({
-    make: { "ui:placeholder": "Garmin" },
-    model: { "ui:placeholder": "GPS 19x" },
+  app.readPluginOptions = () =>
+    ({ configuration: { path: "belowTransducer" } }) as ReturnType<
+      ServerAPI["readPluginOptions"]
+    >;
+  expect(schema(app).properties.sounder.properties.source).toMatchObject({
+    default: "",
+    enum: ["", "bus.2"],
   });
-  expect(schema(app).properties.gnss.properties.make).not.toHaveProperty(
-    "default",
-  );
+  expect((await uiSchema(app)).sounder).toEqual({
+    make: { "ui:placeholder": "Transducer" },
+    model: { "ui:placeholder": "Two" },
+  });
 });
 
-test("preserves a saved depth reference and waits rather than silently switching it", () => {
-  const app = mockApp({}, {});
-  const recorded = {
-    "environment.depth.belowTransducer": ["can.1"],
-    "environment.depth.belowSurface": ["can.1"],
-  };
-  expect(selectDepth(app, "can.1", recorded, "belowSurface")?.path).toBe(
-    "belowSurface",
-  );
-  expect(
-    selectDepth(
-      app,
-      "can.1",
+test("does not mix a known NMEA model with a GPSD manufacturer", async () => {
+  const { uiSchema } = await import("../src/config.js");
+  const gpsd = await import("../src/gpsd-info.js");
+  const query = vi
+    .spyOn(gpsd, "cachedGpsdSensor")
+    .mockReturnValue({ make: "Garmin" });
+  try {
+    const app = mockApp(
+      { "navigation.position": { $source: "bus.1" } },
       {
-        "environment.depth.belowTransducer": ["can.1"],
+        bus: { "1": { n2k: { modelId: "Receiver" } } },
       },
-      "belowSurface",
-    ),
-  ).toBeUndefined();
+    );
+    expect((await uiSchema(app)).gnss).toEqual({
+      make: { "ui:placeholder": "" },
+      model: { "ui:placeholder": "Receiver" },
+    });
+    expect(query).not.toHaveBeenCalled();
+  } finally {
+    query.mockRestore();
+  }
+});
+
+test("saved sources remain selectable with no live data", async () => {
+  const { uiSchema } = await import("../src/config.js");
+  const app = mockApp({}, {});
+  app.readPluginOptions = () =>
+    ({
+      configuration: {
+        path: "belowKeel",
+        sounder: { source: "offline.depth" },
+        gnss: { source: "offline.gps" },
+      },
+    }) as ReturnType<ServerAPI["readPluginOptions"]>;
+  const fields = schema(app).properties;
+  expect(fields.path.default).toBe("belowKeel");
+  expect(fields.sounder.properties.source).toMatchObject({
+    default: "offline.depth",
+    enum: ["", "offline.depth"],
+  });
+  expect(fields.gnss.properties.source).toMatchObject({
+    default: "offline.gps",
+    enum: ["", "offline.gps"],
+  });
+  expect(uiSchema(app)).not.toBeInstanceOf(Promise);
+});
+
+test("preferred is the default with or without live data and derived-data is not offered", () => {
+  for (const paths of [
+    {},
+    {
+      "navigation.position": {
+        $source: "gps.one",
+        values: { "gps.one": {}, "derived-data": {} },
+      },
+    },
+  ]) {
+    const source = schema(mockApp(paths, {})).properties.gnss.properties.source;
+    expect(source.default).toBe("");
+    expect(source.enum[0]).toBe("");
+    expect(source.enumNames[0]).toBe("Preferred source");
+    expect(source.enum).not.toContain("derived-data");
+  }
+});
+
+test("preserves a saved derived-data pin even when offline", () => {
+  const app = mockApp({}, {});
+  app.readPluginOptions = () =>
+    ({
+      configuration: {
+        path: "belowSurface",
+        sounder: { source: "derived-data" },
+      },
+    }) as ReturnType<ServerAPI["readPluginOptions"]>;
+  expect(schema(app).properties.sounder.properties.source).toMatchObject({
+    default: "derived-data",
+    enum: ["", "derived-data"],
+  });
 });

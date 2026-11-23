@@ -5,6 +5,9 @@ import { expect, test } from "vitest";
 
 // The worker thread loads the built module, so this runs against dist/, which CI
 // builds before the tests.
+//
+// Windows refuses to delete a database a worker still has open, so each test
+// awaits the tile service closing before it removes the directory.
 const dist = new URL("../../dist/tiles/service.js", import.meta.url);
 
 test.skipIf(!existsSync(dist))(
@@ -31,9 +34,9 @@ test.skipIf(!existsSync(dist))(
       const tile = await tiles.get(...at);
       expect(tile?.length).toBeGreaterThan(0);
     } finally {
-      tiles.close();
+      await tiles.close();
       db.close();
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
     }
   },
 );
@@ -79,17 +82,19 @@ test.skipIf(!existsSync(dist))(
       const before = await bands(x, y);
       // Written as a backfill writes, on its own connection, which tells the tile
       // service only when it ends.
-      const backfill = createCellStore(createDB(file));
+      const backfillDB = createDB(file);
+      const backfill = createCellStore(backfillDB);
       for (let k = 0; k < 20; k++) backfill.addPasses(pass(30));
+      backfillDB.close();
       // A tile beside it, not built yet, under the same ancestor.
       const sibling = await bands(x, y ^ 1);
       expect(before.length).toBeGreaterThan(0);
       expect(sibling.length).toBeGreaterThan(0);
       expect(Math.min(...sibling)).toBeGreaterThan(Math.max(...before));
     } finally {
-      tiles.close();
+      await tiles.close();
       db.close();
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
     }
   },
 );
@@ -139,7 +144,7 @@ test.skipIf(!existsSync(dist))(
       expect(store.cells(-76.3, 36.9, -76.1, 38, 6).length).toBeGreaterThan(0);
     } finally {
       db.close();
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
     }
   },
   30_000,
@@ -198,7 +203,7 @@ test.skipIf(!existsSync(dist))(
       }
     } finally {
       db.close();
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
     }
   },
   30_000,
@@ -310,7 +315,7 @@ test.skipIf(!existsSync(dist))(
       expect(cells(store)).toEqual(cells(clean));
     } finally {
       db.close();
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
     }
   },
   60_000,
@@ -384,9 +389,9 @@ test.skipIf(!existsSync(dist))(
         readTile(store, ...up, "high", false),
       );
     } finally {
-      tiles.close();
+      await tiles.close();
       db.close();
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
     }
   },
 );
@@ -418,9 +423,52 @@ test.skipIf(!existsSync(dist))(
     try {
       expect(() => tiles.changed([{ lon: -76.2, lat: 36.98 }])).not.toThrow();
     } finally {
-      tiles.close();
+      await tiles.close();
       db.close();
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
+    }
+  },
+);
+
+test.skipIf(!existsSync(dist))(
+  "the preview is worked out on a tile thread, as it is here",
+  async () => {
+    const { createDB } = await import("../../dist/storage.js");
+    const { createCellStore } = await import("../../dist/tiles/cells.js");
+    const { createTileService } = await import("../../dist/tiles/service.js");
+    const { readPreview, previewWindow } =
+      await import("../../dist/tiles/preview.js");
+    const { cellAt, cellCenter } = await import("../../dist/tiles/geometry.js");
+    const dir = mkdtempSync(join(tmpdir(), "crowd-depth-"));
+    const file = join(dir, "bathymetry.sqlite");
+    const db = createDB(file);
+    const store = createCellStore(db);
+    const tiles = createTileService(store, file);
+    try {
+      const pass = (i: number, depth: number) => ({
+        ...cellAt(-76.2, 36.975 + i / 5400),
+        depth,
+        day: 20000,
+      });
+      // Stored water, crossed again: the pending passes fold into it.
+      store.addPasses(Array.from({ length: 20 }, (_, i) => pass(i, 6)));
+      const passes = Array.from({ length: 20 }, (_, i) => pass(i, 5));
+      const req = {
+        ...previewWindow(
+          passes.map((p) => cellCenter(p.py, p.px)),
+          cellCenter(passes[19].py, passes[19].px),
+        ),
+        passes,
+        shoals: [],
+        written: [],
+      };
+      const here = readPreview(store, req);
+      expect(here.length).toBeGreaterThan(0);
+      expect(await tiles.preview(req)).toEqual(here);
+    } finally {
+      await tiles.close();
+      db.close();
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
     }
   },
 );

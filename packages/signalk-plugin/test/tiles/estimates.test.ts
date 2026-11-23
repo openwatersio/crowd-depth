@@ -117,3 +117,73 @@ test("changing half-life reweights retained evidence without History or lost cov
     db.close();
   }
 });
+
+test.each([false, true])(
+  "read-only pending estimates match committed hourly weights with tides=%s",
+  (tided) => {
+    const db = createDB(":memory:");
+    const store = createCellStore(db);
+    const pass = (h: number, depth: number, offset = 0) => ({
+      ...pos,
+      depth,
+      day: Math.floor((origin + h * hour) / 86400000),
+      time: (origin + h * hour + offset) * 1000,
+      ...(tided && h % 2 ? { tide: 0.15 } : {}),
+    });
+    store.addPasses(
+      Array.from({ length: 600 }, (_, i) => pass(i, 3 + Math.sin(i / 8))),
+    );
+    const before = read(store);
+    const pending = [pass(10, 5, 1000), pass(10, 7, 2000), pass(601, 8)];
+    db.exec("PRAGMA query_only=ON");
+    const [preview] = store.previewPasses([...pending, pending[0]]);
+    expect(read(store)).toEqual(before);
+    db.exec("PRAGMA query_only=OFF");
+    store.addPasses(pending);
+    expect(preview).toEqual(read(store));
+    // The worker may receive its request after those same passes were committed.
+    expect(store.previewPasses(pending)).toEqual([]);
+    db.close();
+  },
+);
+
+test("pending estimates retain the published cell until its half-life reweight completes", () => {
+  const db = createDB(":memory:"),
+    store = createCellStore(db);
+  const p = { ...pos, depth: 3, day: 20000, time: origin * 1000 };
+  store.addPasses([p]);
+  store.setMeta("config_weight", "30");
+  expect(store.previewPasses([{ ...p, time: (origin + hour) * 1000 }])).toEqual(
+    [],
+  );
+  db.close();
+});
+
+test("an older pending snapshot does not duplicate a longer committed pass", () => {
+  const db = createDB(":memory:"),
+    store = createCellStore(db);
+  const p = {
+    ...pos,
+    depth: 3,
+    day: 20000,
+    start: origin * 1000,
+    time: (origin + 10000) * 1000,
+  };
+  store.addPasses([{ ...p, time: (origin + 20000) * 1000 }]);
+  expect(store.previewPasses([p])).toEqual([]);
+  db.close();
+});
+
+test("pending-only estimates do not replace legacy published evidence", () => {
+  const db = createDB(":memory:"),
+    store = createCellStore(db);
+  store.addPasses([{ ...pos, depth: 4, day: 20000 }]);
+  const before = read(store);
+  expect(
+    store.previewPasses([
+      { ...pos, depth: 9, day: 20001, time: origin * 1000 },
+    ]),
+  ).toEqual([]);
+  expect(read(store)).toEqual(before);
+  db.close();
+});

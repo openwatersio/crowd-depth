@@ -1,151 +1,204 @@
-import { expect, test } from "vitest";
-import type { Delta, ServerAPI } from "@signalk/server-api";
+import { expect, test, vi } from "vitest";
+import type { Delta, ServerAPI, SubscribeMessage } from "@signalk/server-api";
 import { createLiveStream } from "../src/streams/live.js";
 import { config } from "./helper.js";
 
-test("live collection uses only the selected source and path, with one depth correction", () => {
-  let receive!: (delta: Delta) => void;
+function setup(
+  depth = "",
+  gps = "",
+  model: () => unknown = () => undefined,
+  quality?: unknown,
+) {
+  const subscriptions: {
+    command: SubscribeMessage;
+    callback: (d: Delta) => void;
+  }[] = [];
+  const unsubscribe = vi.fn();
   const app = {
-    debug: () => {},
+    debug: vi.fn(),
+    error: vi.fn(),
     getSelfPath: (path: string) =>
       path === "navigation.position"
-        ? {
-            value: { longitude: -76, latitude: 38 },
-            timestamp: "2026-11-19T01:00:00Z",
-          }
-        : undefined,
+        ? model()
+        : path === "navigation.gnss.satellites"
+          ? quality
+          : undefined,
+    getPath: () => ({ bus: { "35": { n2k: { canName: "stable" } } } }),
     subscriptionmanager: {
-      subscribe: (
-        _request: unknown,
-        _unsub: unknown,
+      subscribe(
+        command: SubscribeMessage,
+        unsubs: (() => void)[],
         _error: unknown,
-        callback: typeof receive,
-      ) => {
-        expect(_request).toMatchObject({
-          sourcePolicy: "all",
-        });
-        receive = callback;
+        callback: (d: Delta) => void,
+      ) {
+        subscriptions.push({ command, callback });
+        unsubs.push(unsubscribe);
       },
     },
   } as unknown as ServerAPI;
   const stream = createLiveStream(app, {
     ...config,
     path: "belowTransducer",
-    sounder: { x: 0, y: 0, z: 0.5, source: "can.35" },
+    sounder: { ...config.sounder, z: 0, source: depth },
+    gnss: { ...config.gnss, source: gps },
   });
-  const emit = (source: string, path: string, value: number) =>
-    receive({
+  const send = (
+    path: string,
+    source: string,
+    value: unknown,
+    time = "2026-01-01T00:00:00Z",
+  ) => {
+    const sub = subscriptions.find(
+      (s) => s.command.subscribe[0].path === path,
+    )!;
+    sub.callback({
+      context: "vessels.self",
       updates: [
-        {
-          $source: source,
-          timestamp: "2026-11-19T01:00:00Z",
-          values: [{ path, value }],
-        },
+        { $source: source, timestamp: time, values: [{ path, value }] },
       ],
-    } as unknown as Delta);
-  emit("other.35", "environment.depth.belowTransducer", 100);
-  emit("can.35", "environment.depth.belowSurface", 20);
-  expect(stream.read()).toBeNull();
-  emit("can.35", "environment.depth.belowTransducer", 4);
-  expect(stream.read().depth).toBe(4.5);
-  emit("can.35", "environment.depth.belowTransducer", 0);
-  expect(stream.read()).toBeNull();
-  stream.destroy();
+    } as Delta);
+  };
+  return { stream, subscriptions, send, unsubscribe };
+}
+const position = "navigation.position";
+const depth = "environment.depth.belowTransducer";
+
+test("preferred subscriptions follow independent position and depth failover", () => {
+  const s = setup();
+  expect(s.subscriptions.map((s) => s.command.sourcePolicy)).toEqual([
+    "preferred",
+    "preferred",
+  ]);
+  s.send(position, "gps.one", { longitude: 1, latitude: 2 });
+  s.send(depth, "depth.one", 3);
+  expect(s.stream.read()).toMatchObject({
+    longitude: 1,
+    latitude: 2,
+    depth: 3,
+  });
+  s.send(position, "gps.two", { longitude: 4, latitude: 5 });
+  s.send(depth, "depth.two", 6);
+  expect(s.stream.read()).toMatchObject({
+    longitude: 4,
+    latitude: 5,
+    depth: 6,
+  });
+  s.stream.destroy();
 });
 
-test("uses the selected GPS value rather than another antenna's prioritized position", () => {
-  let receive!: (delta: Delta) => void;
-  const timestamp = "2026-11-19T01:00:00Z";
-  const app = {
-    debug: () => {},
-    getSelfPath: (path: string) =>
-      path === "navigation.position"
-        ? {
-            $source: "other",
-            value: { longitude: 1, latitude: 2 },
-            timestamp,
-            values: {
-              selected: { value: { longitude: -76, latitude: 38 }, timestamp },
-            },
-          }
-        : undefined,
-    subscriptionmanager: {
-      subscribe: (
-        _request: unknown,
-        _unsub: unknown,
-        _error: unknown,
-        callback: typeof receive,
-      ) => {
-        receive = callback;
-      },
-    },
-  } as unknown as ServerAPI;
-  const stream = createLiveStream(app, {
-    ...config,
-    path: "belowTransducer",
-    gnss: { ...config.gnss, source: "selected" },
+test.each([
+  ["depth.chosen", ""],
+  ["", "gps.chosen"],
+  ["depth.chosen", "gps.chosen"],
+])("mixed selections depth=%s gps=%s keep independent policies", (d, g) => {
+  const s = setup(d, g);
+  expect(s.subscriptions.map((s) => s.command.sourcePolicy)).toEqual([
+    g ? "all" : "preferred",
+    d ? "all" : "preferred",
+  ]);
+  s.send(position, g || "gps.preferred", { longitude: 1, latitude: 2 });
+  if (g) s.send(position, "gps.other", { longitude: 99, latitude: 99 });
+  if (d) {
+    s.send(depth, "depth.other", 9);
+    expect(s.stream.read()).toBeNull();
+  }
+  s.send(depth, d || "depth.preferred", 3);
+  expect(s.stream.read()).toMatchObject({
+    longitude: 1,
+    latitude: 2,
+    depth: 3,
   });
-  receive({
-    updates: [
-      {
-        timestamp,
-        values: [{ path: "environment.depth.belowTransducer", value: 4 }],
-      },
-    ],
-  } as unknown as Delta);
-  expect(stream.read()).toMatchObject({ longitude: -76, latitude: 38 });
-  stream.destroy();
+  s.stream.destroy();
 });
 
-test("matches CAN address and CAN-name aliases for both selected instruments", () => {
-  let receive!: (delta: Delta) => void;
-  const timestamp = "2026-11-19T01:00:00Z";
-  const app = {
-    debug: () => {},
-    getPath: () => ({
-      can: {
-        "35": { n2k: { canName: "sounder-name" } },
-        "21": { n2k: { canName: "gps-name" } },
-      },
-    }),
-    getSelfPath: (path: string) =>
-      path === "navigation.position"
-        ? {
-            $source: "other",
-            values: {
-              "can.gps-name": {
-                value: { longitude: -76, latitude: 38 },
-                timestamp,
-              },
-            },
-          }
-        : undefined,
-    subscriptionmanager: {
-      subscribe: (
-        _a: unknown,
-        _b: unknown,
-        _c: unknown,
-        callback: typeof receive,
-      ) => {
-        receive = callback;
-      },
-    },
-  } as unknown as ServerAPI;
-  const stream = createLiveStream(app, {
-    ...config,
-    path: "belowTransducer",
-    sounder: { ...config.sounder, source: "can.35" },
-    gnss: { ...config.gnss, source: "can.21" },
+test("explicit CAN-name selection accepts its numeric-address alias", () => {
+  const s = setup("bus.stable", "bus.stable");
+  s.send(position, "bus.35", { longitude: 1, latitude: 2 });
+  s.send(depth, "bus.35", 3);
+  expect(s.stream.read()).toMatchObject({ depth: 3, longitude: 1 });
+  s.send(depth, "other.35", 4);
+  expect(s.stream.read()).toBeNull();
+  s.stream.destroy();
+});
+
+test("missing, invalid, or stale selected position never falls back to another receiver", () => {
+  const s = setup("", "gps.chosen");
+  s.send(position, "gps.other", { longitude: 1, latitude: 2 });
+  s.send(depth, "depth.one", 3);
+  expect(s.stream.read()).toBeNull();
+  s.send(position, "gps.chosen", { longitude: 1, latitude: 2 });
+  s.send(depth, "depth.one", 3, "2026-01-01T00:00:03Z");
+  expect(s.stream.read()).toBeNull();
+  s.send(position, "gps.chosen", null);
+  s.send(depth, "depth.one", 3);
+  expect(s.stream.read()).toBeNull();
+  s.stream.destroy();
+});
+
+test("a selected receiver's fix in the full model stands in for a silent subscription", () => {
+  // Signal K 2.28 to 2.34 don't deliver a sourcePolicy "all" subscription to a
+  // path whose meta arrived first (SignalK/signalk-server#3159).
+  const fix = (longitude: number, time = "2026-01-01T00:00:00Z") => ({
+    value: { longitude, latitude: 2 },
+    timestamp: time,
   });
-  receive({
-    updates: [
-      {
-        $source: "can.sounder-name",
-        timestamp,
-        values: [{ path: "environment.depth.belowTransducer", value: 4 }],
-      },
-    ],
-  } as unknown as Delta);
-  expect(stream.read()).toMatchObject({ longitude: -76, latitude: 38 });
-  stream.destroy();
+  // The plugin starts before the first fix.
+  let model: unknown;
+  const s = setup("", "gps.chosen", () => model);
+  model = {
+    ...fix(9),
+    $source: "gps.other",
+    values: { "gps.other": fix(9), "gps.chosen": fix(1) },
+  };
+  s.send(depth, "depth.one", 3, "2026-01-01T00:00:01Z");
+  expect(s.stream.read()).toMatchObject({ longitude: 1, depth: 3 });
+
+  // A stale fix in the model is still refused.
+  s.send(depth, "depth.one", 3, "2026-01-01T00:00:05Z");
+  expect(s.stream.read()).toBeNull();
+  s.stream.destroy();
+});
+
+test("zero and invalid depth remain excluded", () => {
+  const s = setup();
+  s.send(position, "gps.one", { longitude: 1, latitude: 2 });
+  for (const value of [0, null, NaN, Infinity])
+    s.send(depth, "depth.one", value);
+  expect(s.stream.read()).toBeNull();
+  s.stream.destroy();
+});
+
+test("source choices invalidate chart fingerprints including SQLite history cutoff", async () => {
+  const { cellConfig } = await import("../src/chart.js");
+  const before = cellConfig(config);
+  expect(
+    cellConfig({ ...config, gnss: { ...config.gnss, source: "gps.other" } })
+      .depth,
+  ).not.toBe(before.depth);
+  expect(
+    cellConfig({
+      ...config,
+      sounder: { ...config.sounder, source: "depth.other" },
+    }).depth,
+  ).not.toBe(before.depth);
+});
+
+test("GNSS quality follows the receiver that supplied the preferred position", () => {
+  const timestamp = "2026-01-01T00:00:00Z";
+  const s = setup("", "", () => undefined, {
+    $source: "gps.other",
+    value: 99,
+    timestamp,
+    values: {
+      "gps.one": { value: 12, timestamp },
+      "gps.two": { value: 8, timestamp },
+    },
+  });
+  s.send(position, "gps.one", { longitude: 1, latitude: 2 });
+  s.send(depth, "depth.one", 3);
+  expect(s.stream.read().gnss).toEqual({ satellites: 12 });
+  s.send(position, "gps.two", { longitude: 4, latitude: 5 });
+  s.send(depth, "depth.one", 3);
+  expect(s.stream.read().gnss).toEqual({ satellites: 8 });
+  s.stream.destroy();
 });

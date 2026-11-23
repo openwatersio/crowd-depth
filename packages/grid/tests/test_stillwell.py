@@ -64,13 +64,19 @@ def stations(root):
     sql(
         f"""COPY (
           SELECT * FROM (VALUES
-            ('coops', 'g1', MAP {{'MLLW': -1.0::DOUBLE}},
+            ('coops', 'g1', MAP {{'MSL': -1.7::DOUBLE, 'MLLW': -1.0::DOUBLE}},
               [{{'id': 1, 'since': NULL::TIMESTAMPTZ, 'until': NULL::TIMESTAMPTZ,
                 'to_current': 0.0, 'state': 'accepted'}}]),
             ('coops', 'g2', MAP {{'MLLW': -1.0::DOUBLE}},
               [{{'id': 1, 'since': NULL::TIMESTAMPTZ, 'until': TIMESTAMPTZ '2024-07-01 00:00:00+00',
                 'to_current': -0.5, 'state': 'accepted'}},
                {{'id': 2, 'since': TIMESTAMPTZ '2024-07-01 00:00:00+00', 'until': NULL::TIMESTAMPTZ,
+                'to_current': 0.0, 'state': 'accepted'}}]),
+            ('coops', 'river', MAP {{'MSL': -2.0::DOUBLE, 'NAVD88': 0.1::DOUBLE}},
+              [{{'id': 1, 'since': NULL::TIMESTAMPTZ, 'until': NULL::TIMESTAMPTZ,
+                'to_current': 0.0, 'state': 'accepted'}}]),
+            ('coops', 'bare', MAP {{'NAVD88': 0.1::DOUBLE}},
+              [{{'id': 1, 'since': NULL::TIMESTAMPTZ, 'until': NULL::TIMESTAMPTZ,
                 'to_current': 0.0, 'state': 'accepted'}}])
           ) t(source, source_id, datums, epochs)
         ) TO '{root}/stations.parquet'"""
@@ -253,6 +259,25 @@ def test_stillwell_residuals_are_observed_in_mllw_minus_slackwater(bucket, monke
     # A gauge Stillwell doesn't list, or a month no year file covers, is one it can't give.
     assert tide.stillwell_residuals("nowhere", date(2024, 3, 1)) is None
     assert tide.stillwell_residuals("g1", date(2023, 3, 1)) is None
+
+
+def test_a_gauge_without_mllw_takes_its_residuals_in_msl(bucket, monkeypatch):
+    for gauge in ("river", "bare"):
+        obs(bucket, f"{gauge}/2024.parquet", [("2024-03-01 00:00:00", 2.5, 0)])
+    asked = []
+
+    def levels(requests):
+        asked.extend(requests)
+        return [[[t, 0.3] for t in range(r["start"], r["end"] + 1, r["step"])] for r in requests]
+
+    monkeypatch.setattr(tide, "slackwater_levels", levels)
+    assert tide.stillwell_residuals("river", date(2024, 3, 1)) == [
+        (datetime(2024, 3, 1), pytest.approx(0.2))
+    ]
+    assert [r["datum"] for r in asked] == ["MSL"]
+    assert ";MSL=-2.0;" in tide.stillwell_version("river", date(2024, 3, 1))
+    # Neither datum: no residual to take.
+    assert tide.stillwell_residuals("bare", date(2024, 3, 1)) is None
 
 
 def test_december_reads_only_its_own_year(bucket):

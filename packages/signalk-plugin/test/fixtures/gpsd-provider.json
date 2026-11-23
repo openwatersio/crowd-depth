@@ -1,0 +1,25 @@
+{
+  "id": "gpsdProvider",
+  "pipeElements": [
+    {
+      "type": "providers/gpsd",
+      "options": {
+        "hostname": "127.0.0.1",
+        "port": 2947
+      }
+    },
+    {
+      "type": "providers/nmea0183-signalk",
+      "optionMappings": [
+        {
+          "fromAppProperty": "selfId",
+          "toOption": "selfId"
+        },
+        {
+          "fromAppProperty": "selfType",
+          "toOption": "selfType"
+        }
+      ]
+    }
+  ]
+}

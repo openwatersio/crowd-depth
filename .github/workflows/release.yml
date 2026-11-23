@@ -46,6 +46,12 @@ jobs:
       - name: Set version from release tag
         run: npm pkg set version="${TAG#v}" -w crowd-depth
 
+      # npm records gitHead only when it publishes a directory, and this
+      # publishes a tarball. The Signal K plugin registry reads gitHead to find
+      # the plugin-ci run for the release's commit.
+      - name: Record the release's commit
+        run: npm pkg set gitHead="$GITHUB_SHA" -w crowd-depth
+
       - name: Lint the package
         run: npm run lint -w crowd-depth
 
@@ -63,7 +69,7 @@ jobs:
               || { echo "::error::$f is missing from the tarball"; exit 1; }
           done
           grep -qx package/dist/index.js "$RUNNER_TEMP/contents.txt"
-          jq -e --arg v "${TAG#v}" '.version == $v' <(tar -xzOf "$RUNNER_TEMP"/pack/*.tgz package/package.json)
+          jq -e --arg v "${TAG#v}" --arg sha "$GITHUB_SHA" '.version == $v and .gitHead == $sha' <(tar -xzOf "$RUNNER_TEMP"/pack/*.tgz package/package.json)
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

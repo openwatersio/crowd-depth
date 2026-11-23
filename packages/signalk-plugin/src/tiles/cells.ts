@@ -529,6 +529,40 @@ export function createCellStore(db: DatabaseSync, generation?: string) {
       });
       return { done: rows.length < limit, changed: rows };
     },
+    /** Estimate pending passes without changing the published cells. */
+    previewPasses(pending: Pass[]): Cell[] {
+      const groups = new Map<string, Pass[]>();
+      const seen = new Set<string>();
+      const exists = db.prepare(
+        "SELECT 1 FROM cell_passes WHERE job>=? AND job<? AND ordinal=0 AND time>=? LIMIT 1",
+      );
+      for (const p of pending) {
+        const job = `live:${p.py}/${p.px}/${p.start ?? p.time}/${p.time}`;
+        const prefix = `live:${p.py}/${p.px}/${p.start ?? p.time}/`;
+        // A request can arrive after a longer version of its open pass committed.
+        if (seen.has(job) || exists.get(prefix, `${prefix}~`, p.time!))
+          continue;
+        seen.add(job);
+        const key = `${p.py}/${p.px}`;
+        const group = groups.get(key) ?? [];
+        group.push(p);
+        groups.set(key, group);
+      }
+      return [...groups.values()].flatMap((group) => {
+        const cell = estimates.preview(group[0].py, group[0].px, group);
+        return cell
+          ? [
+              {
+                ...cell,
+                m: cmDown(cell.m) / 100,
+                d: cmUp(cell.d) / 100,
+                ...(cell.t === undefined ? {} : { t: cmUp(cell.t) / 100 }),
+              },
+            ]
+          : [];
+      });
+    },
+
     /** Fold passes into their cells in one transaction; returns the cells written.
      * Without `overviews`, as during a backfill, the overviews are left for
      * {@link rebuildOverviews}. */

@@ -11,6 +11,9 @@ predicted level, the weather's part of the water level, is added to the predicti
 observed and predicted levels come from CO-OPS' API, or, with GRID_WATER_LEVELS=stillwell,
 the observed from Open Waters' Stillwell and the predicted from Slackwater at
 the gauge's own station, so at a station that is the gauge the level is what it observed.
+In that mode a station takes the nearest gauge Slackwater can predict: a river or lake
+gauge has no tide to take the weather from. A residual is a difference within one datum, so
+it adds to a station's level above its own chart datum.
 Levels are relative to each station's chart datum: MLLW in US waters, LAT in most
 others.
 
@@ -199,22 +202,22 @@ def month_span(month: date) -> tuple[datetime, datetime]:
 
 
 def stillwell_residuals(gauge: str, month: date) -> list[tuple[datetime, float]] | None:
-    """A CO-OPS gauge's observed level from Stillwell, in MLLW, minus
-    Slackwater's prediction for its station, 6-minute, through one month; [] where Stillwell
-    flags every value. None where it can't give the month: no MLLW, no value in its year
-    files that month (such as at a gauge it hasn't backfilled), or no prediction from
-    Slackwater that matches the values it has."""
+    """A CO-OPS gauge's observed level from Stillwell minus Slackwater's prediction for its
+    station, both in MLLW or, where Stillwell has no MLLW, MSL, 6-minute, through one month;
+    [] where Stillwell flags every value. None where it can't give the month: neither datum,
+    no value in its year files that month (such as at a gauge it hasn't backfilled), or no
+    prediction from Slackwater in that datum that matches the values it has."""
     got = stillwell_observed(gauge, month)
     if got is None:
         return None
-    mllw, observed = got
+    datum, offset, observed = got
     if not observed:
         return []
     start, end = month_span(month)
     t0 = int(start.replace(tzinfo=UTC).timestamp())
     t1 = int(end.replace(tzinfo=UTC).timestamp())
     [series] = slackwater_levels(
-        [{"station": f"noaa/{gauge}", "start": t0, "end": t1 - 360, "step": 360, "datum": "MLLW"}]
+        [{"station": f"noaa/{gauge}", "start": t0, "end": t1 - 360, "step": 360, "datum": datum}]
     )
     predicted = {int(t): h for t, h in series if h is not None and math.isfinite(h)}
     if not predicted:
@@ -223,21 +226,27 @@ def stillwell_residuals(gauge: str, month: date) -> list[tuple[datetime, float]]
     rows = []
     for t, level in observed:
         p = predicted.get(int(t.replace(tzinfo=UTC).timestamp()))
-        if p is not None and abs(r := round(level + mllw, 3) - p) <= MAX_RESIDUAL_M:
+        if p is not None and abs(r := round(level + offset, 3) - p) <= MAX_RESIDUAL_M:
             rows.append((t, r))
-    # Values with no residual are a mismatch, such as a wrong MLLW, not Stillwell's record.
+    # Values with no residual are a mismatch, such as a wrong datum, not Stillwell's record.
     return rows or None
 
 
+def stillwell_datum(gauge: str) -> tuple[str, float] | None:
+    """The datum a gauge's residuals are taken in, and Stillwell's offset to it: MLLW, or
+    MSL where CO-OPS publishes no MLLW."""
+    datums = (stillwell.stations("coops").get(gauge) or {}).get("datums", {})
+    return next(((d, datums[d]) for d in ("MLLW", "MSL") if datums.get(d) is not None), None)
+
+
 def stillwell_observed(gauge: str, month: date):
-    """A gauge's MLLW offset and its unflagged levels through one month, or None where
-    Stillwell can't give them."""
-    station = stillwell.stations("coops").get(gauge)
-    mllw = station and station["datums"].get("MLLW")
-    if mllw is None:
+    """A gauge's datum, Stillwell's offset to it, and its unflagged levels through one month,
+    or None where Stillwell can't give them."""
+    datum = stillwell_datum(gauge)
+    if datum is None:
         return None
     observed = stillwell.observed("coops", gauge, *month_span(month))
-    return None if observed is None else (mllw, observed)
+    return None if observed is None else (*datum, observed)
 
 
 def stillwell_digest(gauge: str, month: date) -> str | None:
@@ -246,18 +255,18 @@ def stillwell_digest(gauge: str, month: date) -> str | None:
     got = stillwell_observed(gauge, month)
     if got is None:
         return None
-    mllw, observed = got
-    return digest([(t, round(level + mllw, 3)) for t, level in observed])
+    _, offset, observed = got
+    return digest([(t, round(level + offset, 3)) for t, level in observed])
 
 
 def stillwell_version(gauge: str, month: date, version=stillwell.version) -> str | None:
     """What a gauge month's Stillwell residuals are read from: its year files' versions, and the
-    station's MLLW and epochs. None where no year file covers the month."""
+    station's datum and epochs. None where no year file covers the month."""
     files = stillwell.versions("coops", gauge, *month_span(month), version)
     if files is None:
         return None
-    station = stillwell.stations("coops")[gauge]
-    return f"{files};MLLW={station['datums'].get('MLLW')};{station['epochs']}"
+    datum, offset = stillwell_datum(gauge) or ("MLLW", None)
+    return f"{files};{datum}={offset};{stillwell.stations('coops')[gauge]['epochs']}"
 
 
 def digest(rows) -> str:
@@ -372,7 +381,12 @@ def eligible(station) -> bool:
 
 
 def load_stations(
-    con, stations=slackwater_stations, gauges=coops_gauges, version=None, accept_departures=False
+    con,
+    stations=slackwater_stations,
+    gauges=coops_gauges,
+    version=None,
+    accept_departures=False,
+    predicted_gauges=False,
 ):
     """Bring `tide_stations` up to Slackwater's current list. New eligible stations join
     with new ids; a station gone from the list or no longer eligible leaves, with its
@@ -380,11 +394,19 @@ def load_stations(
     gauge are taken again and every level is dropped, to be predicted again. Every station
     takes the nearest gauge in today's listing, and one whose gauge changed has its levels
     done again. Both lists are read before anything changes, so a failed listing leaves the
-    store as it was. Returns whether levels were dropped for a new version."""
-    rows = {s["id"]: s for s in stations() if eligible(s)}
+    store as it was. With `predicted_gauges`, only gauges Slackwater lists as a station are
+    taken, and a station on one it doesn't moves to the next. Returns whether levels were
+    dropped for a new version."""
+    listed = stations()
+    rows = {s["id"]: s for s in listed if eligible(s)}
     if not rows:
         raise RuntimeError("no tide station passes the license, quality and datum filter")
-    g = gauges()
+    g, dropped = gauges(), []
+    if predicted_gauges:
+        # The helper finds only the stations it lists, so any other gauge has no prediction.
+        ids = {s["id"] for s in listed}
+        dropped = [x["id"] for x in g if f"noaa/{x['id']}" not in ids]
+        g = [x for x in g if f"noaa/{x['id']}" in ids]
     have = dict(con.execute("SELECT station, station_id FROM lake.tide_stations").fetchall())
     gone = [sid for st, sid in have.items() if st not in rows]
     # A changed filter or a broken release, not stations retired one by one.
@@ -436,7 +458,7 @@ def load_stations(
             },
         )
         con.execute("UPDATE lake.tide_stations SET gauge_km = NULL WHERE isnan(gauge_km)")
-    regauge(con, g)
+    regauge(con, g, dropped)
     if version is not None:
         con.execute("DELETE FROM lake.store_meta WHERE key = 'slackwater'")
         con.execute("INSERT INTO lake.store_meta VALUES ('slackwater', ?)", [version])
@@ -445,11 +467,12 @@ def load_stations(
     return refresh
 
 
-def regauge(con, g):
+def regauge(con, g, dropped=()):
     """Move a station to a gauge in listing `g` nearer than its own, or give one to a station
-    without; a station whose gauge changed has its levels moved to the temp table
-    `old_levels`, to be done again. A gauge missing from today's listing isn't a reason to
-    move: a cut-off listing would otherwise shuffle every station."""
+    without; a station on a `dropped` gauge takes the nearest in `g`, or none. A station whose
+    gauge changed has its levels moved to the temp table `old_levels`, to be done again. A
+    gauge missing from today's listing isn't otherwise a reason to move: a cut-off listing
+    would shuffle every station."""
     st = con.execute("SELECT station_id, lon, lat FROM lake.tide_stations").fetchnumpy()
     if not len(st["station_id"]):
         return
@@ -465,8 +488,10 @@ def regauge(con, g):
     con.execute(
         """CREATE OR REPLACE TEMP TABLE regauged AS SELECT n.* FROM gauges_np n
         JOIN lake.tide_stations s USING (station_id)
-        WHERE n.gauge IS NOT NULL AND s.gauge IS DISTINCT FROM n.gauge
-          AND (s.gauge IS NULL OR n.gauge_km < s.gauge_km)"""
+        WHERE s.gauge IS DISTINCT FROM n.gauge AND (
+          (n.gauge IS NOT NULL AND (s.gauge IS NULL OR n.gauge_km < s.gauge_km))
+          OR list_contains($dropped, s.gauge))""",
+        {"dropped": list(dropped)},
     )
     con.unregister("gauges_np")
     con.execute(
@@ -717,7 +742,9 @@ def build(
     ):
         probe(con, levels)
         con.execute("INSERT INTO old_levels SELECT * FROM lake.tide_levels")
-    load_stations(con, stations, gauges, version, accept_departures)
+    load_stations(
+        con, stations, gauges, version, accept_departures, residuals is stillwell_residuals
+    )
     assign_cells(con)
     # Residuals taken another way, or against another engine's predictions, are all taken
     # again: every month reopens, and is fetched with the open ones below. One the new way
@@ -734,10 +761,12 @@ def build(
     if residuals is stillwell_residuals:
         reopen_changed(con)
     # Gauge months that aren't final are fetched again, and the levels of those that came
-    # back are done again; one CO-OPS can't give now keeps its levels.
+    # back are done again; one CO-OPS can't give now keeps its levels. A gauge no station
+    # uses any more isn't asked for.
     open_ = con.execute(
         f"""SELECT gauge, month FROM lake.tide_residual_months
-        WHERE fetched < last_day(month) + INTERVAL {RECENT_DAYS} DAY ORDER BY ALL"""
+        WHERE fetched < last_day(month) + INTERVAL {RECENT_DAYS} DAY
+          AND gauge IN (SELECT gauge FROM lake.tide_stations) ORDER BY ALL"""
     ).fetchall()
     fetch_residuals(con, open_, today, residuals)
     need = con.execute(

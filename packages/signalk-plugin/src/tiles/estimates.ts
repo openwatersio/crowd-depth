@@ -1,5 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
-import type { Cell } from "./cells.js";
+import type { Cell, Pass } from "./cells.js";
 import {
   halfLifeDays,
   mergeMoments,
@@ -28,10 +28,14 @@ export function createEstimates(db: DatabaseSync) {
     PRIMARY KEY(py,px)
   ) WITHOUT ROWID`);
   const columns = "time,weight,weight2,mean,m2,tide,passes,first,last";
-  const children = db.prepare(`SELECT ${columns} FROM cell_moments
+  const children = db.prepare(`SELECT bucket,${columns} FROM cell_moments
     WHERE py=? AND px=? AND level=? AND reference=? AND bucket>=? AND bucket<? ORDER BY bucket`);
-  const roots = db.prepare(`SELECT ${columns} FROM cell_moments
+  const roots = db.prepare(`SELECT bucket,${columns} FROM cell_moments
     WHERE py=? AND px=? AND level=? AND reference=? ORDER BY bucket LIMIT 257`);
+  const leaf = db.prepare(
+    `SELECT ${columns} FROM cell_moments WHERE py=? AND px=? AND level=0 AND reference=? AND bucket=?`,
+  );
+  const published = db.prepare("SELECT 1 FROM cells WHERE py=? AND px=?");
   const put = db.prepare(
     "INSERT OR REPLACE INTO cell_moments VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
   );
@@ -76,6 +80,130 @@ export function createEstimates(db: DatabaseSync) {
   return {
     clear: () =>
       db.exec("DELETE FROM cell_moments; DELETE FROM cell_moment_config"),
+    /** Fold pending passes through the same hourly summaries without writing.
+     * Only touched ancestors are read; even years at anchor do not replay the log.
+     */
+    preview(py: number, px: number, pending: Pass[]): Cell | undefined {
+      const days = halfLifeDays(
+        Number(
+          db
+            .prepare("SELECT value FROM tile_meta WHERE key='config_weight'")
+            .get()?.value ?? 365,
+        ),
+      );
+      const storedDays = db
+        .prepare("SELECT days FROM cell_moment_config WHERE py=? AND px=?")
+        .get(py, px)?.days;
+      // Reweighting owns changes to existing ancestors. Until it catches up, retain
+      // the published cell instead of mixing summaries built with different decay.
+      if (storedDays !== undefined && storedDays !== days) return;
+      // Pre-ledger cells have no summaries to merge. Never replace their evidence
+      // with a pending-only estimate while history is rebuilding the summaries.
+      if (storedDays === undefined && published.get(py, px)) return;
+      const top = Number(
+        db
+          .prepare(
+            "SELECT MAX(level) AS level FROM cell_moments WHERE py=? AND px=?",
+          )
+          .get(py, px)?.level ?? 0,
+      );
+      const results: (Moments | undefined)[] = [];
+      for (const ref of [0, 1]) {
+        let updates = new Map<number, Moments>();
+        for (const p of pending) {
+          if (Number(p.tide !== undefined) !== ref) continue;
+          const hour = estimateHour(p.time!);
+          let m = updates.get(hour);
+          if (!m) {
+            const old = leaf.get(py, px, ref, hour) as unknown as
+              Moments | undefined;
+            // Hour summaries have unit weight. Restore their equal-weight passes
+            // before adding this pass, then cap the combined hour again below.
+            if (old)
+              m = {
+                ...old,
+                weight: old.passes,
+                weight2: old.passes,
+                m2: old.m2 * old.passes,
+              };
+          }
+          updates.set(
+            hour,
+            mergeMoments(
+              m,
+              {
+                time: hour * HOUR,
+                weight: 1,
+                weight2: 1,
+                mean: p.depth,
+                m2: 0,
+                tide: p.tide ?? 0,
+                passes: 1,
+                first: p.day,
+                last: p.day,
+              },
+              days,
+            ),
+          );
+        }
+        for (const m of updates.values()) {
+          m.m2 /= m.weight;
+          m.weight = m.weight2 = 1;
+        }
+        for (let level = 0; level < top; level++) {
+          const parents = new Map<number, Moments>();
+          for (const parent of new Set(
+            [...updates.keys()].map((b) => Math.floor(b / FANOUT)),
+          )) {
+            const values = new Map<number, Moments>(
+              [
+                ...children.iterate(
+                  py,
+                  px,
+                  level,
+                  ref,
+                  parent * FANOUT,
+                  (parent + 1) * FANOUT,
+                ),
+              ].map((r) => [Number(r.bucket), r as unknown as Moments]),
+            );
+            for (const [bucket, m] of updates)
+              if (Math.floor(bucket / FANOUT) === parent) values.set(bucket, m);
+            parents.set(
+              parent,
+              merge(
+                [...values].sort((a, b) => a[0] - b[0]).map(([, m]) => m),
+                days,
+              )!,
+            );
+          }
+          updates = parents;
+        }
+        const values = new Map<number, Moments>(
+          roots
+            .all(py, px, top, ref)
+            .map((r) => [Number(r.bucket), r as unknown as Moments]),
+        );
+        for (const [bucket, m] of updates) values.set(bucket, m);
+        results[ref] = merge(
+          [...values].sort((a, b) => a[0] - b[0]).map(([, m]) => m),
+          days,
+        );
+      }
+      const m = results[1] ?? results[0];
+      return (
+        m && {
+          py,
+          px,
+          m: m.mean,
+          d: momentSigma(m) / 1.25,
+          ...(results[1] ? { t: m.tide } : {}),
+          passes: m.passes,
+          first: m.first,
+          last: m.last,
+        }
+      );
+    },
     rebuild(py: number, px: number, hours: Iterable<number>): Cell | undefined {
       const config = db
         .prepare("SELECT value FROM tile_meta WHERE key='config_weight'")

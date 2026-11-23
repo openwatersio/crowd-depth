@@ -50,6 +50,7 @@ import {
   tidesUrl,
   withTide,
 } from "./tiles/tide.js";
+import { createPreview } from "./tiles/preview.js";
 import { createQCThread } from "./tiles/qc-thread.js";
 import { registerPlotterExtension } from "./plotterext/provider.js";
 import { DEFAULT_OWN_STYLE, TINTS, type OwnStyle } from "./tiles/style.js";
@@ -103,6 +104,9 @@ export function cellConfig(config: Config) {
     }),
     weight: String(halfLifeDays(config.chart?.halfLifeDays)),
     depth: JSON.stringify({
+      sourceSelection: 1,
+      sounderSource: config.sounder.source || "",
+      positionSource: config.gnss.source || "",
       depthPath: `environment.depth.${config.path}`,
       depthOffset: depthReference(config).offset,
     }),
@@ -263,6 +267,7 @@ export function startChart({
     safetyDepth: config.chart?.safetyDepth ?? DEFAULT_SAFETY_DEPTH_M,
     own: ownStyle(config),
     detail,
+    preview: createPreview(writer, tiles.preview),
   };
   const publish = setInterval(publishChanges, 5000);
   publish.unref?.();

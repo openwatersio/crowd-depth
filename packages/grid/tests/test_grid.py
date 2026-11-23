@@ -5,11 +5,14 @@ import struct
 from datetime import date, datetime, timedelta
 
 import duckdb
+import numpy as np
 import pytest
+import rasterio
 import reference_qc
+from conftest import heights
 from test_ingest import HEADER, VESSEL, env, geojson, ow_key  # noqa: F401  (env is a fixture)
 
-from grid import catalog, cells, ingest, qc, statistic
+from grid import catalog, cells, deep, ingest, qc, statistic, surface
 from grid.catalog import open_store
 
 
@@ -379,7 +382,7 @@ def test_shoals_are_the_soundings_nothing_confirmed_or_rejected():
     con.execute(
         "CREATE TABLE tile_points AS SELECT unnest(range(1, 9)) AS point_id, ? AS tile_id,"
         " 5000 AS r, ? AS lon, ? AS lat, 3.0::DOUBLE AS depth_raw, 3.0::DOUBLE AS depth, false AS excluded,"
-        " point_id IN (5, 6, 7, 8) AS lost_bottom, false AS awaiting_tide",
+        " point_id IN (5, 6, 7, 8) AS lost_bottom, false AS awaiting_tide, false AS off_reference",
         [tile, *at(5000, 7)],
     )
     v = qc.QC_VERSION
@@ -966,6 +969,64 @@ def test_a_flat_shoal_a_coarse_sounder_read_stays_unconfirmed(env):  # noqa: F81
         [lon_lo, lon_hi],
     )
     assert over == []
+
+
+def test_deep_water_rejects_a_lost_bottom_and_keeps_a_bank(env, tmp_path, monkeypatch):  # noqa: F811
+    # GEBCO reads 1,500 m across the tile but for a bank 20 m deep at row 5000's pixels.
+    # A tug's sounder reads a flickering 0.6 m over the deep water; a boat reads 18 m on
+    # the bank and another 1,480 m off it.
+    n = deep.PER_DEGREE
+    z = np.full((3 * n, 3 * n), -1500)  # the tile and a tile around it, rows north to south
+    z[2 * n - 1 - int(5000 / cells.BASE * n), n : n + 3] = -20
+    gebco = heights(tmp_path / "gebco.tif", z, (LON0 - 1, LAT0 - 1, LON0 + 2, LAT0 + 2))
+    monkeypatch.setenv("GRID_DEEP_REFERENCE", str(gebco))
+    put(env, 1, line([0.5, 0.6, 0.7] * 4, r=8000), "TUG")
+    put(env, 2, line([18.0] * 10), "BOAT")
+    put(env, 3, line([1480.0] * 10, r=7000), "SHIP")
+    # Ships reading 800 m and 1,200 m beside it widen σ past what the cells there can
+    # publish: they're left out rather than drawn shoaler than half of GEBCO's depth.
+    put(env, 4, line([800.0] * 10, r=7000), "SHIP2")
+    put(env, 5, line([1200.0] * 10, r=7000), "SHIP3")
+    build(env)
+    assert env.query("SELECT count(*) FROM lake.cells WHERE median > 700 AND depth < 750") == [(0,)]
+    assert env.query("SELECT count(*) FROM lake.cells WHERE median > 700 AND sigma > 300") == [(0,)]
+    # Nor does the surface draw them shoaler: its pixels around the ships are empty or deep.
+    tile = (LAT0 + 90) * 360 + LON0 + 180
+    with open_store(env.store, write=False) as con:
+        [(partition,)] = con.execute("SELECT DISTINCT cell_id FROM lake.cells").fetchall()
+        path = surface.build_tile(con, tile, partition, tmp_path / "surface")
+    with rasterio.open(path) as src:
+        depth = src.read(1)
+    ships = depth[surface.ROWS - 1 - 7010 // 2 : surface.ROWS - 1 - 6990 // 2, :20]
+    assert ((ships == surface.NODATA) | (ships >= 750)).all()
+    assert {(f, reason) for f, reason, d in flags(env) if d < 1} == {("reject", "deep_reference")}
+    assert {d for f, reason, d in flags(env) if reason == "deep_reference"} == {
+        float32(d) for d in (0.5, 0.6, 0.7)
+    }
+    assert min(m for *_, m, _, _, _, _, _ in grid(env)) == 18.0
+    assert {18.0} <= {m for *_, m, _, _, _, _, _ in grid(env)}
+    assert env.query("SELECT count(*) FROM lake.shoals") == [(0,)]
+
+
+def test_only_judged_cells_are_left_out_for_their_margin():
+    # Two base cells: a drying flat outside judged water (median -0.8 m) and one over
+    # 1,500 m of GEBCO deep water whose σ takes it to 0 m. Only the second is left out.
+    con = duckdb.connect()
+    con.execute(
+        """CREATE TABLE group_accepted AS SELECT * FROM (VALUES
+          (1, 1, 0, 0, 0, 0, 'A', -0.8, NULL::VARCHAR, NULL::FLOAT, 1::UBIGINT),
+          (1, 1, 0, 2, 0, 2, 'B', 800.0, NULL, 1500.0, 2::UBIGINT))
+        t(tile_id, level, cr, cc, r, c, vessel, d, outlier, deep_ref, content_key)"""
+    )
+    con.execute(
+        """CREATE TABLE pixel_sigma AS SELECT * FROM (VALUES
+          (1, 0, 0, 0.1, -1.0, -0.8), (1, 0, 1, 500.0, -75.0, 800.0))
+        t(tile_id, py, px, sigma, depth, median)"""
+    )
+    first, children = cells.STATS.split(";\n")[:2]
+    con.execute(first, {"rlo": 0, "rhi": 9})
+    con.execute(children)
+    assert con.execute("SELECT c, round(depth::DOUBLE, 3) FROM children").fetchall() == [(0, -0.8)]
 
 
 def consensus(env, others, vessel_depths):  # noqa: F811

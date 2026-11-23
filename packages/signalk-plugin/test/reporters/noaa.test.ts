@@ -151,7 +151,7 @@ describe("submitGeoJSON", () => {
 });
 
 describe("getMetadata", () => {
-  test("allows manual overrides and sends detected transducer metadata", async () => {
+  test("keeps manual identity separate from detected metadata and includes GNSS quality", async () => {
     const detected = {
       ...vessel,
       sensors: {
@@ -183,12 +183,12 @@ describe("getMetadata", () => {
     };
     const sensors = getMetadata(detected, settings).properties.platform.sensors;
     expect(sensors[0]).toMatchObject({
-      make: "Airmar",
+      make: "Unknown",
       model: "P65",
       transducer: "P65",
       frequency: 235000,
-      nmea2000: detected.sensors.sounder.nmea2000,
     });
+    expect(sensors[0]).not.toHaveProperty("nmea2000");
     expect(sensors[1]).toMatchObject({ make: "Garmin", model: "GPS" });
     const json = JSON.parse(
       await text(
@@ -216,9 +216,7 @@ describe("getMetadata", () => {
       horizontalDilution: 0.7,
     });
     expect(json.properties.platform.sensors[1].gpsd.driver).toBe("Garmin");
-    expect(json.properties.platform.sensors[0].nmea2000).toEqual(
-      detected.sensors.sounder.nmea2000,
-    );
+    expect(json.properties.platform.sensors[0]).not.toHaveProperty("nmea2000");
   });
 
   test("manual values override detection and blank values fall back", () => {

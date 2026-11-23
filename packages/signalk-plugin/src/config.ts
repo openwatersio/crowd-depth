@@ -1,10 +1,10 @@
 import { detectSensor, sourceDevice, sameSource } from "./device-info.js";
+import { cachedGpsdSensor } from "./gpsd-info.js";
 import { ServerAPI } from "@signalk/server-api";
 import { DEFAULT_OWN_STYLE, TINTS, type Tint } from "./tiles/style.js";
 
 // Can this be inferred from the JSON schema?
 export type Config = {
-  /** Resolved internally at startup; not a user setting. */
   path: (typeof DepthPaths)[number];
   sounder: {
     x: number;
@@ -26,7 +26,6 @@ export type Config = {
     model?: string;
     source?: string;
   };
-  /** Origin of server-corrected positions, distinct from the physical antenna. */
   positionOrigin?: { x: number; y: number };
   sharing: {
     anonymous: boolean;
@@ -36,7 +35,6 @@ export type Config = {
     show?: boolean;
     /** Depth areas and soundings shoaler than this, in metres, draw as unsafe. */
     safetyDepth?: number;
-    /** Recency weighting of the rendered layer, independent of data retention. */
     halfLifeDays?: number;
     /** The colour of the boat's own soundings, contours and tint, as `#rrggbb`. */
     color?: string;
@@ -53,12 +51,11 @@ export type Config = {
 
 /**
  * The source Signal K currently prioritizes for a path (its `$source`) plus the
- * full list of sources that have reported it. Used to default and populate the
- * source selectors so soundings stay pinned to one sensor rather than mixing
- * antenna offsets from multiple GPS sources.
+ * full list of sources that have reported it. Used for device choices and
+ * identity hints; an empty configured source follows server preference.
  */
 export function sourcesFor(app: ServerAPI, path: string) {
-  const node = app.getSelfPath?.(path) as
+  const node = app.getSelfPath(path) as
     { $source?: string; values?: Record<string, unknown> } | undefined;
   const selected = node?.$source;
   // Multi-source paths carry a `values` map keyed by sourceRef; single-source
@@ -96,8 +93,8 @@ function sourceLabel(app: ServerAPI, sourceRef: string): string {
 
 /**
  * Schema for a source selector. Always an enum, with friendly device names via
- * enumNames. When nothing has reported the path yet the enum is empty and the
- * description explains when neither live nor recorded sources are available.
+ * enumNames. Preferred source is always available, including before sensors
+ * have reported any data.
  */
 function sourceSchema(
   app: ServerAPI,
@@ -108,18 +105,19 @@ function sourceSchema(
   return {
     type: "string",
     title,
-    enum: sources.available,
-    enumNames: sources.available.map((source) => sourceLabel(app, source)),
-    default: sources.selected,
-    description: sources.available.length
-      ? `The ${noun} source to record. Defaults to the source Signal K prioritizes; choose one when the vessel has more than one.`
-      : `No live or recorded ${noun} sources found. Check the history provider or reload this page once data is being received.`,
+    enum: ["", ...sources.available],
+    enumNames: [
+      "Preferred source",
+      ...sources.available.map((source) => sourceLabel(app, source)),
+    ],
+    default: sources.selected ?? "",
+    description: `Follow Signal K's preferred ${noun} source, or select a specific device. For recorded data, Preferred source uses the history provider's default series.`,
   };
 }
 
 export const DepthPaths = [
-  "belowTransducer",
   "belowSurface",
+  "belowTransducer",
   "belowKeel",
 ] as const;
 
@@ -183,41 +181,64 @@ export function depthReference(config: Pick<Config, "path" | "sounder">): {
   }
 }
 
-export function schema(app: ServerAPI, recorded: RecordedSources = {}) {
+/**
+ * The plugin's config schema. Defaults read from the vessel's data are
+ * undefined until that data arrives; the server stores the schema as JSON,
+ * which would drop those keys anyway, so they are left out.
+ */
+export function schema(app: ServerAPI) {
+  return withoutUndefined(buildSchema(app));
+}
+
+function withoutUndefined<T>(value: T): T {
+  if (Array.isArray(value)) return value.map(withoutUndefined) as T;
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([, v]) => v !== undefined)
+      .map(([k, v]) => [k, withoutUndefined(v)]),
+  ) as T;
+}
+
+function buildSchema(app: ServerAPI) {
   const saved = (
-    app.readPluginOptions?.() as { configuration?: Partial<Config> }
+    app.readPluginOptions?.() as { configuration?: Partial<Config> } | undefined
   )?.configuration;
-  function choices(paths: string[], configured?: string) {
-    const live = paths.map((path) => sourcesFor(app, path));
-    const available = [
-      ...new Set([
-        ...(configured ? [configured] : []),
-        ...live.flatMap((source) => source.available),
-        ...paths.flatMap((path) => recorded[path] ?? []),
-      ]),
-    ].filter((source) => source !== "derived-data");
+  const defaultPath =
+    saved?.path ??
+    DepthPaths.find(
+      (path) =>
+        app.getSelfPath(`environment.depth.${path}.value`) !== undefined,
+    );
+  function choices(path: string, configured?: string) {
+    const sources = sourcesFor(app, path);
+    if (configured && !sources.available.includes(configured))
+      sources.available.unshift(configured);
     return {
-      available,
-      selected:
-        (configured && available.includes(configured)
-          ? configured
-          : undefined) ||
-        (live[0]?.selected && available.includes(live[0].selected)
-          ? live[0].selected
-          : undefined) ||
-        (available.length === 1 ? available[0] : undefined),
+      available: sources.available.filter(
+        (source) => source !== "derived-data" || source === configured,
+      ),
+      selected: configured ?? "",
     };
   }
-  const positionSources = choices(["navigation.position"], saved?.gnss?.source);
-  // Include every depth path: changing Path in the form doesn't regenerate
-  // its schema, and a derived path can have a different source from the sounder.
-  const depthPaths = DepthPaths.map((path) => `environment.depth.${path}`);
-  const depthSources = choices(depthPaths, saved?.sounder?.source);
+  const positionSources = choices("navigation.position", saved?.gnss?.source);
+  const depthSources = choices(
+    `environment.depth.${defaultPath}`,
+    saved?.sounder?.source,
+  );
   return {
     type: "object",
     description:
       "By enabling this plugin, you agree to share your soundings and your vessel and sensor details, and you dedicate them to the public domain under Creative Commons CC0 1.0 Universal.",
     properties: {
+      path: {
+        type: "string",
+        title: "Path",
+        description:
+          "The path to the depth data. (e.g. environment.depth.belowTransducer)",
+        enum: DepthPaths,
+        default: defaultPath,
+      },
       sounder: {
         type: "object",
         title: "Depth Sounder",
@@ -226,14 +247,6 @@ export function schema(app: ServerAPI, recorded: RecordedSources = {}) {
         required: ["x", "y"],
         properties: {
           source: sourceSchema(app, "Depth source", "depth", depthSources),
-          make: {
-            type: "string",
-            title: "Make",
-          },
-          model: {
-            type: "string",
-            title: "Model",
-          },
           y: {
             type: "number",
             title: "Distance of the transducer from the bow (meters)",
@@ -261,11 +274,20 @@ export function schema(app: ServerAPI, recorded: RecordedSources = {}) {
             description: "The draft of the vessel in meters.",
             default: app.getSelfPath("design.draft.value"),
           },
+          make: {
+            type: "string",
+            title: "Make",
+            description: "The manufacturer of the sounder. (e.g. Raymarine)",
+          },
+          model: {
+            type: "string",
+            title: "Model",
+            description: "The model of the sounder. (e.g. ST60+)",
+          },
           frequency: {
             type: "number",
             title: "Frequency",
-            description:
-              "The frequency of the sounder in Hz. Standard NMEA device information does not provide this; leave blank if unknown.",
+            description: "The frequency of the sounder in Hz.",
           },
           transducer: {
             type: "string",
@@ -277,9 +299,7 @@ export function schema(app: ServerAPI, recorded: RecordedSources = {}) {
       gnss: {
         type: "object",
         title: "GPS Receiver",
-        required: ["z"],
-        description:
-          "Horizontal antenna offsets come from Signal K’s per-source GNSS sensor settings. Restart this plugin after changing them.",
+        required: ["x", "y", "z"],
         properties: {
           source: sourceSchema(
             app,
@@ -287,17 +307,32 @@ export function schema(app: ServerAPI, recorded: RecordedSources = {}) {
             "position",
             positionSources,
           ),
-          make: {
-            type: "string",
-            title: "Make",
+          y: {
+            type: "number",
+            title: "Distance of the antenna from the bow (meters)",
+            minimum: 0,
+            default: app.getSelfPath("sensors.gps.fromBow.value"),
           },
-          model: {
-            type: "string",
-            title: "Model",
+          x: {
+            type: "number",
+            title: "Distance of the antenna from the center (meters)",
+            description: "+ve to starboard, -ve to port",
+            default: app.getSelfPath("sensors.gps.fromCenter.value"),
           },
           z: {
             type: "number",
             title: "Distance of the antenna above the waterline (meters)",
+          },
+          make: {
+            type: "string",
+            title: "Make",
+            description:
+              "The manufacturer of the GPS receiver. (e.g. Kongsberg Maritime)",
+          },
+          model: {
+            type: "string",
+            title: "Model",
+            description: "The model of the GPS Receiver. (e.g. Seapath 330+)",
           },
         },
       },
@@ -310,7 +345,7 @@ export function schema(app: ServerAPI, recorded: RecordedSources = {}) {
             default: false,
             title: "Share data anonymously",
             description:
-              "If you do not wish to share your vessel name and MMSI, you can share anonymously with a unique UUID instead.",
+              "Share with a unique UUID instead of vessel name and MMSI.",
           },
         },
       },
@@ -390,22 +425,29 @@ export function schema(app: ServerAPI, recorded: RecordedSources = {}) {
   };
 }
 
-/** Placeholders are hints, not defaults saved as manual overrides. */
-export function uiSchema(app: ServerAPI, recorded: RecordedSources = {}) {
-  const settings = schema(app, recorded).properties;
-  const sounder = detectSensor(
+/** Hints only: opening the form must not save detected values as overrides. */
+export function uiSchema(app: ServerAPI) {
+  const defaults = schema(app).properties;
+  const sounderSource = resolveSource(
     app,
-    settings.sounder.properties.source.default,
-    true,
+    defaults.sounder.properties.source.default,
+    `environment.depth.${defaults.path.default}`,
   );
-  const gnss = detectSensor(app, settings.gnss.properties.source.default, true);
+  const gpsSource = resolveSource(
+    app,
+    defaults.gnss.properties.source.default,
+    "navigation.position",
+  );
+  const sounder = detectSensor(app, sounderSource);
+  const gnss = detectSensor(app, gpsSource);
+  const gpsd = gnss.make || gnss.model ? {} : cachedGpsdSensor(app, gpsSource);
   return {
     sounder: {
       make: { "ui:placeholder": sounder.make ?? "" },
       model: { "ui:placeholder": sounder.model ?? "" },
     },
     gnss: {
-      make: { "ui:placeholder": gnss.make ?? "" },
+      make: { "ui:placeholder": gnss.make ?? gpsd.make ?? "" },
       model: { "ui:placeholder": gnss.model ?? "" },
     },
   };

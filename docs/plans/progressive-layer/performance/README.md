@@ -465,3 +465,31 @@ information loss and defining aggregation weights; fewer retained points must no
 change the time-weighted meaning of an estimate. The current live stream already
 applies the configured depth-reference offset, so its output alone is insufficient
 for the proposed original-reference archive. No permanent thinning is enabled.
+
+## November 23: merged renderer and bounded-query experiment
+
+An isolated copy of the merged renderer ran inside the Pi's existing Signal K
+Docker environment against the real store, read-only, with three tile workers.
+Five rounds each requested nine tiles at zooms 13, 14 and 15, clearing tile and
+surface caches between views. Fresh-worker full views took 1.02–1.29 s; subsequent
+cold-cache views took 490–765 ms. First populated tiles in the initial round took
+401–832 ms. Concurrent Signal K HTTP probes (37 samples) had p95 233 ms and
+maximum 304 ms. These are server timings, not browser paint; background production
+load was uncontrolled. Cold startup remains above target. The active plugin was
+not replaced, and these tile measurements do not validate the later estimator
+integration changes.
+
+A separate read-only broad-viewport SQL experiment compared the current
+latitude-range query plus timestamp sort against center-out primary-key row
+seeks capped at 32 rows and 512 candidates. The current query took 2,511 ms on its
+first call and 260–290 ms on repeats. Bounded seeks took 4.4–6.4 ms. Both returned
+zero useful points in that first batch because its candidates were already
+refined. This proves a useful work bound, not a correct progressive query: bounded
+continuation, receipt filtering, empty/narrow views and fresh-point delivery still
+need implementation and tests. No index or schema was changed by the experiment.
+
+The merge review also found that production backfill disables shared prepared
+surfaces through its whole retry loop. Standalone viewport benchmarks have sharing
+enabled, so they do not represent this worst-case production mode. Retaining safe
+cache reuse between atomic refinement commits, with reliable invalidation on
+commit and worker failure, is a remaining performance priority.

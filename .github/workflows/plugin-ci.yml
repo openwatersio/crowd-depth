@@ -1,0 +1,21 @@
+# Signal K's shared plugin CI: installs, builds and tests the plugin on Linux,
+# macOS and Windows. The Signal K plugin registry looks for this run on the
+# commit each release is published from and scores the plugin by it.
+name: Signal K Plugin CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  plugin-ci:
+    uses: SignalK/signalk-server/.github/workflows/plugin-ci.yml@master
+    with:
+      working-directory: packages/signalk-plugin
+      # The plugin needs Node 24 or later for node:sqlite (engines in its package.json).
+      node-versions: '["24", "26"]'

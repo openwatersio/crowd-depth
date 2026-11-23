@@ -694,3 +694,53 @@ and the attempted fix was withdrawn. The existing cap-before-filter starvation
 remains a release blocker requiring bounded query work. Review limits and the
 confirmed maximum-gap stationary-thinning requirement are recorded in the
 performance notes. SSH was restored again for these Pi measurements.
+
+## Main integration checkpoint (November 23)
+
+The branch had fallen 37 commits behind main. Integrating `356ff743` preserves
+upstream preferred-source settings, metadata privacy, final-report flushing and
+live surface preview, alongside this branch's historical preview and weighted
+estimator. The historical source/API fields are now `historyPreview` and
+`historyPreviewRevision`; upstream's `preview` remains the live surface preview.
+Both can coexist and advance independently. Normal settings start immediately;
+legacy settings missing a depth path or geometry resolve before collection.
+Geometry inferred from a receiver pins that receiver for the running session so a
+preferred-source change cannot apply its offsets to another antenna. Manually
+configured upstream offsets keep the upstream source-selection behavior.
+
+Open Waters rounds 18 and 19 completed with Opus and Sonnet. Round 18 reviewed
+the broad merge; round 19 used an isolated snapshot of its follow-up fixes. Both
+were static reviews. Fixes include matching the pending surface estimator to the
+stored hourly weighted estimator, deduplicating already committed live passes,
+preserving published legacy cells in previews without moment summaries, resolving corrected
+GPS origins, and correcting metadata documentation. Follow-up review is tracked
+in the PR. Canceled snapshot attempts are excluded from completed rounds.
+
+Remaining reviewed blockers include source-provenance-aware archive migration,
+explicit sources with HTTP-only history providers, migration of cells lacking
+pass-ledger/moment evidence before their next live commit, bounded preview queries,
+backfill disabling shared surface caching for its entire retry loop, availability
+recovery, cache eviction, and refinement/live overlap correctness. Pending surface
+estimates retain the published cell while a half-life reweight is outstanding;
+provisional points remain a separate display, but the delayed surface refinement
+still needs an integration test and improvement. The fallback main-thread preview
+also needs a consistent database snapshot. These are not release approval.
+
+The active Pi Docker package remains `progressive-20261122-demand`. An isolated
+merged renderer was benchmarked without activating it. No archival thinning or
+production database migration was performed for these measurements.
+
+Round 20 also completed with Opus and Sonnet. It confirmed the pending-estimator
+math, but did not clear the branch for release. In addition to the blockers above,
+preferred raw/corrected GPS selection can vary at startup and change the derived
+configuration fingerprint between restarts, causing a rebuild and local-history
+cutoff. Removing an inferred depth-source pin can similarly change an old preview's
+fingerprint on upgrade. Resolve these together with source provenance and stable
+configuration migration before deployment; do not treat a passing fresh-store
+test as upgrade validation. Invalid geometry still prevents collection at startup.
+The new read-only estimator's dense multi-year pending-window cost also needs a
+Pi benchmark; the earlier tile timings do not cover it. No behavioral fixes were
+made after round 20; only these limitations were documented. Validation of this
+merge checkpoint: 502 unit tests, nine real Signal K integration tests, build,
+package lint/publint, scoped formatting/lint and diff checks pass. This remains a
+draft checkpoint, not a release or a new active Pi installation.

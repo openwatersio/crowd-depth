@@ -29,12 +29,70 @@ export function createLiveStream(app: ServerAPI, config: Config) {
     unsubscribes.forEach((f) => f());
   });
 
+  type Position = {
+    value: { longitude: number; latitude: number };
+    timestamp: string;
+    $source?: string;
+  };
+  /** The selected receiver's latest fix in the full model. */
+  const cachedPosition = (): Position | undefined => {
+    const cached = app.getSelfPath("navigation.position") as
+      | (Position & {
+          $source?: string;
+          values?: Record<string, Position>;
+        })
+      | undefined;
+    if (!config.gnss.source) return cached;
+    return sameSource(app, cached?.$source, config.gnss.source)
+      ? cached
+      : Object.entries(cached?.values ?? {}).find(([source]) =>
+          sameSource(app, source, config.gnss.source),
+        )?.[1];
+  };
+  let position = cachedPosition();
+  const explicitDepth = config.sounder.source;
+  const explicitGps = config.gnss.source;
+  // Separate subscriptions preserve server preference independently for each path.
+  app.subscriptionmanager.subscribe(
+    {
+      context: "vessels.self" as Context,
+      subscribe: [{ path: "navigation.position" as Path, policy: "instant" }],
+      sourcePolicy: explicitGps ? "all" : "preferred",
+    },
+    unsubscribes,
+    (error) => app.error(error as string),
+    (delta: Delta) => {
+      for (const update of delta.updates) {
+        const source =
+          update.$source ??
+          (update.source ? getSourceId(update.source) : undefined);
+        if (explicitGps && !sameSource(app, source, explicitGps)) continue;
+        if (!("values" in update)) continue;
+        for (const item of update.values) {
+          if (item.path !== "navigation.position") continue;
+          const value = item.value as Position["value"] | null;
+          position =
+            value &&
+            Number.isFinite(value.longitude) &&
+            Number.isFinite(value.latitude)
+              ? {
+                  value,
+                  $source: source,
+                  timestamp:
+                    update.timestamp ?? Temporal.Now.instant().toString(),
+                }
+              : undefined;
+        }
+      }
+    },
+  );
+
   // Subscribe to data updates
   app.subscriptionmanager.subscribe(
     {
       context: "vessels.self" as Context,
-      sourcePolicy: "all",
       subscribe: [{ path, policy: "instant" }],
+      sourcePolicy: explicitDepth ? "all" : "preferred",
     },
     unsubscribes,
     (error) => app.error(error as string),
@@ -43,40 +101,28 @@ export function createLiveStream(app: ServerAPI, config: Config) {
         const source =
           update.$source ??
           (update.source ? getSourceId(update.source) : undefined);
-        if (
-          config.sounder.source &&
-          !sameSource(app, source, config.sounder.source)
-        )
-          return;
+        if (explicitDepth && !sameSource(app, source, explicitDepth)) return;
         const timestamp = Temporal.Instant.from(
           update.timestamp ?? Temporal.Now.instant(),
         );
-        type Position = {
-          value: { longitude: number; latitude: number };
-          timestamp: string;
-        };
-        const positions = app.getSelfPath("navigation.position") as
-          | (Position & { $source?: string; values?: Record<string, Position> })
-          | undefined;
-        const position =
-          !config.gnss.source ||
-          sameSource(app, positions?.$source, config.gnss.source)
-            ? positions
-            : Object.entries(positions?.values ?? {}).find(([ref]) =>
-                sameSource(app, ref, config.gnss.source),
-              )?.[1];
 
         if ("values" in update) {
           update.values.forEach(({ path: valuePath, value }) => {
             if (
               valuePath !== path ||
               typeof value !== "number" ||
-              !Number.isFinite(value) ||
-              value <= 0
+              value === 0 ||
+              !Number.isFinite(value)
             )
               return;
             const depth = (value as number) + offset;
 
+            // Signal K 2.28 to 2.34 never attach a sourcePolicy "all" subscription
+            // to a path whose meta arrived before its first value
+            // (SignalK/signalk-server#3159), as after a restart, so read the full
+            // model when the subscription hasn't delivered a current fix.
+            if (!position || isStale(position, timestamp, ttl))
+              position = cachedPosition() ?? position;
             if (!position)
               return app.debug("No position data, ignoring depth data");
             if (isStale(position, timestamp, ttl))
@@ -102,7 +148,7 @@ export function createLiveStream(app: ServerAPI, config: Config) {
               heading,
               gnss: liveGnssQuality(
                 app,
-                config.gnss.source ?? positions?.$source,
+                config.gnss.source || position.$source,
                 timestamp,
               ),
             };

@@ -1,3 +1,9 @@
+import {
+  createServer as createTcpServer,
+  type AddressInfo,
+  type Socket,
+} from "node:net";
+import gpsdProvider from "../test/fixtures/gpsd-provider.json" with { type: "json" };
 import { afterEach, describe, expect, test } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer, type Server } from "node:http";
@@ -126,12 +132,20 @@ interface ServerOptions {
   /** crowd-depth is enabled at boot, or later through the admin API. */
   enableAtBoot: boolean;
   historyRows?: object[];
+  gpsdPort?: number;
+  schedule?: string;
+  pluginConfig?: Config;
+  priorityOverrides?: Record<string, { sourceRef: string; timeout: number }[]>;
 }
 
 async function startSignalK({
   trustedNodeUrl,
   enableAtBoot,
   historyRows,
+  gpsdPort,
+  schedule,
+  pluginConfig = config,
+  priorityOverrides,
 }: ServerOptions) {
   const configDir = await mkdtemp(join(tmpdir(), "crowd-depth-e2e-"));
   cleanups.push(() => rm(configDir, { recursive: true, force: true }));
@@ -156,11 +170,13 @@ async function startSignalK({
     join(configDir, "package.json"),
     JSON.stringify({ name: "e2e-config", private: true, dependencies }),
   );
+  const provider = structuredClone(gpsdProvider);
+  if (gpsdPort) provider.pipeElements[0].options!.port = gpsdPort;
   await writeFile(
     join(configDir, "settings.json"),
     JSON.stringify({
       interfaces: {},
-      pipedProviders: [],
+      pipedProviders: gpsdPort ? [provider] : [],
       gnssSensors: [
         {
           sensorId: "e2e",
@@ -171,6 +187,12 @@ async function startSignalK({
       ],
     }),
   );
+  if (priorityOverrides) {
+    await writeFile(
+      join(configDir, "priorities.json"),
+      JSON.stringify({ priorityOverrides }),
+    );
+  }
   await writeFile(
     join(configDir, "defaults.json"),
     JSON.stringify({
@@ -185,7 +207,12 @@ async function startSignalK({
   if (enableAtBoot) {
     await writeFile(
       join(configDir, "plugin-config-data", "crowd-depth.json"),
-      JSON.stringify({ enabled: true, configuration: config }),
+      JSON.stringify({
+        enabled: true,
+        configuration: gpsdPort
+          ? { ...config, gnss: { ...config.gnss, source: `${provider.id}.GP` } }
+          : pluginConfig,
+      }),
     );
   }
 
@@ -200,7 +227,7 @@ async function startSignalK({
         PORT: String(port),
         BATHY_URL: trustedNodeUrl,
         // Report every few seconds rather than every six hours.
-        BATHY_DEFAULT_SCHEDULE: "*/3 * * * * *",
+        BATHY_DEFAULT_SCHEDULE: schedule ?? "*/3 * * * * *",
         // Leave reports only the moment a sounding takes to reach storage,
         // not the minutes a buffering history provider needs.
         BATHY_REPORT_DELAY: "1",
@@ -246,11 +273,11 @@ async function startSignalK({
         () => log,
       );
     },
-    async enable() {
+    async enable(configuration = config) {
       const res = await fetch(`${base}/skServer/plugins/crowd-depth/config`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ enabled: true, configuration: config }),
+        body: JSON.stringify({ enabled: true, configuration }),
       });
       expect(res.ok, await res.text()).toBe(true);
     },
@@ -320,6 +347,23 @@ describe.skipIf(!RUN)("uploads from a real Signal K server", () => {
     });
     // Soundings sent before the plugin subscribes would be lost.
 
+    // Signal K must await the async hook before serializing its admin response.
+    const plugins = (await (
+      await fetch(`${sk.base}/skServer/plugins`)
+    ).json()) as {
+      id: string;
+      uiSchema?: unknown;
+    }[];
+    expect(
+      plugins.find((plugin) => plugin.id === "crowd-depth")?.uiSchema,
+    ).toEqual({
+      sounder: {
+        make: { "ui:placeholder": "" },
+        model: { "ui:placeholder": "" },
+      },
+      gnss: { make: { "ui:placeholder": "" }, model: { "ui:placeholder": "" } },
+    });
+
     const fix = (i: number) => ({
       path: "navigation.position",
       value: { latitude: -17.6 + i * 1e-4, longitude: 177.43 },
@@ -372,6 +416,95 @@ describe.skipIf(!RUN)("uploads from a real Signal K server", () => {
     expectAtTransducer(uploads.flatMap((u) => u.features));
   });
 
+  test("a settings restart flushes queued soundings with the previous sensor settings", async () => {
+    const node = await startTrustedNode();
+    const sk = await startSignalK({
+      trustedNodeUrl: node.url,
+      enableAtBoot: true,
+      schedule: "0 0 1 1 *",
+    });
+    await sk.waitForStatus(/Next report at/);
+    const update = (values: object[]) => ({
+      context: "vessels.self",
+      updates: [{ source: { label: "e2e" }, values }],
+    });
+    await sk.sendDeltas([
+      update([
+        {
+          path: "navigation.position",
+          value: { latitude: -17.6, longitude: 177.43 },
+        },
+        { path: "navigation.headingTrue", value: HEADING },
+      ]),
+      update([{ path: "environment.depth.belowTransducer", value: 3.2 }]),
+    ]);
+    // Flush ends on a whole second; let this sounding's second finish.
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    expect(node.uploads).toHaveLength(0);
+    await sk.enable({
+      ...config,
+      sounder: { ...config.sounder, model: "Replacement", z: 5 },
+    });
+    const upload = await node.next();
+    expectValidCsb(upload);
+    expect(upload.features.map((feature) => feature.properties.depth)).toEqual([
+      3.7,
+    ]);
+    expect(upload.properties.platform.sensors).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "Sounder", model: "DST800" }),
+      ]),
+    );
+  });
+
+  test.each(["disable", "anonymous"])(
+    "changing sharing to %s does not flush an identified report",
+    async (action) => {
+      const node = await startTrustedNode();
+      const sk = await startSignalK({
+        trustedNodeUrl: node.url,
+        enableAtBoot: true,
+        schedule: "0 0 1 1 *",
+      });
+      await sk.waitForStatus(/Next report at/);
+      const update = (values: object[]) => ({
+        context: "vessels.self",
+        updates: [{ source: { label: "e2e" }, values }],
+      });
+      await sk.sendDeltas([
+        update([
+          {
+            path: "navigation.position",
+            value: { latitude: -17.6, longitude: 177.43 },
+          },
+          { path: "navigation.headingTrue", value: HEADING },
+        ]),
+        update([{ path: "environment.depth.belowTransducer", value: 3.2 }]),
+      ]);
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      const response = await fetch(
+        `${sk.base}/skServer/plugins/crowd-depth/config`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            enabled: action !== "disable",
+            configuration: {
+              ...config,
+              sharing: { anonymous: action === "anonymous" },
+            },
+          }),
+        },
+      );
+      expect(response.ok, await response.text()).toBe(true);
+      await sk.waitForStatus(
+        action === "disable" ? /Stopped/ : /Next report at/,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      expect(node.uploads).toHaveLength(0);
+    },
+  );
+
   test("soundings read through the History API arrive measured from the waterline", async () => {
     const node = await startTrustedNode();
     const start = Date.now() - 60 * 60 * 1000;
@@ -405,4 +538,126 @@ describe.skipIf(!RUN)("uploads from a real Signal K server", () => {
     await new Promise((r) => setTimeout(r, 4000));
     expect(node.uploads).toEqual([]);
   });
+});
+
+describe.skipIf(!RUN)("identity hints through the real admin API", () => {
+  test.each([true, false])(
+    "GPSD replies=%s: plugin listing stays responsive",
+    async (respond) => {
+      let requests = 0;
+      const sockets = new Set<Socket>();
+      const gpsd = createTcpServer((socket) => {
+        sockets.add(socket);
+        socket.on("close", () => sockets.delete(socket));
+        socket.on("data", (data) => {
+          if (data.toString().includes("?DEVICES;")) {
+            requests++;
+            if (respond)
+              socket.end(
+                '{"class":"DEVICES","devices":[{"driver":"Garmin USB binary"}]}\n',
+              );
+          }
+        });
+      }).listen(0, "127.0.0.1");
+      await once(gpsd, "listening");
+      cleanups.push(async () => {
+        for (const socket of sockets) socket.destroy();
+        await new Promise<void>((resolve) => gpsd.close(() => resolve()));
+      });
+      const node = await startTrustedNode();
+      const sk = await startSignalK({
+        trustedNodeUrl: node.url,
+        enableAtBoot: true,
+        gpsdPort: (gpsd.address() as AddressInfo).port,
+      });
+      await sk.waitForStatus(/Next report at/);
+      const hints = async () => {
+        const response = await fetch(`${sk.base}/skServer/plugins`);
+        expect(response.ok).toBe(true);
+        const plugins = (await response.json()) as {
+          id: string;
+          uiSchema: { gnss: { make: { "ui:placeholder": string } } };
+        }[];
+        return plugins.find((p) => p.id === "crowd-depth")!.uiSchema.gnss.make[
+          "ui:placeholder"
+        ];
+      };
+      const start = performance.now();
+      const values = await Promise.all(Array.from({ length: 6 }, hints));
+      expect(performance.now() - start).toBeLessThan(1000);
+      if (respond) {
+        await waitFor(async () => (await hints()) === "Garmin", sk.log);
+      } else {
+        expect(values).toEqual(Array(6).fill(""));
+      }
+      await waitFor(async () => requests === 1, sk.log);
+      expect(requests).toBe(1);
+    },
+  );
+});
+
+describe.skipIf(!RUN)("source selection through Signal K subscriptions", () => {
+  test.each(["", "chosen.XX"])(
+    "selected source %j respects preferred or explicit delivery",
+    async (selected) => {
+      const node = await startTrustedNode();
+      const priorities = [
+        { sourceRef: "preferred.XX", timeout: 60000 },
+        { sourceRef: "chosen.XX", timeout: 60000 },
+      ];
+      const sk = await startSignalK({
+        trustedNodeUrl: node.url,
+        enableAtBoot: true,
+        pluginConfig: {
+          ...config,
+          sounder: { ...config.sounder, x: 0, y: 0, z: 0, source: selected },
+          gnss: { ...config.gnss, x: 0, y: 0, source: selected },
+        },
+        priorityOverrides: {
+          "navigation.position": priorities,
+          "environment.depth.belowTransducer": priorities,
+        },
+      });
+      await sk.waitForStatus(/Next report at/);
+      const context = (await (
+        await fetch(`${sk.base}/signalk/v1/api/self`)
+      ).json()) as string;
+      const delta = (label: string, values: object[]) => ({
+        context,
+        updates: [{ $source: `${label}.XX`, source: { label }, values }],
+      });
+      await sk.sendDeltas([
+        delta("preferred", [
+          { path: "navigation.position", value: { longitude: 1, latitude: 2 } },
+        ]),
+        delta("chosen", [
+          {
+            path: "navigation.position",
+            value: { longitude: 10, latitude: 20 },
+          },
+        ]),
+        delta("preferred", [
+          { path: "environment.depth.belowTransducer", value: 90 },
+        ]),
+        delta("chosen", [
+          { path: "environment.depth.belowTransducer", value: 3 },
+        ]),
+      ]);
+      const current = (await (
+        await fetch(
+          `${sk.base}/signalk/v1/api/vessels/self/environment/depth/belowTransducer`,
+        )
+      ).json()) as { $source: string };
+      expect(current.$source).toBe("preferred.XX");
+      const uploads = await node.collect(1);
+      expect(
+        uploads.flatMap((u) => u.features.map((f) => f.properties.depth)),
+      ).toEqual([selected ? 3 : 90]);
+      expect(
+        uploads.flatMap((u) =>
+          u.features.map((f) => f.geometry.coordinates.slice(0, 2)),
+        ),
+      ).toEqual([selected ? [10, 20] : [1, 2]]);
+    },
+  );
 });

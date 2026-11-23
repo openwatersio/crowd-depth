@@ -1,6 +1,6 @@
-import { detectGpsdSensor } from "./gpsd-info.js";
-import { gnssOffsets } from "./gnss-offsets.js";
 import { setTimeout as sleep } from "node:timers/promises";
+import { createSourceDiscovery } from "./source-discovery.js";
+import { gnssOffsets } from "./gnss-offsets.js";
 import { ServerAPI, Plugin } from "@signalk/server-api";
 import {
   schema,
@@ -17,13 +17,19 @@ import { settleSource } from "./sources/settle.js";
 import { createDB } from "./storage.js";
 import { join } from "path";
 import { createCollector } from "./collector.js";
-import { createStatus } from "./status.js";
+import { createStatus, Status } from "./status.js";
 import { startChartSafely } from "./chart.js";
-import { createSourceDiscovery } from "./source-discovery.js";
+
+interface Session {
+  controller: AbortController;
+  reporting: AbortController;
+  anonymous: boolean;
+  reporter?: ReturnType<typeof createReporter>;
+  stopping?: Promise<void>;
+}
 
 export default function createPlugin(app: ServerAPI): Plugin {
-  let abortController: AbortController | undefined = undefined;
-  const discoverSources = createSourceDiscovery(app);
+  let current: Session | undefined;
 
   return {
     id: "crowd-depth",
@@ -31,62 +37,21 @@ export default function createPlugin(app: ServerAPI): Plugin {
     description:
       "Collect and share depth data with crowd-sourced bathymetry programs",
 
-    async start(options: Omit<Config, "path"> & { path?: Config["path"] }) {
+    start(config: Config) {
       app.debug("Starting (ENV=%s)", ENV);
       const status = createStatus(app);
 
-      // A restart can replace abortController while this start still waits.
+      // Each start owns its lifetime, including an outstanding final upload.
       const controller = new AbortController();
-      abortController = controller;
-      void initialize().catch((error: unknown) => {
-        if (!controller.signal.aborted) status.error(error);
-      });
-
-      async function initialize() {
-        status.set({ waitingForDepth: true });
-        let selected;
-        let gpsSource: string | undefined;
-        while (!controller.signal.aborted) {
-          // Live source identities do not need an all-history metadata query.
-          selected = selectDepth(app, options.sounder.source, {}, options.path);
-          gpsSource = resolveSource(
-            app,
-            options.gnss.source,
-            "navigation.position",
-          );
-          if (selected && gpsSource) break;
-          const recorded = await discoverSources();
-          if (controller.signal.aborted) return;
-          selected = selectDepth(
-            app,
-            options.sounder.source,
-            recorded,
-            options.path,
-          );
-          const positionSources = (
-            recorded["navigation.position"] ?? []
-          ).filter((source) => source !== "derived-data");
-          gpsSource =
-            resolveSource(app, options.gnss.source, "navigation.position") ??
-            (positionSources.length === 1 ? positionSources[0] : undefined);
-          if (selected && gpsSource) break;
-          await sleep(2000, undefined, { signal: controller.signal });
-        }
-        if (!selected || !gpsSource || controller.signal.aborted) return;
-        status.set({ waitingForDepth: false });
-        const geometry = gnssOffsets(app, gpsSource, options.gnss);
-        const config: Config = {
-          ...options,
-          path: selected.path,
-          sounder: { ...options.sounder, source: selected.source },
-          gnss: { ...options.gnss, ...geometry.gnss, source: gpsSource },
-          positionOrigin: geometry.positionOrigin,
-        };
-        app.debug(
-          "Selected depth source %s, path %s",
-          selected.source,
-          selected.path,
-        );
+      current?.controller.abort("Replaced crowd-depth instance");
+      current?.reporting.abort("Replaced crowd-depth instance");
+      const session: Session = {
+        controller,
+        reporting: new AbortController(),
+        anonymous: config.sharing?.anonymous === true,
+      };
+      current = session;
+      const ready = (config: Config) => {
         const db = createDB(join(app.getDataDirPath(), `bathymetry.sqlite`));
         const chart = startChartSafely({
           app,
@@ -95,54 +60,197 @@ export default function createPlugin(app: ServerAPI): Plugin {
           signal: controller.signal,
         });
 
-        const sqlite = createSqliteSource(app, db);
-        const source = await settleSource({
-          findHistory: () => createHistorySource(app, config),
-          sqlite,
-          record: (signal) =>
-            createCollector({
-              app,
-              config,
-              writer: sqlite.createWriter!(),
-              signal,
-            }).catch((err: unknown) => {
-              if (!signal.aborted) status.error(err as Error, "collector");
-            }),
-          status,
-          wait: BATHY_HISTORY_WAIT,
-          signal: controller.signal,
-        });
-        if (!source) return;
-
-        void chart?.backfill(source);
-
-        createReporter({
+        // Settling can wait up to BATHY_HISTORY_WAIT for a history provider, so
+        // it runs in the background and start() doesn't hold up the server.
+        void settleAndReport({
           app,
           config,
-          source,
           db,
+          chart,
           status,
-          signal: controller.signal,
+          session,
+        }).catch((err: unknown) => {
+          if (!controller.signal.aborted) status.error(err as Error);
         });
+      };
+      // Older progressive previews saved neither a path nor horizontal offsets.
+      // Keep that configuration usable; normal upstream settings start immediately.
+      if (
+        config.path &&
+        Number.isFinite(config.gnss.x) &&
+        Number.isFinite(config.gnss.y) &&
+        !resolveSource(
+          app,
+          config.gnss.source,
+          "navigation.position",
+        )?.endsWith(".ccrp")
+      ) {
+        ready(config);
+      } else {
+        void resolveLegacyConfig(app, config, controller.signal, status)
+          .then((resolved) => {
+            if (!controller.signal.aborted) ready(resolved);
+          })
+          .catch((error: unknown) => {
+            if (!controller.signal.aborted) status.error(error);
+          });
       }
     },
 
-    stop() {
-      abortController?.abort("Stopping crowd-depth plugin");
+    stop(options) {
+      const session = current;
+      if (!session) return Promise.resolve();
+      session.controller.abort("Stopping crowd-depth collection");
+      try {
+        const saved = app.readPluginOptions?.() as
+          { enabled?: boolean; configuration?: Partial<Config> } | undefined;
+        // Recheck even during a flush: another settings request can withdraw sharing.
+        const morePrivate =
+          saved?.configuration?.sharing?.anonymous && !session.anonymous;
+        if (
+          options?.reason === "disable" ||
+          saved?.enabled === false ||
+          morePrivate
+        )
+          session.reporting.abort("Sharing disabled or made anonymous");
+      } catch (error) {
+        session.reporting.abort("Could not read sharing settings");
+        app.error(`Final report skipped: ${error}`);
+      }
+      if (session.stopping) return session.stopping;
+      session.stopping = (async () => {
+        try {
+          if (!session.reporting.signal.aborted)
+            await session.reporter?.flush();
+        } catch (error) {
+          if (!session.reporting.signal.aborted)
+            app.error(
+              `Final report failed; unreported data remains queued: ${error}`,
+            );
+        } finally {
+          session.reporting.abort("Stopping crowd-depth reporter");
+        }
+      })();
+      return session.stopping;
     },
 
-    async uiSchema() {
-      const recorded = await discoverSources();
-      const result = uiSchema(app, recorded);
-      const gpsSource = schema(app, recorded).properties.gnss.properties.source
-        .default;
-      const gpsd = await detectGpsdSensor(app, gpsSource);
-      result.gnss.make["ui:placeholder"] ||= gpsd.make ?? "";
-      return result;
+    uiSchema() {
+      return uiSchema(app);
     },
 
-    async schema() {
-      return schema(app, await discoverSources());
+    schema() {
+      return schema(app);
     },
   };
+}
+
+interface SettleAndReportOptions {
+  app: ServerAPI;
+  config: Config;
+  db: ReturnType<typeof createDB>;
+  chart: ReturnType<typeof startChartSafely>;
+  status: Status;
+  session: Session;
+}
+
+async function settleAndReport({
+  app,
+  config,
+  db,
+  chart,
+  status,
+  session,
+}: SettleAndReportOptions) {
+  const { controller } = session;
+  const sqlite = createSqliteSource(app, db);
+  const source = await settleSource({
+    findHistory: () => createHistorySource(app, config),
+    sqlite,
+    record: (signal) =>
+      createCollector({
+        app,
+        config,
+        writer: sqlite.createWriter!(),
+        signal,
+      }).catch((err: unknown) => {
+        if (!signal.aborted) status.error(err as Error, "collector");
+      }),
+    status,
+    wait: BATHY_HISTORY_WAIT,
+    signal: controller.signal,
+  });
+  if (!source || controller.signal.aborted) return;
+
+  void chart?.backfill(source);
+
+  session.reporter = createReporter({
+    app,
+    config,
+    source,
+    db,
+    status,
+    signal: session.reporting.signal,
+  });
+}
+
+async function resolveLegacyConfig(
+  app: ServerAPI,
+  config: Config,
+  signal: AbortSignal,
+  status: Status,
+): Promise<Config> {
+  const discover = createSourceDiscovery(app);
+  let resolved = config;
+  if (!resolved.path) status.set({ waitingForDepth: true });
+  while (!resolved.path) {
+    signal.throwIfAborted();
+    const depth =
+      selectDepth(app, config.sounder.source) ??
+      selectDepth(app, config.sounder.source, await discover());
+    if (depth) {
+      resolved = {
+        ...config,
+        path: depth.path,
+      };
+    } else await sleep(2000, undefined, { signal });
+  }
+  status.set({ waitingForDepth: false });
+  if (
+    !Number.isFinite(resolved.gnss.x) ||
+    !Number.isFinite(resolved.gnss.y) ||
+    resolveSource(app, resolved.gnss.source, "navigation.position")?.endsWith(
+      ".ccrp",
+    )
+  ) {
+    let source = resolveSource(
+      app,
+      resolved.gnss.source,
+      "navigation.position",
+    );
+    if (!source) {
+      status.error(
+        new Error(
+          "Waiting for the selected GPS source to resolve its antenna geometry",
+        ),
+        "configuration",
+      );
+      while (!source) {
+        await sleep(2000, undefined, { signal });
+        source = resolveSource(
+          app,
+          resolved.gnss.source,
+          "navigation.position",
+        );
+      }
+    }
+    status.clearError("configuration");
+    const geometry = gnssOffsets(app, source, resolved.gnss);
+    resolved = {
+      ...resolved,
+      // Inferred geometry belongs to this receiver, including its correction mode.
+      gnss: { ...resolved.gnss, ...geometry.gnss, source },
+      positionOrigin: geometry.positionOrigin,
+    };
+  }
+  return resolved;
 }

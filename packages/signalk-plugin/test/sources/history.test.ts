@@ -424,3 +424,37 @@ test("availability uses the same selected sounder as detailed history reads", as
   );
   expect(calls[0][0].sourceRef).toBe("chosen");
 });
+
+test("preferred history does not pin today's live source onto old recordings", async () => {
+  const { app: testApp, calls } = providerApp({ data: [] });
+  testApp.getSelfPath = () => ({ $source: "current.receiver" });
+  const source = await createHistorySource(testApp, {
+    ...config,
+    gnss: { ...config.gnss, source: "" },
+    sounder: { ...config.sounder, source: "" },
+  });
+  await source!.createReader(new Timeframe(from, to));
+  expect(calls[0].every((spec) => spec.sourceRef === undefined)).toBe(true);
+});
+
+test("explicit selection does not silently use unfiltered legacy HTTP history", async () => {
+  nock("http://legacy.test")
+    .get("/signalk/v1/history/contexts")
+    .query(true)
+    .reply(200, { data: [] });
+  const source = await createHistorySource(
+    app,
+    { ...config, sounder: { ...config.sounder, source: "chosen" } },
+    { host: "http://legacy.test/" },
+  );
+  expect(source).toBeDefined();
+  await expect(source!.createReader(new Timeframe(from, to))).rejects.toThrow(
+    "Legacy HTTP history cannot filter sensor sources",
+  );
+  await expect(
+    source!.getAvailableTimeframes(
+      new Timeframe(from, to),
+      Temporal.Duration.from({ hours: 1 }),
+    ),
+  ).rejects.toThrow("Legacy HTTP history cannot filter sensor sources");
+});

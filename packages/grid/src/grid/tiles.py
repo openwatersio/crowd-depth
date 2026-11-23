@@ -37,7 +37,7 @@ from pathlib import Path
 import duckdb
 import numpy as np
 
-from . import calibrate, catalog, cells, leaves, manifest, overlay, qc, surface
+from . import calibrate, catalog, cells, deep, leaves, manifest, overlay, qc, surface
 from .catalog import ACTIVE_POINTS, BASE_ROW, MIGRATIONS, POINT_ID, SCHEMA, open_store
 from .cells import BASE, CELL_REASONS, K_LIST
 from .sources import literal
@@ -1207,6 +1207,9 @@ def run_locked(store, run, cores, memory_mb, dry_run, publish_to=None, take_down
             return 0
         hint = "; --take-down unpublishes what went out" if publish_to is not None else ""
         raise RuntimeError("nothing to tile: the store has no active soundings" + hint)
+    if not dry_run:
+        # Once here, so the cells jobs don't each download GEBCO at once.
+        deep.ensure()
     # The machine's cores, and three quarters of its memory, by default: what runs beside
     # the jobs needs the rest.
     cores = cores or machine()[0]

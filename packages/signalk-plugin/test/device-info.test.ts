@@ -2,71 +2,87 @@ import { expect, test } from "vitest";
 import type { ServerAPI } from "@signalk/server-api";
 import { detectSensor } from "../src/device-info.js";
 
-const device = {
-  manufacturerCode: "Airmar",
-  modelId: "DT200",
-  modelVersion: "IDTP65-40-1,HW2:3,OEM0",
-  softwareVersionCode: "4.003,4.004",
-  productCode: 5602,
-  modelSerialCode: "A000GYRA",
-  canName: "c078820010eb32c0",
-};
 const app = {
   getPath: () => ({
-    canhat: {
-      "35": { n2k: device },
-      "36": { n2k: { manufacturerCode: "Garmin", modelId: "GPS" } },
+    bus: {
+      "12": {
+        n2k: {
+          manufacturerCode: "Vendor A",
+          modelId: "Model A",
+          canName: "stable-id",
+        },
+      },
+      "13": { n2k: { manufacturerCode: "Vendor B", modelId: "Model B" } },
     },
   }),
 } as unknown as ServerAPI;
 
-test("reports the selected device's identity without guessing a retail model", () => {
-  expect(detectSensor(app, "canhat.35", false)).toEqual({
-    make: "Airmar",
-    model: "DT200",
-    nmea2000: {
-      modelId: "DT200",
-      modelVersion: device.modelVersion,
-      softwareVersionCode: device.softwareVersionCode,
-      productCode: 5602,
-      modelSerialCode: "A000GYRA",
-      canName: device.canName,
-    },
+test("uses the selected device by address or stable CAN name", () => {
+  for (const source of ["bus.12", "bus.stable-id"]) {
+    expect(detectSensor(app, source)).toEqual({
+      make: "Vendor A",
+      model: "Model A",
+    });
+  }
+  expect(detectSensor(app, "bus.13")).toEqual({
+    make: "Vendor B",
+    model: "Model B",
   });
-  expect(detectSensor(app, `canhat.${device.canName}`, false)).toEqual(
-    detectSensor(app, "canhat.35", false),
-  );
 });
 
-test("anonymous reports exclude hardware identifiers but retain model and firmware", () => {
-  const result = detectSensor(app, "canhat.35", true);
-  expect(result.nmea2000?.modelSerialCode).toBeUndefined();
-  expect(result.nmea2000?.canName).toBeUndefined();
-  expect(result.nmea2000?.modelVersion).toBe(device.modelVersion);
-});
-
-test("missing and non-NMEA sources do not borrow another device's metadata", () => {
-  for (const source of [undefined, "canhat.99", "gpsd.GP", "derived-data"]) {
-    expect(detectSensor(app, source, false)).toEqual({});
+test("does not borrow identity from other devices", () => {
+  for (const source of [undefined, "bus.99", "gpsd.GP", "derived-data"]) {
+    expect(detectSensor(app, source)).toEqual({});
   }
 });
 
-test("ignores malformed fields rather than sending invalid metadata", () => {
-  const invalid = {
+test("ignores numeric manufacturer codes and malformed model names", () => {
+  const malformed = {
+    getPath: () => ({
+      bus: { "1": { n2k: { manufacturerCode: 135, modelId: {} } } },
+    }),
+  } as unknown as ServerAPI;
+  expect(detectSensor(malformed, "bus.1")).toEqual({
+    make: undefined,
+    model: undefined,
+  });
+});
+
+test("report metadata preserves firmware but never includes device identifiers", async () => {
+  const { detectSensorDetails } = await import("../src/device-info.js");
+  const detailed = {
     getPath: () => ({
       bus: {
         "1": {
           n2k: {
-            manufacturerCode: 135,
-            modelId: " ",
-            productCode: NaN,
-            modelVersion: {},
+            manufacturerCode: "Vendor",
+            modelId: "Model",
+            modelVersion: "HW2",
+            softwareVersionCode: "1.2",
+            productCode: 42,
+            modelSerialCode: "serial",
+            canName: "stable",
           },
         },
       },
     }),
   } as unknown as ServerAPI;
-  expect(
-    JSON.parse(JSON.stringify(detectSensor(invalid, "bus.1", false))),
-  ).toEqual({ nmea2000: {} });
+  const identified = detectSensorDetails(detailed, "bus.stable", false);
+  expect(identified).toMatchObject({
+    make: "Vendor",
+    model: "Model",
+    nmea2000: {
+      modelVersion: "HW2",
+      softwareVersionCode: "1.2",
+      productCode: 42,
+    },
+  });
+  expect(identified.nmea2000).not.toHaveProperty("modelSerialCode");
+  expect(identified.nmea2000).not.toHaveProperty("canName");
+  const anonymous = detectSensorDetails(detailed, "bus.1", true);
+  expect(anonymous.nmea2000).not.toHaveProperty("modelSerialCode");
+  expect(anonymous.nmea2000).not.toHaveProperty("canName");
+  expect(anonymous.nmea2000).not.toHaveProperty("modelVersion");
+  expect(anonymous.nmea2000).not.toHaveProperty("softwareVersionCode");
+  expect(detectSensorDetails(detailed, "bus.2", false)).toEqual({});
 });
