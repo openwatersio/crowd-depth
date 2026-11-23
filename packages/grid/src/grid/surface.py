@@ -40,7 +40,7 @@ from scipy.spatial import cKDTree
 
 from . import deep, statistic
 from .catalog import MIN_DEPTH_M
-from .cells import BASE, CELL_SAMPLE, k_for
+from .cells import BASE, CELL_SAMPLE, MAX_PUBLISHED_DEPTH_M, k_for
 from .definitions import SURFACE
 from .qc import HAZARD_M, MAX_DEPTH_M, QC_VERSION, SHALLOW_M
 
@@ -134,10 +134,12 @@ SELECT py, px, hash(vessel) AS v, median(d) AS m, median(sigma) AS s
 FROM surface_points WHERE keep GROUP BY py, px, vessel ORDER BY py, px, v, m
 """
 
-# Each sounded pixel's soundings, those of them that vote, and its shoalest confirmed
-# shoal, which no pixel may be deeper than; north to south, as the raster's rows run.
-COUNTS = """
-SELECT py, px, count(*) AS n, count(*) FILTER (WHERE NOT unconfirmed) AS votes,
+# Each sounded pixel's soundings, those of them shallow enough to publish, those of them
+# that vote, and its shoalest confirmed shoal, which no pixel may be deeper than; north to
+# south, as the raster's rows run.
+COUNTS = f"""
+SELECT py, px, count(*) AS n, count(*) FILTER (WHERE d::FLOAT < {MAX_PUBLISHED_DEPTH_M}) AS shallow,
+  count(*) FILTER (WHERE NOT unconfirmed) AS votes,
   min(d) FILTER (WHERE confirmed) AS confirmed
 FROM surface_points GROUP BY ALL ORDER BY py DESC, px
 """
@@ -153,9 +155,10 @@ def entries(con, params, counts=True):
 
 
 def tiles(con):
-    """Every tile with cells, with its 10° partition."""
+    """Every tile that publishes a cell or a shoal, with its 10° partition."""
     return con.execute(
-        "SELECT DISTINCT tile_id, cell_id FROM lake.cells ORDER BY tile_id"
+        "SELECT tile_id, cell_id FROM lake.cells UNION SELECT tile_id, cell_id FROM lake.shoals"
+        " ORDER BY tile_id"
     ).fetchall()
 
 
@@ -264,7 +267,7 @@ def grid_tile(tile_id: int, got, out: Path):
     cpx = np.clip(counted["px"].astype(np.int64), 0, cols - 1)
     # NULL, a pixel without one, comes back masked: as NaN, never as its 0 fill.
     shoal = np.ma.filled(np.ma.asarray(counted["confirmed"], dtype=np.float32), np.nan)
-    sounded_at = Sounded(ROWS - 1 - cpy, cpx, np.asarray(counted["n"], dtype=np.float32), shoal)
+    sounded_at = Sounded(ROWS - 1 - cpy, cpx, counted["n"], counted["shallow"], shoal)
     # Every pixel with a vote, this tile's and its neighbors', in metres: distance is to
     # the nearest, wherever it is, and a pixel holding only shoals the surface ignores
     # isn't sounded for it.
@@ -370,17 +373,24 @@ def grid_tile(tile_id: int, got, out: Path):
                 qx, qy = cc + c0, ROWS - 1 - (rr + r0)
                 distance[rr, cc] = sounded.query(np.column_stack([qx * dx, qy * dy]))[0]
                 sigma[rr, cc] = sigma_of(qx, qy, distance[rr, cc])
-                count, confirmed = sounded_at.rasters(wr0, wc0, wr1, wc1)
+                count, shallow, confirmed = sounded_at.rasters(wr0, wc0, wr1, wc1)
                 depth = finish(surface, sigma, around(confirmed)[inner])
                 # In deep water, a pixel its margin takes shoaler than any sounding there may
-                # read doesn't know its depth: left empty, as cells leave theirs out.
-                depth[depth < floor(r0, c0, r1, c1)] = NODATA
+                # read doesn't know its depth: left empty, as cells leave theirs out. Deep votes
+                # shape the surface near the publishing limit, but nothing at or past it
+                # publishes. A pixel left empty for either has no count: the overlay covers
+                # any sounding published in it. One the surface didn't reach counts only
+                # soundings shallow enough to publish, so coverage reaches no deeper water.
+                had = depth != NODATA
+                dropped = had & ((depth < floor(r0, c0, r1, c1)) | (depth >= MAX_PUBLISHED_DEPTH_M))
+                depth[dropped] = NODATA
                 distance[depth == NODATA] = NODATA
                 sigma[depth == NODATA] = NODATA
                 near_px = np.where(depth == NODATA, NODATA, only_near.pop(key)).astype(np.float32)
                 # No soundings is no data, as a block left out reads: a leaf's splice writes
                 # only the blocks it has data in (tiles.do_surface).
-                counted = np.where(count[inner] > 0, count[inner], NODATA)
+                count = np.where(had, np.where(dropped, 0, count[inner]), shallow[inner])
+                counted = np.where(count > 0, count, NODATA)
                 dst.write(
                     np.stack([depth, distance, counted, sigma, near_px]),
                     window=Window(c0, r0, c1 - c0, r1 - r0),
@@ -390,22 +400,24 @@ def grid_tile(tile_id: int, got, out: Path):
 
 
 class Sounded:
-    """The tile's sounded pixels, by row and column: each one's soundings and its shoalest
-    confirmed shoal (NaN for none), rasterized a window at a time, so a tile holds its
-    windows' rasters, not the whole tile's: 16 bytes a sounded pixel, against 8 a pixel."""
+    """The tile's sounded pixels, by row and column: each one's soundings, those of them
+    shallow enough to publish, and its shoalest confirmed shoal (NaN for none), rasterized
+    a window at a time, so a tile holds its windows' rasters, not the whole tile's: 20
+    bytes a sounded pixel, against 12 a pixel."""
 
-    def __init__(self, rows, cols, n, shoal):
+    def __init__(self, rows, cols, n, shallow, shoal):
         rows, cols = np.asarray(rows, dtype=np.int32), np.asarray(cols, dtype=np.int32)
+        n, shallow = np.asarray(n, dtype=np.float32), np.asarray(shallow, dtype=np.float32)
+        shoal = np.asarray(shoal, dtype=np.float32)
         # COUNTS returns them in row order; sorted only if not.
         if len(rows) and (np.diff(rows) < 0).any():
             order = np.argsort(rows, kind="stable")
-            rows, cols, n, shoal = rows[order], cols[order], n[order], shoal[order]
+            rows, cols, n, shallow, shoal = (a[order] for a in (rows, cols, n, shallow, shoal))
         self.rows, self.cols = rows, cols
-        self.n = np.asarray(n, dtype=np.float32)
-        self.shoal = np.asarray(shoal, dtype=np.float32)
+        self.n, self.shallow, self.shoal = n, shallow, shoal
 
     def rasters(self, r0, c0, r1, c1):
-        """(soundings, shoalest confirmed shoal or inf) for rows [r0, r1), columns [c0,
+        """(soundings, shallow soundings, shoalest confirmed shoal or inf) for rows [r0, r1), columns [c0,
         c1). Accumulated, not assigned: a sounding on the tile's north or east edge is its
         own group in SQL but shares the last pixel, and must not overwrite its values."""
         a, b = np.searchsorted(self.rows, [r0, r1])
@@ -413,10 +425,12 @@ class Sounded:
         at = self.rows[i] - r0, self.cols[i] - c0
         count = np.zeros((r1 - r0, c1 - c0), dtype=np.float32)
         np.add.at(count, at, self.n[i])
+        shallow = np.zeros((r1 - r0, c1 - c0), dtype=np.float32)
+        np.add.at(shallow, at, self.shallow[i])
         confirmed = np.full((r1 - r0, c1 - c0), np.inf, dtype=np.float32)
         has = ~np.isnan(self.shoal[i])
         np.minimum.at(confirmed, (at[0][has], at[1][has]), self.shoal[i][has])
-        return count, confirmed
+        return count, shallow, confirmed
 
 
 class Near:

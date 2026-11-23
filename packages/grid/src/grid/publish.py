@@ -128,8 +128,9 @@ def publish_locked(run, objects, lock, now):
                 entry[kind] = key
                 uploads.append((key, path))
             elif kind != "surface":
-                # A tile with no cells has no surface, but every live tile has cells and
-                # areas: without them its published files would be withdrawn.
+                # A tile that publishes nothing has no surface, but every live tile has
+                # cells and areas files, empty or not: without them its published files
+                # would be withdrawn.
                 raise RuntimeError(f"{path} is missing: the run didn't finish")
         current[str(tile)] = entry
 

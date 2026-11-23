@@ -990,15 +990,16 @@ def test_deep_water_rejects_a_lost_bottom_and_keeps_a_bank(env, tmp_path, monkey
     build(env)
     assert env.query("SELECT count(*) FROM lake.cells WHERE median > 700 AND depth < 750") == [(0,)]
     assert env.query("SELECT count(*) FROM lake.cells WHERE median > 700 AND sigma > 300") == [(0,)]
-    # Nor does the surface draw them shoaler: its pixels around the ships are empty or deep.
+    # Nor does the surface draw them: its pixels around the ships are empty, and with no
+    # sounding count, so no coverage is drawn over them.
     tile = (LAT0 + 90) * 360 + LON0 + 180
     with open_store(env.store, write=False) as con:
         [(partition,)] = con.execute("SELECT DISTINCT cell_id FROM lake.cells").fetchall()
         path = surface.build_tile(con, tile, partition, tmp_path / "surface")
     with rasterio.open(path) as src:
-        depth = src.read(1)
-    ships = depth[surface.ROWS - 1 - 7010 // 2 : surface.ROWS - 1 - 6990 // 2, :20]
-    assert ((ships == surface.NODATA) | (ships >= 750)).all()
+        depth, count = src.read(1), src.read(3)
+    around = np.s_[surface.ROWS - 1 - 7010 // 2 : surface.ROWS - 1 - 6990 // 2, :20]
+    assert (depth[around] == surface.NODATA).all() and (count[around] == surface.NODATA).all()
     assert {(f, reason) for f, reason, d in flags(env) if d < 1} == {("reject", "deep_reference")}
     assert {d for f, reason, d in flags(env) if reason == "deep_reference"} == {
         float32(d) for d in (0.5, 0.6, 0.7)

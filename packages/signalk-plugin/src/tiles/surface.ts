@@ -44,9 +44,9 @@ export const CELL_M = (2 * M_PER_DEG_LAT) / DEFINITIONS.cells.rows_per_degree;
 const BLUR_M = blur_px * CELL_M;
 const MAX_POINTS = 12;
 const MIN_POINTS = 3;
-/** Areas and contours stop here, as the grid's: deeper crowd soundings are mostly
- * sounders that lost the bottom. */
-export const MAX_AREA_DEPTH_M = 200;
+/** Only depths shallower than this are drawn, as in the grid: deeper crowd soundings are
+ * mostly sounders that lost the bottom. */
+export const MAX_PUBLISHED_DEPTH_M = DEFINITIONS.cells.max_published_depth_m;
 /** The deepest band's floor below chart datum, as the grid's drying band. */
 const DRYING_FLOOR_M = -30;
 /** How finely depths are drawn: contours every metre and every foot, or the chart's
@@ -73,7 +73,7 @@ const SIMPLIFY_MAX_ZOOM_UNITS = SIMPLIFY_UNITS / 4;
  * as lines: where its edge parts from the areas' by half a pixel, it doesn't show. */
 const AREA_SHARE = 1 / 4;
 export const MIN_ZOOM = 4;
-const LEVELS = P.isobaths_m.filter((l) => l <= MAX_AREA_DEPTH_M);
+const LEVELS = P.isobaths_m.filter((l) => l <= MAX_PUBLISHED_DEPTH_M);
 /** Depths finely drawn reach as deep as this; past it, the chart's isobaths. */
 const FINE_MAX_M = 50;
 /** Bands finely drawn: every metre to FINE_MAX_M, then the chart's. */
@@ -98,7 +98,7 @@ const FINE_CONTOURS: Level[] = [
   })),
   // Deeper, the chart's, in either unit.
   ...P.isobaths_m
-    .filter((l) => l > FINE_MAX_M && l <= MAX_AREA_DEPTH_M)
+    .filter((l) => l > FINE_MAX_M && l <= MAX_PUBLISHED_DEPTH_M)
     .map((m) => ({ m })),
 ];
 const POSACC_M = 10;
@@ -182,7 +182,7 @@ export function areaBand(d: number, fine: boolean): number {
 export function contourLevels(z: number): number[] {
   const tier = P.contour_tiers.find((t) => z < t.below_zoom);
   return (tier?.isobaths_m ?? P.isobaths_m).filter(
-    (l) => l <= MAX_AREA_DEPTH_M,
+    (l) => l <= MAX_PUBLISHED_DEPTH_M,
   );
 }
 
@@ -698,6 +698,16 @@ export function areasAndContours(
   return { DEPARE, DEPCNT };
 }
 
+/** The cells and shoals shallower than MAX_PUBLISHED_DEPTH_M. A cell's median, not its
+ * depth: the surface interpolates medians before taking off the margin, so it then never
+ * reaches the limit. */
+function published(cells: Cell[], shoals: Shoal[]): [Cell[], Shoal[]] {
+  return [
+    cells.filter((c) => c.m < MAX_PUBLISHED_DEPTH_M),
+    shoals.filter((s) => s.depth < MAX_PUBLISHED_DEPTH_M),
+  ];
+}
+
 /** The S-57 layers of one tile: DEPARE, DEPCNT, SOUNDG and M_QUAL. */
 export function buildTile(
   z: number,
@@ -708,6 +718,7 @@ export function buildTile(
   detail: Detail = "high",
   shared?: Map<string, Prepared>,
 ): Buffer | undefined {
+  [cells, shoals] = published(cells, shoals);
   if (cells.length === 0 && shoals.length === 0) return undefined;
   // Cut from the ancestor's surface past SHARED_ZOOM, which `cells` and `shoals` cover,
   // kept for its other tiles. Zoomed out, a tile shares its surface with none.
@@ -881,6 +892,7 @@ export function previewLayers(
   focus: { m: number; at: { lon: number; lat: number }[] },
   detail: Detail = "high",
 ) {
+  [cells, shoals] = published(cells, shoals);
   const r = surface(PIXEL_ZOOM, x, y, cells, shoals, span, focus);
   const top = rasterSize(MAX_ZOOM);
   const t = cut(prepare(r), 0, 0, r.n, Math.max(1, Math.round(256 / top)));

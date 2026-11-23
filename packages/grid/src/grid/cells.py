@@ -24,10 +24,13 @@ from .qc import HAZARD_M, MAX_DEPTH_M, QC_VERSION, SHALLOW_M, TRACK_REASONS
 
 log = logging.getLogger(__name__)
 
-GRID_VERSION = 13
+GRID_VERSION = 14
 BATCH_POINTS = 5_000_000
 BASE = CELLS["rows_per_degree"]  # base rows per 1° tile
 MIN_VESSELS = 2
+# Only depths shallower than this publish: past it most crowd soundings are sounders that lost the bottom,
+# and a navigation sounder that holds it is good to a few percent at best.
+MAX_PUBLISHED_DEPTH_M = CELLS["max_published_depth_m"]
 CELL_REASONS = [
     "cell_deep",
     "cell_shoal",
@@ -488,6 +491,9 @@ SELECT s.tile_id, s.level, s.cr AS "row", s.cc AS col,
   p.at.lon AS depth_lon, p.at.lat AS depth_lat, s.cell_id, {GRID_VERSION} AS grid_version,
   s.tided, s.calibrated
 FROM stats s JOIN placed p USING (tile_id, level, cr, cc)
+-- As stored: a depth just under the limit as a double can round to it as a float. A cell
+-- with no depth publishes by its median, or its shoalest sounding if it has none.
+WHERE coalesce(s.depth, s.median, s.min)::FLOAT < {MAX_PUBLISHED_DEPTH_M}
 """
 
 CELL_FLAGS = f"""
@@ -544,6 +550,7 @@ SELECT p.tile_id, p.r,
 FROM tile_points p
 -- A segment too deep to correct publishes nothing, its shoals included.
 WHERE NOT p.excluded AND NOT p.awaiting_tide AND NOT p.off_reference
+  AND p.depth::FLOAT < {MAX_PUBLISHED_DEPTH_M}
   -- A run whose sounder lost the bottom warns of no hazard from deeper than HAZARD_M, nor from
   -- a reading under SHALLOW_M, a sounder's junk.
   AND NOT (p.lost_bottom AND (p.depth >= {HAZARD_M} OR p.depth_raw < {SHALLOW_M}))
