@@ -738,6 +738,24 @@ def parallel(depth=10.0, rows=(5000, 5012), length=60):
     return [(v, [(i, r, i, depth) for i in range(length)]) for v, r in zip("AB", rows)]
 
 
+def test_centimeters_round_toward_shoal_and_keep_whole_ones():
+    # A hair under 10 m that isn't 10 m's float32 stays under it, in the 5 to 10 m band.
+    depths = [0.29, 199.99, 12.347, -0.123, 10.0, 9.99999]
+    got = surface.centimeters(np.array(depths, dtype=np.float32))
+    assert got.tolist() == np.array([0.29, 199.99, 12.34, -0.13, 10.0, 9.99], np.float32).tolist()
+
+
+def test_surface_depths_are_whole_centimeters(env):  # noqa: F811
+    depth = surface_from(env, [("A", varied(5000))])
+    valid = depth != surface.NODATA
+    assert valid.any()
+    # Each the float32 nearest a whole centimeter.
+    cm = np.round(depth[valid].astype(np.float64) * 100)
+    assert ((cm / 100).astype(np.float32) == depth[valid]).all()
+    # Rounded toward shoal: no deeper than the shallowest the track reads, less the margin.
+    assert depth[valid].max() <= 11.2 - statistic.K * CSIG + 1e-6
+
+
 def test_surface_fills_between_tracks_but_not_past_their_ends(env, monkeypatch):  # noqa: F811
     monkeypatch.setattr(statistic, "SIGMA_PER_M", 0.0)  # σ without widening
     depth = surface_from(env, parallel())

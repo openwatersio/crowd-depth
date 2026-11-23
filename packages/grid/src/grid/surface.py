@@ -15,8 +15,11 @@ What is interpolated is each pixel's median of vessels' medians; the depth is th
 surface less K times σ (statistic.py). A pixel with a depth and no sounding is
 interpolated, and its σ widens with its distance from the nearest sounding.
 
-Each tile is a cloud-optimized GeoTIFF with five bands: depth (positive down), the
-distance in metres to the nearest sounding, the soundings in the pixel, σ, and 1 where
+Each tile is a cloud-optimized GeoTIFF with five bands: depth (positive down, to the
+centimeter, rounded toward shoal), the
+distance in metres to the nearest sounding, the soundings in the pixel (none where the
+depth is too deep to publish, and only those shallow enough to where the surface doesn't
+reach), σ, and 1 where
 the depth is the band's, in a pixel interpolation left empty, or 0. The whole
 tile is worked in 512-pixel blocks: only the extent of the blocks with a sounding within
 the search radius is interpolated, and only those blocks are blurred, guarded, measured
@@ -382,6 +385,7 @@ def grid_tile(tile_id: int, got, out: Path):
                 # any sounding published in it. One the surface didn't reach counts only
                 # soundings shallow enough to publish, so coverage reaches no deeper water.
                 had = depth != NODATA
+                depth = np.where(had, centimeters(depth), depth)
                 dropped = had & ((depth < floor(r0, c0, r1, c1)) | (depth >= MAX_PUBLISHED_DEPTH_M))
                 depth[dropped] = NODATA
                 distance[depth == NODATA] = NODATA
@@ -397,6 +401,19 @@ def grid_tile(tile_id: int, got, out: Path):
                 )
         rasterio.shutil.copy(sparse, path, driver="COG", compress="deflate", sparse_ok=True)
     return path
+
+
+def centimeters(depth):
+    """`depth` to the centimeter, rounded toward shoal, so it's never deeper than computed:
+    finer is noise against σ, and a tile whose inputs didn't change changes less often
+    when computed in another order. A float32 that is a centimeter's nearest, a hair under
+    it, stays that centimeter; any other a hair under one rounds down, so no depth crosses
+    an isobath."""
+    d = np.asarray(depth, dtype=np.float32)
+    x = d.astype(np.float64) * 100
+    near = np.round(x)
+    cm = np.where((near / 100).astype(np.float32) == d, near, np.floor(x))
+    return (cm / 100).astype(np.float32)
 
 
 class Sounded:

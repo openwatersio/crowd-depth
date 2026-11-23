@@ -322,9 +322,11 @@ def surface_bands(path, soundings=None):
         if src.count < 5:
             raise ValueError(f"{path} has no band marking the band beside a track: rebuild it")
         depth, count = src.read(1), src.read(3)
-        # A published sounding's own pixel is covered, whatever depth the surface has there.
-        if soundings is not None and len(soundings[0]):
-            r, c = (np.asarray(a) for a in rasterio.transform.rowcol(src.transform, *soundings[:2]))
+        # A published sounding's own pixel is covered, whatever depth the surface has there;
+        # placed a chunk at a time, as the cap below is.
+        for i in range(0, 0 if soundings is None else len(soundings[0]), CAP_CHUNK):
+            lon, lat = (np.asarray(a[i : i + CAP_CHUNK], dtype=float) for a in soundings[:2])
+            r, c = (np.asarray(a) for a in rasterio.transform.rowcol(src.transform, lon, lat))
             on = (r >= 0) & (r < count.shape[0]) & (c >= 0) & (c < count.shape[1])
             count[r[on], c[on]] = np.maximum(count[r[on], c[on]], 1)
         # Worked on the window the tile's depths and soundings reach, WINDOW_PX past them:
