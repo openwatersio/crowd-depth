@@ -155,7 +155,7 @@ cd packages/grid
 ./docker.sh                            # tests, one at a time, in the same image CI uses
 ./docker.sh uv run pytest -n logical   # the same, one worker per logical CPU, as CI runs them
 ./docker.sh uv run ruff check          # any command, in that image
-uv run pytest                          # tests on the host; those that need tippecanoe, gdal_grid, gdal_contour or potrace fail without them
+uv run pytest                          # tests on the host; those that need tippecanoe, gdal_grid, gdal_contour, gdalbuildvrt or potrace fail without them
 uv run pytest -n logical               # the same, one worker per logical CPU
 uv run ruff check && uv run ruff format --check
 uv run grid --store /tmp/grid ingest --prefix 2026/10/14   # one day of both sources into a local store
@@ -168,6 +168,7 @@ uv run grid --store /tmp/grid ingest --source noaa --keys keys.txt   # only thes
 uv run grid --store /tmp/grid cells --bbox=-77.5,36.8,-75.5,39.7      # only the 1° tiles a box touches, with = as a west longitude starts with -; overlay then waits for a full cells run
 ./docker.sh uv run grid --store .preview/store overlay --out .preview/out   # overlay layers and PMTiles, in the image; it mounts only packages/grid, so the store must be in it
 uv run grid --store /tmp/grid tiles --out /tmp/run   # rebuild only the tiles whose inputs moved since the last run into /tmp/run, through Snakemake; see docs/plans/global-grid/per-tile-pipeline.md
+uv run grid depth --out /tmp/run                       # merge the run's depths into /tmp/run/depth.tif, a COG for QGIS (packages/grid/qgis)
 uv run grid --store .preview/store benchmark --surface .preview/out/surface --out .preview/bench   # score a render against S-102 and BlueTopo; see Validation in docs/plans/global-grid
 uv run grid --store /tmp/grid compact  # QC any unchecked batches, then rewrite each partition's points and flags sorted by tile, once per store layout and again once either collects small files; run it after each ingest, QC or cells build, and first after upgrading an older store
 uv run grid --store /tmp/grid stats

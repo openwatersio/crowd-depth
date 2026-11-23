@@ -1,7 +1,7 @@
 """Run one per-tile job on the warm worker, and exit with its status. Standard library only,
 so it starts in milliseconds under `python -S`.
 
-    python -S worker_client.py SOCKET LOG STAGE RUN THREADS [KEY...]
+    python -S worker_client.py SOCKET LOG STAGE RUN THREADS EXTRA_MB [KEY...]
 """
 
 import json
