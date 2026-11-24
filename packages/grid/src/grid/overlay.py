@@ -36,7 +36,7 @@ from scipy.ndimage import (
 
 from . import cells, deep, surface
 from .catalog import MIN_DEPTH_M, TIDE_CELL
-from .cells import GRID_VERSION
+from .cells import GRID_VERSION, MAX_PUBLISHED_DEPTH_M
 from .definitions import PORTRAYAL
 from .qc import MAX_DEPTH_M
 
@@ -58,10 +58,6 @@ CELLS_PER_TILE = 8
 # multiplies the tiles a long, thin track touches.
 MAX_ZOOM = 15
 MIN_ZOOM = 6
-# At or beyond each depth a sounding displays from a 2^shift coarser level, so deep
-# water reads sparse while navigable depths keep full density (Seascape's defaults).
-THIN_TIERS = [(200.0, 1), (1000.0, 2)]
-
 # S-57 quality attributes: the grid's soundings are reported, not surveyed, and an
 # unconfirmed shoal is reported but not confirmed. TECSOU 1 is an echo-sounder.
 QUALITY = {False: {"QUASOU": 8, "QUAPOS": 7}, True: {"QUASOU": 9, "QUAPOS": 8}}
@@ -88,14 +84,6 @@ def depths(d):
         "depth_ft": _floor(d / M_PER_FT),
         "depth_fm": _floor(d / M_PER_FATHOM),
     }
-
-
-def thin_shift(d):
-    shift = 0
-    for depth, s in THIN_TIERS:
-        if d >= depth:
-            shift = s
-    return shift
 
 
 def zooms(display):
@@ -129,12 +117,11 @@ def soundings(con, primes=None):
 
     Each level keeps the shoalest sounding of every pyramid cell, and its position, so a
     shoal is never hidden at coarse zoom; a level is built from the one below it, since
-    pyramid cells nest. A sounding deep enough to thin shows from a coarser level.
+    pyramid cells nest.
     A sounding at a position in `primes`, {(lon, lat): minzoom}, is left out from that
     zoom on, where it publishes as a prime sounding; below it, the pyramid shows it.
     """
     primes = primes or {}
-    max_shift = max(s for _, s in THIN_TIERS)
     n = 2**MAX_ZOOM * CELLS_PER_TILE
     # The shoalest per pyramid cell, as the least (depth, lon, lat): a grouped aggregate
     # spills past the memory limit, and ties break on position, not on read order.
@@ -146,7 +133,7 @@ def soundings(con, primes=None):
           FROM (SELECT *, {MERCATOR} FROM ({SOURCES})))
         GROUP BY px, py"""
     )
-    for level in range(MAX_ZOOM - MIN_ZOOM + 1 + max_shift):
+    for level in range(MAX_ZOOM - MIN_ZOOM + 1):
         if level:
             con.execute(
                 """CREATE OR REPLACE TEMP TABLE pyramid AS
@@ -156,10 +143,9 @@ def soundings(con, primes=None):
         rows = con.execute("SELECT s.lon, s.lat, s.d, s.unconfirmed FROM pyramid ORDER BY px, py")
         while batch := rows.fetchmany(10_000):
             for lon, lat, d, unconfirmed in batch:
-                display = zoom + thin_shift(d)
                 at = (round(lon, COORD_DECIMALS), round(lat, COORD_DECIMALS))
-                if MIN_ZOOM <= display <= MAX_ZOOM and display < primes.get(at, 99):
-                    yield feature(lon, lat, d, unconfirmed, display)
+                if zoom < primes.get(at, 99):
+                    yield feature(lon, lat, d, unconfirmed, zoom)
     con.execute("DROP TABLE pyramid")
 
 
@@ -196,11 +182,11 @@ def feature(lon, lat, d, unconfirmed, display, prime=False):
 # and 0 m is the drying line.
 DRYING_M = MIN_DEPTH_M
 LEVELS = [DRYING_M, *PORTRAYAL["isobaths_m"]]
+# The deepest band ends at the publishing limit, so the limit must be an isobath.
+assert MAX_PUBLISHED_DEPTH_M in LEVELS, "cells.max_published_depth_m is not on the isobath ladder"
 # Isobaths drawn below each zoom ceiling (Seascape's CONTOUR_TIERS); every one from the last on.
 CONTOUR_TIERS = [(t["below_zoom"], t["isobaths_m"]) for t in PORTRAYAL["contour_tiers"]]
 FIRST_AREA_ZOOM = 4
-# Past this an enclosed rise is a seabed feature, not a least depth a vessel can touch.
-PRIME_MAX_DEPTH_M = 200
 # Crowd positions are good to about 10 m.
 POSACC_M = 10
 INFORM = (
@@ -226,18 +212,20 @@ def band(d):
     return LEVELS[max(i, 0)], LEVELS[i + 1] if i + 1 < len(LEVELS) else None
 
 
-# Areas and contours stop here: crowd soundings deeper than this are mostly sounders
-# that have lost bottom, so deeper water shows soundings only.
-MAX_AREA_DEPTH_M = 200
-
 # A tile's cells for its coverage's properties. Cells keep only the month, or the
 # year of a single vessel's cell, so a survey ends at the end of that period, never
-# after today.
-TILE_QUALITY = """
+# after today. Its shoals count among its soundings, and its uncertainty is never less
+# than the tolerance at their depths: they carry no dates, so a tile with only shoals has
+# none.
+TILE_QUALITY = f"""
+WITH shoals AS (
+  SELECT count(*) AS n, max({cells.tolerance("depth")}) AS tvu
+  FROM lake.shoals WHERE cell_id = $partition AND tile_id = $tile
+)
 SELECT min(first),
   least(max(CASE WHEN kind = 'single' THEN last + INTERVAL 1 YEAR ELSE last + INTERVAL 1 MONTH
     END - INTERVAL 1 DAY), current_date),
-  sum(count), max(tvu)
+  coalesce(sum(count), 0) + (SELECT n FROM shoals), greatest(max(tvu), (SELECT tvu FROM shoals))
 FROM lake.cells WHERE cell_id = $partition AND tile_id = $tile AND depth IS NOT NULL"""
 
 # A tile's published cell soundings shallow enough to be primes: a prime is the least
@@ -246,7 +234,7 @@ FROM lake.cells WHERE cell_id = $partition AND tile_id = $tile AND depth IS NOT 
 # pyramid breaks ties, however the store's files hold the rows.
 PRIME_CANDIDATES = f"""
 SELECT depth_lon AS lon, depth_lat AS lat, depth FROM lake.cells
-WHERE cell_id = $partition AND tile_id = $tile AND depth <= $max
+WHERE cell_id = $partition AND tile_id = $tile AND depth IS NOT NULL
   AND abs(depth_lat) <= {MERCATOR_MAX_LAT}
 ORDER BY depth, lon, lat"""
 
@@ -303,7 +291,7 @@ def areas(con, surfaces: Path):
             continue
         params = {"partition": partition, "tile": tile}
         first, last, count, tvu = con.execute(TILE_QUALITY, params).fetchone()
-        got = con.execute(PRIME_CANDIDATES, params | {"max": PRIME_MAX_DEPTH_M}).fetchnumpy()
+        got = con.execute(PRIME_CANDIDATES, params).fetchnumpy()
         candidates = got["lon"], got["lat"], got["depth"]
         with rasterio.open(path) as src:
             nearby = nearby_soundings(con, tile, src.transform)
@@ -325,15 +313,22 @@ def surface_bands(path, soundings=None):
     to the surface's `outline`. A carried depth, or one the surface took from the band
     beside a track, is never deeper than one of `soundings`, (lon, lat, depth) arrays of
     the published soundings in and beside the tile, in its pixel or next to it, as the
-    surface guards its own pixels. All water past
-    MAX_AREA_DEPTH_M is one more band, kept for the contour at its edge but never
-    published: `gdal_contour -p` makes no polygon past its last level.
+    surface guards its own pixels. The surface publishes nothing past
+    MAX_PUBLISHED_DEPTH_M; the levels end at MAX_DEPTH_M all the same, since
+    `gdal_contour -p` makes no polygon past its last level.
     """
-    levels = [lv for lv in LEVELS if lv <= MAX_AREA_DEPTH_M] + [MAX_DEPTH_M]
+    levels = [lv for lv in LEVELS if lv <= MAX_PUBLISHED_DEPTH_M] + [MAX_DEPTH_M]
     with rasterio.open(path) as src:
         if src.count < 5:
             raise ValueError(f"{path} has no band marking the band beside a track: rebuild it")
         depth, count = src.read(1), src.read(3)
+        # A published sounding's own pixel is covered, whatever depth the surface has there;
+        # placed a chunk at a time, as the cap below is.
+        for i in range(0, 0 if soundings is None else len(soundings[0]), CAP_CHUNK):
+            lon, lat = (np.asarray(a[i : i + CAP_CHUNK], dtype=float) for a in soundings[:2])
+            r, c = (np.asarray(a) for a in rasterio.transform.rowcol(src.transform, lon, lat))
+            on = (r >= 0) & (r < count.shape[0]) & (c >= 0) & (c < count.shape[1])
+            count[r[on], c[on]] = np.maximum(count[r[on], c[on]], 1)
         # Worked on the window the tile's depths and soundings reach, WINDOW_PX past them:
         # outside it every band is empty, and nothing here looks further than that.
         # By rows and columns that hold any, not by pixel: a covered tile has 29M pixels.
@@ -774,7 +769,7 @@ def tile_areas(candidates, properties, bands, footprint, surfaced=None, interpol
     the footprint drawn between tracks: its coverage is a separate M_QUAL marked
     `interpolated`, so styles can show it, and the rest is marked `measured`."""
     surfaced = footprint if surfaced is None else surfaced
-    deepest = int(np.searchsorted(LEVELS, MAX_AREA_DEPTH_M, side="right")) - 1
+    deepest = int(np.searchsorted(LEVELS, MAX_PUBLISHED_DEPTH_M, side="right")) - 1
     for b, area in bands.items():
         if b < deepest:
             lo, hi = band(LEVELS[b])
@@ -816,7 +811,7 @@ def tile_areas(candidates, properties, bands, footprint, surfaced=None, interpol
         if line.is_empty:
             continue
         yield shape("DEPCNT", line, {"VALDCO": v, "QUAPOS": 4}, level_minzoom(v))
-        if v > PRIME_MAX_DEPTH_M or not len(points):
+        if not len(points):
             continue
         rings = shapely.get_parts(shoaler)
         # A closed isobath: deeper water all the way round, so the shoal grown by about

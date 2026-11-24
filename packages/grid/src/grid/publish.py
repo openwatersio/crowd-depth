@@ -3,6 +3,7 @@
     overlay.pmtiles                          the archive, at a key that never changes
     tiles/{kind}/{tile}-{sha256[:16]}.{ext}  a tile's surface, cells or areas, named by content
     manifest.json                            what is published now, written last
+    depth.tif                                the depths as one COG, from `grid depth`
     lock                                     held while a run publishes
 
 A tile's files are named by their content, so a file that didn't change keeps its key and
@@ -41,6 +42,8 @@ log = logging.getLogger(__name__)
 
 ARCHIVE = "overlay.pmtiles"
 MANIFEST = "manifest.json"
+# The depth COG, published by `grid depth` (depth.py) and taken down with the tiles.
+DEPTH = "depth.tif"
 LOCK = "lock"
 # How long a changed tile's old files stay for readers of the last manifest. Short, since
 # they may hold soundings withdrawn since.
@@ -97,6 +100,17 @@ def publish(run: Path, objects, now=None) -> dict:
         lock.release()
 
 
+def check_store(run, objects, manifest) -> str:
+    """The hash of `run`'s store, if `manifest`, what's published at `objects`, came from
+    the same store or none."""
+    built = run / "store.txt"
+    # Hashed: the manifest is public, and the store's endpoint and path aren't.
+    store = hashlib.sha256(built.read_bytes()).hexdigest()[:16] if built.exists() else ""
+    if manifest.get("store", store) != store:
+        raise RuntimeError(f"{objects.url} holds another store's tiles: publish elsewhere")
+    return store
+
+
 def tile_of(key):
     """The tile a tile file's key names: tiles/{kind}/{tile}-{hash}.{ext}."""
     return key.rsplit("/", 1)[1].split("-", 1)[0]
@@ -105,11 +119,7 @@ def tile_of(key):
 def publish_locked(run, objects, lock, now):
     got = objects.get(MANIFEST)
     old, etag = (json.loads(got[0]), got[1]) if got else ({}, None)
-    built = run / "store.txt"
-    # Hashed: the manifest is public, and the store's endpoint and path aren't.
-    store = hashlib.sha256(built.read_bytes()).hexdigest()[:16] if built.exists() else ""
-    if old.get("store", store) != store:
-        raise RuntimeError(f"{objects.url} holds another store's tiles: publish elsewhere")
+    store = check_store(run, objects, old)
     counts = tiles.counts(run)
     archive = run / ARCHIVE
     if counts and not archive.exists():
@@ -128,8 +138,9 @@ def publish_locked(run, objects, lock, now):
                 entry[kind] = key
                 uploads.append((key, path))
             elif kind != "surface":
-                # A tile with no cells has no surface, but every live tile has cells and
-                # areas: without them its published files would be withdrawn.
+                # A tile that publishes nothing has no surface, but every live tile has
+                # cells and areas files, empty or not: without them its published files
+                # would be withdrawn.
                 raise RuntimeError(f"{path} is missing: the run didn't finish")
         current[str(tile)] = entry
 
@@ -169,6 +180,7 @@ def publish_locked(run, objects, lock, now):
     # archive and the manifest leaves them apart.
     was = old.get("archive")
     live = stored(objects, ARCHIVE)
+    depth_gone = False
     if counts:
         digest = sha256(archive)
         replaced = not (was and live and was["sha256"] == digest and was.get("etag") == live.etag)
@@ -197,6 +209,11 @@ def publish_locked(run, objects, lock, now):
         if replaced:
             lock.check()
             objects.delete(ARCHIVE)
+        # And the depth COG `grid depth --publish` put beside it.
+        depth_gone = stored(objects, DEPTH) is not None
+        if depth_gone:
+            lock.check()
+            objects.delete(DEPTH)
         about = None
 
     credits = run / "credits.txt"
@@ -240,4 +257,5 @@ def publish_locked(run, objects, lock, now):
         "kept": len(uploads) - len(todo),
         "archive": "replaced" if replaced and about else "deleted" if replaced else "kept",
         "deleted": len(deleted),
+        "depth": "deleted" if depth_gone else "kept",
     }

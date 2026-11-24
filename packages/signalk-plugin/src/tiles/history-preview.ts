@@ -7,7 +7,7 @@ import { Timeframe } from "../types.js";
 import { correctForSensorPosition } from "../streams/transforms.js";
 import type { Config } from "../config.js";
 import { cellAt, DEFINITIONS } from "./geometry.js";
-import { depthLabels } from "./surface.js";
+import { depthLabels, MAX_PUBLISHED_DEPTH_M } from "./surface.js";
 
 export type PreviewView = readonly [number, number, number, number, number];
 export type Observation = {
@@ -133,7 +133,11 @@ export function createPreviewStore(db: DatabaseSync, config: string) {
           )
         : undefined;
       return rows
-        .filter((s) => Number(refined?.get(s.time)?.end ?? -Infinity) <= s.time)
+        .filter(
+          (s) =>
+            s.depth < MAX_PUBLISHED_DEPTH_M &&
+            Number(refined?.get(s.time)?.end ?? -Infinity) <= s.time,
+        )
         .sort((a, b) => b.time - a.time)
         .slice(0, LIMIT)
         .map((s) => ({

@@ -5,7 +5,13 @@ import type { Request, Response } from "express";
 import type { ServerAPI } from "@signalk/server-api";
 import { ASSET_BASE } from "../plotterext/manifest.js";
 import { charted, type Sounding } from "./writer.js";
-import { MAX_ZOOM, MIN_ZOOM, depthLabels, type Detail } from "./surface.js";
+import {
+  MAX_PUBLISHED_DEPTH_M,
+  MAX_ZOOM,
+  MIN_ZOOM,
+  depthLabels,
+  type Detail,
+} from "./surface.js";
 import type { PreviewView, PreviewStore } from "./history-preview.js";
 import type { TileService } from "./service.js";
 import type { GeoFeature, Preview } from "./preview.js";
@@ -63,6 +69,9 @@ export function parseView(view: unknown) {
   const z = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.floor(zoom) - 1));
   return [z, west, south, east, north] as const;
 }
+
+/** Whether a provisional sounding is shallow enough to draw. */
+export const drawn = (s: Sounding) => charted(s) < MAX_PUBLISHED_DEPTH_M;
 
 /** The provisional soundings as points, each named for its time, so the runtime can
  * tell which have left. */
@@ -274,7 +283,7 @@ export function registerLayerRoutes(
         }
       }
       const since = Number(req.query.since ?? -1);
-      const provisional = spatialProvisional(layer.provisional());
+      const provisional = spatialProvisional(layer.provisional().filter(drawn));
       layer.tiles.watched(view);
       const held = view && layer.tiles.held(...view);
       const historyPreviewPoints = layer.historyPreview?.(view);

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, time, timedelta
 
 import pytest
 from test_ingest import ROWS, env, noaa_csv, noaa_key  # noqa: F401  (env is a fixture)
@@ -130,6 +130,15 @@ def test_a_tiles_fingerprint_moves_with_its_inputs_alone(env):  # noqa: F811
 
     assert prints(env, level(day))[SOUTH_TILE] != covered[SOUTH_TILE]
     assert prints(env, level(datetime(2020, 1, 1))) == covered
+    # By UTC day: its first and last days count, those either side of them don't.
+    [(t0, t1)] = env.query(
+        "SELECT time_min::DATE, time_max::DATE FROM lake.files WHERE file_id = ?", [south]
+    )
+    first, last = datetime.combine(t0, time()), datetime.combine(t1, time(23, 30))
+    assert prints(env, level(first))[SOUTH_TILE] != covered[SOUTH_TILE]
+    assert prints(env, level(last))[SOUTH_TILE] != covered[SOUTH_TILE]
+    assert prints(env, level(first - timedelta(minutes=30))) == covered
+    assert prints(env, level(last + timedelta(minutes=30))) == covered
 
 
 def test_an_open_waters_copy_moves_the_noaa_files_tile(env):  # noqa: F811

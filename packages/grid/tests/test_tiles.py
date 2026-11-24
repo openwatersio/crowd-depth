@@ -53,11 +53,11 @@ def two_tiles(env):  # noqa: F811
 
 
 def test_resources_grow_with_soundings():
-    assert tiles.resources("cells", 50_000) == (512, 1)
+    assert tiles.resources("cells", 50_000) == (1024, 1)
     assert tiles.resources("cells", 5_000_000) == (1792, 2)
     # A surface takes one thread, however dense its tile.
     assert tiles.resources("surface", 30_000_000) == (2304, 1)
-    assert tiles.resources("overlay", 30_000_000) == (2304, 4)
+    assert tiles.resources("overlay", 30_000_000) == (3584, 4)
     assert tiles.resources("web", 10) == (tiles.WEB_MEMORY_MB, 1)
 
 
@@ -161,6 +161,36 @@ def test_a_cells_job_gives_duckdb_less_memory_than_the_others(env, tmp_path, mon
     assert seen == want and want[0] != want[1]
 
 
+def test_a_retried_job_gives_its_duckdb_the_memory_added(tmp_path, monkeypatch):
+    (tmp_path / "data_url").write_text(str(tmp_path) + "/\n")
+
+    def setting():
+        with tiles.scratch(tmp_path) as con:
+            return con.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+
+    def megabytes(limit):
+        with duckdb.connect() as con:
+            con.execute("SET memory_limit = ?", [limit])
+            return con.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+
+    # A first try keeps the limit its peaks were measured with; a retry adds its new memory.
+    assert setting() == megabytes(tiles.JOB_MEMORY_LIMIT)
+    monkeypatch.setattr(tiles, "extra_mb", 2048)
+    assert setting() == megabytes("3248MB")
+    # A job reads it from its command line, and records it, and the error a try fails with.
+    monkeypatch.setitem(tiles.PER_KEY, "web", lambda *a: None)
+    tiles.job(["web", str(tmp_path), "1", "4096", "1_1"])
+    assert tiles.extra_mb == 4096 and jobs(tmp_path)[-1]["extra_mb"] == 4096
+
+    def fails(*a):
+        raise MemoryError("out of memory\nat line 2")
+
+    monkeypatch.setitem(tiles.PER_KEY, "web", fails)
+    with pytest.raises(MemoryError):
+        tiles.job(["web", str(tmp_path), "1", "0", "1_1"])
+    assert jobs(tmp_path)[-1]["error"] == "MemoryError: out of memory"
+
+
 def test_one_run_at_a_time_in_a_run_directory(env, tmp_path):  # noqa: F811
     with open(tmp_path / ".lock", "w") as held:
         fcntl.flock(held, fcntl.LOCK_EX)
@@ -219,7 +249,7 @@ def test_a_failed_job_reports_its_status_and_log(tmp_path):
         log = tmp_path / "job.log"
         done = subprocess.run(
             [sys.executable, "-S", str(CLIENT), str(sock), str(log), "web", str(tmp_path), "1"]
-            + ["1_1"],
+            + ["0", "1_1"],
             cwd=tmp_path,
             check=False,
         )
@@ -234,7 +264,7 @@ def blocking_job(sock, run):
     os.mkfifo(run / "data_url")
     client = subprocess.Popen(
         [sys.executable, "-S", str(CLIENT), str(sock), str(run / "log"), "web", str(run)]
-        + ["1", "1_1"]
+        + ["1", "0", "1_1"]
     )
     for _ in range(400):
         try:
@@ -338,7 +368,17 @@ def test_memory_must_be_a_megabyte_or_more(gb):
 def test_the_client_fails_without_a_worker(tmp_path):
     client = Path(tiles.__file__).with_name("worker_client.py")
     done = subprocess.run(
-        [sys.executable, "-S", str(client), str(tmp_path / "none.sock"), "log", "low", ".", "1"],
+        [
+            sys.executable,
+            "-S",
+            str(client),
+            str(tmp_path / "none.sock"),
+            "log",
+            "low",
+            ".",
+            "1",
+            "100",
+        ],
         capture_output=True,
         check=False,
     )
@@ -374,6 +414,38 @@ def planned(out):
         for r in rows
         if len(r) == 2 and r[1].isdigit() and r[0].isidentifier() and r[0] != "total"
     }
+
+
+def test_a_failed_job_runs_again_with_twice_the_memory(env, tmp_path, monkeypatch):  # noqa: F811
+    two_tiles(env)
+    # Loaded by every Python the run starts, its warm worker too: each overlay's first try
+    # fails, as one out of memory would.
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    (shim / "sitecustomize.py").write_text(
+        "from grid import tiles\n"
+        "real = tiles.PER_KEY['overlay']\n"
+        "def first_fails(*args):\n"
+        "    if not tiles.extra_mb:\n"
+        "        raise MemoryError('first try')\n"
+        "    return real(*args)\n"
+        "tiles.PER_KEY['overlay'] = first_fails\n"
+    )
+    monkeypatch.setenv(
+        "PYTHONPATH", os.pathsep.join(filter(None, [str(shim), os.environ.get("PYTHONPATH")]))
+    )
+    run = tmp_path / "run"
+    assert tiles.build(env.store, run, cores=2, memory_mb=8192) == 0
+    # Each overlay failed once, and ran again with its estimate's memory added.
+    overlays = sorted(
+        (j["keys"], j["extra_mb"], "error" in j) for j in jobs(run) if j["stage"] == "overlay"
+    )
+    added = tiles.resources("overlay", 0)[0]
+    assert overlays == sorted(
+        [([str(t)], 0, True) for t in (SOUTH, NORTH)]
+        + [([str(t)], added, False) for t in (SOUTH, NORTH)]
+    )
+    assert all(j["extra_mb"] == 0 for j in jobs(run) if j["stage"] != "overlay")
 
 
 def test_a_run_rebuilds_only_what_moved_and_matches_the_whole_region_build(
@@ -487,9 +559,9 @@ def sounding_lake(rows):
 
 
 def test_split_soundings_match_the_whole_pyramid_across_web_tiles():
-    # 500 m and 1,500 m in two z8 tiles of one level-4 pyramid cell, and deep water
-    # elsewhere: the shallower one keeps the deeper from showing at z6, as in the pyramid.
-    rows = [(0.1, 0.1, 500.0), (1.5, 0.1, 1500.0), (4.1, 0.2, 1200.0), (5.6, 0.3, 30.0)]
+    # Soundings in four z8 tiles: every level shown nests in one, so the web jobs' parts
+    # add up to the whole pyramid.
+    rows = [(0.1, 0.1, 50.0), (1.5, 0.1, 150.0), (4.1, 0.2, 120.0), (5.6, 0.3, 30.0)]
     whole = {json.dumps(f, sort_keys=True) for f in overlay.soundings(sounding_lake(rows))}
     keys = {}
     for lon, lat, d in rows:
@@ -497,15 +569,10 @@ def test_split_soundings_match_the_whole_pyramid_across_web_tiles():
         y = int(tiles.mercator_y(lat) * 2**tiles.Z)
         keys.setdefault((x, y), []).append((lon, lat, d))
     assert len(keys) == 4
-    split, candidates = set(), []
+    split = set()
     for part in keys.values():
-        con = sounding_lake(part)
-        split |= {json.dumps(f, sort_keys=True) for _, f in tiles.web_soundings(con, {})}
-        candidates += tiles.level4_candidates(con)
-    split |= {json.dumps(f, sort_keys=True) for f in tiles.reduce_level4(candidates)}
+        split |= {json.dumps(f, sort_keys=True) for f in overlay.soundings(sounding_lake(part))}
     assert split == whole
-    at_z6 = [json.loads(f) for f in whole if json.loads(f)["tippecanoe"]["minzoom"] == 6]
-    assert 1500 not in {f["properties"]["VALSOU"] for f in at_z6}
 
 
 def test_a_run_whose_tiles_are_all_withdrawn_publishes_nothing(env, tmp_path):  # noqa: F811
@@ -616,10 +683,10 @@ def test_a_job_caps_gdals_block_cache(tmp_path, monkeypatch):
     monkeypatch.setitem(
         tiles.PER_KEY, "cells", lambda *a: seen.setdefault("cache", os.environ["GDAL_CACHEMAX"])
     )
-    tiles.job(["cells", str(tmp_path), "1", "1"])
+    tiles.job(["cells", str(tmp_path), "1", "0", "1"])
     assert seen["cache"] == tiles.GDAL_CACHE_MB
     # One set for the run wins.
     monkeypatch.setenv("GDAL_CACHEMAX", "256")
     seen.clear()
-    tiles.job(["cells", str(tmp_path), "1", "1"])
+    tiles.job(["cells", str(tmp_path), "1", "0", "1"])
     assert seen["cache"] == "256"

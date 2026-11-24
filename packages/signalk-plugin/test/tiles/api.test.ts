@@ -13,10 +13,12 @@ import {
 } from "../../src/tiles/index.js";
 import {
   parseView,
+  drawn,
   provisionalFeatures,
   refreshMs,
   thin,
 } from "../../src/tiles/api.js";
+import { MAX_PUBLISHED_DEPTH_M } from "../../src/tiles/surface.js";
 import { DEFAULT_OWN_STYLE } from "../../src/tiles/style.js";
 import type { Layer } from "../../src/tiles/api.js";
 import type { GeoFeature } from "../../src/tiles/preview.js";
@@ -371,4 +373,14 @@ test("live surface and historical previews coexist with independent revisions", 
   ).body;
   expect(next).not.toHaveProperty("preview");
   expect(next).not.toHaveProperty("historyPreview");
+});
+
+test("provisional soundings past the published limit aren't drawn", () => {
+  const at = { lon: -76.2, lat: 36.98 };
+  const got = [
+    { time: 1, ...at, depth: MAX_PUBLISHED_DEPTH_M - 1 },
+    { time: 2, ...at, depth: MAX_PUBLISHED_DEPTH_M },
+    { time: 3, ...at, depth: 900 },
+  ].filter(drawn);
+  expect(got.map((s) => s.time)).toEqual([1]);
 });

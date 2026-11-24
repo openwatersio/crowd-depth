@@ -14,7 +14,7 @@ Each job reads the frozen catalog read-only and works in an in-memory `lake` hol
 what it writes, so jobs run side by side and never write to the store. Jobs run in children
 forked from a warm worker (worker.py), so each pays a fork rather than a Python start.
 
-    python -m grid.tiles STAGE RUN THREADS [KEY...]
+    python -m grid.tiles STAGE RUN THREADS EXTRA_MB [KEY...]
 """
 
 import contextlib
@@ -53,7 +53,7 @@ JOB_MEMORY_LIMIT = "1200MB"
 # The densest Chesapeake tile's per-pixel medians (cells.sigmas), which can't spill,
 # fit in it; at 800 MB they ran out. Its peaks were measured on OrbStack's VM, where
 # main's read 0.36 GB lower than on Colima's, so its entries keep that much over them.
-CELLS_MEMORY_LIMIT = "1GB"
+CELLS_MEMORY_LIMIT = "1000MB"
 # Tables a job writes; everything else is a view over the frozen catalog.
 WRITTEN = ("cells", "qc_flags", "shoals", "cells_built", "store_meta", "tile_changes")
 # Peak memory of a job, Python and the tools it runs, by its tile's active soundings:
@@ -67,16 +67,26 @@ WRITTEN = ("cells", "qc_flags", "shoals", "cells_built", "store_meta", "tile_cha
 # Galveston's densest leaves, past 10M soundings in reach, peak at up to 2.0 GB for
 # cells and 1.54 GB for surfaces, and its overlays at 1.49 GB: within these, though
 # cells at 2.0 GB keep less than that gap under 2,304 MB and none in a 2 GB worker.
-# ponytail: measured on two regions on Apple silicon; refit once x86 workers run them
+# On the planet, leaf cells under 100k soundings peaked at 589 MB (median) and 789 MB, and
+# overlays past 1M at up to 3,037 MB, kept about 0.5 GB over.
+# ponytail: measured on two regions and the planet on Apple silicon; refit once x86
+# workers run them
 MEMORY_MB = {
-    "cells": [(100_000, 512), (1_000_000, 1536), (10_000_000, 1792), (None, 2304)],
+    "cells": [(100_000, 1024), (1_000_000, 1536), (10_000_000, 1792), (None, 2304)],
     "surface": [(1_000_000, 1792), (None, 2304)],
-    "overlay": [(1_000_000, 1536), (None, 2304)],
+    "overlay": [(1_000_000, 1536), (None, 3584)],
 }
 WEB_MEMORY_MB = 2048
 # A splice's: it copies a tile's leaves' files into the tile's, DuckDB sorting the rows.
 SPLICE_MEMORY_MB = 1536
 SPLICE_MEMORY_LIMIT = "768MB"
+# Retries of a per-tile job that fails, each with twice the memory of the one before:
+# soundings don't predict every job's peak. On the planet, 14 of 55,368 ran out at their
+# limits.
+RETRIES = 2
+# The memory, in MB, the running job was given past its first try's, which `job` sets: all
+# of it goes to DuckDB (`limit`), as what a job holds outside DuckDB stays the same.
+extra_mb = 0
 # GDAL's block cache in each job, in MB.
 GDAL_CACHE_MB = "64"
 # DuckDB threads by soundings: dense tiles set the run's critical path. A surface's
@@ -114,6 +124,12 @@ def code() -> str:
     parts += [f"{lib} {importlib.metadata.version(lib)}".encode() for lib in LIBRARIES]
     parts.append(f"GDAL {rasterio.__gdal_version__}".encode())
     return hashlib.sha256(b"\0".join(parts)).hexdigest()[:16]
+
+
+def limit(base: str) -> str:
+    """DuckDB's limit in a job: `base`, in MB, and the memory it was given past its first
+    try's (`extra_mb`)."""
+    return f"{int(base.removesuffix('MB')) + extra_mb}MB"
 
 
 def resources(stage, soundings):
@@ -272,6 +288,7 @@ def prepare(store, run: Path) -> dict:
         for path in (
             f"web/{key}.pmtiles",
             f"lowsnd/{key}.geojsons",
+            # Written by builds that thinned deep soundings; it holds sounding positions.
             f"lowsnd/{key}.level4.jsonl",
             f"done/web/{key}",
         ):
@@ -519,7 +536,7 @@ def scratch(run: Path, threads=1, memory_limit=JOB_MEMORY_LIMIT):
     """A connection with an empty in-memory `lake`, for a job's work."""
     data_url = (run / "data_url").read_text().strip()
     with tempfile.TemporaryDirectory(dir=os.environ.get("GRID_TEMP_DIR") or None) as spill:
-        con = catalog.session(data_url, spill, memory_limit)
+        con = catalog.session(data_url, spill, limit(memory_limit))
         try:
             con.execute("SET threads = ?", [threads])
             con.execute("ATTACH ':memory:' AS lake")
@@ -711,29 +728,30 @@ def do_cells(run: Path, tile: int, threads):
     splice_files(run, tile, threads)
 
 
-def has_cells(con, run: Path, tile: int) -> bool:
-    return bool(
-        con.execute(
-            "SELECT count(*) FROM read_parquet(?)", [str(run / TILE_FILES["cells"].format(tile))]
-        ).fetchone()[0]
+def publishes(con, run: Path, tile: int) -> bool:
+    """Whether a tile publishes a cell or a shoal: a tile whose cells are all too deep to
+    publish can still hold shoals, which its surface draws coverage for."""
+    files = [run / TILE_FILES[kind].format(tile) for kind in ("cells", "shoals")]
+    return any(
+        f.exists() and con.execute("SELECT count(*) FROM read_parquet(?)", [str(f)]).fetchone()[0]
+        for f in files
     )
 
 
 def do_leaf_surface(run: Path, key: str, threads):
     """A leaf's surface from its and its neighbors' points within the surface's reach of it,
     into leaves/{tile}/{quadkey}/surface.tif: a tile's raster, of which only the leaf's own
-    pixels are its; none for a tile with no cells, as `overlay.areas` builds none."""
+    pixels are its; none for a tile that publishes nothing, as `overlay.areas` builds none."""
     tile, leaf, box = leaf_of(run, key)
     around = neighbors(tile)
     out = leaf_dir(run, tile, leaf)
     path = out / "surface.tif"
     # What it was last built from: its fingerprint, the code, which Snakemake reruns on, and
-    # whether its tile has cells, which a change out of its reach can turn.
-    cells_file = run / TILE_FILES["cells"].format(tile)
+    # whether its tile publishes anything, which a change out of its reach can turn.
     # A connection of its own: the module's default one may be the warm worker's, from before
     # the fork, and hangs.
     with duckdb.connect() as con:
-        has = cells_file.exists() and has_cells(con, run, tile)
+        has = publishes(con, run, tile)
     stamp = f"{(run / 'fp' / str(tile) / f'{leaf}.surface').read_text()}{code()} {has}"
     built = out / "surface.fp"
     if built.exists() and built.read_text() == stamp:
@@ -741,11 +759,13 @@ def do_leaf_surface(run: Path, key: str, threads):
     built.unlink(missing_ok=True)
     path.unlink(missing_ok=True)
     out.mkdir(parents=True, exist_ok=True)
-    near = None if leaf == leaves.ROOT else within(tile, box, "surface")
+    # A whole tile's too: its neighbors past the surface's reach are read for nothing, and
+    # a dense one beside a sparse tile ran its job out of memory.
+    near = within(tile, box, "surface")
     with open_job(run, around, threads, box=near) as con:
         load(con, run, around, kinds=("flags",), box=near)
-        got = has_cells(con, run, tile) and surface.tile_entries(
-            con, tile, partition(tile), alone=near is None
+        got = publishes(con, run, tile) and surface.tile_entries(
+            con, tile, partition(tile), alone=leaf == leaves.ROOT
         )
     # Gridded with the job's DuckDB closed, so what it held is free for the rasters.
     if got:
@@ -805,9 +825,7 @@ def do_overlay(run: Path, tile: int, threads):
         attach(con, run, around, kinds=("cells", "shoals"))
         params = {"partition": partition(tile), "tile": tile}
         first, last, count, tvu = con.execute(overlay.TILE_QUALITY, params).fetchone()
-        got = con.execute(
-            overlay.PRIME_CANDIDATES, params | {"max": overlay.PRIME_MAX_DEPTH_M}
-        ).fetchnumpy()
+        got = con.execute(overlay.PRIME_CANDIDATES, params).fetchnumpy()
         candidates = got["lon"], got["lat"], got["depth"]
         with rasterio.open(path) as src:
             nearby = overlay.nearby_soundings(con, tile, src.transform)
@@ -862,6 +880,8 @@ def do_web(run: Path, key: str, threads):
     out.parent.mkdir(exist_ok=True)
     (run / "lowsnd").mkdir(exist_ok=True)
     out.unlink(missing_ok=True)
+    # Written by builds that thinned deep soundings; nothing reads it, and it holds positions.
+    (run / "lowsnd" / f"{key}.level4.jsonl").unlink(missing_ok=True)
     n = 2**Z
     with scratch(run, threads) as con:
         load(con, run, mine, kinds=("cells", "shoals"))
@@ -888,12 +908,11 @@ def do_web(run: Path, key: str, threads):
         sounds = run / "web" / f"{key}.soundings.geojsons"
         count = 0
         with open(sounds, "w") as hi, open(run / "lowsnd" / f"{key}.geojsons", "w") as lo:
-            for high, feat in web_soundings(con, primes):
-                line = json.dumps(feat, separators=(",", ":")) + "\n"
-                (hi if high else lo).write(line)
+            # Every pyramid level shown, from z6 on, nests in one z8 tile.
+            for feat in overlay.soundings(con, primes):
+                high = feat["tippecanoe"]["minzoom"] >= Z
+                (hi if high else lo).write(json.dumps(feat, separators=(",", ":")) + "\n")
                 count += high
-        with open(run / "lowsnd" / f"{key}.level4.jsonl", "w") as f:
-            f.writelines(json.dumps(row) + "\n" for row in level4_candidates(con))
     w, s, e, nn = z8_bounds(key)
     # Clipped to the z8 tile plus tippecanoe's buffer at z8, 5/256 of a tile.
     bx, by = (e - w) * 5 / 256, (nn - s) * 5 / 256
@@ -910,55 +929,8 @@ def do_web(run: Path, key: str, threads):
     sounds.unlink()
 
 
-# The one pyramid level that shows below z8 and whose cells are wider than a z8 tile:
-# zoom 4, shown at z6 past 1,000 m. Every finer level nests in one z8 tile.
-LEVEL4 = 4
-
-
-def web_soundings(con, primes):
-    """Yield a web job's soundings as (shown at z8 or past it, feature): all of them but
-    those from level 4, which the low job reduces across web jobs (level4_candidates)."""
-    for feat in overlay.soundings(con, primes):
-        display = feat["tippecanoe"]["minzoom"]
-        if display - overlay.thin_shift(feat["properties"]["VALSOU"]) > LEVEL4:
-            yield display >= Z, feat
-
-
-def level4_candidates(con):
-    """Every level-4 pyramid cell's shoalest sounding in `lake`, as [cx, cy, depth, lon,
-    lat, unconfirmed], whatever depth: a shallow one that shows at no zoom still keeps a
-    deeper one in another web job's part of the cell from showing, as in the pyramid."""
-    n = 2**overlay.MAX_ZOOM * overlay.CELLS_PER_TILE
-    step = 2 ** (overlay.MAX_ZOOM - LEVEL4)
-    rows = con.execute(
-        f"""SELECT cx, cy, s.d, s.lon, s.lat, s.unconfirmed FROM (
-          SELECT floor(mx * {n})::BIGINT // {step} AS cx, floor(my * {n})::BIGINT // {step} AS cy,
-            min(struct_pack(d := d, lon := lon, lat := lat, unconfirmed := unconfirmed)) AS s
-          FROM (SELECT *, {overlay.MERCATOR} FROM ({overlay.SOURCES}))
-          GROUP BY ALL
-        ) ORDER BY cx, cy"""
-    ).fetchall()
-    return [list(r) for r in rows]
-
-
-def reduce_level4(candidates):
-    """Level 4's soundings from every web job's candidates: each cell's shoalest, ties
-    broken on position as the pyramid breaks them, shown where its depth shows at level 4.
-    None is a prime: those are 200 m or shallower, and level 4 shows only past 1,000 m."""
-    best = {}
-    for cx, cy, d, lon, lat, unconfirmed in candidates:
-        if (cx, cy) not in best or (d, lon, lat, unconfirmed) < best[cx, cy]:
-            best[cx, cy] = (d, lon, lat, unconfirmed)
-    for (cx, cy), (d, lon, lat, unconfirmed) in sorted(best.items()):
-        display = LEVEL4 + overlay.thin_shift(d)
-        if overlay.MIN_ZOOM <= display <= overlay.MAX_ZOOM:
-            yield overlay.feature(lon, lat, d, unconfirmed, display)
-
-
 def do_low(run: Path, threads):
-    """z0–7: every tile's areas shown below z8, and the web jobs' soundings shown below it,
-    with the pyramid's zoom-4 level (shown at z6, past 1,000 m) reduced across them, as a
-    whole-region pyramid would."""
+    """z0–7: every tile's areas shown below z8, and the web jobs' soundings shown below it."""
     tiles = counts(run)
     keys = web_keys(tiles)
     feats = run / "low.areas.geojsons"
@@ -970,19 +942,10 @@ def do_low(run: Path, threads):
                     if json.loads(line)["tippecanoe"].get("minzoom", 0) < Z:
                         out.write(line)
     sounds = run / "low.soundings.geojsons"
-
-    def candidates():
-        for key in sorted(keys):
-            with open(run / "lowsnd" / f"{key}.level4.jsonl") as fh:
-                yield from map(json.loads, fh)
-
     with open(sounds, "w") as out:
         for key in sorted(keys):
             with open(run / "lowsnd" / f"{key}.geojsons") as fh:
                 shutil.copyfileobj(fh, out)
-        out.writelines(
-            json.dumps(feat, separators=(",", ":")) + "\n" for feat in reduce_level4(candidates())
-        )
     mbtiles = run / "low.mbtiles"
     if tippecanoe(mbtiles, [sounds, feats], (0, Z - 1), threads):
         to_pmtiles(mbtiles, run / "low.pmtiles")
@@ -1113,35 +1076,60 @@ WHOLE = {"low": do_low, "assemble": do_assemble}
 
 
 def job(argv):
-    """Run one job, STAGE RUN THREADS [KEY...], and log its time and peak memory to
-    RUN/jobs.jsonl."""
-    stage, run, threads, keys = argv[0], Path(argv[1]), int(argv[2]), argv[3:]
+    """Run one job, STAGE RUN THREADS EXTRA_MB [KEY...], and log its time and peak memory to
+    RUN/jobs.jsonl, or the error it failed with. EXTRA_MB is the memory it was given past its
+    first try's."""
+    global extra_mb
+    stage, run, threads, extra_mb, keys = (
+        argv[0],
+        Path(argv[1]),
+        int(argv[2]),
+        int(argv[3]),
+        argv[4:],
+    )
     # GDAL's block cache is 5% of the machine's memory by default, whatever the job's
     # share: 1.6 GB on a 32 GB worker, which a tile's rasters fill. Set before the job
     # first reads a raster, and inherited by the GDAL tools it runs.
     os.environ["GDAL_CACHEMAX"] = os.environ.get("GDAL_CACHEMAX") or GDAL_CACHE_MB
     started = time.time()
-    if stage in PER_KEY:
-        results = [
-            PER_KEY[stage](run, k if stage in ("web", *LEAF_STAGES) else int(k), threads)
-            for k in keys
-        ]
-    else:
-        results = [WHOLE[stage](run, threads)]
+    results, error = [], None
+    try:
+        if stage in PER_KEY:
+            results = [
+                PER_KEY[stage](run, k if stage in ("web", *LEAF_STAGES) else int(k), threads)
+                for k in keys
+            ]
+        else:
+            results = [WHOLE[stage](run, threads)]
+    except BaseException as e:
+        # A retry's log replaces this one's: what it failed with stays here. A try the
+        # kernel kills leaves no line.
+        error = f"{type(e).__name__}: {str(e).partition(chr(10))[0]}"[:300]
+        raise
+    finally:
+        record(run, stage, keys, started, results, error)
+
+
+def record(run, stage, keys, started, results, error):
+    """A job's line in RUN/jobs.jsonl."""
     # ru_maxrss is in bytes on macOS and in KB on Linux.
     unit = 2**20 if sys.platform == "darwin" else 2**10
-    record = {
+    line = {
         "stage": stage,
         "keys": keys,
+        # A retry's peak, with more memory and a higher limit, isn't a first try's.
+        "extra_mb": extra_mb,
         "seconds": round(time.time() - started, 3),
         "maxrss_mb": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / unit),
         # gdal_grid, potrace and tippecanoe.
         "tools_maxrss_mb": round(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / unit),
     }
-    if results and all(r == "unchanged" for r in results):
-        record["unchanged"] = True
+    if error:
+        line["error"] = error
+    elif results and all(r == "unchanged" for r in results):
+        line["unchanged"] = True
     with open(run / "jobs.jsonl", "a") as f:
-        f.write(json.dumps(record) + "\n")
+        f.write(json.dumps(line) + "\n")
 
 
 # The run --------------------------------------------------------------------------------------
