@@ -501,54 +501,67 @@ export function nearestSearch(
     0,
   );
   const r2 = searchM * searchM;
-  let cx = 0,
-    cy = 0,
-    n = 0;
-  let js: Int32Array, bs: Int32Array;
-  let d2s: Float64Array, dxs: Float64Array, dys: Float64Array;
-  const visit = (j: number) => {
-    if (j < 0) return;
-    const dx = (xs[j] - cx) * pm;
-    const dy = (ys[j] - cy) * pm;
-    const d2 = dx * dx + dy * dy;
-    const b = pixels[j];
-    if (d2 <= r2) {
-      let k = n;
-      while (k > 0 && (d2s[k - 1] > d2 || (d2s[k - 1] === d2 && bs[k - 1] > b)))
-        k--;
-      if (k < max) {
-        for (let q = Math.min(n, max - 1); q > k; q--) {
-          js[q] = js[q - 1];
-          d2s[q] = d2s[q - 1];
-          dxs[q] = dxs[q - 1];
-          dys[q] = dys[q - 1];
-          bs[q] = bs[q - 1];
-        }
-        js[k] = j;
-        d2s[k] = d2;
-        dxs[k] = dx;
-        dys[k] = dy;
-        bs[k] = b;
-        if (n < max) n++;
-      }
-    }
-    const delta = split[j] ? dy : dx;
-    visit(delta > 0 ? left[j] : right[j]);
-    // Include equal distances: pixel order decides which tied neighbour wins.
-    if (delta * delta <= (n === max ? Math.min(r2, d2s[max - 1]) : r2))
-      visit(delta > 0 ? right[j] : left[j]);
-  };
+  // A depth-first stack avoids a recursive call for every visited point.
+  const pending = new Int32Array(points.length + 1);
+  const bounds = new Float64Array(points.length + 1);
   return (px, py, out) => {
     if (
       raster &&
       occupied[Math.floor(py / 8) * across + Math.floor(px / 8)] >= 9
     )
       return raster(px, py, out);
-    cx = px + 0.5;
-    cy = py + 0.5;
-    ({ j: js, d2: d2s, dx: dxs, dy: dys, b: bs } = out);
-    n = 0;
-    visit(root);
+    const cx = px + 0.5,
+      cy = py + 0.5;
+    const { j: js, d2: d2s, dx: dxs, dy: dys, b: bs } = out;
+    let n = 0,
+      count = 1;
+    pending[0] = root;
+    bounds[0] = 0;
+    while (count) {
+      const at = --count;
+      const j = pending[at];
+      // Include equal distances: pixel order decides which tied neighbour wins.
+      if (j < 0 || bounds[at] > (n === max ? Math.min(r2, d2s[max - 1]) : r2))
+        continue;
+      const dx = (xs[j] - cx) * pm;
+      const dy = (ys[j] - cy) * pm;
+      const d2 = dx * dx + dy * dy;
+      const b = pixels[j];
+      if (d2 <= r2) {
+        let k = n;
+        while (
+          k > 0 &&
+          (d2s[k - 1] > d2 || (d2s[k - 1] === d2 && bs[k - 1] > b))
+        )
+          k--;
+        if (k < max) {
+          for (let q = Math.min(n, max - 1); q > k; q--) {
+            js[q] = js[q - 1];
+            d2s[q] = d2s[q - 1];
+            dxs[q] = dxs[q - 1];
+            dys[q] = dys[q - 1];
+            bs[q] = bs[q - 1];
+          }
+          js[k] = j;
+          d2s[k] = d2;
+          dxs[k] = dx;
+          dys[k] = dy;
+          bs[k] = b;
+          if (n < max) n++;
+        }
+      }
+      const delta = split[j] ? dy : dx;
+      const far = delta > 0 ? right[j] : left[j];
+      const near = delta > 0 ? left[j] : right[j];
+      if (far >= 0) {
+        pending[count] = far;
+        bounds[count++] = delta * delta;
+      }
+      if (near >= 0) {
+        pending[count] = near;
+        bounds[count++] = 0;
+      }
+    }
     out.n = n;
   };
 }

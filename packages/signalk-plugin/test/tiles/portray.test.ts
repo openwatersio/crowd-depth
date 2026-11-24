@@ -4,12 +4,44 @@ import { PbfReader as Pbf } from "pbf";
 import { Cell } from "../../src/tiles/cells.js";
 import { cellAt, cellCenter, tileFraction } from "../../src/tiles/geometry.js";
 import { EXTENT } from "../../src/tiles/mvt.js";
-import { isolines, carry, PAD_PX } from "../../src/tiles/portray.js";
+import { isolines, carry, cut, PAD_PX } from "../../src/tiles/portray.js";
 import { buildTile } from "../../src/tiles/surface.js";
 
 const Z = 14;
 const LON = -76.2;
 const LAT = 36.98;
+
+test("a one-sample cut preserves depths and leaves missing water outside the window", () => {
+  const n = 4,
+    w = n + 2 * PAD_PX;
+  const depth = new Float64Array(w * w).fill(NaN);
+  const at = (PAD_PX + 1) * w + PAD_PX + 1;
+  depth[at] = 9;
+  const result = cut(
+    {
+      w,
+      depth,
+      wet: depth.slice(),
+      extent: new Float64Array(w * w).fill(1),
+      measured: new Float64Array(w * w).fill(1),
+      shoal: new Float64Array(w * w).fill(Infinity),
+      window: [PAD_PX, PAD_PX, PAD_PX + n - 1, PAD_PX + n - 1],
+    },
+    0,
+    0,
+    n,
+    1,
+  );
+  expect(result.depth[at]).toBe(9);
+  expect(result.wet[at]).toBe(9);
+  expect(result.extent[at]).toBe(1);
+  expect(result.measured[at]).toBe(1);
+  expect(result.depth[at + 1]).toBe(10_000);
+  expect(result.depth[0]).toBe(10_000);
+  expect(result.extent[0]).toBeLessThan(0);
+  expect(result.measured[0]).toBeLessThan(0);
+  expect(Number.isNaN(depth[at + 1])).toBe(true);
+});
 const tile = (() => {
   const f = tileFraction(LON, LAT, Z);
   return { x: Math.floor(f.x), y: Math.floor(f.y) };

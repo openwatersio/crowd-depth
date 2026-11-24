@@ -967,3 +967,46 @@ checks, and plugin lint/publint. The installed renderer SHA-256 matches the loca
 build (`63270272be6dda3e6b5f0eb32c3a4cfb2a88cedf366c4d58434ed945c6cc7345`).
 A post-restart full-model HTTP probe returned 200 in 43 ms; this single probe is
 not the loaded acceptance run.
+
+### November 24: iterative search follow-up (v23, isolated)
+
+The exact active-v22 post-deployment Abaco run remains a gate failure: initial
+viewports took 1.85–5.27 s, settling to 0.62–0.81 s in the final two rounds. Full
+Signal K HTTP p95 was 233.15 ms over 79 samples. The benchmark's event loop max
+was 40.86 ms. This is the measured reason the draft stays blocked.
+
+Production-worker CPU profiles identified tree traversal among the largest CPU
+costs. V23 replaces recursion with a reused explicit depth-first stack, preserving
+near-first order and delayed far-branch pruning. Five alternating Pi kernel rounds
+showed total setup/query medians: sparse spacing 5.7, 194.34 → 140.67 ms; spacing
+10, 82.49 → 56.05 ms; track, 23.65 → 16.66 ms; high latitude, 18.16 → 13.98 ms.
+Dense raster cases were essentially unchanged. All 27 actual-data tiles matched
+byte-for-byte, and all 574 tests passed. Round 36 Opus/Sonnet static reviews found
+no important/correctness defect. Their missing-measurement concern is covered by
+these Pi kernel runs. Unsupported NaN/zero-limit inputs are not produced by the
+only production caller. The stack allocates 12 extra bytes per point once per
+search; this is below the sparse dispatch threshold.
+
+The v23 whole-viewport run still fails nine timing checks, though later views take
+0.52–0.97 s; HTTP p95 is 180.20 ms across 71 samples. It is an isolated experiment,
+not the active package. Kernel improvement does not establish cold-start acceptance.
+
+### November 24: no-upsampling allocation reduction (v24, isolated)
+
+When `cut` uses one sample per pixel, its four field conversions now copy and
+normalize only the used window instead of first allocating full intermediate
+arrays. Paired Pi field comparisons were exact for sparse/dense windows at sizes
+64, 208 and 256. Median `cut` timings fell from 13.36 to 9.13 ms for the sparse
+208-pixel case and 21.28 to 15.98 ms for dense 256 pixels. All 27 actual-data tiles
+matched byte-for-byte. Round 37 Opus/Sonnet reviews found no issue. A direct
+one-sample regression now checks preserved depth, NaN normalization, missing-water
+fields outside the window, and unchanged input. The full suite passes 575 tests.
+Opus's note that the default one-sample path requires n≥342 was arithmetically
+incorrect: `round(256/n)` is 1 already at n=208, covered by the Pi measurements.
+
+The Lake Worth view at (-80.04408, 26.72592) passes the server acceptance gate for
+all 15 views, with 37 concurrent HTTP samples at p95 89.79 ms. Abaco still fails
+five timing checks, with HTTP p95 140.40 ms across 70 samples. Browser paint,
+loaded-backfill coverage and other release blockers remain open. V22 remains
+active; v24 is staged only. A further experiment delaying neighbour-offset writes
+was discarded after mixed microbenchmark results; it is not in the candidate.

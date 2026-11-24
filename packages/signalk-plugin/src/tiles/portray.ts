@@ -515,13 +515,16 @@ function upsample(
   const m = w * u;
   const o = new Float64Array(m * m).fill(far);
   if (X1 < X0 || Y1 < Y0) return o;
-  const src = v.map((d) => (Number.isNaN(d) ? DEEP : d));
   if (u === 1) {
     for (let Y = Y0; Y <= Y1; Y++) {
-      o.set(src.subarray(Y * w + X0, Y * w + X1 + 1), Y * m + X0);
+      for (let X = X0; X <= X1; X++) {
+        const i = Y * w + X;
+        o[i] = Number.isNaN(v[i]) ? DEEP : v[i];
+      }
     }
     return o;
   }
+  const src = v.map((d) => (Number.isNaN(d) ? DEEP : d));
   // Each sample's four source pixels along an axis, and their weights: Catmull-Rom's,
   // or linear; the same for rows and columns, so it's done in two passes.
   const taps = 4;
