@@ -448,7 +448,8 @@ export function neighbours(max: number): Neighbours {
  * row, so the sums and ties that follow come out the same.
  *
  * Sparse searches use a balanced spatial tree to skip empty pixels and distant
- * branches. Dense grids and small radii retain the cheaper raster search.
+ * branches. Globally dense grids and small radii use raster search; sparse grids
+ * with dense patches choose per pixel so empty water can still use the tree.
  */
 export function nearestSearch(
   points: { x: number; y: number }[],
@@ -461,14 +462,18 @@ export function nearestSearch(
   // Tiny radii need too few raster probes to justify a tree.
   if (points.length >= (size * size) / 32 || searchM / pm <= 2)
     return rasterSearch(points, size, pm, searchM, max);
-  // A dense harbour patch can hide inside a sparse tile. Raster probing is
-  // cheaper there; count small blocks before paying to build a tree.
+  // A dense harbour patch can hide inside a sparse tile. Use raster probing
+  // inside that patch, without making distant track pixels probe empty space.
   const across = Math.ceil(size / 8);
   const occupied = new Uint8Array(across * across);
+  let dense = false;
   for (const p of points) {
     const b = Math.floor(p.y / 8) * across + Math.floor(p.x / 8);
-    if (++occupied[b] >= 9) return rasterSearch(points, size, pm, searchM, max);
+    if (++occupied[b] >= 9) dense = true;
   }
+  const raster = dense
+    ? rasterSearch(points, size, pm, searchM, max)
+    : undefined;
   // A balanced spatial tree visits occupied pixels only. Sparse tracks otherwise
   // spend most of the search probing empty pixels across the entire radius.
   const xs = Float64Array.from(points, (p) => p.x);
@@ -534,6 +539,11 @@ export function nearestSearch(
       visit(delta > 0 ? right[j] : left[j]);
   };
   return (px, py, out) => {
+    if (
+      raster &&
+      occupied[Math.floor(py / 8) * across + Math.floor(px / 8)] >= 9
+    )
+      return raster(px, py, out);
     cx = px + 0.5;
     cy = py + 0.5;
     ({ j: js, d2: d2s, dx: dxs, dy: dys, b: bs } = out);

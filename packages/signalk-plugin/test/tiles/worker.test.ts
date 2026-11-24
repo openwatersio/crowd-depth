@@ -78,14 +78,15 @@ test.skipIf(!existsSync(dist))(
       store.addPasses(pass(8));
       tiles.changed([{ lon: -76.2, lat: 36.98 }]);
       // A backfill starts, and a tile is built while it runs.
-      tiles.share(false);
+      tiles.persist(false);
       const before = await bands(x, y);
       // Written as a backfill writes, on its own connection, which tells the tile
-      // service only when it ends.
+      // service after each atomic window commit.
       const backfillDB = createDB(file);
       const backfill = createCellStore(backfillDB);
       for (let k = 0; k < 20; k++) backfill.addPasses(pass(30));
       backfillDB.close();
+      tiles.changed([{ lon: -76.2, lat: 36.98 }]);
       // A tile beside it, not built yet, under the same ancestor.
       const sibling = await bands(x, y ^ 1);
       expect(before.length).toBeGreaterThan(0);
@@ -616,8 +617,9 @@ test.skipIf(!existsSync(dist))(
     store.setMeta("config_depth", settings.depth);
     store.setMeta("config_weight", settings.weight);
     store.addPasses([{ ...cellAt(-80, 26), depth: 5, day: 20000 }]);
+    let chart: ReturnType<typeof startChart> | undefined;
     try {
-      startChart({
+      chart = startChart({
         app: {
           ...app,
           subscriptionmanager: { subscribe: () => {} },
@@ -630,13 +632,336 @@ test.skipIf(!existsSync(dist))(
         db,
         signal: controller.signal,
       });
+      await expect
+        .poll(
+          () =>
+            !!db
+              .prepare("SELECT 1 FROM sqlite_master WHERE name='kept_tiles'")
+              .get(),
+        )
+        .toBe(true);
       expect(db.prepare("SELECT count(*) n FROM kept_tiles").get()).toEqual({
         n: 0,
       });
     } finally {
       controller.abort();
+      await chart?.close();
       db.close();
       rmSync(dir, { recursive: true, force: true });
     }
   },
 );
+
+test.skipIf(!existsSync(dist))(
+  "legacy preview indexing runs on a worker and preserves receipts and evidence",
+  async () => {
+    const { createDB } = await import("../../dist/storage.js");
+    const { createPreviewStore } =
+      await import("../../dist/tiles/history-preview.js");
+    const dir = mkdtempSync(join(tmpdir(), "crowd-depth-preview-"));
+    const file = join(dir, "bathymetry.sqlite");
+    const db = createDB(file);
+    const time = Date.parse("2026-10-16T12:00:00Z");
+    const before = createPreviewStore(db, "a");
+    before.write(
+      "history",
+      Array.from({ length: 1501 }, (_, i) => ({
+        lon: -80 + i * 0.0002,
+        lat: 26,
+        depth: 5,
+        time: time + i,
+      })),
+    );
+    db.prepare("INSERT INTO refined_windows VALUES(?,?)").run(
+      time,
+      time + 1000,
+    );
+    db.exec("DROP TABLE preview_spatial");
+    before.close();
+    const after = createPreviewStore(db, "a");
+    try {
+      // A failed migration must close its connection and allow a subsequent retry.
+      db.exec(
+        "CREATE TRIGGER interrupt_preview_fill BEFORE INSERT ON preview_times BEGIN SELECT RAISE(ABORT,'interrupted index fill'); END",
+      );
+      await expect(after.prepare()).rejects.toThrow();
+      expect(after.features([14, -81, 25, -79, 27], 0)).toEqual([]);
+      db.exec("DROP TRIGGER interrupt_preview_fill");
+      await after.prepare();
+      expect(after.features([14, -81, 25, -79, 27], 0)).toHaveLength(501);
+      expect(
+        db.prepare("SELECT count(*) AS n FROM preview_cells").get()?.n,
+      ).toBe(1501);
+    } finally {
+      after.close();
+      db.close();
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
+    }
+  },
+);
+
+test.skipIf(!existsSync(dist))(
+  "a failed worker's exit cannot reject its replacement's requests",
+  async () => {
+    const { createDB } = await import("../../dist/storage.js");
+    const { createCellStore } = await import("../../dist/tiles/cells.js");
+    const { createTileService } = await import("../../dist/tiles/service.js");
+    const dir = mkdtempSync(join(tmpdir(), "crowd-depth-worker-retry-"));
+    const file = join(dir, "missing.sqlite");
+    const local = createDB(":memory:");
+    const service = createTileService(createCellStore(local), file);
+    let repaired: ReturnType<typeof createDB> | undefined;
+    try {
+      await expect(service.get(15, 100, 100)).rejects.toThrow();
+      repaired = createDB(file);
+      createCellStore(repaired);
+      await expect(service.get(15, 100, 100)).resolves.toBeUndefined();
+    } finally {
+      await service.close();
+      repaired?.close();
+      local.close();
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
+    }
+  },
+);
+
+test.skipIf(!existsSync(dist))(
+  "preview acquisition writes on a worker, retries failures and fences older instances",
+  async () => {
+    const { createDB } = await import("../../dist/storage.js");
+    const { createPreviewStore } =
+      await import("../../dist/tiles/history-preview.js");
+    const dir = mkdtempSync(join(tmpdir(), "crowd-depth-preview-writer-"));
+    const db = createDB(join(dir, "data.sqlite"));
+    const busy: boolean[] = [];
+    const first = createPreviewStore(db, "a", (on) => busy.push(on));
+    let next: ReturnType<typeof createPreviewStore> | undefined;
+    const time = Date.parse("2026-10-16T12:00:00Z");
+    const p = { lon: -80, lat: 26, depth: 5, time };
+    try {
+      db.exec(
+        "CREATE TRIGGER fail_preview BEFORE INSERT ON preview_cells BEGIN SELECT RAISE(ABORT,'preview write failed'); END",
+      );
+      await expect(
+        first.writeAsync("history", [p], [time, time + 1]),
+      ).rejects.toThrow("preview write failed");
+      expect(first.done("history", time, time + 1)).toBe(false);
+      db.exec("DROP TRIGGER fail_preview");
+      await first.writeAsync("history", [p], [time, time + 1]);
+      expect(first.done("history", time, time + 1)).toBe(true);
+      expect(first.features([14, -81, 25, -79, 27], 0)).toHaveLength(1);
+      next = createPreviewStore(db, "b");
+      await first.writeAsync("history", [p], [time, time + 1]);
+      expect(next.features([14, -81, 25, -79, 27], 0)).toEqual([]);
+      expect(next.done("history", time, time + 1)).toBe(false);
+      expect(busy).toEqual([true, false, true, false, true, false]);
+    } finally {
+      await first.close();
+      await next?.close();
+      db.close();
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
+    }
+  },
+);
+
+test.skipIf(!existsSync(dist))(
+  "closing during cold startup rejects queued tiles without opening more workers",
+  async () => {
+    const { createDB } = await import("../../dist/storage.js");
+    const { createCellStore } = await import("../../dist/tiles/cells.js");
+    const { createTileService } = await import("../../dist/tiles/service.js");
+    const dir = mkdtempSync(join(tmpdir(), "crowd-depth-close-start-"));
+    const file = join(dir, "data.sqlite"),
+      db = createDB(file);
+    const service = createTileService(createCellStore(db), file);
+    try {
+      const pending = Promise.allSettled(
+        Array.from({ length: 9 }, (_, i) => service.get(13, 100 + i, 100)),
+      );
+      await service.close();
+      expect((await pending).every((p) => p.status === "rejected")).toBe(true);
+    } finally {
+      await service.close();
+      db.close();
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
+    }
+  },
+);
+
+test("preview worker quarantines a damaged derived tree and preserves canonical writes", async () => {
+  const { createDB } = await import("../../dist/storage.js");
+  const { createPreviewStore } =
+    await import("../../dist/tiles/history-preview.js");
+  const { createCellStore } = await import("../../dist/tiles/cells.js");
+  const dir = mkdtempSync(join(tmpdir(), "crowd-depth-runtime-damage-"));
+  const db = createDB(join(dir, "test.sqlite"));
+  const cells = createCellStore(db);
+  const preview = createPreviewStore(db, "a");
+  const time = Date.now();
+  try {
+    preview.write("history", [{ lon: -80, lat: 26, depth: 4, time }]);
+    db.enableDefensive?.(false);
+    db.exec("UPDATE preview_spatial_node SET data=x'00' WHERE nodeno=1");
+    // The new worker opens the damaged on-disk tree, then retries its rolled-back write.
+    await preview.writeAsync("history", [
+      { lon: -80.01, lat: 26, depth: 5, time },
+    ]);
+    expect(db.prepare("SELECT count(*) n FROM preview_cells").get()?.n).toBe(2);
+    expect(preview.unavailable).toMatch(/RTree|malformed/);
+    cells.replaceWindow(time, time + 1, [], []);
+    expect(db.prepare("SELECT count(*) n FROM refined_windows").get()?.n).toBe(
+      1,
+    );
+    expect(preview.features([15, -81, 25, -79, 27], 0)).toEqual([]);
+  } finally {
+    await preview.close();
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("refinement worker can commit QC receipts after isolating a damaged preview tree", async () => {
+  const { createDB } = await import("../../dist/storage.js");
+  const { createPreviewStore } =
+    await import("../../dist/tiles/history-preview.js");
+  const { createCellStore } = await import("../../dist/tiles/cells.js");
+  const { Worker } = await import("node:worker_threads");
+  const dir = mkdtempSync(join(tmpdir(), "crowd-depth-refinement-damage-"));
+  const file = join(dir, "test.sqlite");
+  const db = createDB(file);
+  createCellStore(db);
+  const preview = createPreviewStore(db, "a");
+  const time = Date.now();
+  preview.write("history", [{ lon: -80, lat: 26, depth: 4, time }]);
+  db.enableDefensive?.(false);
+  db.exec("UPDATE preview_spatial_node SET data=x'00' WHERE nodeno=1");
+  const worker = new Worker(
+    new URL("../../dist/tiles/refine-worker.js", import.meta.url),
+    { workerData: { file } },
+  );
+  const send = (message: unknown) =>
+    new Promise<{ error?: string }>((resolve, reject) => {
+      const error = (err: Error) => {
+        worker.off("message", done);
+        reject(err);
+      };
+      const done = (result: { error?: string }) => {
+        worker.off("error", error);
+        if (result.error) reject(new Error(result.error));
+        else resolve(result);
+      };
+      worker.once("message", done);
+      worker.once("error", error);
+      worker.postMessage(message);
+    });
+  try {
+    await send({ start: time, stop: time + 1 });
+    await send({ end: true });
+    expect(db.prepare("SELECT count(*) n FROM refined_windows").get()?.n).toBe(
+      1,
+    );
+    expect(db.prepare("SELECT count(*) n FROM preview_cells").get()?.n).toBe(1);
+    expect(preview.unavailable).toMatch(/RTree|malformed/);
+  } finally {
+    await worker.terminate();
+    await preview.close();
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a new renderer serves tiles while its old disk cache is cleared off-thread", async () => {
+  const { createDB } = await import("../../dist/storage.js");
+  const { createCellStore } = await import("../../dist/tiles/cells.js");
+  const { createKeptTiles, prepareKeptTiles } =
+    await import("../../dist/tiles/kept.js");
+  const { createTileService } = await import("../../dist/tiles/service.js");
+  const { cellAt, tileFraction } = await import("../../dist/tiles/geometry.js");
+  const dir = mkdtempSync(join(tmpdir(), "crowd-depth-cache-upgrade-"));
+  const file = join(dir, "test.sqlite"),
+    db = createDB(file);
+  const store = createCellStore(db);
+  store.addPasses([{ ...cellAt(-80, 26), depth: 5, day: 20000 }]);
+  const f = tileFraction(-80, 26, 14),
+    at = [14, Math.floor(f.x), Math.floor(f.y)] as const;
+  const old = createKeptTiles(db, "high", { version: "old-renderer" });
+  const stale = Buffer.from("stale tile");
+  old.keep(old.reserve(...at), stale);
+  const tiles = createTileService(store, file, "high");
+  const controller = new AbortController();
+  let preparing: ReturnType<typeof prepareKeptTiles> | undefined;
+  try {
+    preparing = prepareKeptTiles(db, "high", controller.signal);
+    const drawn = await tiles.get(...at);
+    expect(drawn?.length).toBeGreaterThan(0);
+    expect(drawn?.equals(stale)).toBe(false);
+    const next = await preparing;
+    expect(next.get(...at)).toBeUndefined();
+    tiles.attachKept(next);
+    tiles.reset();
+    expect((await tiles.get(...at))?.equals(drawn!)).toBe(true);
+    expect(next.get(...at)?.equals(drawn!)).toBe(true);
+  } finally {
+    controller.abort();
+    await preparing?.catch(() => {});
+    await tiles.close();
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a rolled-back refinement worker commit is not reported as an uncertain commit", async () => {
+  const { createDB } = await import("../../dist/storage.js");
+  const { createCellStore } = await import("../../dist/tiles/cells.js");
+  const { refineHistory, UncertainRefinementCommit } =
+    await import("../../dist/tiles/refine.js");
+  const { Temporal } = await import("@js-temporal/polyfill");
+  const { Readable } = await import("node:stream");
+  const { config } = await import("../helper.js");
+  const dir = mkdtempSync(join(tmpdir(), "crowd-depth-rollback-"));
+  const file = join(dir, "test.sqlite"),
+    db = createDB(file),
+    store = createCellStore(db);
+  const from = Temporal.Instant.from("2026-10-01T00:00Z"),
+    to = from.add({ hours: 1 });
+  store.setMeta("backfill", `${from}/${to}`);
+  db.exec(
+    "CREATE TRIGGER fail_receipt BEFORE INSERT ON refined_windows BEGIN SELECT RAISE(ABORT,'receipt rejected'); END;",
+  );
+  const errors: unknown[] = [];
+  try {
+    await expect(
+      refineHistory({
+        store,
+        config,
+        file,
+        signal: new AbortController().signal,
+        source: {
+          createReader: () =>
+            Readable.from(
+              Array.from({ length: 600 }, (_, i) => ({
+                longitude: -80 + i * 0.00001,
+                latitude: 26,
+                depth: 5,
+                timestamp: from.add({ seconds: i }),
+              })),
+            ),
+          getAvailableTimeframes: () => [],
+        },
+        onError: (error) => errors.push(error),
+      }),
+    ).rejects.toThrow("Some refinement windows remain pending");
+    expect(errors.length).toBeGreaterThan(0);
+    for (const error of errors) {
+      expect(String(error)).toContain("receipt rejected");
+      expect(error).not.toBeInstanceOf(UncertainRefinementCommit);
+    }
+    expect(db.prepare("SELECT count(*) n FROM cells").get()?.n).toBe(0);
+    expect(db.prepare("SELECT count(*) n FROM refined_windows").get()?.n).toBe(
+      0,
+    );
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

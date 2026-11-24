@@ -1,3 +1,4 @@
+import { createCollector } from "../src/collector.js";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -7,6 +8,17 @@ import createPlugin from "../src/plugin.js";
 import { createReporter } from "../src/reporters/index.js";
 import { settleSource } from "../src/sources/settle.js";
 import { app as baseApp, config } from "./helper.js";
+import { startChartSafely } from "../src/chart.js";
+
+vi.mock("../src/collector.js", async (original) => {
+  const actual = await original<typeof import("../src/collector.js")>();
+  return { ...actual, createCollector: vi.fn(actual.createCollector) };
+});
+
+vi.mock("../src/chart.js", async (original) => {
+  const actual = await original<typeof import("../src/chart.js")>();
+  return { ...actual, startChartSafely: vi.fn(actual.startChartSafely) };
+});
 
 vi.mock("../src/sources/settle.js", async (importOriginal) => {
   const original =
@@ -64,6 +76,66 @@ describe("plugin", () => {
     const plugin = createPlugin(app);
     expect(plugin.start(config, () => {})).toBeUndefined();
     plugin.stop();
+  });
+
+  test("rapid replacements wait for the oldest chart's workers", async () => {
+    let release!: () => void;
+    const closing = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const first = { close: vi.fn(() => closing), backfill: async () => {} };
+    const last = { close: vi.fn(async () => {}), backfill: async () => {} };
+    const starts = vi.mocked(startChartSafely);
+    const before = starts.mock.calls.length;
+    const recording = vi.mocked(createCollector).mock.calls.length;
+    starts.mockReturnValueOnce(first).mockReturnValueOnce(last);
+    const plugin = createPlugin(app);
+    try {
+      plugin.start(config, () => {});
+      plugin.start(config, () => {});
+      plugin.start(config, () => {});
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(starts.mock.calls.length - before).toBe(1);
+      await vi.waitFor(() =>
+        expect(vi.mocked(createCollector).mock.calls.length).toBeGreaterThan(
+          recording,
+        ),
+      );
+      release();
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(starts.mock.calls.length - before).toBe(2);
+      await plugin.stop();
+      expect(last.close).toHaveBeenCalled();
+    } finally {
+      release();
+      await plugin.stop();
+    }
+  });
+
+  test("a rejected chart backfill is logged without stopping reporting", async () => {
+    vi.mocked(startChartSafely).mockReturnValueOnce({
+      close: async () => {},
+      backfill: async () => {
+        throw new Error("cache initialization failed");
+      },
+    });
+    vi.mocked(settleSource).mockResolvedValueOnce({
+      createReader: () => undefined,
+      getAvailableTimeframes: () => [],
+    });
+    const plugin = createPlugin(app);
+    const before = vi.mocked(createReporter).mock.calls.length;
+    try {
+      plugin.start(config, () => {});
+      await vi.waitFor(() =>
+        expect(error).toHaveBeenCalledWith(
+          expect.stringContaining("cache initialization failed"),
+        ),
+      );
+      expect(vi.mocked(createReporter).mock.calls.length).toBe(before + 1);
+    } finally {
+      await plugin.stop();
+    }
   });
 
   test("settings from the progressive preview resolve a missing depth path", async () => {

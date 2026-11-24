@@ -25,6 +25,8 @@ interface Session {
   reporting: AbortController;
   anonymous: boolean;
   reporter?: ReturnType<typeof createReporter>;
+  chartReady?: Promise<ReturnType<typeof startChartSafely>>;
+  previousClosed: Promise<void>;
   stopping?: Promise<void>;
 }
 
@@ -43,22 +45,35 @@ export default function createPlugin(app: ServerAPI): Plugin {
 
       // Each start owns its lifetime, including an outstanding final upload.
       const controller = new AbortController();
+      const previous = current;
       current?.controller.abort("Replaced crowd-depth instance");
       current?.reporting.abort("Replaced crowd-depth instance");
       const session: Session = {
         controller,
         reporting: new AbortController(),
         anonymous: config.sharing?.anonymous === true,
+        previousClosed: Promise.allSettled([
+          previous?.previousClosed,
+          previous?.chartReady?.then((chart) => chart?.close()),
+        ]).then(() => undefined),
       };
       current = session;
       const ready = (config: Config) => {
         const db = createDB(join(app.getDataDirPath(), `bathymetry.sqlite`));
-        const chart = startChartSafely({
-          app,
-          config,
-          db,
-          signal: controller.signal,
-        });
+        const createChart = () => {
+          if (controller.signal.aborted) return undefined;
+          const chart = startChartSafely({
+            app,
+            config,
+            db,
+            signal: controller.signal,
+          });
+          return chart;
+        };
+        const chart = previous
+          ? session.previousClosed.then(createChart)
+          : Promise.resolve(createChart());
+        session.chartReady = chart;
 
         // Settling can wait up to BATHY_HISTORY_WAIT for a history provider, so
         // it runs in the background and start() doesn't hold up the server.
@@ -129,6 +144,8 @@ export default function createPlugin(app: ServerAPI): Plugin {
             );
         } finally {
           session.reporting.abort("Stopping crowd-depth reporter");
+          await session.previousClosed;
+          await (await session.chartReady)?.close();
         }
       })();
       return session.stopping;
@@ -148,7 +165,7 @@ interface SettleAndReportOptions {
   app: ServerAPI;
   config: Config;
   db: ReturnType<typeof createDB>;
-  chart: ReturnType<typeof startChartSafely>;
+  chart: Promise<ReturnType<typeof startChartSafely>>;
   status: Status;
   session: Session;
 }
@@ -181,7 +198,14 @@ async function settleAndReport({
   });
   if (!source || controller.signal.aborted) return;
 
-  void chart?.backfill(source);
+  void chart
+    .then((ready) => {
+      if (!controller.signal.aborted) return ready?.backfill(source);
+    })
+    .catch((error: unknown) => {
+      if (!controller.signal.aborted)
+        app.error(`Chart backfill stopped: ${error}`);
+    });
 
   session.reporter = createReporter({
     app,

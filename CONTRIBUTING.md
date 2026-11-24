@@ -61,7 +61,7 @@ Requires Node >= 24. Local development and CI read the tested Node version from 
 
 ```sh
 npm ci            # installs all workspaces from package-lock.json
-npm run build     # tsc -b, all packages
+npm run build     # TypeScript, plugin worker bundle and web assets
 npm test          # vitest, all packages
 npm run check     # oxlint + prettier + per-package lint
 npm run format    # auto-fix lint and formatting issues
@@ -90,7 +90,7 @@ It also runs the end-to-end suite (below) and boots the API Worker under `wrangl
 ```sh
 npm test -- --project crowd-depth   # plugin tests only
 npm run build -w crowd-depth
-npm run dev -w crowd-depth     # tsc --watch
+npm run dev -w crowd-depth     # tsc -b --force && tsc -w
 ```
 
 The end-to-end suite boots a real Signal K server with the built plugin,

@@ -14,7 +14,7 @@ const sample = {
   heading: 0,
   timestamp: from,
 };
-function setup(read = () => Readable.from([sample])) {
+async function setup(read = () => Readable.from([sample])) {
   const db = createDB(":memory:");
   const controller = new AbortController();
   const createReader = vi.fn(read);
@@ -22,7 +22,12 @@ function setup(read = () => Readable.from([sample])) {
     createReader,
     getAvailableTimeframes: () => [window],
   };
-  const cached = cacheChartInputs(db, source, "source-v1", controller.signal);
+  const cached = await cacheChartInputs(
+    db,
+    source,
+    "source-v1",
+    controller.signal,
+  );
   return { db, controller, source, cached, createReader };
 }
 async function collect(reader: ReturnType<BathymetrySource["createReader"]>) {
@@ -37,7 +42,7 @@ test("preview streams immediately, concurrent refinement shares the completed ho
   const gate = new Promise<void>((resolve) => {
     finish = resolve;
   });
-  const s = setup(() =>
+  const s = await setup(() =>
     Readable.from(
       (async function* () {
         yield sample;
@@ -58,7 +63,7 @@ test("preview streams immediately, concurrent refinement shares the completed ho
     /* drain */
   }
   expect((await refinement).map((s) => s.depth)).toEqual([3, 4]);
-  const restarted = cacheChartInputs(
+  const restarted = await cacheChartInputs(
     s.db,
     s.source,
     "source-v1",
@@ -66,7 +71,7 @@ test("preview streams immediately, concurrent refinement shares the completed ho
   );
   expect(await collect(restarted.createReader(window))).toHaveLength(2);
   expect(s.createReader).toHaveBeenCalledTimes(1);
-  const changed = cacheChartInputs(
+  const changed = await cacheChartInputs(
     s.db,
     s.source,
     "source-v2",
@@ -78,7 +83,7 @@ test("preview streams immediately, concurrent refinement shares the completed ho
 });
 
 test("failed or cancelled streams never publish partial input chunks", async () => {
-  const s = setup(() =>
+  const s = await setup(() =>
     Readable.from(
       (async function* () {
         for (let i = 0; i < 1100; i++) yield sample;
@@ -102,7 +107,7 @@ test("failed or cancelled streams never publish partial input chunks", async () 
 });
 
 test("mutable tail and partial windows are reread, and empty settled hours remain retryable", async () => {
-  const s = setup(() => Readable.from([]));
+  const s = await setup(() => Readable.from([]));
   const partial = new Timeframe(from.add({ seconds: 1 }), window.to);
   await collect(s.cached.createReader(partial));
   await collect(s.cached.createReader(partial));
@@ -120,7 +125,7 @@ test("mutable tail and partial windows are reread, and empty settled hours remai
 });
 
 test("acquired chunks can be prioritized spatially without calling history", async () => {
-  const s = setup();
+  const s = await setup();
   try {
     await collect(s.cached.createReader(window));
     expect(s.cached.getStoredTimeframes!(window, [0, 1, 2, 3])).toEqual([
@@ -154,7 +159,7 @@ test("timed-out provider reads release consumers without stacking queries", asyn
         }),
     )
     .mockImplementation(() => Readable.from([sample]));
-  const cached = cacheChartInputs(
+  const cached = await cacheChartInputs(
     db,
     { createReader: read, getAvailableTimeframes: () => [] },
     "timeout",
@@ -183,3 +188,46 @@ test("timed-out provider reads release consumers without stacking queries", asyn
     vi.useRealTimers();
   }
 });
+
+test.each(["initialize", "page"])(
+  "input cache retries %s locks without blocking the event loop",
+  async (stage) => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { DatabaseSync } = await import("node:sqlite");
+    const dir = mkdtempSync(join(tmpdir(), "crowd-depth-input-lock-"));
+    const file = join(dir, "test.sqlite"),
+      db = createDB(file),
+      locker = new DatabaseSync(file);
+    const controller = new AbortController();
+    const source: BathymetrySource = {
+      createReader: () => Readable.from([sample]),
+      getAvailableTimeframes: () => [window],
+    };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      let cached =
+        stage === "page"
+          ? await cacheChartInputs(db, source, "a", controller.signal)
+          : undefined;
+      locker.exec("BEGIN IMMEDIATE");
+      timer = setTimeout(() => locker.exec("ROLLBACK"), 80);
+      const start = performance.now();
+      cached ??= await cacheChartInputs(db, source, "a", controller.signal);
+      expect(await collect(cached.createReader(window))).toHaveLength(1);
+      expect(performance.now() - start).toBeLessThan(1000);
+      expect(db.prepare("PRAGMA busy_timeout").get()?.timeout).toBe(5000);
+      expect(
+        db.prepare("SELECT count(*) n FROM chart_input_chunks").get()?.n,
+      ).toBe(1);
+    } finally {
+      clearTimeout(timer);
+      controller.abort();
+      if (locker.isTransaction) locker.exec("ROLLBACK");
+      locker.close();
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);

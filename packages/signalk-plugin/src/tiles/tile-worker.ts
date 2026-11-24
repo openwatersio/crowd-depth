@@ -5,6 +5,14 @@ import { DatabaseSync } from "node:sqlite";
 import { createCellStore } from "./cells.js";
 import { readPreview } from "./preview.js";
 import { clearShared, readTile } from "./service.js";
+import { setPriority } from "node:os";
+
+// Keep Signal K's main thread responsive when a viewport needs several cold tiles.
+if (process.platform === "linux") {
+  try {
+    setPriority(10);
+  } catch {}
+}
 
 const db = new DatabaseSync(workerData.file, { readOnly: true });
 const store = createCellStore(db);

@@ -21,6 +21,7 @@ const config = { sounder: { x: 0, y: 0 }, gnss: { x: 0, y: 0 } };
 for (const moving of [true, false]) {
   const dir = mkdtempSync(join(tmpdir(), "crowd-depth-preview-bench-"));
   const db = createDB(join(dir, "bench.sqlite"));
+  let preview;
   const samples = function* () {
     for (let i = 0; i < count; i++)
       yield {
@@ -33,12 +34,12 @@ for (const moving of [true, false]) {
       };
   };
   try {
-    const preview = createPreviewStore(db, "benchmark");
-    const original = preview.write;
+    preview = createPreviewStore(db, "benchmark");
+    const original = preview.writeAsync;
     const started = performance.now();
     let first;
-    preview.write = (...args) => {
-      original(...args);
+    preview.writeAsync = async (...args) => {
+      await original(...args);
       if (args[1].length) first ??= performance.now() - started;
     };
     await scanPreview({
@@ -76,6 +77,7 @@ for (const moving of [true, false]) {
       }),
     );
   } finally {
+    await preview?.close();
     db.close();
     rmSync(dir, { recursive: true, force: true });
   }

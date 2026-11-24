@@ -959,7 +959,7 @@ test("settled history is processed immediately while its mutable tail remains pe
   db.close();
 });
 
-test("source-selection upgrade rebuilds derived cells and retains recorded soundings", () => {
+test("source-selection upgrade without provenance retains raw soundings but sets a boundary", () => {
   const db = createDB(":memory:");
   const store = createCellStore(db);
   const previous = JSON.parse(cellConfig(config).depth);
@@ -982,3 +982,48 @@ test("source-selection upgrade rebuilds derived cells and retains recorded sound
     controller.abort();
   }
 });
+
+test.each([
+  { changed: false, explicit: true },
+  { changed: true, explicit: true },
+  { changed: false, explicit: false },
+  { changed: true, explicit: false },
+])(
+  "source-selection upgrade preserves a proven recording boundary ($changed, $explicit)",
+  ({ changed, explicit }) => {
+    const db = createDB(":memory:");
+    const store = createCellStore(db);
+    const next = {
+      ...config,
+      chart: { show: false },
+      sounder: { ...config.sounder, source: explicit ? "sounder" : undefined },
+      gnss: { ...config.gnss, source: explicit ? "gps" : undefined },
+    };
+    const keys = cellConfig(next);
+    const old = JSON.parse(keys.depth);
+    delete old.sourceSelection;
+    delete old.sounderSource;
+    delete old.positionSource;
+    const sensors = JSON.parse(keys.position);
+    if (changed) sensors.sounderSource = "another-sounder";
+    store.setMeta("config_position", JSON.stringify(sensors));
+    store.setMeta("config_depth", JSON.stringify(old));
+    const cutoff = "2026-11-22T14:06:46.969401946Z";
+    store.setMeta("depth_since", cutoff);
+    const controller = new AbortController();
+    try {
+      startChart({
+        app: serverApp().app,
+        config: next,
+        db,
+        signal: controller.signal,
+      });
+      expect(store.getMeta("depth_since") === cutoff).toBe(!changed);
+      expect(store.getMeta("config_depth")).toBe(
+        changed ? keys.depth : JSON.stringify(old),
+      );
+    } finally {
+      controller.abort();
+    }
+  },
+);

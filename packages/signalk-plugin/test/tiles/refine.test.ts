@@ -321,8 +321,10 @@ test("visible legacy previews refine without discovery or advancing global cover
   preview.write("history", [{ lon: -80, lat: 26, depth: 5, time: ms + 60000 }]);
   const view = [14, -80.01, 25.99, -79.99, 26.01] as const;
   let discovery = 0;
+  const busy: boolean[] = [];
   try {
     await refineVisible({
+      onBusy: (value) => busy.push(value),
       store,
       config,
       signal: controller.signal,
@@ -346,6 +348,7 @@ test("visible legacy previews refine without discovery or advancing global cover
       onChange: () => controller.abort(),
     });
     expect(discovery).toBe(0);
+    expect(busy).toEqual([true, false]);
     expect(store.getMeta("backfill")).toBe(pending);
     expect(store.windowDone(ms, ms + HOUR, false)).toBe(true);
     expect(cells(store).length).toBeGreaterThan(0);

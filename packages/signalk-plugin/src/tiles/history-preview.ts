@@ -1,3 +1,15 @@
+import {
+  createPreviewWriter,
+  createPreviewWriteThread,
+} from "./preview-write.js";
+import { createPreviewQuery } from "./preview-query.js";
+import {
+  createPreviewSpatial,
+  clearPreviewSpatial,
+  disablePreviewSpatial,
+  isolateDamagedPreview,
+} from "./preview-spatial.js";
+import { Worker } from "node:worker_threads";
 import type { DatabaseSync } from "node:sqlite";
 import { Temporal } from "@js-temporal/polyfill";
 import { setImmediate, setTimeout as sleep } from "node:timers/promises";
@@ -7,7 +19,7 @@ import { Timeframe } from "../types.js";
 import { correctForSensorPosition } from "../streams/transforms.js";
 import type { Config } from "../config.js";
 import { cellAt, DEFINITIONS } from "./geometry.js";
-import { depthLabels, MAX_PUBLISHED_DEPTH_M } from "./surface.js";
+import { depthLabels } from "./surface.js";
 
 export type PreviewView = readonly [number, number, number, number, number];
 export type Observation = {
@@ -18,7 +30,6 @@ export type Observation = {
 };
 const HOUR = 3600_000;
 const DAY = 24 * HOUR;
-const LIMIT = 1200;
 
 /** Preview is evidence of an observation, never an input to the refined statistic. */
 export function observation(data: BathymetryData): Observation | undefined {
@@ -38,23 +49,42 @@ export function observation(data: BathymetryData): Observation | undefined {
 }
 
 /** One latest observation per cell: bounded by visited water, not time at anchor. */
-export function createPreviewStore(db: DatabaseSync, config: string) {
+export function createPreviewStore(
+  db: DatabaseSync,
+  config: string,
+  onBusy: (busy: boolean) => void = () => {},
+) {
   db.exec(`CREATE TABLE IF NOT EXISTS preview_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS preview_cells(py INTEGER, px INTEGER, lon REAL NOT NULL,
       lat REAL NOT NULL, depth REAL NOT NULL, time INTEGER NOT NULL, source TEXT NOT NULL,
       PRIMARY KEY(py, px)) WITHOUT ROWID;
-    CREATE INDEX IF NOT EXISTS preview_lat ON preview_cells(lat, lon);
+    DROP INDEX IF EXISTS preview_lat;
     CREATE TABLE IF NOT EXISTS preview_windows(source TEXT, start INTEGER, end INTEGER,
       PRIMARY KEY(source, start, end)) WITHOUT ROWID;`);
   const meta = db.prepare("SELECT value FROM preview_meta WHERE key = ?");
   const put = db.prepare("INSERT OR REPLACE INTO preview_meta VALUES(?, ?)");
   const value = (key: string) =>
     (meta.get(key) as { value: string } | undefined)?.value;
+  let spatial: ReturnType<typeof createPreviewSpatial> | undefined;
+  let unavailable: string | undefined;
+  try {
+    spatial = createPreviewSpatial(db);
+    // IF NOT EXISTS alone does not open an existing virtual table's module.
+    db.prepare("SELECT 1 FROM preview_spatial LIMIT 1").get();
+    db.exec("DELETE FROM preview_meta WHERE key='spatial_unavailable'");
+  } catch (error) {
+    if (String(error).includes("no such module: rtree_i32"))
+      disablePreviewSpatial(db, String(error));
+    else if (!isolateDamagedPreview(db, error)) throw error;
+    unavailable = String(error);
+    spatial = undefined;
+  }
   db.exec("BEGIN IMMEDIATE");
   let generation: string;
   try {
     if (value("config") !== config) {
-      db.exec("DELETE FROM preview_cells; DELETE FROM preview_windows");
+      if (spatial) clearPreviewSpatial(db);
+      else db.exec("DELETE FROM preview_cells; DELETE FROM preview_windows");
       put.run("config", config);
     }
     generation = String(Number(value("generation") ?? 0) + 1);
@@ -66,91 +96,139 @@ export function createPreviewStore(db: DatabaseSync, config: string) {
   }
   let closed = false;
   const current = () => !closed && value("generation") === generation;
-  const insert =
-    db.prepare(`INSERT INTO preview_cells VALUES(?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(py,px) DO UPDATE SET lon=excluded.lon, lat=excluded.lat,
-      depth=excluded.depth, time=excluded.time, source=excluded.source
-    WHERE excluded.time >= preview_cells.time`);
-  const complete = db.prepare(
-    "INSERT OR IGNORE INTO preview_windows VALUES(?, ?, ?)",
-  );
+  const write = createPreviewWriter(db, generation);
+  let writingThread: ReturnType<typeof createPreviewWriteThread> | undefined;
   const has = db.prepare(
     "SELECT 1 FROM preview_windows WHERE source=? AND start=? AND end=?",
   );
-  const read =
-    db.prepare(`SELECT py, px, lon, lat, depth, time FROM preview_cells
-    WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ? AND time >= ?
-    ORDER BY time DESC LIMIT ?`);
+  const query = spatial ? createPreviewQuery(db) : undefined;
+  let migration: Promise<void> | undefined;
+  let worker: Worker | undefined;
+  let priorityView: PreviewView | undefined;
+  let priorityKey: string | undefined;
+  const prioritize = (view: PreviewView | undefined) => {
+    if (!view) return;
+    const key = JSON.stringify(view);
+    if (key === priorityKey) return;
+    priorityView = view;
+    priorityKey = key;
+    worker?.postMessage({ view });
+  };
   return {
     current,
+    spatial: spatial !== undefined,
+    get unavailable() {
+      return unavailable ?? value("spatial_unavailable");
+    },
     close() {
       closed = true;
+      return Promise.all([worker?.terminate(), writingThread?.close()]);
+    },
+    prepare(view?: PreviewView) {
+      if (!current() || !spatial || unavailable || value("spatial_unavailable"))
+        return Promise.resolve();
+      prioritize(view);
+      if (migration) return migration;
+      if (spatial.ready()) return Promise.resolve();
+      const file = db.location();
+      if (!file)
+        return (migration = (async () => {
+          while (current() && !spatial!.fill(generation)) await setImmediate();
+        })().finally(() => {
+          migration = undefined;
+        }));
+      return (migration = new Promise<void>((resolve, reject) => {
+        worker = new Worker(
+          new URL("./preview-spatial-worker.js", import.meta.url),
+          { workerData: { file, generation, view: priorityView } },
+        );
+        let finished = false;
+        let failure: Error | undefined;
+        worker.once(
+          "message",
+          (message: { error?: string; done?: boolean }) => {
+            finished = message.done === true;
+            if (message.error) failure = new Error(message.error);
+          },
+        );
+        worker.once("error", (error) => {
+          failure = error instanceof Error ? error : new Error(String(error));
+        });
+        worker.once("exit", (code) => {
+          if (closed || (code === 0 && finished && !failure)) resolve();
+          else
+            reject(
+              failure ?? new Error(`Preview index worker exited: ${code}`),
+            );
+        });
+      }).finally(() => {
+        migration = undefined;
+        worker = undefined;
+      }));
     },
     done(source: string, start: number, end: number) {
       return !!has.get(source, start, end);
     },
     write(source: string, points: Observation[], window?: [number, number]) {
+      if (!closed) write(source, points, window);
+    },
+    async writeAsync(
+      source: string,
+      points: Observation[],
+      window?: [number, number],
+    ) {
       if (closed) return;
-      db.exec("BEGIN IMMEDIATE");
+      onBusy(true);
       try {
-        if (current()) {
-          // History's paired 1s buckets replace local preview for the settled interval.
-          if (source === "history" && window)
-            db.prepare(
-              "DELETE FROM preview_cells WHERE source='local' AND time>=? AND time<?",
-            ).run(...window);
-          for (const s of points) {
-            const { py, px } = cellAt(s.lon, s.lat);
-            insert.run(py, px, s.lon, s.lat, s.depth, s.time, source);
+        const file = db.location();
+        if (!file) write(source, points, window);
+        else {
+          const thread = (writingThread ??= createPreviewWriteThread(
+            file,
+            generation,
+          ));
+          try {
+            await thread.write(source, points, window);
+          } catch (error) {
+            if (writingThread === thread) writingThread = undefined;
+            await thread.close();
+            throw error;
           }
-          if (window) complete.run(source, ...window);
         }
-        db.exec("COMMIT");
-      } catch (err) {
-        db.exec("ROLLBACK");
-        throw err;
+      } finally {
+        onBusy(false);
       }
     },
     features(view: PreviewView | undefined, since: number) {
-      if (!view || closed) return [];
-      const [, west, south, east, north] = view;
-      const ranges =
-        west > east
-          ? [
-              [west, 180],
-              [-180, east],
-            ]
-          : [[west, east]];
-      const rows = ranges.flatMap(([w, e]) =>
-        read.all(south, north, w, e, since, LIMIT),
-      ) as (Observation & { py: number; px: number })[];
-      const hasRefined = !!db
-        .prepare("SELECT 1 FROM sqlite_master WHERE name='refined_windows'")
-        .get();
-      const refined = hasRefined
-        ? db.prepare(
-            "SELECT end FROM refined_windows WHERE start<=? ORDER BY start DESC LIMIT 1",
-          )
-        : undefined;
-      return rows
-        .filter(
-          (s) =>
-            s.depth < MAX_PUBLISHED_DEPTH_M &&
-            Number(refined?.get(s.time)?.end ?? -Infinity) <= s.time,
-        )
-        .sort((a, b) => b.time - a.time)
-        .slice(0, LIMIT)
-        .map((s) => ({
-          type: "Feature",
-          id: `history:${s.py}:${s.px}`,
-          geometry: { type: "Point", coordinates: [s.lon, s.lat] },
-          properties: {
-            ...depthLabels(s.depth),
-            provisional: true,
-            reference: "untided",
-            time: s.time,
-          },
-        }));
+      if (
+        !view ||
+        !current() ||
+        !query ||
+        unavailable ||
+        value("spatial_unavailable")
+      )
+        return [];
+      prioritize(view);
+      let rows;
+      try {
+        rows = query.read(view, since);
+      } catch (error) {
+        if (![11, 267].includes((error as { errcode: number })?.errcode))
+          throw error;
+        unavailable = String(error);
+        return [];
+      }
+      return rows.map((s) => ({
+        type: "Feature",
+        id: `history:${s.py}:${s.px}`,
+        geometry: { type: "Point", coordinates: [s.lon, s.lat] },
+        properties: {
+          ...depthLabels(s.depth),
+          provisional: true,
+          reference: "untided",
+          time: s.time,
+        },
+      }));
     },
   };
 }
@@ -244,8 +322,8 @@ export async function scanPreview({
             if (points.size > 50_000)
               throw new Error("preview window exceeds cell limit");
           }
-          if (++count % 1000 === 0) {
-            store.write(name, publish);
+          if (++count % 250 === 0) {
+            await store.writeAsync(name, publish);
             publish = [];
             await setImmediate();
           }
@@ -259,7 +337,11 @@ export async function scanPreview({
     if (!active()) return;
     // Recent provider writes can still arrive; never checkpoint that tail as settled.
     const settled = to <= Date.now() - BATHY_REPORT_DELAY.total("milliseconds");
-    store.write(name, [...points.values()], settled ? [from, to] : undefined);
+    await store.writeAsync(
+      name,
+      [...points.values()],
+      settled ? [from, to] : undefined,
+    );
   };
   // Retry failures without converting them to empty successful intervals.
   const retry = async (run: () => Promise<void>) => {
@@ -338,7 +420,7 @@ export async function scanPreview({
         active() &&
         to <= Date.now() - BATHY_REPORT_DELAY.total("milliseconds")
       )
-        store.write(name, [], [from, to]);
+        await store.writeAsync(name, [], [from, to]);
       span = windows.length ? DAY : Math.min(span * 2, 365 * DAY);
     });
     to = from;

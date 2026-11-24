@@ -304,7 +304,8 @@ sparse full-search equivalence, maximum counts 1/3/12, exact-radius ties, empty
 inputs, and a collinear track. A separate 64-tile matrix across latitudes,
 zooms, contour detail and shoals produced byte-identical output.
 
-Desktop medians after one warm-up and five alternating-order rounds (Node
+Historical round-14 desktop medians, superseded by the November 24 hybrid-search
+measurements below, after one warm-up and five alternating-order rounds (Node
 24.21.0, not Pi acceptance), including index setup:
 
 | Search workload                         | Before ms | Candidate ms |
@@ -330,10 +331,12 @@ focused-review attempt had an empty snapshot and is not a completed review.
 
 The round 14 focused review found no correctness defect but identified a missing
 performance case: a dense harbour inside an otherwise sparse raster. Direct
-measurement confirmed the tree regression. The final implementation now checks
+measurement confirmed the tree regression. That iteration checked
 8×8-pixel blocks before constructing a tree; a block with at least 9 occupied
-pixels keeps the tile on the original raster search. The measured harbour case
-returns to baseline performance while sparse tracks retain their improvement.
+pixels kept the tile on the original raster search. That measured harbour case
+returned to baseline performance while sparse tracks retained their improvement.
+The November 24 candidate instead chooses per query block; see its newer Pi
+measurements and the explicit dense-harbour setup regression below.
 Both dispatches still compute identical neighbours. Tests now compare clustered
 and dispersed inputs just below, at and above the global dispatch threshold, at
 48- and 288-pixel sizes, against a full sort, including max counts larger than
@@ -490,6 +493,477 @@ need implementation and tests. No index or schema was changed by the experiment.
 
 The merge review also found that production backfill disables shared prepared
 surfaces through its whole retry loop. Standalone viewport benchmarks have sharing
-enabled, so they do not represent this worst-case production mode. Retaining safe
-cache reuse between atomic refinement commits, with reliable invalidation on
-commit and worker failure, is a remaining performance priority.
+enabled, so they did not represent that production mode. The November 24 changes
+retain shared surfaces across atomic commits and invalidate changed regions; the
+older measurements above predate that fix.
+
+## November 24: bounded primary-key trial (not accepted)
+
+The primary-key trial advanced at most 32 populated latitude rows and 1,200
+candidates per poll. On the Pi, a broad viewport took 1.6–6.8 ms per slice versus
+2,649 ms for the existing full-range timestamp sort. Local/narrow slices took
+about 2 ms. With refinement filtering disabled to simulate a populated provisional
+cache, retaining/rechecking the visible set took up to 24.3 ms. These are read-only
+Docker measurements, not browser latency or acceptance results.
+
+Open Waters rounds 21–22 (Opus and Sonnet, static reviews) exposed correctness and
+latency limits: GPS jitter could restart a sweep, near-identical clients could
+interfere, invisible incoming rows could evict useful points, and a wide sparse
+view could take minutes to scan even though each individual call was fast.
+Jitter/eviction/write-lock tests were added, but the overall query design is not
+accepted. Do not count the slice timings as meeting the useful-first-view target.
+A native pending-point spatial index is the next candidate; both local and Pi
+Node SQLite builds support R*Tree, so no SpatiaLite dependency is needed for it.
+The trial is retained outside the repository under `/tmp/preview-keyrange-trial`.
+
+The independent cache-control change separates prepared-surface reuse from
+persistent tile-cache writes. Refinement commits already report changed positions;
+keep shared surfaces between commits, invalidate them on each commit, and reset
+on uncertain worker failures. Persistent-cache writes remain suspended while any
+background refinement/reweight writer is active. This change is under review in
+round 23; the active Pi package has not been replaced.
+
+## November 24: native preview spatial index candidate
+
+The replacement uses SQLite's built-in `rtree_i32`, with integer longitude,
+latitude, QC epoch and observation-minute bounds. It returns up to 1,200 pending
+observations per viewport in one lookup (two across the dateline). The result is
+a spatial sample, not the globally newest 1,200 observations. Acquisition still
+prioritizes recent history. There is no shared viewport cursor: jitter, zooming
+and multiple plotters do not restart or interfere with each other's queries.
+
+Insertion/update/deletion triggers keep the index transactional with preview
+cells. Refinement receipts mark covered observations complete before query LIMIT;
+QC invalidation advances an epoch rather than rewriting every index entry.
+Configuration invalidation drops/recreates the disposable index in the same
+transaction as clearing the preview cache. Canonical raw history is untouched.
+Stationary input batches coalesce to the latest observation per preview cell;
+replaying an identical batch does not rewrite cells or index entries. This is
+not archival thinning and does not reduce the raw data retained for tide analysis.
+
+Existing preview caches migrate on a low-priority worker, committing 500 rows at
+a time and yielding 25 ms between batches. Newly acquired evidence is indexed
+immediately. Migration resumes from a durable key and retries failed attempts;
+shutdown terminates the worker. During migration a viewport only sees the indexed
+portion of old evidence. Completing a dense refinement hour still updates each
+covered index entry and needs Pi write-lock measurements before acceptance.
+
+The additive index/triggers remain on rollback to the earlier preview, whose
+writes maintain them. The earlier preview recreates its dropped latitude index
+on startup, which may cost time. A changed preview configuration can rebuild
+this derived cache; it is not a migration of the proposed archival point store.
+
+Local tests cover sparse/broad views, dateline and latitude bands, independent
+clients, stable quiet sampling, deep-point exclusion, atomic replacement,
+constant-cost QC reset, migration recovery and transactional configuration reset.
+The full suite passes 521 tests. A small local file benchmark (7,896 retained
+cells) measured pending viewport p95 5.44 ms, 500-row ingest p95 9.70 ms, and a
+single 7,896-point retirement at 83.36 ms. These are desktop diagnostics, not Pi
+acceptance; SD-card amplification and large dense retirements remain unverified.
+Use `bench-preview-index.mjs` with a new output file for isolated storage tests,
+and `bench-history-preview.mjs` only on an already indexed database.
+
+Round 23 reviewed the cache-control change. Fixes restrict full cache resets to
+failures that could have committed without reporting changes, release persistence
+suppression during retry waits, and resume optional warming after suppression.
+Tests exercise overlapping writers, provider versus uncertain-commit failures,
+and real cross-connection sibling-tile invalidation. The native index and these
+follow-up fixes still need another model review. Neither is installed in the
+active Pi package; SSH signing is currently unavailable.
+
+Round 24 (Opus/Sonnet, static-only) found that migration gated refinement,
+overlapping receipts had inconsistent marks, trigger schema lacked a version, and
+time-only lookups on the R*Tree could scan unrelated spatial nodes. Follow-up
+fixes remove the refinement gate, use the union of coverage receipts, version the
+derived schema, and maintain a compact `(time,id)` table for receipt updates.
+The maximum receipt span bounds coverage lookups by start time; it grows
+transactionally with inserted receipts. Replaying an identical receipt leaves
+retired points unchanged. The next model review includes these fixes.
+
+The index uses SQLite's built-in `rtree_i32` extension, present in the tested
+Node builds. A subsequent fallback keeps collection and refined tiles available
+without the extension, logs the missing historical preview capability, and
+reindexes retained preview data when the extension becomes available.
+Persistent corruption of the derived tree also needs a recovery policy before
+release. Rollback is correct but can be slow: older code clears receipts and
+preview cells with per-row triggers, as well as recreating the latitude index.
+Do not treat rollback/configuration reset timings as verified.
+
+A separate worker bundle reduces renderer module loading from 77 inputs to one
+file. Twenty alternating local startup trials measured median 20.04 ms unbundled
+versus 11.35 ms bundled, without pre-rendering any tiles. Fourteen worker tests
+pass, including byte-equivalent tiles and recovery after worker startup failure.
+The failure test exposed and fixed an old worker's delayed exit rejecting requests
+already assigned to its replacement. Pi results are still required.
+
+The local SQLite history reader now uses existence and keyset seeks, avoiding a
+full COUNT before its first row and repeated OFFSET scans. Equal timestamps use
+a separate timestamp/rowid seek so large tied batches remain efficient without
+another persistent index. Bounds/order/ties are tested; this does not provide a
+snapshot against late inserts behind a running cursor.
+
+`check-viewport-benchmark.mjs` enforces the server targets over five rounds and
+at least 30 HTTP samples, rejecting missing, empty or slow results. Applied to the
+previous merged Pi run, it fails the first populated tile in round 0 at zoom 13;
+HTTP p95 233 ms passes. Browser paint and loaded/backfill runs remain separate
+gates. The current candidate is now staged separately in Docker for measurement;
+the active plugin has not been switched.
+
+### November 24 Docker measurements and follow-up candidates
+
+SSH access resumed. The active plugin is still `progressive-20261122-demand`;
+`crowd-depth-nov24-spatial-v2`, `v3` and `v4` are separate benchmark packages
+alongside it, not active installs. Each uses the active database read-only for
+rendering; index/write experiments use separate disposable databases on the SD.
+
+The v2 native index ingested 100,000 actual retained preview points in timestamp
+order. Pending-world queries returned 1,200 points: first 8.49 ms, p95 5.28 ms.
+The fully QC'd query was empty at p95 0.35 ms. Ingest batches of 500 had p95
+136 ms and maximum 436 ms; 326 distributed hour retirements had p95 22.7 ms
+and maximum 440 ms. Replaying those receipts had p95 0.67 ms. The file plus WAL
+was 28.8 MB, with 131 MB process RSS. These measurements precede asynchronous
+preview writes and geographically stratified queries.
+
+A synthetic 50,000-cell single hour on the Pi retired in 2,088 ms. Its 250-point
+writes had p95 9.4 ms and maximum 137 ms, with 73 MB RSS and 25.9 MB file+WAL.
+This is below the SQLite busy timeout but is still a main-thread write-lock risk;
+it is not an acceptable event-loop latency. Source/collector and live-cell writes
+sharing that lock remain to be examined. Preview acquisition itself now writes
+through a persistent low-priority worker with acknowledgements, retry/restart on
+failure, generation fencing and awaited shutdown. Its 250-observation streaming
+batches and final atomic window replacement no longer execute on the server
+thread. This change still needs model review and loaded Pi verification.
+
+Twenty alternating Pi startup trials measured median 74.34 ms unbundled versus
+50.09 ms bundled (p95 105.88 versus 62.79 ms). Three-renderer Lake Worth runs still
+missed first content (769 ms), despite HTTP p95 26 ms. Two renderers did worse.
+One renderer reached first content in 440–445 ms at two nearby Lake Worth views,
+passing the server gate, but failed full-view latency in a distinct Abaco area.
+A candidate serializes only the first populated tile, then uses the full pool;
+its first Abaco run still failed several targets (first content 583 ms and some
+warm-worker cold views above 1 s). Do not claim either schedule meets acceptance.
+
+A profile led to replacing repeated whole-raster carry scans with frontier
+propagation. All 512 small source masks match a nearest-Manhattan-source oracle;
+64 synthetic tiles are byte-identical to the preceding renderer. Alternating Pi
+prepared-field trials retain exact values and reduce sparse-track preparation
+from roughly 10.4 to 7.5 ms and dense preparation from 10.2 to 8.5 ms. The complete
+viewport gate, not these kernel timings, decides whether it helps enough.
+
+Open Waters round 25 (Opus/Sonnet, static-only) highlighted clustered spatial
+samples, long retirement locks, migration cache suppression and retry policy.
+Follow-ups prefer the latest acquisition day within a 4-by-4 viewport sample,
+fill unused capacity without shared cursors, preserve the first refinement-worker
+failure classification, and back migration retries off to five minutes. Tests
+cover recent-track reachability and widely separated track segments. Disk-cache
+**reads**, encoded memory tiles and shared surfaces remain enabled during index
+migration; only new persistent writes are suppressed to avoid main-thread lock
+waits. This is an intentional temporary tradeoff, not disabled rendering/cache
+reuse. Corrupt-derived-index recovery, migration viewport priority, loaded-write
+latency and the full performance gate remain open.
+
+The v4 dense Abaco run improved first content to 463 ms, but still failed first
+content at zoom 14 (540 ms) and the next zoom-13 cold view (1,241 ms total,
+588 ms first content). Later rounds passed. A subsequent scheduler candidate
+serializes the first populated tile of each request burst and retains stable
+worker affinity; it is not yet measured. The current full local suite passes
+533 tests. No active Pi installation has been changed.
+
+### Follow-up: nonblocking live writes (November 24)
+
+The v5 per-burst scheduler still fails the Abaco gate: first zoom-13 content
+556.6 ms, round-1 zoom-13/14 full cold views and round-2 zoom-13 full cold view
+over target. HTTP p95 was 30.4 ms. Empty bursts now stop serializing after three
+empty tiles; this bounds the first-content search but is not a performance pass.
+
+Optional cache writes now temporarily use zero SQLite busy timeout and restore
+the connection's timeout on success or failure. In Docker on the Pi, with another
+connection holding BEGIN IMMEDIATE, reserve failed promptly in 0.122 ms and keep
+in 0.154 ms; the timeout returned to 5,000 ms and keep succeeded after rollback.
+Raw recording uses the same nonblocking attempt with asynchronous 100 ms retries
+(up to 24 seconds) and stream backpressure. Live cell flushes also fail promptly,
+retain their uncommitted buffers, and retry asynchronously every 100 ms while busy. A busy
+release from a tide/backfill hold leaves its passes queued. These changes avoid
+waiting on the event loop; they do not shorten a successful large transaction.
+
+An upgrade preflight on the active Pi found the old depth fingerprint had no
+source-selection fields, while its position fingerprint already recorded the
+same selected sensors. That proven-compatible migration now preserves the
+existing depth_since rather than moving it forward to installation time.
+Unknown provenance and actual sensor/reference changes still set a new boundary.
+
+Open Waters round 26 (Opus and Sonnet, static inspection) found an obsolete
+preview benchmark wrapper and unclosed workers, incomplete missing-RTree
+fallback, unbounded empty-view serialization, optional cache-write lock risk,
+and unresolved corruption/shutdown/rollback concerns. The benchmark now times
+acknowledged asynchronous writes and closes the workers. Fallback opens an
+existing virtual table explicitly and clears stale coverage-span metadata before
+recovery. Cache writes refuse locks regardless of writer-counter coordination.
+The alleged between-batch counter race is not reproducible from that path alone:
+write acknowledgments follow COMMIT, and the next onBusy(true) precedes posting
+the next write; the zero-timeout guard also covers independent writers.
+Corrupt-derived-index recovery, fully awaited plugin shutdown, rollback costs,
+and release performance acceptance remain open. Latest full suite: 539 tests;
+E2E: nine tests passed before the subsequent live-write retry changes.
+
+The v7 Pi recording contention test held another write connection for 2.1 seconds.
+All 20 observations were recorded after it released; the release timer ran at
+2,100.07 ms, total recording completed at 2,111.97 ms, and event-loop maximum was
+10.85 ms. The v7 full viewport test still failed: first content 563 ms, several
+round-1/2 full views above one second, and full-model HTTP p95 359.79 ms. That HTTP
+endpoint returns 1.2 MB; idle samples took 69–119 ms, while idle admin HTML took
+2–28 ms. These are different endpoint costs, not evidence that the loaded gate
+passed. The current active plugin remains unchanged.
+
+Round 27's Opus report included its map and identified live-flush lock starvation
+and automatic-source migration. Both are addressed: busy live flushes retry at
+100 ms for up to 30 seconds, independent of the three-failure budget for other
+errors, and unset sources normalize consistently. Sonnet reported the same issues
+but its retained report omitted the required map; count that as a limited review,
+not a fully completed round. Both also saw a symlink-to-copy conversion that was
+an isolated review-snapshot copying error: the real definitions.json remains a
+symlink. Subsequent snapshots must preserve symbolic links.
+
+Chart close now awaits preview and tile workers plus active refinement/reweight
+jobs; plugin stop waits for it, and replacement starts wait before opening the
+new chart. An additional Gaussian-loop fusion preserves exact prepared fields
+and 64 synthetic tile byte outputs. Alternating Pi medians changed from 7.33 to
+7.01 ms for a sparse track and 8.39 to 7.82 ms for a dense field. This small kernel
+improvement does not establish full viewport acceptance. Shutdown and these last
+changes need another full model review and hardware verification.
+
+### Viewport-first migration and follow-up review
+
+A rehearsal against a backup of the active Pi database retained all 408,105
+refined cells, 408,053 preview cells, 4,331 receipts and the existing depth_since.
+Config migration took 13.18 ms; the initial full spatial fill took 37.65 seconds.
+The migration worker now accepts viewport priorities and visits populated rows
+outwards from the viewport centre, with primary-key seeks bounded to 32 rows and
+500 cells per priority batch. The ordinary complete sweep continues between
+priority batches. Dateline and dense-row paging have focused tests.
+
+On a second copy of that Pi backup, the boat viewport's first indexed cells were
+available at 112.49 ms and all 106 viewport cells at 212.91 ms, while the complete
+408,053-cell migration finished at 41.47 seconds. These are index-availability
+measurements, not pending-preview/browser-paint timings; existing QC receipts
+remain intact. Panning can update the worker's priority without restarting the
+complete sweep.
+
+Lower-priority renderer workers (Linux nice 10) brought the concurrent full-model
+HTTP p95 to 224.36 ms in the v8 Abaco run, but first content remained 568.68 ms and
+round-1/2 cold viewport failures remain. Do not call this a full gate pass.
+
+Open Waters round 28 included complete static maps from Opus and Sonnet. The
+rapid-restart chain race is fixed and tested across three starts, and closed tile
+services ignore later persistence notifications. The development command forces
+an unbundled TypeScript emit before watch, avoiding a stale release bundle;
+its emitted worker imports were verified, but sandbox FSEvents prevented a full
+watch-session check. Final live flushes now retry a busy lock before completing.
+The report's bulk-flush concern does not apply to the chart wrapper: it is passed
+only to the live writer with bulk=false; refinement stages its passes in memory
+and bulk backfill receives its own normal store/connection. A file-backed chart
+test exercises actual preview-worker writes and awaited lock release. These
+changes, viewport-priority migration, and worker priority need the next review.
+
+### November 24: rollback and damaged-index isolation
+
+The isolated v11 package passed a Pi round trip through the actual deployed old
+package: upgrade, old `syncConfig`, then upgrade again preserved all 408,105
+cells, 408,053 preview cells, 4,331 QC receipts and the original recording boundary.
+The v11 package is staged but has not replaced the running plugin.
+
+Review round 29 (Opus and Sonnet, complete static reports) identified a shutdown
+race after live-pipeline failure and rollback fingerprint incompatibility. Closing
+the chart now aborts its own lifetime before awaiting workers, even if the parent
+session remains active. Equivalent legacy depth fingerprints retain their exact
+encoding, verified by the real Pi rollback rehearsal. The HTTP-error acceptance
+fixture now changes one sample in a complete run, so it tests the intended rule.
+
+Actual corrupt-RTree fixtures exposed failure during statement preparation as
+well as transaction execution. Preview and refinement workers now quarantine the
+confirmed damaged derived index and retry once after rollback. Startup similarly
+detaches its triggers, preserving canonical observations and QC receipts. Preview
+queries return no provisional features while quarantined; refined tiles remain
+available. No production code edits SQLite shadow tables. Automatic reconstruction
+of a severely damaged virtual table remains unresolved: even DROP TABLE can fail.
+This fallback preserves recording but is not an index-repair implementation.
+
+Cold viewport acceptance still fails for several Pi views. These correctness fixes
+and passing local tests do not constitute performance acceptance.
+
+### November 24: active Docker preview and remaining contention
+
+The v14 preview is now active inside the Pi's `signalk` container at
+`local-pkgs/progressive-20261124-v14/node_modules/crowd-depth`. Activation saved
+and checked a fresh 334 MB online database backup at
+`local-pkgs/pre-progressive-v14-2026-11-24T16-26-34-131Z`, plus the previous manifest,
+configuration and plugin link. All 408,105 refined cells and the recording boundary
+survived. Background indexing completed with 408,130 preview rows indexed; the
+increase reflects ongoing acquisition. No all-history tile pre-render was enabled.
+
+The v12 isolated populated Abaco benchmark measured HTTP p95 213.62 ms but still
+failed first zoom-13 content and two cold viewport checks. A subsequent experiment
+removing the dense-patch raster-search shortcut matched fields and improved one
+microbenchmark, but worsened the complete viewport run (HTTP p95 305.94 ms). It was
+reverted; the deployed v14 retains the original search selection.
+
+The browser reload after activation completed its document load in 970 ms; its
+four tile revalidations took 64–82 ms. Those were cached revalidations, not cold
+renders, and are not evidence that the cold viewport target passes. Startup HTTP
+sampling also caught a 2.5 s response during acquisition. The input cache still
+used synchronous SQLite busy waits. The next local change makes schema creation,
+page writes, publishing and cleanup yield/retry, with a held-lock regression test.
+That change is not in the active v14 package yet.
+
+Round 30 completed Opus and Sonnet static reviews. Both could not execute checks.
+Confirmed fixes: damaged-index handling now verifies both SQLite corruption codes;
+visible startup quarantines before config rebuild, and hidden startup retries its
+config rebuild after quarantining; CI's root build now runs the plugin bundle/web
+build before tests. Opus's formatting concern was dismissed after the exact script
+passed Prettier. The existing licence audit covered the bundle's three dependencies.
+The arbitrary bounded sample within the most recent day, long writer-lock bounds,
+and full cold-viewport failures remain limitations. Local v14 checks: 559 tests,
+TypeScript and publint passed; nine server integration checks passed on v12.
+
+### November 24: bounded cache cleanup and dense-query coverage
+
+A replay of the real pre-upgrade database isolated 1,870 ms of the 2,031 ms chart
+startup in synchronous deletion of old rendered tiles. The next candidate prepares
+that optional cache in a worker, deleting 128 old tiles per transaction and yielding
+between batches. Requested tiles render while the service cannot read the stale
+cache; the cache attaches only after maintenance succeeds. The same Pi startup
+profile then took 84 ms, preserving the original backup and canonical data.
+
+The cleanup fixture contained 29,141 cached tiles and 408,105 canonical cells. All
+cells survived. Stressing the same database with a synthetic write every 10 ms still
+caused long synchronous write delays, including with WAL and NORMAL enabled;
+disabling automatic checkpoints did not improve this experiment and was not applied
+to production. This remains a limitation of main-thread SQLite writes under heavy
+SD I/O, not evidence that the cleanup's complete lifecycle meets all latency targets.
+
+Dense stratified preview queries were measured on 408,053 indexed points, all marked
+pending in a disposable fixture. World, Florida and Abaco views each returned 1,200
+points in all 30 samples. Their p95 query times were 18.03, 11.73 and 10.48 ms;
+the empty view was 0.39 ms. Across 48 concurrent Signal K probes, HTTP p95 was
+31.15 ms. This closes the missing large stratified-query measurement; it does not
+represent refinement committing to that same fixture during the query run.
+
+Round 31 completed both static reviews. Opus's uncaught-backfill finding was fixed
+with cache-initialization retry/abort handling and a caller rejection handler;
+plain SQLite read corruption now suppresses only the preview portion of a live
+response. Known rolled-back worker errors no longer force global tile-cache resets.
+Lint now rebuilds the bundled renderer, and contributor build instructions match
+those commands. Sonnet's restart finding led to separating source collection and
+reporting from the pending chart restart; the next chart still waits for old workers.
+The regression test confirms recording starts before the old chart is released.
+Sonnet's dense-query coverage concern prompted the above actual Pi measurement.
+Full cold-render acceptance, other synchronous metadata writes and owned-archive
+retention remain open. These changes and worker cache cleanup postdate round 31 and
+are being reviewed again before the next checkpoint.
+
+### November 24: Docker v19 and renderer follow-up
+
+The active preview is now `progressive-20261124-v19`, installed inside the Signal K
+Docker container. Its predecessor, configuration and a verified online database
+backup are preserved under `pre-progressive-v19-2026-11-24T17-01-42-225Z`.
+This package includes asynchronous input-cache writes, worker cache cleanup and
+fingerprinting, independent collection during chart restart, and bounded backoff
+for input-cache initialization failures. The first startup preview read timed out;
+this is recorded as a remaining startup/provider interaction, not a successful
+first-paint measurement.
+
+The portable cleanup benchmark is reproducible with:
+
+```sh
+node packages/signalk-plugin/scripts/bench-kept-startup.mjs /path/to/bathymetry.sqlite 5
+```
+
+It copies the input database before modifying anything. On the Pi, its 5 Hz write
+fixture retained all 408,105 cells while deleting 29,141 obsolete cached tiles.
+Synchronous initialization took 3.22 ms; background completion took 11.89 s;
+maximum measured write/event-loop delay was 108.15/118.42 ms. This does not close
+the previously reported 100 Hz storage-stress limitation.
+
+Five dense Abaco viewport rounds against v19 recorded 75 concurrent full-model
+HTTP samples, p95 92.43 ms. Rendering still failed: initial content 744.98 ms,
+and nine subsequent cold views exceeded 1 s. An isolated v20 experiment uses the
+raster nearest-neighbor search inside dense 8×8 patches and the spatial tree
+outside them. All 27 actual-data tiles compared byte-for-byte equal. Both full
+viewport runs include search setup cost: the first had four timing failures and
+HTTP p95 237.07 ms; the repeat had five timing failures and HTTP p95 125.84 ms.
+Later cold viewports improve, but cold startup still fails. V20 is installed only
+for isolated testing; v19 remains active. Do not call either a full gate pass.
+
+Round 32 completed Opus and Sonnet static reviews. The fixed five-second cache
+retry now backs off to five minutes. The claimed formatting failure was dismissed
+after the exact files passed the configured Prettier check. The missing renderer watchdog was confirmed. The final correction, described
+below, terminates after 30 seconds without replies, allowing a later request to
+start a replacement; it does not automatically retry failed requests. This is
+recovery, not a performance pass.
+The generic shutdown-timeout recommendation was not applied: provider calls already
+race abort/deadlines, and worker-owning jobs terminate on abort and await exit.
+Starting replacement writers before those workers exit would weaken fencing.
+Native SQLite or filesystem calls can delay worker termination and chart
+restart. Busy waits have configured limits, but the OS does not guarantee a
+maximum filesystem latency. Shutdown deliberately waits for worker exit. The legacy explicit-source provenance shortcut remains an open finding;
+matching settings alone do not establish the origin of old observations.
+
+Round 33 reviews only follow-ups to the round-32 snapshot, including moving cache
+fingerprinting off-thread and the hybrid search. The worker timeout postdates that
+snapshot and needs its own review. Local checks currently pass 569 tests in 50
+files plus plugin lint/publint. The first full-suite attempt was sandbox-blocked
+on localhost fixture listeners; the unrestricted rerun passed. Source provenance,
+full cold-viewport acceptance, storage retention and the other release blockers
+remain open; the draft PR is not release-ready.
+
+Round 33 completed both static reviews with no correctness defect identified. The
+stale search description above is now labeled historical. Alternating Pi kernel
+runs, including setup, measured these medians (baseline v19 / hybrid v20):
+
+| Case             |      Setup ms |        Query ms |
+| ---------------- | ------------: | --------------: |
+| Dense harbour    | 0.313 / 3.887 |   4.527 / 4.129 |
+| 9-point patches  | 0.235 / 0.571 |   7.401 / 4.904 |
+| 15-point patches | 0.244 / 0.878 |   6.080 / 4.324 |
+| High latitude    | 1.207 / 1.851 | 68.946 / 15.925 |
+| Single track     | 0.303 / 0.310 | 22.273 / 22.296 |
+
+The harbour-only kernel regresses by about 3 ms including setup; the full dense
+Abaco viewport improves in repeated runs but still fails acceptance. These numbers
+justify continuing evaluation, not calling every workload faster. The new retry
+regression checks all exponential delays through the repeated five-minute cap and
+successful recovery. The timeout follow-up is being reviewed separately.
+
+Separate Pi processes running the harbour/patch/high-latitude kernel cases peaked
+at 64,080 KiB RSS for v19 and 65,888 KiB for v20 (about 1.8 MiB higher in this single sample). This is
+process peak RSS, not an isolated per-index allocation measurement. All nine Signal
+K integration checks also passed after the renderer timeout change.
+
+### November 24: reviewed worker recovery and v22 activation
+
+Round 34 completed both static reviews and found two defects in the initial
+watchdog: queue time could kill healthy workers, and timed-out worker termination
+was not tracked for shutdown. The corrected implementation measures 30 seconds
+without a reply and waits for all terminating threads. It was reviewed in round 35
+by both models. Opus found no correctness defect; its missing rearm regression is
+now covered by replying at 20 s and verifying the next stalled request times out
+at 50 s. Tests also cover healthy 60-second queues, queued failures, delayed exits,
+and stale replies/exits after replacement. Test-only changes followed round 35.
+
+Sonnet's proposed shutdown deadline was not applied: returning before the thread
+exits would violate the verified resource-release requirement. Native filesystem
+latency remains a limitation. The hypothesized rejected `terminate()` promise was
+checked against the Pi's Node 24.22.2 `internal/worker` implementation: it resolves
+on `exit` (or immediately if already exited), with no rejection callback. The
+watchdog is not a per-request latency cap; a progressing queue can take longer.
+
+V22 was backed up and activated inside Docker on November 24 at 17:18 UTC. The
+verified prior database/config/package remain under
+`pre-progressive-v22-2026-11-24T17-18-02-948Z`. This supersedes v19's active-package
+status above. V21's flawed watchdog was only staged and never activated.
+
+The final v22 tree passes 574 tests in 50 files, all nine Signal K integration
+checks, and plugin lint/publint. The installed renderer SHA-256 matches the local
+build (`63270272be6dda3e6b5f0eb32c3a4cfb2a88cedf366c4d58434ed945c6cc7345`).
+A post-restart full-model HTTP probe returned 200 in 43 ms; this single probe is
+not the loaded acceptance run.

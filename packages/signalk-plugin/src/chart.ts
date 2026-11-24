@@ -1,5 +1,12 @@
+import { prepareKeptTiles } from "./tiles/kept.js";
+import { isolateDamagedPreview } from "./tiles/preview-spatial.js";
 import { halfLifeDays } from "./tiles/decay.js";
-import { refineHistory, refineVisible, reweightCells } from "./tiles/refine.js";
+import {
+  refineHistory,
+  refineVisible,
+  reweightCells,
+  UncertainRefinementCommit,
+} from "./tiles/refine.js";
 import { TIDE_CONFIG_KEY, tideConfig } from "./tiles/backfill.js";
 import { cacheChartInputs } from "./tiles/inputs.js";
 import type { PreviewView } from "./tiles/history-preview.js";
@@ -11,11 +18,11 @@ import {
   observation,
 } from "./tiles/history-preview.js";
 import { createSqliteSource } from "./sources/sqlite.js";
+import { withoutBusyWait } from "./storage.js";
 import type { BathymetryData } from "./types.js";
 import { setTimeout } from "node:timers/promises";
 import { BATHY_REPORT_DELAY } from "./constants.js";
 import { DatabaseSync } from "node:sqlite";
-import type { Detail } from "./tiles/surface.js";
 import { Temporal } from "@js-temporal/polyfill";
 import { transform } from "stream-transform";
 import { ServerAPI } from "@signalk/server-api";
@@ -35,7 +42,6 @@ import {
   createCellStore,
   createCellWriter,
   createTileService,
-  createKeptTiles,
   startRebuild,
   recordBackfillFailure,
   registerLayerRoutes,
@@ -130,9 +136,20 @@ export function startChart({
   db: DatabaseSync;
   signal: AbortSignal;
 }) {
+  const lifetime = new AbortController();
+  signal = AbortSignal.any([signal, lifetime.signal]);
   const generation = randomUUID();
   const store = createCellStore(db, generation);
   const startedAt = Temporal.Now.instant();
+  const jobs = new Set<Promise<unknown>>();
+  const track = <T>(job: Promise<T>) => {
+    jobs.add(job);
+    void job.then(
+      () => jobs.delete(job),
+      () => jobs.delete(job),
+    );
+    return job;
+  };
 
   // First, so a refused provider stops the start before anything runs.
   registerPlotterExtension(app, () => current !== undefined);
@@ -141,10 +158,6 @@ export function startChart({
     routesRegistered = true;
   }
 
-  store.setMeta("build_generation", generation);
-  syncConfig(store, cellConfig(config), startedAt);
-  // Before the live writer starts, so its marker doesn't hide the gap.
-  addPendingBackfill(store, startedAt);
   const preview = createPreviewStore(
     db,
     JSON.stringify({
@@ -155,7 +168,17 @@ export function startChart({
       sounder: config.sounder.source,
       gnss: config.gnss.source,
     }),
+    (busy) => writing(busy),
   );
+  if (!preview.spatial)
+    app.error(
+      `Historical preview unavailable (${preview.unavailable}); collection and refined My Soundings remain enabled.`,
+    );
+  // Detach a damaged preview index before config changes can reset QC receipts.
+  store.setMeta("build_generation", generation);
+  syncConfig(store, cellConfig(config), startedAt);
+  // Before the live writer starts, so its marker doesn't hide the gap.
+  addPendingBackfill(store, startedAt);
   let previewRun: AbortController | undefined;
   let previewView: PreviewView | undefined;
   const boatView = (): PreviewView | undefined => {
@@ -205,19 +228,51 @@ export function startChart({
     config.chart?.contourDetail === "standard" ? "standard" : "high";
   const file = db.location() ?? undefined;
   // Build requested tiles only: eager all-history warming saturated the Pi for 36 minutes.
-  const tiles = createTileService(
-    store,
-    file,
-    detail,
-    file ? keepTiles(db, detail, app) : undefined,
-  );
+  const tiles = createTileService(store, file, detail);
+  if (file)
+    void track(prepareKeptTiles(db, detail, signal))
+      .then((kept) => {
+        if (!signal.aborted) tiles.attachKept(kept);
+      })
+      .catch((error) => {
+        if (!signal.aborted)
+          app.error(`Chart layer keeps no tiles on disk: ${error}`);
+      });
+  let diskWriters = 0;
+  const writing = (on: boolean) => {
+    diskWriters += on ? 1 : -1;
+    tiles.persist(diskWriters === 0);
+  };
+  void (async () => {
+    let retryMs = 5000;
+    while (!signal.aborted) {
+      writing(true);
+      try {
+        await preview.prepare(previewView ?? boatView());
+        return;
+      } catch (err) {
+        if (!signal.aborted)
+          app.error(`Chart preview index incomplete; retrying: ${err}`);
+      } finally {
+        writing(false);
+      }
+      await setTimeout(retryMs, undefined, { signal }).catch(() => {});
+      retryMs = Math.min(retryMs * 2, 300_000);
+    }
+  })();
   // Off the main thread, given a database file to say the plugin is built and running.
   const qc = db.location() ? createQCThread() : undefined;
-  const writer = createCellWriter(store, {
-    onChange: tiles.changed,
-    qc: qc?.run,
-    onError: (err) => app.error(`Chart layer: ${err.message}`),
-  });
+  const writer = createCellWriter(
+    {
+      ...store,
+      transaction: (fn) => withoutBusyWait(db, () => store.transaction(fn)),
+    },
+    {
+      onChange: tiles.changed,
+      qc: qc?.run,
+      onError: (err) => app.error(`Chart layer: ${err.message}`),
+    },
+  );
   // One for the live writer and the backfill, so they share what they've fetched. Without
   // signalk-tides the soundings stay untided, and the tiles say so.
   const tides = tidesInstalled(app)
@@ -272,16 +327,24 @@ export function startChart({
   const publish = setInterval(publishChanges, 5000);
   publish.unref?.();
   current = started;
+  let stopping: Promise<void> | undefined;
   // Only this start's own state: an older start can end after a newer one
   // replaced it.
   const stop = () => {
+    if (stopping) return stopping;
+    signal.removeEventListener("abort", stop);
+    lifetime.abort();
     clearInterval(publish);
     previewRun?.abort();
-    preview.close();
     waitingForTide.clear();
-    tiles.close();
     qc?.close();
     if (current === started) current = undefined;
+    stopping = Promise.allSettled([
+      preview.close(),
+      tiles.close(),
+      ...jobs,
+    ]).then(() => undefined);
+    return stopping;
   };
   signal.addEventListener("abort", stop);
 
@@ -309,62 +372,97 @@ export function startChart({
     stop();
   });
 
-  const reweighted = reweightCells({
-    store,
-    signal,
-    file,
-    onChange: tiles.changed,
-  }).catch((err) => {
-    if (!signal.aborted) app.error(`Chart reweight remains pending: ${err}`);
-  });
+  writing(true);
+  const reweighted = track(
+    reweightCells({
+      store,
+      signal,
+      file,
+      onChange: tiles.changed,
+    }),
+  )
+    .catch((err) => {
+      if (!signal.aborted) {
+        if (err instanceof UncertainRefinementCommit) tiles.reset();
+        app.error(`Chart reweight remains pending: ${err}`);
+      }
+    })
+    .finally(() => writing(false));
 
   // Existing local history is useful even while plugin startup waits for a provider.
   startPreview(createSqliteSource(app, db));
   return {
+    close: stop,
     backfill: async (source: BathymetrySource) => {
       await reweighted;
       if (signal.aborted) return;
       if (!source.createWriter) {
-        source = cacheChartInputs(
-          db,
-          source,
-          JSON.stringify({
-            version: 1,
-            path: config.path,
-            offset: depthReference(config).offset,
-            sounder: config.sounder.source,
-            gnss: config.gnss.source,
-          }),
-          signal,
-        );
+        let retryMs = 5000;
+        while (!signal.aborted) {
+          try {
+            source = await cacheChartInputs(
+              db,
+              source,
+              JSON.stringify({
+                version: 1,
+                path: config.path,
+                offset: depthReference(config).offset,
+                sounder: config.sounder.source,
+                gnss: config.gnss.source,
+              }),
+              signal,
+            );
+            break;
+          } catch (error) {
+            if (signal.aborted) return;
+            app.error(
+              `Historical input cache unavailable; retrying in ${retryMs / 1000}s: ${error}`,
+            );
+            await setTimeout(retryMs, undefined, { signal }).catch(() => {});
+            retryMs = Math.min(retryMs * 2, 300_000);
+          }
+        }
       }
+      if (signal.aborted) return;
       startPreview(source);
-      // Worker commits publish periodically; do not retain shared surfaces between them.
-      tiles.share(false);
+      // Each refinement commit invalidates its surfaces; only disk-cache writes
+      // need to stop while the worker can hold SQLite's write lock.
       const run = async (availableThrough?: Temporal.Instant) => {
         let retryMs = 30_000;
         while (!signal.aborted) {
           try {
-            await refineHistory({
-              config,
-              source,
-              store,
-              signal,
-              file: db.location() ?? undefined,
-              tides: useTides ? tides : undefined,
-              availableThrough,
-              view: () => previewView ?? boatView(),
-              onError: (err) =>
-                app.error(`Chart refinement window remains pending: ${err}`),
-              onChange: (positions) => {
-                for (const point of positions)
-                  changed.set(`${point.lon}/${point.lat}`, point);
-                publishChanges();
-              },
-            });
+            writing(true);
+            try {
+              await track(
+                refineHistory({
+                  config,
+                  source,
+                  store,
+                  signal,
+                  file: db.location() ?? undefined,
+                  tides: useTides ? tides : undefined,
+                  availableThrough,
+                  view: () => previewView ?? boatView(),
+                  onError: (err) => {
+                    if (err instanceof UncertainRefinementCommit) tiles.reset();
+                    app.error(
+                      `Chart refinement window remains pending: ${err}`,
+                    );
+                  },
+                  onChange: (positions) => {
+                    for (const point of positions)
+                      changed.set(`${point.lon}/${point.lat}`, point);
+                    publishChanges();
+                  },
+                }),
+              );
+            } finally {
+              writing(false);
+            }
             return;
           } catch (err) {
             if (signal.aborted) return;
+            if (err instanceof UncertainRefinementCommit) tiles.reset();
             app.error(`Chart refinement will retry: ${err}`);
             await setTimeout(retryMs, undefined, { signal }).catch(() => {});
             retryMs = Math.min(retryMs * 2, 15 * 60_000);
@@ -375,32 +473,38 @@ export function startChart({
       if (signal.aborted) return;
       if (tideChanged(store, useTides)) {
         startRebuild(store);
+        tiles.reset();
         addPendingBackfill(store, startedAt);
       }
       store.setMeta(TIDE_CONFIG_KEY, tideConfig(useTides));
       writer.hold(false);
-      void refineVisible({
-        source,
-        store,
-        config,
-        signal,
-        file,
-        tides: useTides ? tides : undefined,
-        availableThrough: source.createWriter
-          ? startedAt
-          : startedAt.subtract(BATHY_REPORT_DELAY),
-        timestamps: () =>
-          preview
-            .features(previewView ?? boatView(), 0)
-            .map((f) => f.properties.time),
-        onChange: tiles.changed,
-        onError: (err) =>
-          app.error(`Visible chart refinement will retry: ${err}`),
-      }).catch((err) => {
+      void track(
+        refineVisible({
+          onBusy: writing,
+          source,
+          store,
+          config,
+          signal,
+          file,
+          tides: useTides ? tides : undefined,
+          availableThrough: source.createWriter
+            ? startedAt
+            : startedAt.subtract(BATHY_REPORT_DELAY),
+          timestamps: () =>
+            preview
+              .features(previewView ?? boatView(), 0)
+              .map((f) => f.properties.time),
+          onChange: tiles.changed,
+          onError: (err) => {
+            if (err instanceof UncertainRefinementCommit) tiles.reset();
+            app.error(`Visible chart refinement will retry: ${err}`);
+          },
+        }),
+      ).catch((err) => {
         if (!signal.aborted)
           app.error(`Visible chart refinement stopped: ${err}`);
       });
-      return (async () => {
+      return await (async () => {
         // Old history is already settled. Only the final provider tail needs
         // its buffering delay; it must not delay the entire historical build.
         await run(
@@ -419,14 +523,12 @@ export function startChart({
           // Stopped meanwhile: the writer is gone, and its held passes with it.
           if (signal.aborted) return;
           writer.hold(false);
-          tiles.share(true);
           tiles.reset();
           changed.clear();
         })
         .catch((err: unknown) => {
           if (signal.aborted) return;
           writer.hold(false);
-          tiles.share(true);
           tiles.reset();
           changed.clear();
           // Keep failed coverage pending for the next start; the live layer goes on.
@@ -452,7 +554,25 @@ function syncConfig(
 ) {
   // A first start has nothing recorded under another depth reference.
   const previousDepth = store.getMeta(DEPTH_CONFIG_KEY);
-  const depthChanged = previousDepth !== undefined && previousDepth !== depth;
+  const previousPosition = store.getMeta(POSITION_CONFIG_KEY);
+  let compatible = previousDepth === depth;
+  if (!compatible && previousDepth && previousPosition) {
+    try {
+      const old = JSON.parse(previousDepth);
+      const sensors = JSON.parse(previousPosition);
+      const next = JSON.parse(depth);
+      // Older builds recorded the selected sensors in the position fingerprint.
+      compatible =
+        old.sourceSelection === undefined &&
+        old.depthPath === next.depthPath &&
+        old.depthOffset === next.depthOffset &&
+        (sensors.sounderSource ?? "") === next.sounderSource &&
+        (sensors.gnssSource ?? "") === next.positionSource;
+    } catch {
+      // Unproven provenance still requires a new recording boundary.
+    }
+  }
+  const depthChanged = previousDepth !== undefined && !compatible;
   if (store.getMeta(POSITION_CONFIG_KEY) !== position || depthChanged) {
     startRebuild(store);
     if (depthChanged) store.setMeta(DEPTH_SINCE_KEY, startedAt.toString());
@@ -465,17 +585,12 @@ function syncConfig(
       store.setMeta("reweight_after", "");
     });
   }
-  store.setMeta(DEPTH_CONFIG_KEY, depth);
-}
-
-/** Tiles kept on disk, or none where they can't be: they only ever save building. */
-function keepTiles(db: DatabaseSync, detail: Detail, app: ServerAPI) {
-  try {
-    return createKeptTiles(db, detail);
-  } catch (err) {
-    app.error(`Chart layer keeps no tiles on disk: ${err}`);
-    return undefined;
-  }
+  // Preserve an equivalent legacy fingerprint so rolling back does not mistake
+  // a metadata-only upgrade for a new depth reference and discard chart history.
+  store.setMeta(
+    DEPTH_CONFIG_KEY,
+    compatible && previousDepth ? previousDepth : depth,
+  );
 }
 
 /**
@@ -486,12 +601,16 @@ function keepTiles(db: DatabaseSync, detail: Detail, app: ServerAPI) {
 export function startChartSafely(options: Parameters<typeof startChart>[0]) {
   try {
     if (options.config.chart?.show === false) {
-      createCellStore(options.db).setMeta("build_generation", randomUUID());
-      syncConfig(
-        createCellStore(options.db),
-        cellConfig(options.config),
-        Temporal.Now.instant(),
-      );
+      const store = createCellStore(options.db);
+      store.setMeta("build_generation", randomUUID());
+      const sync = () =>
+        syncConfig(store, cellConfig(options.config), Temporal.Now.instant());
+      try {
+        sync();
+      } catch (error) {
+        if (!isolateDamagedPreview(options.db, error)) throw error;
+        sync();
+      }
       return undefined;
     }
     return startChart(options);

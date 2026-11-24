@@ -4,7 +4,7 @@ import { PbfReader as Pbf } from "pbf";
 import { Cell } from "../../src/tiles/cells.js";
 import { cellAt, cellCenter, tileFraction } from "../../src/tiles/geometry.js";
 import { EXTENT } from "../../src/tiles/mvt.js";
-import { isolines } from "../../src/tiles/portray.js";
+import { isolines, carry, PAD_PX } from "../../src/tiles/portray.js";
 import { buildTile } from "../../src/tiles/surface.js";
 
 const Z = 14;
@@ -283,4 +283,37 @@ test("a contour round a shoal narrower than the simplification stays drawn", () 
   };
   const [loop] = isolines(t, [2], 8).get(2)!;
   expect(new Set(loop.map(String)).size).toBeGreaterThan(2);
+});
+
+test("frontier fill matches nearest Manhattan sources without changing measured pixels", () => {
+  for (let mask = 0; mask < 512; mask++) {
+    const input = Float64Array.from({ length: 9 }, (_, i) =>
+      mask & (1 << i) ? 9 - i : NaN,
+    );
+    const original = input.slice();
+    const expected = input.map((value, i) => {
+      if (!Number.isNaN(value)) return value;
+      let distance = Infinity,
+        depth = NaN;
+      for (let j = 0; j < input.length; j++) {
+        if (Number.isNaN(input[j])) continue;
+        const d =
+          Math.abs((i % 3) - (j % 3)) +
+          Math.abs(Math.floor(i / 3) - Math.floor(j / 3));
+        if (d < distance) {
+          distance = d;
+          depth = input[j];
+        } else if (d === distance) depth = Math.min(depth, input[j]);
+      }
+      return depth;
+    });
+    expect(carry(input, 3)).toEqual(expected);
+    expect(input).toEqual(original);
+  }
+  const strip = new Float64Array(30).fill(NaN);
+  strip[0] = 5;
+  const result = carry(strip, 30);
+  expect([...result.slice(0, PAD_PX + 3)]).toEqual(Array(PAD_PX + 3).fill(5));
+  expect([...result.slice(PAD_PX + 3)].every(Number.isNaN)).toBe(true);
+  expect(Object.is(carry(Float64Array.of(-0, NaN, 0), 3)[1], -0)).toBe(true);
 });

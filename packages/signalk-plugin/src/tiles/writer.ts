@@ -6,6 +6,7 @@ import { CellStore, Pass, Shoal } from "./cells.js";
 import type { QCRunner } from "./qc-thread.js";
 import { DEFINITIONS, cellAt, cellCenter, neighbours } from "./geometry.js";
 import { Tide } from "./tide.js";
+import { isBusy } from "../storage.js";
 
 /** A sounding with its tide, where it has one. QC judges its raw depth. */
 export type Sounding = QCSounding & { tide?: Tide };
@@ -300,6 +301,8 @@ export function createCellWriter(
   let latest = 0;
   let held = false;
   let failures = 0;
+  let busySince: number | undefined;
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
   let holdTimer: ReturnType<typeof setTimeout> | undefined;
 
   /** Soundings taken in and QC's verdicts, counted, so the preview knows when it's
@@ -536,6 +539,7 @@ export function createCellWriter(
     },
     final(callback) {
       clearInterval(timer);
+      clearTimeout(retryTimer);
       clearTimeout(holdTimer);
       void (running ?? Promise.resolve())
         .catch(() => {})
@@ -545,8 +549,19 @@ export function createCellWriter(
             while (judged < buffer.length) judge(true);
             for (const [k, pass] of [...open]) closePass(k, pass);
             held = false;
-            flush();
-            callback();
+            const started = Date.now();
+            const finish = () => {
+              if (writer.destroyed) return;
+              try {
+                flush();
+                callback();
+              } catch (err) {
+                if (isBusy(err) && Date.now() - started < 30_000)
+                  retryTimer = setTimeout(finish, 100);
+                else callback(err as Error);
+              }
+            };
+            finish();
           } catch (err) {
             callback(err as Error);
           }
@@ -556,6 +571,7 @@ export function createCellWriter(
     // closed are written; what's held is left for the next start's backfill.
     destroy(error, callback) {
       clearInterval(timer);
+      clearTimeout(retryTimer);
       clearTimeout(holdTimer);
       try {
         flush();
@@ -566,7 +582,8 @@ export function createCellWriter(
     },
   });
 
-  const timer = setInterval(() => {
+  const tick = () => {
+    clearTimeout(retryTimer);
     try {
       // A sounder gone quiet, at a berth or switched off, would leave its last passes
       // open for good.
@@ -579,12 +596,18 @@ export function createCellWriter(
       }
       flush();
       failures = 0;
+      busySince = undefined;
     } catch (err) {
       // A busy or briefly failing database is tried again next time; one that keeps
       // failing ends the writer.
-      if (++failures >= MAX_FLUSH_FAILURES) writer.destroy(err as Error);
+      if (isBusy(err)) {
+        busySince ??= Date.now();
+        if (Date.now() - busySince >= 30_000) writer.destroy(err as Error);
+        else retryTimer = setTimeout(tick, 100);
+      } else if (++failures >= MAX_FLUSH_FAILURES) writer.destroy(err as Error);
     }
-  }, flushIntervalMs);
+  };
+  const timer = setInterval(tick, flushIntervalMs);
   timer.unref?.();
 
   const hold = (on: boolean) => {
@@ -594,7 +617,12 @@ export function createCellWriter(
       holdTimer = setTimeout(() => hold(false), HOLD_MAX_MS);
       holdTimer.unref?.();
     } else {
-      flush();
+      try {
+        flush();
+      } catch (err) {
+        // The periodic flush retries the same buffered passes once the lock clears.
+        if (!isBusy(err)) throw err;
+      }
     }
   };
 

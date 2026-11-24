@@ -1,13 +1,29 @@
 import { DatabaseSync } from "node:sqlite";
 
+export const isBusy = (err: unknown) =>
+  /SQLITE_BUSY|database is locked/i.test(
+    `${(err as { errstr?: string })?.errstr ?? ""} ${String(err)}`,
+  );
+
+/** Try a synchronous write without holding the event loop behind another connection. */
+export function withoutBusyWait<T>(db: DatabaseSync, fn: () => T): T {
+  const timeout = Number(db.prepare("PRAGMA busy_timeout").get()!.timeout);
+  db.exec("PRAGMA busy_timeout=0");
+  try {
+    return fn();
+  } finally {
+    db.exec(`PRAGMA busy_timeout=${timeout}`);
+  }
+}
+
 export function createDB(filename: string): DatabaseSync {
   const db = new DatabaseSync(filename);
   db.exec("PRAGMA journal_mode = WAL");
   // Skip per-commit fsync so 1Hz depth inserts don't wear out SD cards (#100).
   // WAL + NORMAL is durable against corruption; worst case loses recent rows on power loss.
   db.exec("PRAGMA synchronous = NORMAL");
-  // The chart's backfill writes from a worker thread on a connection of its own, in
-  // short transactions; this connection waits for one rather than failing.
+  // Setup writes wait for worker transactions. Latency-sensitive live writes
+  // temporarily disable this wait and retry asynchronously.
   db.exec("PRAGMA busy_timeout = 5000");
 
   runMigrations(db, [

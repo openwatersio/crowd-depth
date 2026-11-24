@@ -4,6 +4,8 @@ import { randomUUID } from "node:crypto";
 import { deflateSync, inflateSync } from "node:zlib";
 import type { DatabaseSync } from "node:sqlite";
 import { Readable } from "node:stream";
+import { setTimeout as sleep } from "node:timers/promises";
+import { isBusy, withoutBusyWait } from "../storage.js";
 import { Temporal } from "@js-temporal/polyfill";
 import { BATHY_REPORT_DELAY } from "../constants.js";
 import {
@@ -21,13 +23,26 @@ const MAX_BYTES = 256 * 1024 * 1024;
 type Row = [number, number, number, number, number | null];
 
 /** Shared by preview and refinement, with an identity independent of derived QC. */
-export function cacheChartInputs(
+export async function cacheChartInputs(
   db: DatabaseSync,
   source: BathymetrySource,
   identity: string,
   signal: AbortSignal,
-): BathymetrySource {
-  db.exec(`
+): Promise<BathymetrySource> {
+  async function write<T>(action: () => T, cleanup = false): Promise<T> {
+    const deadline = Date.now() + 30_000;
+    while (true) {
+      if (!cleanup) signal.throwIfAborted();
+      try {
+        return withoutBusyWait(db, action);
+      } catch (error) {
+        if (!isBusy(error) || Date.now() >= deadline) throw error;
+        await sleep(100, undefined, cleanup ? undefined : { signal });
+      }
+    }
+  }
+  await write(() =>
+    db.exec(`
     CREATE TABLE IF NOT EXISTS chart_input_chunks (
       identity TEXT NOT NULL, start INTEGER NOT NULL, token TEXT NOT NULL,
       PRIMARY KEY(identity, start)
@@ -45,7 +60,8 @@ export function cacheChartInputs(
       DELETE FROM chart_input_spatial WHERE id IN (SELECT id FROM chart_input_boxes WHERE token=OLD.token AND part=OLD.part);
       DELETE FROM chart_input_boxes WHERE token=OLD.token AND part=OLD.part;
     END;
-  `);
+  `),
+  );
   const lookup = db.prepare(
     "SELECT token FROM chart_input_chunks WHERE identity = ? AND start = ?",
   );
@@ -174,7 +190,7 @@ export function cacheChartInputs(
         let upstream: Readable | undefined;
         const abort = () =>
           upstream?.destroy(new Error("Chart input acquisition stopped"));
-        const save = () => {
+        const save = async () => {
           if (!rows.length || signal.aborted) return;
           const saving = rows;
           const encoded = deflateSync(JSON.stringify(saving));
@@ -183,39 +199,47 @@ export function cacheChartInputs(
             cacheFull = true;
             return;
           }
-          db.exec("SAVEPOINT chart_input_page");
-          try {
-            insert.run(token, part, encoded);
-            const points = saving.filter(
-              (r) =>
-                Number.isFinite(r[1]) &&
-                Number.isFinite(r[2]) &&
-                Math.abs(r[1]) <= 180 &&
-                Math.abs(r[2]) <= 90,
-            );
-            if (points.length) {
-              const id = db
-                .prepare(
-                  "INSERT INTO chart_input_boxes(token,part) VALUES(?,?) RETURNING id",
-                )
-                .get(token, part)!.id;
-              db.prepare(
-                "INSERT INTO chart_input_spatial VALUES(?,?,?,?,?)",
-              ).run(
-                id,
-                Math.min(...points.map((p) => p[1])),
-                Math.max(...points.map((p) => p[1])),
-                Math.min(...points.map((p) => p[2])),
-                Math.max(...points.map((p) => p[2])),
+          const saved = await write(() => {
+            if (bytes + encoded.length > MAX_BYTES) return false;
+            db.exec("SAVEPOINT chart_input_page");
+            try {
+              insert.run(token, part, encoded);
+              const points = saving.filter(
+                (r) =>
+                  Number.isFinite(r[1]) &&
+                  Number.isFinite(r[2]) &&
+                  Math.abs(r[1]) <= 180 &&
+                  Math.abs(r[2]) <= 90,
               );
+              if (points.length) {
+                const id = db
+                  .prepare(
+                    "INSERT INTO chart_input_boxes(token,part) VALUES(?,?) RETURNING id",
+                  )
+                  .get(token, part)!.id;
+                db.prepare(
+                  "INSERT INTO chart_input_spatial VALUES(?,?,?,?,?)",
+                ).run(
+                  id,
+                  Math.min(...points.map((p) => p[1])),
+                  Math.max(...points.map((p) => p[1])),
+                  Math.min(...points.map((p) => p[2])),
+                  Math.max(...points.map((p) => p[2])),
+                );
+              }
+              db.exec("RELEASE chart_input_page");
+            } catch (err) {
+              db.exec("ROLLBACK TO chart_input_page; RELEASE chart_input_page");
+              throw err;
             }
-            db.exec("RELEASE chart_input_page");
-            part++;
-          } catch (err) {
-            db.exec("ROLLBACK TO chart_input_page; RELEASE chart_input_page");
-            throw err;
+            bytes += encoded.length;
+            return true;
+          });
+          if (!saved) {
+            cacheFull = true;
+            return;
           }
-          bytes += encoded.length;
+          part++;
           storedBytes += encoded.length;
         };
         signal.addEventListener("abort", abort, { once: true });
@@ -243,7 +267,7 @@ export function cacheChartInputs(
                 data.depth,
                 data.heading ?? null,
               ]);
-              if (rows.length === PAGE) save();
+              if (rows.length === PAGE) await save();
             }
             yield data;
           }
@@ -254,21 +278,24 @@ export function cacheChartInputs(
             !cacheFull &&
             !signal.aborted
           ) {
-            save();
+            await save();
             if (!cacheFull) {
-              publish.run(identity, start, token);
+              await write(() => publish.run(identity, start, token));
               published = cached(start) === token;
             }
           }
         } finally {
           signal.removeEventListener("abort", abort);
           upstream?.destroy();
-          if (!published) {
-            discard.run(token);
-            bytes -= storedBytes;
+          try {
+            if (!published && storedBytes) {
+              await write(() => discard.run(token), true);
+              bytes -= storedBytes;
+            }
+          } finally {
+            if (eligible) pending.delete(start);
+            release?.();
           }
-          if (eligible) pending.delete(start);
-          release?.();
         }
       })(),
     );

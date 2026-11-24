@@ -1,3 +1,4 @@
+import { resetPreviewSpatial } from "./preview-spatial.js";
 import { createEstimates, estimateHour } from "./estimates.js";
 import { DatabaseSync } from "node:sqlite";
 import { hasKeptTiles, keptTileTriggers } from "../storage.js";
@@ -492,8 +493,16 @@ export function createCellStore(db: DatabaseSync, generation?: string) {
         db.prepare("DELETE FROM refined_empty_windows WHERE start=?").run(
           start,
         );
-        db.prepare("DELETE FROM refined_windows WHERE start=?").run(start);
-        db.prepare("INSERT INTO refined_windows VALUES(?,?)").run(start, end);
+        // Replacing an already covered window need not retire its preview index
+        // twice. A changed end still retracts the old coverage atomically.
+        db.prepare("DELETE FROM refined_windows WHERE start=? AND end!=?").run(
+          start,
+          end,
+        );
+        db.prepare("INSERT OR IGNORE INTO refined_windows VALUES(?,?)").run(
+          start,
+          end,
+        );
         return [...positions.values()];
       });
     },
@@ -691,8 +700,10 @@ export function createCellStore(db: DatabaseSync, generation?: string) {
             "DELETE FROM kept_tile_boxes; DELETE FROM kept_tile_box_owners; DELETE FROM kept_tiles;",
           );
         }
-        db.exec(
-          "DELETE FROM cells; DELETE FROM overviews; DELETE FROM shoals; DELETE FROM cell_passes; DELETE FROM cell_job_shoals; DELETE FROM refined_windows; DELETE FROM refined_empty_windows;",
+        resetPreviewSpatial(db, () =>
+          db.exec(
+            "DELETE FROM cells; DELETE FROM overviews; DELETE FROM shoals; DELETE FROM cell_passes; DELETE FROM cell_job_shoals; DELETE FROM refined_windows; DELETE FROM refined_empty_windows;",
+          ),
         );
         estimates.clear();
         setMetaStmt.run("reweight_pending", "");

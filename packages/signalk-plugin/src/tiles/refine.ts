@@ -87,6 +87,12 @@ export function refinementWriter(store: CellStore, from: number, to: number) {
   };
 }
 
+export class UncertainRefinementCommit extends Error {
+  constructor(cause: Error) {
+    super(cause.message, { cause });
+  }
+}
+
 /** One reusable worker, bounded by acknowledged batches, for independently replaceable jobs. */
 function refinementWorker(file: string, generation: string | undefined) {
   const worker = new Worker(new URL("./refine-worker.js", import.meta.url), {
@@ -96,12 +102,17 @@ function refinementWorker(file: string, generation: string | undefined) {
     | {
         resolve: (result: { changed?: Changed; done?: boolean }) => void;
         reject: (error: Error) => void;
+        mayCommit: boolean;
       }
     | undefined;
   let failed: Error | undefined;
-  const fail = (error: Error) => {
-    failed = error;
-    waiting?.reject(error);
+  const fail = (error: Error, uncertain = true) => {
+    if (failed) return;
+    failed =
+      uncertain && waiting?.mayCommit
+        ? new UncertainRefinementCommit(error)
+        : error;
+    waiting?.reject(failed);
     waiting = undefined;
   };
   worker.on("error", fail);
@@ -111,7 +122,7 @@ function refinementWorker(file: string, generation: string | undefined) {
   worker.on(
     "message",
     (msg: { error?: string; changed?: Changed; done?: boolean }) => {
-      if (msg.error) return fail(new Error(msg.error));
+      if (msg.error) return fail(new Error(msg.error), false);
       waiting?.resolve(msg);
       waiting = undefined;
     },
@@ -120,7 +131,17 @@ function refinementWorker(file: string, generation: string | undefined) {
     send(message: object): Promise<{ changed?: Changed; done?: boolean }> {
       if (failed) return Promise.reject(failed);
       return new Promise((resolve, reject) => {
-        waiting = { resolve, reject };
+        const request = message as {
+          end?: boolean;
+          commit?: boolean;
+          reweight?: boolean;
+        };
+        waiting = {
+          resolve,
+          reject,
+          mayCommit:
+            !!request.reweight || (!!request.end && request.commit !== false),
+        };
         worker.postMessage(message);
       });
     },
@@ -429,9 +450,11 @@ export async function refineHistory({
  */
 export async function refineVisible({
   timestamps,
+  onBusy = () => {},
   ...options
 }: Omit<Parameters<typeof refineHistory>[0], "windows"> & {
   timestamps: () => number[];
+  onBusy?: (busy: boolean) => void;
 }) {
   const retryAt = new Map<number, number>();
   while (!options.signal.aborted) {
@@ -456,10 +479,13 @@ export async function refineVisible({
       if (options.signal.aborted) return;
       const stop = Math.min(hour + HOUR, end);
       if (options.store.windowDone(hour, stop, false)) continue;
+      onBusy(true);
       try {
         await refineHistory({ ...options, windows: [frame(hour, stop)] });
       } catch (err) {
         if (!options.signal.aborted) options.onError?.(err);
+      } finally {
+        onBusy(false);
       }
       // Also back off when a provider returns empty despite the visible evidence.
       retryAt.set(hour, Date.now() + 60_000);

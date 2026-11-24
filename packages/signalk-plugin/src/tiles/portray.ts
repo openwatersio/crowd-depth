@@ -352,13 +352,17 @@ function gauss(
         if (set[p + hi + 1] === set[p + lo]) continue;
         const i = first + p * step;
         let a = 0;
-        for (let j = lo; j <= hi; j++) a += k[j + r] * s[i + j * step];
-        o[i] = a;
         if (c && oc) {
           let b = 0;
-          for (let j = lo; j <= hi; j++) b += k[j + r] * c[i + j * step];
+          for (let j = lo; j <= hi; j++) {
+            const weight = k[j + r],
+              at = i + j * step;
+            a += weight * s[at];
+            b += weight * c[at];
+          }
           oc[i] = b;
-        }
+        } else for (let j = lo; j <= hi; j++) a += k[j + r] * s[i + j * step];
+        o[i] = a;
       }
     }
     return [o, oc ?? o];
@@ -429,35 +433,61 @@ function soften(cap: Float64Array, w: number, h: number) {
 }
 
 /** Each pixel without a value takes the shoalest of its neighbours', a few times over. */
-function carry(v: Float64Array, w: number) {
-  let a = v;
-  for (let pass = 0; pass < CARRY_PX; pass++) {
-    const prev = a;
-    const next = prev.slice();
-    let changed = false;
-    for (let i = 0; i < prev.length; i++) {
-      if (!Number.isNaN(prev[i])) continue;
-      const x = i % w;
-      let best = NaN;
-      // Left, right, up and down, the shoalest first found winning a tie.
-      const take = (j: number) => {
-        const p = prev[j];
-        if (!Number.isNaN(p) && !(p >= best)) best = p;
-      };
-      if (x > 0) take(i - 1);
-      if (x < w - 1) take(i + 1);
-      if (i - w >= 0) take(i - w);
-      if (i + w < prev.length) take(i + w);
-      if (!Number.isNaN(best)) {
-        next[i] = best;
-        changed = true;
-      }
+export function carry(v: Float64Array, w: number) {
+  const queue = new Int32Array(v.length);
+  const state = new Uint8Array(v.length);
+  let end = 0;
+  for (let i = 0; i < v.length; i++) {
+    if (!Number.isNaN(v[i])) {
+      queue[end++] = i;
+      state[i] = 1;
     }
-    // A pass that carries nothing leaves every later one the same.
-    if (!changed) break;
-    a = next;
   }
-  return a;
+  if (!end || end === v.length) return v;
+  const out = v.slice();
+  const values = new Float64Array(v.length);
+  let start = 0;
+  const enqueue = (i: number) => {
+    if (!state[i]) {
+      state[i] = 2;
+      queue[end++] = i;
+    }
+  };
+  for (let pass = 0; pass < CARRY_PX && start < end; pass++) {
+    const through = end;
+    // Only the frontier can reach previously empty pixels in the next pass.
+    for (let q = start; q < through; q++) {
+      const i = queue[q],
+        x = i % w;
+      if (x > 0) enqueue(i - 1);
+      if (x < w - 1) enqueue(i + 1);
+      if (i >= w) enqueue(i - w);
+      if (i + w < v.length) enqueue(i + w);
+    }
+    // Read the previous pass completely before publishing this pass's values.
+    for (let q = through; q < end; q++) {
+      const i = queue[q],
+        x = i % w;
+      let best = NaN;
+      if (x > 0) best = out[i - 1];
+      if (x < w - 1) {
+        const p = out[i + 1];
+        if (!Number.isNaN(p) && !(p >= best)) best = p;
+      }
+      if (i >= w) {
+        const p = out[i - w];
+        if (!Number.isNaN(p) && !(p >= best)) best = p;
+      }
+      if (i + w < v.length) {
+        const p = out[i + w];
+        if (!Number.isNaN(p) && !(p >= best)) best = p;
+      }
+      values[q] = best;
+    }
+    for (let q = through; q < end; q++) out[queue[q]] = values[q];
+    start = through;
+  }
+  return out;
 }
 
 /** About the distance in pixels to where `share` is a half, for a straight edge blurred

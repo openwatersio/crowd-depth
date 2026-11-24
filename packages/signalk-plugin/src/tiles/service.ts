@@ -34,10 +34,6 @@ export function overviewLevel(z: number, lat: number): number {
   return Math.max(0, ...OVERVIEW_LEVELS.filter((l) => CELL_M * 2 ** l <= pm));
 }
 
-/** Threads that build tiles. Worked out when a service starts, not when the module
- * loads, which the API's Worker bundle does too. */
-const tileThreads = () => Math.max(1, Math.min(3, availableParallelism() - 1));
-
 /** Bytes of encoded tiles kept in memory, the most recently used: a z13 tile of busy
  * water at High detail is about 60 KB, so a few views' worth. Tiles kept on disk are read
  * back in a millisecond or so. */
@@ -218,6 +214,14 @@ export function readTile(
 function createTileWorker(file: string, detail: Detail) {
   let worker: Worker | undefined;
   let next = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const terminating = new Set<Promise<number>>();
+  const terminate = (running: Worker) => {
+    const exited = running.terminate();
+    terminating.add(exited);
+    const forget = () => terminating.delete(exited);
+    void exited.then(forget, forget);
+  };
   const waiting = new Map<
     number,
     {
@@ -225,36 +229,63 @@ function createTileWorker(file: string, detail: Detail) {
       reject: (e: Error) => void;
     }
   >();
+  const deadline = (running: Worker) => {
+    clearTimeout(timer);
+    if (!waiting.size) return;
+    // Measure lack of progress, not time queued behind other healthy requests.
+    timer = setTimeout(() => {
+      if (worker !== running) return;
+      terminate(running);
+      worker = undefined;
+      for (const w of waiting.values())
+        w.reject(new Error("tile worker made no progress for 30 seconds"));
+      waiting.clear();
+    }, 30_000);
+    timer.unref();
+  };
   const start = () => {
-    worker = new Worker(new URL("./tile-worker.js", import.meta.url), {
+    const running = new Worker(new URL("./tile-worker.js", import.meta.url), {
       workerData: { file, detail },
     });
-    worker.unref();
-    worker.on("message", ({ id, error, ...result }) => {
+    worker = running;
+    running.unref();
+    running.on("message", ({ id, error, ...result }) => {
+      if (worker !== running) return;
       const w = waiting.get(id);
+      if (!w) return;
       waiting.delete(id);
-      if (error) w?.reject(new Error(error));
-      else w?.resolve(result);
+      deadline(running);
+      if (error) w.reject(new Error(error));
+      else w.resolve(result);
     });
     const fail = (err: Error) => {
+      // error rejects the current requests before exit arrives. A caller can
+      // already have started a replacement by the time that old exit is delivered.
+      if (worker !== running) return;
+      clearTimeout(timer);
       for (const w of waiting.values()) w.reject(err);
       waiting.clear();
       worker = undefined;
     };
-    worker.on("error", (err) => fail(err as Error));
+    running.on("error", (err) => {
+      if (worker === running) terminate(running);
+      fail(err as Error);
+    });
     // An exit with tiles still asked for answers them, rather than leaving them hanging;
     // the next request starts a new thread.
-    worker.on("exit", (code) =>
+    running.on("exit", (code) =>
       fail(new Error(`tile worker exited (${code})`)),
     );
   };
   const ask = (message: object) => {
     if (!worker) start();
+    const running = worker!;
     const id = next++;
     return new Promise<{ tile?: Uint8Array; preview?: GeoFeature[] }>(
       (resolve, reject) => {
         waiting.set(id, { resolve, reject });
-        worker!.postMessage({ id, ...message });
+        if (waiting.size === 1) deadline(running);
+        running.postMessage({ id, ...message });
       },
     );
   };
@@ -281,12 +312,13 @@ function createTileWorker(file: string, detail: Detail) {
     },
     /** Resolves once the thread has exited and let go of the database file. */
     close(): Promise<void> {
-      const exiting = worker?.terminate();
+      if (worker) terminate(worker);
       worker = undefined;
+      clearTimeout(timer);
       for (const w of waiting.values())
         w.reject(new Error("tile worker closed"));
       waiting.clear();
-      return exiting ? exiting.then(() => undefined) : Promise.resolve();
+      return Promise.all(terminating).then(() => undefined);
     },
   };
 }
@@ -355,7 +387,7 @@ export function createTileService(
   const reserve = (z: number, x: number, y: number) => {
     // Not while a backfill writes: its transactions hold the write lock, which this
     // would wait on with the server's thread, and its writes drop the tile anyway.
-    if (!sharing || !quiet(`${z}/${x}/${y}`)) return undefined;
+    if (!sharing || !persisting || !quiet(`${z}/${x}/${y}`)) return undefined;
     try {
       return kept?.reserve(z, x, y);
     } catch {
@@ -365,11 +397,10 @@ export function createTileService(
   /** Bumped when a tile changes, so a build that started before isn't cached. */
   const stamps = new Map<string, number>();
   const building = new Map<string, Promise<Buffer | undefined>>();
-  // A few threads, leaving a core for the server: a chart asks for a view's tiles at
-  // once, and each takes up to a second or so on a Pi.
   const workers = file
-    ? Array.from({ length: tileThreads() }, () =>
-        createTileWorker(file, detail),
+    ? Array.from(
+        { length: Math.max(1, Math.min(3, availableParallelism() - 1)) },
+        () => createTileWorker(file, detail),
       )
     : [];
   let turn = 0;
@@ -383,14 +414,46 @@ export function createTileService(
     return workers[(a.x * 31 + a.y) % workers.length];
   };
   let sharing = true;
-  const build = (z: number, x: number, y: number, w = worker(z, x, y)) =>
-    w
-      ? w.build(z, x, y, sharing)
-      : Promise.resolve(readTile(store, z, x, y, detail, sharing));
+  let persisting = true;
+  let firstContent = false;
+  let emptyStarts = 0;
+  let opening = Promise.resolve();
+  const build = async (z: number, x: number, y: number, w?: TileWorker) => {
+    // Competing cold renderers delay first content on the Pi. For each new burst
+    // of requests, try up to three tiles before using the full pool. An empty
+    // viewport must not serialize indefinitely while searching for first content.
+    if (workers.length && !w && !firstContent) {
+      const previous = opening;
+      let release!: () => void;
+      opening = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      await previous;
+      try {
+        if (closed) throw new Error("tile service closed");
+        if (!firstContent) {
+          const tile = await worker(z, x, y)!.build(z, x, y, sharing);
+          if (tile || ++emptyStarts >= 3) firstContent = true;
+          return tile;
+        }
+      } finally {
+        release();
+      }
+    }
+    if (closed) throw new Error("tile service closed");
+    const chosen = w ?? worker(z, x, y);
+    return chosen
+      ? chosen.build(z, x, y, sharing)
+      : readTile(store, z, x, y, detail, sharing);
+  };
 
   /** Build a tile, on worker `w` when built ahead, and keep it on disk where it can be;
    * in memory if it was asked for, or can't be kept on disk yet. */
   const load = (k: string, z: number, x: number, y: number, w?: TileWorker) => {
+    if (!w && !building.size) {
+      firstContent = false;
+      emptyStarts = 0;
+    }
     const stamp = stamps.get(k);
     // Before the build reads the cells, so a write after it drops the reservation.
     const id = reserve(z, x, y);
@@ -399,7 +462,7 @@ export function createTileService(
         sizes.set(k, tile?.length ?? 0);
         let onDisk = false;
         // Not once a backfill has started meanwhile, whose write lock this would wait on.
-        if (id !== undefined && sharing) {
+        if (id !== undefined && sharing && persisting) {
           try {
             onDisk = kept!.keep(id, tile);
           } catch {
@@ -627,6 +690,10 @@ export function createTileService(
   scan();
 
   return {
+    /** Attach only after old renderer caches have been removed. */
+    attachKept(prepared: KeptTiles) {
+      if (!closed) kept = prepared;
+    },
     /** A tile's encoded MVT, or undefined where the boat has no soundings. */
     async get(z: number, x: number, y: number): Promise<Buffer | undefined> {
       const k = `${z}/${x}/${y}`;
@@ -683,9 +750,16 @@ export function createTileService(
       enqueue(touched.values());
     },
 
-    /** Share no surfaces between tiles while `on` is false, as while a backfill writes
-     * cells on a connection of its own and tells nothing until it ends: each tile is
-     * then built from the cells as they stand. */
+    /** Avoid main-thread SQLite writes while refinement owns the write lock.
+     * Prepared surfaces still share between commits and are invalidated by changed(). */
+    persist(on: boolean) {
+      if (closed) return;
+      persisting = on;
+      if (on) scan();
+    },
+
+    /** Disable prepared-surface reuse for callers without commit notifications.
+     * Normal refinement uses changed() and keeps reuse enabled. */
     share(on: boolean) {
       sharing = on;
       clearShared(store);

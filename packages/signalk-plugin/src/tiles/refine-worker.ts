@@ -1,3 +1,4 @@
+import { isolateDamagedPreview } from "./preview-spatial.js";
 import { cellCenter } from "./geometry.js";
 import { parentPort, workerData } from "node:worker_threads";
 import { DatabaseSync } from "node:sqlite";
@@ -14,7 +15,14 @@ if (process.platform === "linux") {
 }
 const db = new DatabaseSync(workerData.file);
 db.exec("PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=10000");
-const store = createCellStore(db, workerData.generation);
+const store = (() => {
+  try {
+    return createCellStore(db, workerData.generation);
+  } catch (error) {
+    if (!isolateDamagedPreview(db, error)) throw error;
+    return createCellStore(db, workerData.generation);
+  }
+})();
 let job: ReturnType<typeof refinementWriter> | undefined;
 parentPort!.on(
   "message",
@@ -57,7 +65,15 @@ parentPort!.on(
       if (message.end) {
         job!.writer.end();
         await finished(job!.writer);
-        const changed = message.commit === false ? [] : job!.commit();
+        let changed: ReturnType<NonNullable<typeof job>["commit"]> = [];
+        if (message.commit !== false) {
+          try {
+            changed = job!.commit();
+          } catch (error) {
+            if (!isolateDamagedPreview(db, error)) throw error;
+            changed = job!.commit();
+          }
+        }
         job = undefined;
         parentPort!.postMessage({ changed });
       } else parentPort!.postMessage({ ack: true });

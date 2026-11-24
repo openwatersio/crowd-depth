@@ -42,9 +42,9 @@ a provider returns geographically useful data.
   availability are independent of raw preview eligibility.
 - src/tiles/cells.ts stores quantized EMA/deviation and spatial overviews.
   backfill.ts/worker build oldest-first, skip overviews, and publish at completion.
-- src/tiles/service.ts caches encoded empty/nonempty tiles and shared surfaces,
-  builds tiles on workers and prebuilds nearby tiles; share(false) does not
-  invalidate encoded caches or publish changes.
+- src/tiles/service.ts caches encoded empty/nonempty tiles and shared surfaces.
+  It now renders on demand, reuses surfaces between notified commits, and suspends
+  persistent-cache writes while background writers are active.
 - src/tiles/kept.ts maintains on-disk tiles with SQL invalidation triggers.
 - src/tiles/surface.ts/portray.ts interpolate, smooth, trace polygons/contours,
   with spatial halos and shared ancestor surfaces. Preview must bypass this work.
