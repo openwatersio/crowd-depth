@@ -163,13 +163,16 @@ describe("getMetadata", () => {
   });
 
   test("gives sensor offsets from the reference point, forward, starboard and down", () => {
-    const metadata = getMetadata(vessel, {
-      ...config,
-      // Transducer 3 m from the bow, 0.5 m to port, 0.4 m below the waterline
-      sounder: { x: -0.5, y: 3, z: 0.4 },
-      // Antenna 9 m from the bow on the centreline, 2 m above the waterline
-      gnss: { x: 0, y: 9, z: 2 },
-    });
+    const metadata = getMetadata(
+      { ...vessel, gnssOrigin: { x: 0, y: 9 } },
+      {
+        ...config,
+        // Transducer 3 m from the bow, 0.5 m to port, 0.4 m below the waterline
+        sounder: { x: -0.5, y: 3, z: 0.4 },
+        // Antenna 9 m from the bow on the centreline, 2 m above the waterline
+        gnss: { x: 0, y: 9, z: 2 },
+      },
+    );
     const [sounder, gnss] = metadata.properties.platform.sensors;
 
     expect(metadata.properties.trustedNode.vesselPositionReferencePoint).toBe(
@@ -274,4 +277,14 @@ describe("describeSubmissionError", () => {
     expect(describeSubmissionError("boom")).toBe("boom");
     expect(describeSubmissionError(undefined)).toBe("undefined");
   });
+});
+
+test("the correction flag describes submitted positions even without static GNSS metadata", () => {
+  const metadata = getMetadata(vessel, { ...config, gnss: { z: 2 } });
+  expect(metadata.properties.platform.positionOffsetsDocumented).toBe(true);
+  expect(
+    metadata.properties.platform.sensors.find(
+      (sensor) => sensor.type === "GNSS",
+    )?.position,
+  ).toBeUndefined();
 });

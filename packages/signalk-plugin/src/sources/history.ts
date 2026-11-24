@@ -1,3 +1,4 @@
+import { gnssOrigin } from "../gnss-offsets.js";
 import { Config, depthReference } from "../config.js";
 import { Readable } from "stream";
 import { BathymetryData, BathymetrySource, Timeframe } from "../types.js";
@@ -115,6 +116,18 @@ export async function createHistorySource(
       return typeof value === "number" ? value : undefined;
     };
 
+    const positionOrigin = gnssOrigin(
+      app,
+      config,
+      positionSource ||
+        res.values?.find((value) => value.path === "navigation.position")
+          ?.$source,
+    );
+    if (res.data.length && !positionOrigin)
+      throw new Error(
+        "GPS geometry unavailable for historical positions. Configure the selected receiver in Signal K GNSS sensor settings; use a source-aware history provider and select an explicit source if history does not identify it. Use off/both correction mode.",
+      );
+
     const data = res.data
       .map((row): BathymetryData | undefined => {
         const depth = depthColumn === undefined ? undefined : row[depthColumn];
@@ -137,6 +150,7 @@ export async function createHistorySource(
             longitude,
             latitude,
             depth: depth + offset,
+            positionOrigin,
             heading: bowBearing({
               heading: column(row, HEADING),
               courseOverGround: column(row, COG),

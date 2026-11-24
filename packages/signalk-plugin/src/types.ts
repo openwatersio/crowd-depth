@@ -31,6 +31,8 @@ export type BathymetryData = {
   depth: number;
   timestamp: Temporal.Instant;
   heading?: number;
+  /** Recorded coordinate origin; null means geometry could not be established. */
+  positionOrigin?: { x: number; y: number } | null;
   /** The water level above chart datum at the sounding, for the chart layer. */
   tide?: Tide;
 };

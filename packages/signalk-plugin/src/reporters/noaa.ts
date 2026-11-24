@@ -245,7 +245,17 @@ export function getMetadata(info: VesselInfo, config: Config) {
           {
             type: "GNSS",
             ...sensorIdentity(config.gnss, info.sensors?.gnss),
-            position: sensorPosition(gnssLocation(config), reference),
+            ...(info.gnssOrigin
+              ? {
+                  position: sensorPosition(
+                    gnssLocation({
+                      ...config,
+                      gnss: { ...config.gnss, ...info.gnssOrigin },
+                    }),
+                    reference,
+                  ),
+                }
+              : {}),
           },
         ],
         // Positions are corrected for GNSS/sounder offsets; soundings that

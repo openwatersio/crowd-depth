@@ -1,6 +1,7 @@
 import { detectSensorDetails, type SensorInfo } from "./device-info.js";
 import { detectGpsdDetails } from "./gpsd-info.js";
 import { resolveSource, type Config } from "./config.js";
+import { gnssOrigin, type PositionOrigin } from "./gnss-offsets.js";
 import { ServerAPI } from "@signalk/server-api";
 import { readFile, writeFile } from "fs/promises";
 import { join } from "path";
@@ -19,6 +20,7 @@ export type VesselInfo = Identity & {
   imo?: string;
   name?: string;
   loa?: number;
+  gnssOrigin?: PositionOrigin;
   type?: string;
 };
 
@@ -30,6 +32,10 @@ export async function getVesselInfo(
   return {
     ...(await identify(app, BATHY_URL, signal)),
     ...(config ? { sensors: await getSensorInfo(app, config) } : {}),
+    gnssOrigin:
+      config && !config.gnss.source?.endsWith(".ccrp")
+        ? (gnssOrigin(app, config, config.gnss.source) ?? undefined)
+        : undefined,
     // @ts-expect-error remove after next signalk release
     mmsi: app.config.vesselMMSI,
     imo: app.getSelfPath("registrations.imo") as string | undefined,

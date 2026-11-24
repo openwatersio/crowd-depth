@@ -784,6 +784,7 @@ test("a database from a preview build moves to cells", () => {
       DROP TABLE cells; DROP TABLE overviews; DROP TABLE shoals;
       CREATE TABLE tiles(z INTEGER, x INTEGER, y INTEGER, cells BLOB, updated INTEGER);
       INSERT INTO tile_meta(key, value) VALUES ('through', '2026-10-16T09:00:00Z');
+      ALTER TABLE bathymetry DROP COLUMN position_origin;
       PRAGMA user_version = 3;
     `);
     old.close();

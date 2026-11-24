@@ -159,7 +159,7 @@ test("identity placeholders use saved selections and leave configuration fields 
     model: { "ui:placeholder": "GPS 2" },
   });
   expect(schema(app)).toEqual(before);
-  expect(before.properties.gnss.required).toEqual(["x", "y", "z"]);
+  expect(before.properties.gnss.required).toEqual(["z"]);
   expect(before.properties).toHaveProperty("path");
   expect(before.properties.gnss.properties.make).not.toHaveProperty("default");
 });

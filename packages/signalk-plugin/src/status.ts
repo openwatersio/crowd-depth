@@ -3,6 +3,9 @@ import { ServerAPI } from "@signalk/server-api";
 
 export type Status = ReturnType<typeof createStatus>;
 
+const statuses = new WeakMap<ServerAPI, Status>();
+export const getStatus = (app: ServerAPI) => statuses.get(app);
+
 export function createStatus(app: ServerAPI) {
   const state = {
     usingHistory: false,
@@ -31,12 +34,12 @@ export function createStatus(app: ServerAPI) {
     const message = getStatusMessage();
     if (errors.size)
       app.setPluginError(
-        `${[...errors.values()].map((err) => err.message).join("; ")}; ${message}`,
+        `${[...new Set([...errors.values()].map((err) => err.message))].join("; ")}; ${message}`,
       );
     else app.setPluginStatus(message);
   }
 
-  return {
+  const status = {
     get state() {
       return { ...state };
     },
@@ -61,4 +64,6 @@ export function createStatus(app: ServerAPI) {
       return err;
     },
   };
+  statuses.set(app, status);
+  return status;
 }

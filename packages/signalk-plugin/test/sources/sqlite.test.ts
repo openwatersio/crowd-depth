@@ -190,6 +190,7 @@ test("the log keeps no index on position", () => {
     // Back to a log from user_version 6, with the index.
     db.exec(`
       CREATE INDEX idx_bathymetry_location ON bathymetry(latitude, longitude);
+      ALTER TABLE bathymetry DROP COLUMN position_origin;
       PRAGMA user_version = 6;
     `);
     db.close();
@@ -223,4 +224,28 @@ test("getAvailableTimeframes counts windows from the span's start, up to its end
     "2025-01-01T00:10:00Z/2025-01-01T01:10:00Z",
     "2025-01-01T03:10:00Z/2025-01-01T04:10:00Z",
   ]);
+});
+
+test("SQLite preserves per-reading origins and distinguishes unknown from legacy geometry", async () => {
+  const db = createDB(":memory:");
+  const source = createSqliteSource(app, db);
+  await pipeline(
+    Readable.from([
+      { ...data[0], positionOrigin: { x: -1, y: 8 } },
+      { ...data[1], positionOrigin: null },
+      data[2],
+    ]),
+    source.createWriter!(),
+  );
+  const reader = await source.createReader(
+    new Timeframe(
+      Temporal.Instant.fromEpochMilliseconds(0),
+      Temporal.Now.instant(),
+    ),
+  );
+  const points = await reader!.toArray();
+  expect(points[0].positionOrigin).toEqual({ x: -1, y: 8 });
+  expect(points[1].positionOrigin).toBeNull();
+  expect(points[2].positionOrigin).toBeUndefined();
+  db.close();
 });
