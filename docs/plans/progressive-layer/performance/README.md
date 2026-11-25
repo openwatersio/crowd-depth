@@ -1465,7 +1465,7 @@ original acquisition/window semantics, source provenance, completeness flags
 and cancellation. Merely yielding after a whole response has been parsed will
 not bound the provider's synchronous parsing cost.
 
-### Bounded history acquisition candidate (not installed)
+### Bounded history acquisition — v44
 
 The live v43 main-thread profile motivates five-minute provider requests within
 one hourly archive receipt. Each segment is saved before the next request, so a
@@ -1497,5 +1497,41 @@ release blocker or establish the loaded viewport acceptance gates.
 [Remote v43 HTTP samples](pi-v43-remote-health-nov25.json) contain thirty successful
 full-model responses with p95 387.99 ms. Network latency is included, and no
 simultaneous viewport workload was applied; this does not replace the Docker
-acceptance runs. SSH retry reached key acceptance but the agent could not sign,
-so v43 remains the installed build.
+acceptance runs. SSH initially reached key acceptance but could not sign. Access subsequently resumed; v44 deployment and measurements follow.
+
+### Active v44 Docker comparison, November 25
+
+[Raw measurements and activation evidence](pi-v44-active-nov25.json) record the
+reviewed c974578 package (SHA1 6ec99a11ddff33de68bc49eb7867def5786d9a86), active
+through Docker after restart at 20:07:05 UTC. Both databases were backed up and
+verified in pre-progressive-v44-2026-11-25T20-06-22-193Z. The archive remains schema 7,
+with more than 5.4 million observations present and depth_since unchanged.
+
+The fresh pre-activation v43 north viewport baseline failed: 15 views, 57 HTTP samples,
+p95 1015.6 ms and one HTTP timeout. v44 north also failed: 15 views, 75 successful HTTP
+samples, p95 414.8 ms. v44 LakeWorth failed: 15 views, 46 successful HTTP samples, p95 414.2 ms.
+Both v44 runs still exceed the first-populated-tile/cold-viewport gates. These are
+before/after observations, not a controlled attribution: restart and changing
+backfill activity affect the comparison. The failed runs remain in the evidence.
+
+The synthetic 18,000-observation cold archive-to-preview test, with recent history
+stalled, returned first preview in 231.3, 320.0, and 186.1 ms. This verifies that focused
+startup path, not browser paint or arbitrary real-archive viewport latency.
+
+A new CPU profiling attempt timed out in Profiler.start; no CPU profile was
+produced, and the temporary inspector was verified closed. Initial statistics
+showed 2.73 GB RSS and 724 MB main-thread heap used. Host samples showed active swap
+traffic and 32–56% I/O wait; swap is backed by /var/swap. RSS includes worker memory,
+so these numbers do not assign all memory to the main thread or this plugin.
+Host samples overlapped attempted profiler startup. A subsequent filtered worker
+heap report also timed out; no per-worker attribution was obtained. The following
+full-model health request succeeded in 1078 ms and the inspector was closed.
+
+Local validation passed 706 tests/57 files and nine real Signal K E2E tests. Exact-checkpoint
+GitHub CI 45691317564 passed. Plugin CI 45691318163 passed all eight platform/Node jobs,
+each executing 674 tests/54 files; its shared integration job was explicitly skipped,
+while the repository E2E suite passed separately. Three external Codex rounds and
+supplementary focused reviews covered batching, timeouts, cancellation, local
+preview preservation and rollback recovery. The final reviews found no new
+high/medium issue in those fixes. Canonical raw/live/history routing, production
+thinning, and loaded performance acceptance remain release blockers.
