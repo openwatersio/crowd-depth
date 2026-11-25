@@ -1,0 +1,274 @@
+{
+  "package": "progressive-20261125-v43",
+  "scope": "10-second main-thread inspector CPU profile during normal backfill; separate cold tile benchmark processes had exited. Heap figures are main isolate; RSS is whole process. Inspector closed after profiling.",
+  "runtime": [
+    {
+      "before": {
+        "memory": {
+          "rss": 2028601344,
+          "heapTotal": 856686592,
+          "heapUsed": 408674856,
+          "external": 43647288,
+          "arrayBuffers": 14940780
+        },
+        "heap": {
+          "total_heap_size": 856686592,
+          "total_heap_size_executable": 21610496,
+          "total_physical_size": 856686592,
+          "total_available_size": 1938169640,
+          "used_heap_size": 408759856,
+          "heap_size_limit": 2348810240,
+          "malloced_memory": 4235352,
+          "peak_malloced_memory": 52607848,
+          "does_zap_garbage": 0,
+          "number_of_native_contexts": 2,
+          "number_of_detached_contexts": 0,
+          "total_global_handles_size": 159816,
+          "used_global_handles_size": 149536,
+          "external_memory": 43667800
+        }
+      }
+    },
+    {
+      "after": {
+        "memory": {
+          "rss": 2015789056,
+          "heapTotal": 857800704,
+          "heapUsed": 531406968,
+          "external": 44430666,
+          "arrayBuffers": 15712318
+        },
+        "heap": {
+          "total_heap_size": 857800704,
+          "total_heap_size_executable": 22134784,
+          "total_physical_size": 857800704,
+          "total_available_size": 1815488544,
+          "used_heap_size": 531407192,
+          "heap_size_limit": 2348810240,
+          "malloced_memory": 4235352,
+          "peak_malloced_memory": 52607848,
+          "does_zap_garbage": 0,
+          "number_of_native_contexts": 2,
+          "number_of_detached_contexts": 0,
+          "total_global_handles_size": 1101896,
+          "used_global_handles_size": 153792,
+          "external_memory": 44430666
+        }
+      },
+      "profile": "/tmp/signalk-v43-main.cpuprofile"
+    }
+  ],
+  "topSelfSamples": [
+    {
+      "selfMs": 1967.666,
+      "inclusiveMs": 1967.666,
+      "function": "parseInner",
+      "module": ".signalk/node_modules/influx/lib/src/results.js",
+      "line": 50
+    },
+    {
+      "selfMs": 1309.349,
+      "inclusiveMs": 1309.349,
+      "function": "(idle)",
+      "module": "",
+      "line": 0
+    },
+    {
+      "selfMs": 492.152,
+      "inclusiveMs": 492.152,
+      "function": "(garbage collector)",
+      "module": "",
+      "line": 0
+    },
+    {
+      "selfMs": 309.804,
+      "inclusiveMs": 309.804,
+      "function": "get",
+      "module": "",
+      "line": 0
+    },
+    {
+      "selfMs": 261.976,
+      "inclusiveMs": 352.538,
+      "function": "br",
+      "module": ".signalk/local-pkgs/progressive-20261125-v43/node_modules/@js-temporal/polyfill/dist/index.esm.js",
+      "line": 1
+    },
+    {
+      "selfMs": 234.215,
+      "inclusiveMs": 234.215,
+      "function": "",
+      "module": ".signalk/node_modules/signalk-to-influxdb2/dist/HistoryAPI.js",
+      "line": 604
+    },
+    {
+      "selfMs": 152.951,
+      "inclusiveMs": 152.951,
+      "function": "<computed>.v.<computed>",
+      "module": "signalk/node_modules/@js-temporal/polyfill/dist/index.cjs",
+      "line": 1
+    },
+    {
+      "selfMs": 118.98,
+      "inclusiveMs": 132.542,
+      "function": "Mt",
+      "module": ".signalk/local-pkgs/progressive-20261125-v43/node_modules/@js-temporal/polyfill/dist/index.esm.js",
+      "line": 1
+    },
+    {
+      "selfMs": 114.668,
+      "inclusiveMs": 250.359,
+      "function": "observation",
+      "module": ".signalk/local-pkgs/progressive-20261125-v43/node_modules/crowd-depth/dist/tiles/history-preview.js",
+      "line": 16
+    },
+    {
+      "selfMs": 95.427,
+      "inclusiveMs": 862.008,
+      "function": "read",
+      "module": ".signalk/local-pkgs/progressive-20261125-v43/node_modules/crowd-depth/dist/tiles/history-preview.js",
+      "line": 232
+    },
+    {
+      "selfMs": 94.612,
+      "inclusiveMs": 94.612,
+      "function": "<computed>.v.<computed>",
+      "module": "signalk/node_modules/@js-temporal/polyfill/dist/index.cjs",
+      "line": 1
+    },
+    {
+      "selfMs": 91.169,
+      "inclusiveMs": 1843.463,
+      "function": "createReader",
+      "module": ".signalk/local-pkgs/progressive-20261125-v43/node_modules/crowd-depth/dist/sources/history.js",
+      "line": 23
+    },
+    {
+      "selfMs": 89.767,
+      "inclusiveMs": 89.767,
+      "function": "isoToDate",
+      "module": ".signalk/node_modules/influx/lib/src/grammar/times.js",
+      "line": 247
+    },
+    {
+      "selfMs": 84.742,
+      "inclusiveMs": 4397.155,
+      "function": "runMicrotasks",
+      "module": "",
+      "line": 0
+    },
+    {
+      "selfMs": 83.384,
+      "inclusiveMs": 393.188,
+      "function": "value",
+      "module": ".signalk/local-pkgs/progressive-20261125-v43/node_modules/crowd-depth/dist/tiles/history-preview.js",
+      "line": 40
+    },
+    {
+      "selfMs": 82.387,
+      "inclusiveMs": 82.387,
+      "function": "<computed>.v.<computed>",
+      "module": "signalk/node_modules/@js-temporal/polyfill/dist/index.cjs",
+      "line": 1
+    },
+    {
+      "selfMs": 79.753,
+      "inclusiveMs": 79.753,
+      "function": "",
+      "module": ".signalk/node_modules/influx/lib/src/pool.js",
+      "line": 140
+    },
+    {
+      "selfMs": 79.189,
+      "inclusiveMs": 79.189,
+      "function": "",
+      "module": ".signalk/local-pkgs/progressive-20261125-v43/node_modules/@js-temporal/polyfill/dist/index.esm.js",
+      "line": 1
+    },
+    {
+      "selfMs": 75.26,
+      "inclusiveMs": 75.26,
+      "function": "(program)",
+      "module": "",
+      "line": 0
+    },
+    {
+      "selfMs": 71.539,
+      "inclusiveMs": 77.833,
+      "function": "Mt",
+      "module": ".signalk/local-pkgs/progressive-20261125-v43/node_modules/@js-temporal/polyfill/dist/index.esm.js",
+      "line": 1
+    },
+    {
+      "selfMs": 60.69,
+      "inclusiveMs": 60.69,
+      "function": "",
+      "module": ".signalk/node_modules/signalk-to-influxdb2/dist/HistoryAPI.js",
+      "line": 680
+    },
+    {
+      "selfMs": 59.951,
+      "inclusiveMs": 59.951,
+      "function": "write",
+      "module": "",
+      "line": 0
+    },
+    {
+      "selfMs": 58.165,
+      "inclusiveMs": 58.165,
+      "function": "Wt",
+      "module": ".signalk/local-pkgs/progressive-20261125-v43/node_modules/@js-temporal/polyfill/dist/index.esm.js",
+      "line": 1
+    },
+    {
+      "selfMs": 54.299,
+      "inclusiveMs": 54.299,
+      "function": "write",
+      "module": "",
+      "line": 0
+    },
+    {
+      "selfMs": 53.198,
+      "inclusiveMs": 53.198,
+      "function": "writev",
+      "module": "",
+      "line": 0
+    },
+    {
+      "selfMs": 51.745,
+      "inclusiveMs": 51.745,
+      "function": "__trim",
+      "module": ".signalk/local-pkgs/progressive-20261125-v43/node_modules/jsbi/dist/jsbi-cjs.js",
+      "line": 1
+    },
+    {
+      "selfMs": 50.604,
+      "inclusiveMs": 50.604,
+      "function": "<computed>.v.<computed>",
+      "module": "signalk/node_modules/@js-temporal/polyfill/dist/index.cjs",
+      "line": 1
+    },
+    {
+      "selfMs": 50.161,
+      "inclusiveMs": 2439.787,
+      "function": "onReadable",
+      "module": "signalk/node_modules/@canboat/canboatjs/dist/canSocket.js",
+      "line": 79
+    },
+    {
+      "selfMs": 49.167,
+      "inclusiveMs": 115.453,
+      "function": "",
+      "module": ".signalk/node_modules/signalk-venus-plugin/dist/index.js",
+      "line": 501
+    },
+    {
+      "selfMs": 48.444,
+      "inclusiveMs": 321.675,
+      "function": "gr",
+      "module": ".signalk/local-pkgs/progressive-20261125-v43/node_modules/@js-temporal/polyfill/dist/index.esm.js",
+      "line": 1
+    }
+  ],
+  "hostLoad": "    PID    PPID STAT %CPU %MEM COMMAND\n2416158 2416157 R     100  0.0 ps\n2415061 2415049 Sl   93.7 39.4 MainThread\n1227148 1227109 Ssl   6.1  8.5 influxd\n2416148     825 Ss    2.7  0.1 sshd\n    865     818 Ss    1.9  0.6 python3\n    734       2 S     1.5  0.0 irq/186-spi0.0\n    866     818 Dsl   1.2  7.2 MainThread\n    811       1 Ssl   0.7  0.5 tailscaled\n1227370 1227287 SLl   0.6  0.7 telegraf\n     92       2 I<    0.6  0.0 kworker/u21:0-brcmf_wq/mmc1:0001:1\n1227285 1227231 Ssl   0.5  1.8 grafana\n   1058       1 Ssl   0.4  0.6 dockerd\n1227189    1058 Sl    0.3  0.2 docker-proxy\n      1       0 Ss    0.2  0.1 systemd\n2409446 2409444 S     0.2  0.0 candump\n2409445     869 S     0.2  0.0 gzip\n2415457       2 I     0.1  0.0 kworker/1:4-pm\n               total        used        free      shared  buff/cache   available\nMem:            8063        5534         268           0        2606        2529\nSwap:           2047        1283         764\nprocs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----\n r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st\n 3  4 1313856 274288  70064 2599408    4    6    45   111 2453 3285 16  2 81  1  0\n 2  1 1313856 274288  70064 2599408 4672    0 13744  1400 12979 16185 13  2 55 30  0\n 4  3 1313856 274288  70064 2599408 5296    0 16760     0 13340 16791  3  2 35 60  0\n 2  3 1313856 274288  70064 2599408 3616 13328  7492 13328 12726 16911 12  3 38 47  0\n 3  3 1313856 274288  70064 2599408 3376 21392  8744 21552 12188 15556  8  2 41 49  0\nsignalk 11.96%\ngrafana 0.38%\nstarlink-path-monitor 0.65%\nstarlink-collector 0.01%\ninfluxdb 0.54%\nhomepage 0.00%\nportainer 0.00%\nsignalk-pi-stremio-1 0.04%\n"
+}

@@ -1442,3 +1442,60 @@ Freeboard navigation during the north run reached DOMContentLoaded in 918 ms,
 load in 1326 ms and first contentful paint in 164 ms. A later screenshot showed
 My Soundings tracks in the current Tybee Island viewport. This was not a cold
 browser-cache experiment and does not measure first useful sounding latency.
+
+### November 25: live server profile after viewport benchmarks exited
+
+The host still showed load 6.6, about 1.28 GiB of occupied swap, and 30–60% I/O
+wait in four one-second samples. Signal K's process RSS was initially about
+3 GiB by `ps`, then about 2 GiB during a ten-second internal inspector profile.
+The main isolate held 409–531 MB of used heap inside an 857 MB heap; process RSS
+also includes workers and native allocations, so those quantities differ.
+
+The profile's largest self-time was InfluxDB `parseInner` (1968 ms). Our history
+`createReader` accounted for 1843 ms inclusive, and GC for 492 ms; idle samples
+accounted for 1309 ms. This identifies provider response parsing and main-thread
+history conversion as concrete targets alongside rendering. It does not prove
+that those functions account for all resident memory or all I/O pressure.
+The temporary inspector was closed after collection. Aggregate memory/sample
+evidence is in `pi-v43-runtime-profile-nov25.json`; the full local profile is
+`/tmp/pi-signalk-v43-main.cpuprofile`.
+
+The next change should bound detailed provider response sizes while retaining
+original acquisition/window semantics, source provenance, completeness flags
+and cancellation. Merely yielding after a whole response has been parsed will
+not bound the provider's synchronous parsing cost.
+
+### Bounded history acquisition candidate (not installed)
+
+The live v43 main-thread profile motivates five-minute provider requests within
+one hourly archive receipt. Each segment is saved before the next request, so a
+later failure retains already acquired data. This means twelve chunk commits
+per fully populated 1-Hz hour rather than eight, and additional provider metadata
+queries. The change is not a measured Pi performance improvement yet.
+
+Review reproduced a healthy three-second-per-segment provider failing the old
+thirty-second whole-hour deadline after ten requests. Preview/refinement now
+allow thirty seconds per segment for the enclosing read, with separate
+thirty-second request-creation and stream-consumption deadlines. Reader destruction
+aborts acquisition before async-generator cleanup: no subsequent requests or
+completion publication, while uncancellable provider reservations remain held
+until settlement. Targeted regressions include slow healthy completion, stalled
+streams, all four public reader cancellation paths, segment boundary duplication,
+and late empty metadata failure.
+
+The same review found interval-wide deletion of unmatched local previews. History
+coverage now checkpoints without deleting unrelated local points; newer observations
+still replace previews in their cell. A new local coverage namespace retries old
+local input windows incrementally, preserving already populated previews. A persisted
+cell-deletion trigger sets one recovery flag when an older writer removes local
+cells after rollback; the next startup invalidates local:v2 coverage and rescans
+retained inputs. The trigger avoids scanning coverage for each deleted cell. Canonical
+live/history reconciliation remains unresolved: a live pass can still suppress a
+distinct historical pass in the same cell/hour. This candidate does not fix that
+release blocker or establish the loaded viewport acceptance gates.
+
+[Remote v43 HTTP samples](pi-v43-remote-health-nov25.json) contain thirty successful
+full-model responses with p95 387.99 ms. Network latency is included, and no
+simultaneous viewport workload was applied; this does not replace the Docker
+acceptance runs. SSH retry reached key acceptance but the agent could not sign,
+so v43 remains the installed build.

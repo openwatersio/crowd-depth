@@ -126,7 +126,7 @@ test("latest writes, refinement receipts and paired history replacement update t
   store.write("local", [point(start.px, start.py, time + 1000)]);
   expect(store.features(view, 0)[0].properties.time).toBe(time + 1000);
   store.write("history", [], [time + 1000, time + 1001]);
-  expect(store.features(view, 0)).toEqual([]);
+  expect(store.features(view, 0)[0].properties.time).toBe(time + 1000);
   store.write("history", [point(start.px, start.py, time + 1000)]);
   store.write("local", [point(start.px, start.py, time - 1)]);
   expect(store.features(view, 0)[0].properties.time).toBe(time + 1000);

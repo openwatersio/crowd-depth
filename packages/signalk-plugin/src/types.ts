@@ -38,6 +38,8 @@ export type BathymetryData = {
 };
 
 export interface BathymetrySource {
+  /** Maximum provider request span during archive import; receipt ownership stays unchanged. */
+  observationRequestMilliseconds?: number;
   /** Uncorrected paired observations, with actual metadata when the provider supplies it. */
   createObservationReader?: (
     options: Timeframe,

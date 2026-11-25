@@ -691,3 +691,67 @@ it.each([false, true])(
         ).toBeGreaterThan(0);
     }),
 );
+
+it.each([
+  "createReader",
+  "createPreviewReader",
+  "createObservationReader",
+  "createObservationPreviewReader",
+] as const)(
+  "%s destruction stops segmented acquisition before an uncancellable request settles",
+  async (method) =>
+    fixture(async (store) => {
+      const first = Promise.withResolvers<Readable>();
+      const entered = Promise.withResolvers<void>();
+      let calls = 0;
+      const provider: BathymetrySource = {
+        ...upstream(() => {
+          calls++;
+          if (calls === 1) {
+            entered.resolve();
+            return first.promise;
+          }
+          return Readable.from([]);
+        }),
+        observationRequestMilliseconds: 300000,
+      };
+      const source = storedHistorySource(
+        store,
+        provider,
+        config,
+        new AbortController().signal,
+      );
+      const reader = (await source[method]!(window))!;
+      const result = reader.toArray();
+      void result.catch(() => {});
+      await entered.promise;
+      reader.destroy(new Error("consumer cancelled"));
+      await expect(result).rejects.toThrow("consumer cancelled");
+      const retry = (await source[method]!(window))!;
+      await expect(retry.toArray()).rejects.toThrow(
+        "Observation provider request still pending",
+      );
+      expect(calls).toBe(1);
+      const late = Readable.from([]);
+      first.resolve(late);
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(late.destroyed).toBe(true);
+      expect(calls).toBe(1);
+      expect(
+        await store.imported(
+          JSON.stringify({
+            kind: "history-aggregate",
+            depthPath: `environment.depth.${config.path}`,
+            settings: {
+              sounder: config.sounder,
+              gnss: config.gnss,
+              path: config.path,
+              positionOrigin: config.positionOrigin,
+            },
+          }),
+          from,
+          from + 3600000,
+        ),
+      ).toBeUndefined();
+    }),
+);

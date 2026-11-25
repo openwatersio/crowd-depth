@@ -45,7 +45,7 @@ test("preview keeps one recent observation per cell, survives restart, and fence
   db.close();
 });
 
-test("settled history replaces local observations only inside its half-open window", () => {
+test("settled history preserves unmatched local observations", () => {
   const db = createDB(":memory:");
   const store = createPreviewStore(db, "a");
   store.write("local", [
@@ -59,9 +59,9 @@ test("settled history replaces local observations only inside its half-open wind
       .features(view, 0)
       .map((f) => f.geometry.coordinates[0])
       .sort((a, b) => a - b),
-  ).toEqual([-80.4, -80.3, -80.1]);
+  ).toEqual([-80.4, -80.3, -80.2, -80.1]);
   store.write("history", [point(t, -80.4)], [t, t + 1000]);
-  expect(store.features(view, 0)).toHaveLength(3);
+  expect(store.features(view, 0)).toHaveLength(4);
   db.close();
 });
 
@@ -912,6 +912,148 @@ test("returning to a view retries spatial hints interrupted by a pan", async () 
     });
     expect(reads).toEqual([t - 20 * hour, t - 21 * hour]);
     expect(store.features(view, 0)).toHaveLength(2);
+  } finally {
+    db.close();
+  }
+});
+
+test("segmented preview completes a healthy hour beyond a single-request deadline", async () => {
+  const db = createDB(":memory:"),
+    store = createPreviewStore(db, "segmented");
+  const controller = new AbortController();
+  let yielded = 0;
+  const discover = vi.fn(() => {
+    controller.abort();
+    return [];
+  });
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    const source: BathymetrySource = {
+      observationRequestMilliseconds: 300000,
+      createReader: ({ from }) =>
+        Readable.from(
+          (async function* () {
+            for (let i = 0; i < 12; i++) {
+              await vi.advanceTimersByTimeAsync(3000);
+              yielded++;
+              yield sample(from.epochMilliseconds + i * 300000);
+            }
+          })(),
+        ),
+      getAvailableTimeframes: discover,
+    };
+    await scanPreview({
+      source,
+      store,
+      config,
+      signal: controller.signal,
+      since: t - hour,
+      until: t,
+    });
+    expect(yielded).toBe(12);
+    expect(store.features(view, 0)).toHaveLength(1);
+    expect(store.done("history", t - hour, t)).toBe(true);
+  } finally {
+    controller.abort();
+    vi.useRealTimers();
+    db.close();
+  }
+});
+
+test("empty history coverage keeps local evidence and old local coverage is rescanned", () => {
+  const db = createDB(":memory:");
+  const store = createPreviewStore(db, "local-preservation");
+  try {
+    store.write("local", [point(t - 1000)]);
+    db.prepare("INSERT INTO preview_windows VALUES('local', ?, ?)").run(
+      t - hour,
+      t,
+    );
+    expect(store.done("local", t - hour, t)).toBe(false);
+    store.write("history", [], [t - hour, t]);
+    expect(store.features(view, 0)).toHaveLength(1);
+    expect(store.done("history", t - hour, t)).toBe(true);
+    store.write("local", [point(t - 1000)], [t - hour, t]);
+    expect(store.done("local", t - hour, t)).toBe(true);
+    // New evidence in the same cell still replaces its older preview.
+    store.write("history", [point(t - 500)], [t - hour, t]);
+    expect(store.features(view, 0)).toHaveLength(1);
+    expect(store.features(view, 0)[0].properties.time).toBe(t - 500);
+  } finally {
+    db.close();
+  }
+});
+
+test("rolling forward rescans local coverage invalidated by an older writer", async () => {
+  const db = createDB(":memory:");
+  const first = createPreviewStore(db, "same-config");
+  const retained = [
+    sample(t - hour + 1000, -80),
+    sample(t - hour + 2000, -80.1),
+  ];
+  const controller = new AbortController();
+  try {
+    first.write(
+      "local",
+      retained.map((p) => observation(p)!),
+      [t - hour, t],
+    );
+    expect(first.done("local", t - hour, t)).toBe(true);
+    // Exact deletion performed by the older history writer after rollback.
+    db.prepare(
+      "DELETE FROM preview_cells WHERE source='local' AND time>=? AND time<?",
+    ).run(t - hour, t);
+    expect(first.features(view, 0)).toHaveLength(0);
+    const next = createPreviewStore(db, "same-config");
+    expect(next.done("local", t - hour, t)).toBe(false);
+    let reads = 0;
+    const source: BathymetrySource = {
+      createWriter: () => {
+        throw Error("read-only local fixture");
+      },
+      createReader: () => {
+        reads++;
+        return Readable.from(retained);
+      },
+      getAvailableTimeframes: () => [],
+    };
+    await scanPreview({
+      source,
+      store: next,
+      config,
+      signal: controller.signal,
+      since: t - hour,
+      until: t,
+    });
+    expect(reads).toBe(1);
+    expect(
+      next
+        .features(view, 0)
+        .map((p) => p.geometry.coordinates[0])
+        .sort(),
+    ).toEqual([-80.1, -80].sort());
+    expect(next.done("local", t - hour, t)).toBe(true);
+  } finally {
+    controller.abort();
+    db.close();
+  }
+});
+
+test("configuration reset reinstalls local deletion recovery without stale invalidation", () => {
+  const db = createDB(":memory:");
+  try {
+    createPreviewStore(db, "old").write(
+      "local",
+      [point(t - 1000)],
+      [t - hour, t],
+    );
+    const changed = createPreviewStore(db, "new");
+    changed.write("local", [point(t - 1000)], [t - hour, t]);
+    expect(createPreviewStore(db, "new").done("local", t - hour, t)).toBe(true);
+    db.prepare("DELETE FROM preview_cells WHERE source='local'").run();
+    expect(createPreviewStore(db, "new").done("local", t - hour, t)).toBe(
+      false,
+    );
   } finally {
     db.close();
   }

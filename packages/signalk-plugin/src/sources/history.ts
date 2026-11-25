@@ -292,6 +292,8 @@ export async function createHistorySource(
   return {
     // History providers handle the recording of data themselves
     createWriter: undefined,
+    // Bound the provider's buffered response before it parses and pairs rows.
+    observationRequestMilliseconds: 5 * 60 * 1000,
     createObservationReader: (window: Timeframe) =>
       createReader(window, true, true),
     createObservationPreviewReader: (window: Timeframe) =>

@@ -56,7 +56,21 @@ or wear bound. A new store uses a regular indexed bounds table on SQLite builds
 without RTree. An existing RTree store still requires a runtime with that module.
 
 The chart acquires raw history through this store when the provider exposes
-original observations. Completed imports publish ordered chunk manifests;
+original observations. History acquisition uses sequential requests of at most five minutes, preserving
+one completion receipt for the caller's hourly window. Each segment is committed
+before the next request, with at most 512 observations per chunk. At one observation
+per second this is twelve commits per populated hour rather than eight. Request
+creation and segment consumption each have a thirty-second deadline; the enclosing
+preview/refinement stream allows thirty seconds per segment. Destroying a reader
+aborts its acquisition before generator teardown, prevents subsequent requests,
+and discards late streams while retaining reservations until provider calls settle.
+This changes request/commit overhead and still requires loaded Pi acceptance.
+The segment setting is internal; production History callers use hourly windows
+and one-second aggregate buckets. Arbitrary longer/high-rate segmented imports can
+exceed the archive's 196-chunk manifest bound before the point bound and are not a
+supported extension without revisiting that limit.
+
+Completed imports publish ordered chunk manifests;
 replays and spatial hints use only current published manifests. Reads resolve
 all overlapping windows, so whole-hour refinement retains observations acquired
 by a nonaligned preview even after provider pruning. Overlapping versions are

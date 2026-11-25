@@ -199,3 +199,161 @@ it("records acquisition time rather than a slow consumer's completion time", asy
       now.mockRestore();
     }
   }));
+
+it("bounds provider requests, preserves inclusive boundaries once, and keeps one hourly receipt", async () =>
+  fixture(async (store) => {
+    const spans: Timeframe[] = [];
+    const source: BathymetrySource = {
+      ...provider(() => undefined),
+      observationRequestMilliseconds: 300000,
+      createObservationReader: (span) => {
+        spans.push(span);
+        // Deliberately include both boundaries, as history providers may do.
+        return Readable.from(
+          points.filter((p) => {
+            const time = Date.parse(p.timestamp);
+            return (
+              time >= span.from.epochMilliseconds &&
+              time <= span.to.epochMilliseconds
+            );
+          }),
+        );
+      },
+    };
+    const iterator = importObservations(
+      store,
+      source,
+      context,
+      "bounded",
+      window,
+      new AbortController().signal,
+    );
+    const first = await iterator.next();
+    expect(first.value).toEqual(points[0]);
+    expect(spans).toHaveLength(1);
+    expect(
+      await store.imported("bounded", start, start + 3600000),
+    ).toBeUndefined();
+    const received = [first.value];
+    for await (const p of iterator) received.push(p);
+    expect(received).toEqual(points);
+    expect(spans).toHaveLength(12);
+    expect(
+      spans.every(
+        (s) => s.to.epochMilliseconds - s.from.epochMilliseconds === 300000,
+      ),
+    ).toBe(true);
+    expect(spans[11].to.equals(window.to)).toBe(true);
+    expect(
+      await store.imported("bounded", start, start + 3600000),
+    ).toMatchObject({ stage: "full" });
+    expect(
+      await store.imported("bounded", start, start + 300000),
+    ).toBeUndefined();
+  }));
+
+it("keeps a late empty metadata failure partial across bounded requests", async () =>
+  fixture(async (store) => {
+    let calls = 0;
+    const source: BathymetrySource = {
+      ...provider(() =>
+        Object.assign(Readable.from(++calls === 1 ? [points[0]] : []), {
+          metadataIncomplete: calls === 12,
+        }),
+      ),
+      observationRequestMilliseconds: 300000,
+    };
+    for await (const _ of importObservations(
+      store,
+      source,
+      context,
+      "partial",
+      window,
+      new AbortController().signal,
+    )) {
+    }
+    expect(calls).toBe(12);
+    expect(
+      await store.imported("partial", start, start + 3600000),
+    ).toMatchObject({ stage: "partial" });
+  }));
+
+it("retains the first segment and destroys a late reader after cancellation", async () =>
+  fixture(async (store) => {
+    const controller = new AbortController();
+    const pending = Promise.withResolvers<Readable>();
+    const started = Promise.withResolvers<void>();
+    let calls = 0;
+    const source: BathymetrySource = {
+      ...provider(() => undefined),
+      observationRequestMilliseconds: 300000,
+      createObservationReader: () => {
+        if (++calls === 1) return Readable.from([points[0]]);
+        started.resolve();
+        return pending.promise;
+      },
+    };
+    const iterator = importObservations(
+      store,
+      source,
+      context,
+      "cancelled",
+      window,
+      controller.signal,
+    );
+    expect((await iterator.next()).value).toEqual(points[0]);
+    const next = iterator.next();
+    await started.promise;
+    controller.abort(new Error("cancelled"));
+    await expect(next).rejects.toThrow("cancelled");
+    const late = Readable.from([points[300]]);
+    pending.resolve(late);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(late.destroyed).toBe(true);
+    expect(calls).toBe(2);
+    expect(
+      (await store.query(start, start + 3600000)).map((c) => c.count),
+    ).toEqual([1]);
+    expect(
+      await store.imported("cancelled", start, start + 3600000),
+    ).toBeUndefined();
+  }));
+
+it("times out a stalled segment stream without starting another request", async () =>
+  fixture(async (store) => {
+    const stalled = new Readable({ objectMode: true, read() {} });
+    let calls = 0;
+    const source: BathymetrySource = {
+      ...provider(() => {
+        calls++;
+        return stalled;
+      }),
+      observationRequestMilliseconds: 300000,
+    };
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const iterator = importObservations(
+        store,
+        source,
+        context,
+        "stalled",
+        window,
+        new AbortController().signal,
+      );
+      const next = iterator.next();
+      const rejected = expect(next).rejects.toThrow(
+        "Observation segment read timed out",
+      );
+      await new Promise((resolve) => setImmediate(resolve));
+      await vi.advanceTimersByTimeAsync(30000);
+      await rejected;
+      expect(stalled.destroyed).toBe(true);
+      expect(calls).toBe(1);
+      expect(
+        await store.imported("stalled", start, start + 3600000),
+      ).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+      stalled.destroy();
+    }
+  }));

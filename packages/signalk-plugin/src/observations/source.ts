@@ -161,8 +161,12 @@ export function storedHistorySource(
       await store.closeMergedRead(id);
     }
   }
-  async function* observations(window: Timeframe, preview: boolean) {
-    signal.throwIfAborted();
+  async function* observations(
+    window: Timeframe,
+    preview: boolean,
+    readSignal: AbortSignal,
+  ) {
+    readSignal.throwIfAborted();
     const partial = preview && !!provider.createObservationPreviewReader;
     const key = `${partial ? "preview" : "full"}:${window.from}/${window.to}`;
     const receipt = () =>
@@ -210,7 +214,7 @@ export function storedHistorySource(
     }
     while (importing.has(key)) {
       await importing.get(key);
-      signal.throwIfAborted();
+      readSignal.throwIfAborted();
       saved = await receipt();
       if (
         saved &&
@@ -241,7 +245,7 @@ export function storedHistorySource(
         acquisition,
         identity,
         window,
-        signal,
+        readSignal,
         partial,
       );
       if (saved || hasOwned) {
@@ -259,10 +263,17 @@ export function storedHistorySource(
       release();
     }
   }
-  function reader(window: Timeframe, preview: boolean) {
+  function reader(window: Timeframe, preview: boolean, original = false) {
+    const controller = new AbortController();
+    const readSignal = AbortSignal.any([signal, controller.signal]);
     return Readable.from(
       (async function* () {
-        for await (const p of observations(window, preview)) {
+        for await (const p of observations(window, preview, readSignal)) {
+          readSignal.throwIfAborted();
+          if (original) {
+            yield p;
+            continue;
+          }
           // Coordinates remain at their acquisition origin; chart correction runs once downstream.
           yield {
             timestamp: Temporal.Instant.from(p.timestamp),
@@ -278,6 +289,13 @@ export function storedHistorySource(
           } satisfies BathymetryData;
         }
       })(),
+      {
+        // Abort before Readable.from waits for its pending generator.next().
+        destroy(error, callback) {
+          controller.abort(error ?? new Error("Observation reader closed"));
+          callback(error);
+        },
+      },
     );
   }
   const stored: NonNullable<BathymetrySource["getStoredTimeframes"]> = async (
@@ -299,10 +317,8 @@ export function storedHistorySource(
     );
   return {
     ...upstream,
-    createObservationReader: (window) =>
-      Readable.from(observations(window, false)),
-    createObservationPreviewReader: (window) =>
-      Readable.from(observations(window, true)),
+    createObservationReader: (window) => reader(window, false, true),
+    createObservationPreviewReader: (window) => reader(window, true, true),
     createReader: (window) => reader(window, false),
     createPreviewReader: (window) => reader(window, true),
     getStoredTimeframes: stored,

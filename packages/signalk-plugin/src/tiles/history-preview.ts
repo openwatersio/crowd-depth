@@ -87,10 +87,22 @@ export function createPreviewStore(
   let generation: string;
   try {
     if (value("config") !== config) {
+      db.exec("DROP TRIGGER IF EXISTS preview_local_deleted");
       if (spatial) clearPreviewSpatial(db);
       else db.exec("DELETE FROM preview_cells; DELETE FROM preview_windows");
       put.run("config", config);
     }
+    // This trigger also runs under older writers after rollback. Recover on the
+    // next startup without scanning/deleting coverage once per removed cell.
+    if (value("local_rebuild_required")) {
+      db.exec(
+        "DELETE FROM preview_windows WHERE source='local:v2'; DELETE FROM preview_meta WHERE key='local_rebuild_required';",
+      );
+    }
+    db.exec(`CREATE TRIGGER IF NOT EXISTS preview_local_deleted AFTER DELETE ON preview_cells
+      WHEN OLD.source='local' BEGIN
+        INSERT OR IGNORE INTO preview_meta(key,value) VALUES('local_rebuild_required','1');
+      END;`);
     generation = String(Number(value("generation") ?? 0) + 1);
     put.run("generation", generation);
     db.exec("COMMIT");
@@ -172,7 +184,11 @@ export function createPreviewStore(
     },
     done(source: string, start: number, end: number) {
       return !!has.get(
-        source === "history" ? "history:v2" : source,
+        source === "history"
+          ? "history:v2"
+          : source === "local"
+            ? "local:v2"
+            : source,
         start,
         end,
       );
@@ -312,7 +328,13 @@ export async function scanPreview({
       const abort = () => reader.destroy();
       const timer = setTimeout(
         () => reader.destroy(new Error("preview read timed out")),
-        30_000,
+        30_000 *
+          Math.max(
+            1,
+            Math.ceil(
+              (to - from) / (source.observationRequestMilliseconds ?? Infinity),
+            ),
+          ),
       );
       signal.addEventListener("abort", abort, { once: true });
       try {

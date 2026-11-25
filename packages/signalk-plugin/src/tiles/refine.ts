@@ -272,7 +272,14 @@ export async function refineHistory({
             signal.addEventListener("abort", cancel, { once: true });
             const timer = setTimeout(
               () => reader.destroy(new Error("refinement read timed out")),
-              30_000,
+              30_000 *
+                Math.max(
+                  1,
+                  Math.ceil(
+                    (until - at) /
+                      (source.observationRequestMilliseconds ?? Infinity),
+                  ),
+                ),
             );
             try {
               for await (const data of reader) {

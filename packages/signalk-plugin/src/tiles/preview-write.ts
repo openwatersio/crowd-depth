@@ -30,15 +30,18 @@ export function createPreviewWriter(db: DatabaseSync, generation: string) {
     db.exec("BEGIN IMMEDIATE");
     try {
       if (current()) {
-        // History's paired 1s buckets replace local preview for the settled interval.
-        if (source === "history" && window)
-          db.prepare(
-            "DELETE FROM preview_cells WHERE source='local' AND time>=? AND time<?",
-          ).run(...window);
+        // Completion describes acquisition coverage, not replacement of unmatched local evidence.
         for (const s of latest.values())
           insert.run(s.py, s.px, s.lon, s.lat, s.depth, s.time, source);
         if (window)
-          complete.run(source === "history" ? "history:v2" : source, ...window);
+          complete.run(
+            source === "history"
+              ? "history:v2"
+              : source === "local"
+                ? "local:v2"
+                : source,
+            ...window,
+          );
       }
       db.exec("COMMIT");
     } catch (err) {

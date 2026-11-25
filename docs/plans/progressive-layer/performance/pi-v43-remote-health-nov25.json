@@ -1,0 +1,125 @@
+{
+  "context": "v43 remote HTTP, no simultaneous viewport benchmark; network latency included",
+  "samples": [
+    {
+      "ms": 159.25,
+      "status": 200
+    },
+    {
+      "ms": 294.91,
+      "status": 200
+    },
+    {
+      "ms": 345.32,
+      "status": 200
+    },
+    {
+      "ms": 1291.84,
+      "status": 200
+    },
+    {
+      "ms": 51.46,
+      "status": 200
+    },
+    {
+      "ms": 237.06,
+      "status": 200
+    },
+    {
+      "ms": 58.24,
+      "status": 200
+    },
+    {
+      "ms": 158.04,
+      "status": 200
+    },
+    {
+      "ms": 277.56,
+      "status": 200
+    },
+    {
+      "ms": 355.62,
+      "status": 200
+    },
+    {
+      "ms": 387.99,
+      "status": 200
+    },
+    {
+      "ms": 57.73,
+      "status": 200
+    },
+    {
+      "ms": 96.51,
+      "status": 200
+    },
+    {
+      "ms": 87.49,
+      "status": 200
+    },
+    {
+      "ms": 124.79,
+      "status": 200
+    },
+    {
+      "ms": 245.03,
+      "status": 200
+    },
+    {
+      "ms": 49.83,
+      "status": 200
+    },
+    {
+      "ms": 147.15,
+      "status": 200
+    },
+    {
+      "ms": 59.83,
+      "status": 200
+    },
+    {
+      "ms": 165.29,
+      "status": 200
+    },
+    {
+      "ms": 327.88,
+      "status": 200
+    },
+    {
+      "ms": 84.4,
+      "status": 200
+    },
+    {
+      "ms": 190.85,
+      "status": 200
+    },
+    {
+      "ms": 38.11,
+      "status": 200
+    },
+    {
+      "ms": 245.22,
+      "status": 200
+    },
+    {
+      "ms": 80.67,
+      "status": 200
+    },
+    {
+      "ms": 250.11,
+      "status": 200
+    },
+    {
+      "ms": 83.91,
+      "status": 200
+    },
+    {
+      "ms": 136.09,
+      "status": 200
+    },
+    {
+      "ms": 40.2,
+      "status": 200
+    }
+  ]
+}

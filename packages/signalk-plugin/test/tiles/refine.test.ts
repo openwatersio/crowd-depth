@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createObservationStore } from "../../dist/observations/client.js";
 import { storedHistorySource } from "../../src/observations/source.js";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { Readable } from "node:stream";
 import { Temporal } from "@js-temporal/polyfill";
 import { createDB } from "../../src/storage.js";
@@ -610,3 +610,45 @@ test.each([false, true])(
     }
   },
 );
+
+test("segmented history may complete a healthy hour beyond the single-request deadline", async () => {
+  const db = createDB(":memory:"),
+    store = createCellStore(db);
+  const controller = new AbortController();
+  let yielded = 0;
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    const source: BathymetrySource = {
+      observationRequestMilliseconds: 300000,
+      createReader: ({ from }) =>
+        Readable.from(
+          (async function* () {
+            for (let i = 0; i < 12; i++) {
+              await vi.advanceTimersByTimeAsync(3000);
+              yielded++;
+              yield {
+                timestamp: from.add({ minutes: i * 5 }),
+                longitude: -80,
+                latitude: 26,
+                depth: 5,
+              };
+            }
+          })(),
+        ),
+      getAvailableTimeframes: () => [],
+    };
+    await refineHistory({
+      source,
+      store,
+      config,
+      signal: controller.signal,
+      windows: [new Timeframe(at, at.add({ hours: 1 }))],
+    });
+    expect(yielded).toBe(36);
+    expect(store.windowDone(ms, ms + HOUR)).toBe(true);
+  } finally {
+    controller.abort();
+    vi.useRealTimers();
+    db.close();
+  }
+});

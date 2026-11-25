@@ -1,7 +1,7 @@
 import { ObservationDataError } from "./errors.js";
 import { Readable, addAbortSignal } from "node:stream";
 import { Temporal } from "@js-temporal/polyfill";
-import type { BathymetrySource, Timeframe } from "../types.js";
+import { type BathymetrySource, Timeframe } from "../types.js";
 import type { createObservationStore } from "./client.js";
 import {
   CHUNK_POINTS,
@@ -26,75 +26,93 @@ export async function* importObservations(
   signal.throwIfAborted();
   // Freshness describes the provider snapshot, not time spent persisting/consuming it.
   const acquiredAt = Date.now();
-  const timeout = AbortSignal.timeout(30000);
-  const requestSignal = AbortSignal.any([signal, timeout]);
-  let late = false;
-  const request = Promise.resolve().then(() =>
-    preview && source.createObservationPreviewReader
-      ? source.createObservationPreviewReader(window)
-      : source.createObservationReader!(window),
-  );
-  // Providers need not support cancellation. A late result must not retain a stream.
-  void request.then(
-    (reader) => {
-      if (late) reader?.destroy();
-    },
-    () => {},
-  );
-  let abort!: () => void;
-  let reader: Readable | undefined;
-  try {
-    reader = await Promise.race([
-      request,
-      new Promise<never>((_, reject) => {
-        abort = () => reject(requestSignal.reason);
-        requestSignal.addEventListener("abort", abort, { once: true });
-        if (requestSignal.aborted) abort();
-      }),
-    ]);
-  } catch (error) {
-    late = true;
-    throw error;
-  } finally {
-    requestSignal.removeEventListener("abort", abort);
-  }
-  if (signal.aborted) {
-    reader?.destroy();
-    signal.throwIfAborted();
-  }
   const chunks: number[] = [];
   let incomplete = false;
   let points: Observation[] = [],
     seen = 0;
-  try {
-    if (reader) {
-      incomplete ||=
-        "metadataIncomplete" in reader && reader.metadataIncomplete === true;
-      addAbortSignal(signal, reader);
-      for await (const point of reader as AsyncIterable<Observation>) {
-        signal.throwIfAborted();
-        incomplete ||= point.metadataIncomplete === true;
-        if (++seen > MAX_IMPORT_POINTS)
-          throw new ObservationDataError(
-            "Observation import window exceeds 100,000 samples",
-          );
-        const time = Temporal.Instant.from(point.timestamp);
-        if (
-          Temporal.Instant.compare(time, window.from) < 0 ||
-          Temporal.Instant.compare(time, window.to) >= 0
-        )
-          continue;
-        points.push(point);
-        if (points.length === CHUNK_POINTS) {
-          const saved = await store.append(acquisition, points);
-          chunks.push(saved.id);
-          for (const p of points) {
-            signal.throwIfAborted();
-            yield p;
+  const step = source.observationRequestMilliseconds ?? Infinity;
+  if (!(step > 0)) throw new Error("Invalid observation request duration");
+  for (let from = window.from; Temporal.Instant.compare(from, window.to) < 0;) {
+    signal.throwIfAborted();
+    const to = Number.isFinite(step)
+      ? new Timeframe(from, from.add({ milliseconds: step })).clamp(window).to
+      : window.to;
+    const part = new Timeframe(from, to);
+    const timeout = AbortSignal.timeout(30000);
+    const requestSignal = AbortSignal.any([signal, timeout]);
+    let late = false;
+    const request = Promise.resolve().then(() =>
+      preview && source.createObservationPreviewReader
+        ? source.createObservationPreviewReader(part)
+        : source.createObservationReader!(part),
+    );
+    // Providers need not support cancellation. A late result must not retain a stream.
+    void request.then(
+      (reader) => {
+        if (late) reader?.destroy();
+      },
+      () => {},
+    );
+    let abort!: () => void;
+    let reader: Readable | undefined;
+    try {
+      reader = await Promise.race([
+        request,
+        new Promise<never>((_, reject) => {
+          abort = () => reject(requestSignal.reason);
+          requestSignal.addEventListener("abort", abort, { once: true });
+          if (requestSignal.aborted) abort();
+        }),
+      ]);
+    } catch (error) {
+      late = true;
+      throw error;
+    } finally {
+      requestSignal.removeEventListener("abort", abort);
+    }
+    if (signal.aborted) {
+      reader?.destroy();
+      signal.throwIfAborted();
+    }
+    const timer =
+      reader &&
+      setTimeout(
+        () => reader.destroy(new Error("Observation segment read timed out")),
+        30_000,
+      );
+    try {
+      if (reader) {
+        incomplete ||=
+          "metadataIncomplete" in reader && reader.metadataIncomplete === true;
+        addAbortSignal(signal, reader);
+        for await (const point of reader as AsyncIterable<Observation>) {
+          signal.throwIfAborted();
+          incomplete ||= point.metadataIncomplete === true;
+          if (++seen > MAX_IMPORT_POINTS)
+            throw new ObservationDataError(
+              "Observation import window exceeds 100,000 samples",
+            );
+          const time = Temporal.Instant.from(point.timestamp);
+          if (
+            Temporal.Instant.compare(time, part.from) < 0 ||
+            Temporal.Instant.compare(time, part.to) >= 0
+          )
+            continue;
+          points.push(point);
+          if (points.length === CHUNK_POINTS) {
+            const saved = await store.append(acquisition, points);
+            chunks.push(saved.id);
+            for (const p of points) {
+              signal.throwIfAborted();
+              yield p;
+            }
+            points = [];
           }
-          points = [];
         }
       }
+    } finally {
+      if (timer) clearTimeout(timer);
+      reader?.destroy();
     }
     if (points.length) {
       signal.throwIfAborted();
@@ -104,17 +122,17 @@ export async function* importObservations(
         yield p;
       }
     }
-    signal.throwIfAborted();
-    await store.publishImport(
-      identity,
-      window.from.epochMilliseconds,
-      window.to.epochMilliseconds,
-      chunks,
-      acquiredAt,
-      "backfill",
-      preview ? "preview" : incomplete ? "partial" : "full",
-    );
-  } finally {
-    reader?.destroy();
+    points = [];
+    from = to;
   }
+  signal.throwIfAborted();
+  await store.publishImport(
+    identity,
+    window.from.epochMilliseconds,
+    window.to.epochMilliseconds,
+    chunks,
+    acquiredAt,
+    "backfill",
+    preview ? "preview" : incomplete ? "partial" : "full",
+  );
 }
