@@ -112,6 +112,9 @@ export function createObservationStore(file: string) {
       request("importedInView", args),
     importedPageInView: (...args: Parameters<Store["importedPageInView"]>) =>
       request("importedPageInView", args),
+    indexCapturedPage: () => request("indexCapturedPage", []),
+    capturedPageInView: (...args: Parameters<Store["capturedPageInView"]>) =>
+      request("capturedPageInView", args),
     append: (...args: Parameters<Store["append"]>) => request("append", args),
     query: (...args: Parameters<Store["query"]>) => request("query", args),
     readRange: (...args: Parameters<Store["readRange"]>) =>

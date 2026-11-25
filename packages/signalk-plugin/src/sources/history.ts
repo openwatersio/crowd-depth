@@ -206,9 +206,14 @@ export async function createHistorySource(
           Number.isFinite(latitude) &&
           Math.abs(latitude) <= 90
         ) {
+          const timestamp = Temporal.Instant.from(row[0]);
+          // Providers include `to`; leave that bucket for the next window.
+          if (Temporal.Instant.compare(timestamp, to) >= 0) return;
+          const key = timestamp.toString();
+          const gnss = quality.get(key);
           if (original)
             return {
-              timestamp: Temporal.Instant.from(row[0]).toString(),
+              timestamp: key,
               longitude,
               latitude,
               depth,
@@ -217,17 +222,15 @@ export async function createHistorySource(
               headingTrue: column(row, HEADING),
               courseOverGroundTrue: column(row, COG),
               speedOverGround: column(row, SOG),
-              gnss: quality.get(Temporal.Instant.from(row[0]).toString()),
+              gnss,
               ...(metadataIncomplete ? { metadataIncomplete: true } : {}),
             };
           return {
-            timestamp: Temporal.Instant.from(row[0]),
+            timestamp,
             longitude,
             latitude,
             depth: depth + offset,
-            ...(quality.has(Temporal.Instant.from(row[0]).toString())
-              ? { gnss: quality.get(Temporal.Instant.from(row[0]).toString()) }
-              : {}),
+            ...(gnss ? { gnss } : {}),
             heading: bowBearing({
               heading: column(row, HEADING),
               courseOverGround: column(row, COG),
@@ -236,10 +239,7 @@ export async function createHistorySource(
           };
         }
       })
-      .filter((point): point is Paired => point !== undefined)
-      // Providers include `to`, but the next report starts there, so leave the
-      // bucket stamped `to` for it.
-      .filter((point) => Temporal.Instant.compare(point.timestamp, to) < 0);
+      .filter((point): point is Paired => point !== undefined);
 
     app.debug("Read %d bathymetry points from history", data.length);
 

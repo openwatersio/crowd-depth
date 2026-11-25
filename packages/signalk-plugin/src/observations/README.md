@@ -29,6 +29,22 @@ queries return at most 128 candidate chunks; exact point/time filtering is the
 reader's responsibility. A bounded result count does not guarantee bounded SQL
 scan time for arbitrary overlapping chunk bounds.
 
+Live chunks now also maintain a derived capture index in the same append transaction.
+Existing originals are discovered newest-ID-first in resumable batches of at most
+16 chunks, with one second between worker transactions. Startup does not decode
+the archive. Corrupt unindexed originals are quarantined without deleting their
+bytes; an identical append repairs compressed bytes and derived time/count headers.
+Migration errors are logged separately from capture failures.
+
+`capturedPageInView` bounds spatial candidate selection before exact time filtering,
+returns at most 64 chunk headers, and can return an empty page with a continuation.
+Consumers must preserve that cursor across their own work budgets; only an absent
+cursor means exhaustion. It is currently a storage foundation, not connected to
+production chart reads. The migration high-water mark assumes original IDs are not
+reused: before introducing pruning, handle deletion followed by older-writer ID
+reuse. No pruning is enabled here. Derived-index repair is not proof that all
+originals have been recovered or that chart coverage is complete.
+
 WAL with FULL synchronization protects acknowledged commits, subject to the
 filesystem/device honoring synchronization. Live batches seal every ten seconds
 or 512 points. An abrupt process/power failure can lose the unsealed batch and

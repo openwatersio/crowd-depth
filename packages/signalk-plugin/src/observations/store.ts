@@ -1,3 +1,4 @@
+import { createCaptureIndex } from "./capture-index.js";
 import { mergeObservationGroups } from "./merge.js";
 import { ObservationDataError, ObservationReadBusy } from "./errors.js";
 import { statfsSync } from "node:fs";
@@ -119,6 +120,7 @@ export interface Chunk {
 /** Worker-owned, lossless storage, separate from disposable chart databases. */
 export function openObservationStore(file: string) {
   const db = new DatabaseSync(file);
+  let captures: ReturnType<typeof createCaptureIndex>;
   let nextRead = 0;
   const mergedReads = new Map<
     number,
@@ -261,6 +263,7 @@ export function openObservationStore(file: string) {
     // a refresh cannot reconstruct ages of observations already pruned upstream.
     if (version > 0 && version < 7)
       db.exec("UPDATE observation_imports SET legacy=1");
+    captures = createCaptureIndex(db);
     db.exec("PRAGMA user_version=7; COMMIT;");
     const quarantined = Number(
       db
@@ -274,7 +277,9 @@ export function openObservationStore(file: string) {
     insert = db.prepare(
       "INSERT INTO observation_chunks(key,start,end,count,data) VALUES(?,?,?,?,?) RETURNING id",
     );
-    existing = db.prepare("SELECT id,data FROM observation_chunks WHERE key=?");
+    existing = db.prepare(
+      "SELECT id,data,start,end,count FROM observation_chunks WHERE key=?",
+    );
     spatial = db.prepare("INSERT INTO observation_spatial VALUES(?,?,?,?,?)");
   } catch (error) {
     db.close();
@@ -517,6 +522,14 @@ export function openObservationStore(file: string) {
             Math.ceil(north * SCALE),
           );
         } else {
+          if (
+            prior!.start !== start ||
+            prior!.end !== end ||
+            prior!.count !== points.length
+          )
+            db.prepare(
+              "UPDATE observation_chunks SET start=?,end=?,count=? WHERE id=?",
+            ).run(start, end, points.length, id);
           // The content hash proves these exact original bytes belong to this ID.
           // A retry can repair damaged compressed bytes without changing manifests.
           if (!Buffer.from(prior!.data as Uint8Array).equals(data))
@@ -535,12 +548,19 @@ export function openObservationStore(file: string) {
               Math.ceil(north * SCALE),
             );
         }
+        captures.put(id, acquisition, start, end, [west, south, east, north]);
         if (ownsTransaction) db.exec("COMMIT");
         return { id, key, start, end, count: points.length };
       } catch (error) {
         if (ownsTransaction && db.isTransaction) db.exec("ROLLBACK");
         throw error;
       }
+    },
+    indexCapturedPage() {
+      return captures.migrate(readChunk);
+    },
+    capturedPageInView(...args: Parameters<typeof captures.page>) {
+      return captures.page(...args);
     },
     /** Bounded chunk candidates; exact point filtering follows decompression.
      * Cursor is an ID, so late/out-of-order imports are not missed on continuation. */

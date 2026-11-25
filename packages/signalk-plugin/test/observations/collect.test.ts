@@ -197,3 +197,50 @@ it("seals sparse data on the timer and retries a transient commit without losing
     vi.useRealTimers();
   }
 });
+
+it("yields between capture migration pages and cancels without admitting more work", async () => {
+  const { indexCapturedObservations } =
+    await import("../../src/observations/collect.js");
+  const controller = new AbortController();
+  const indexCapturedPage = vi.fn().mockResolvedValue({
+    processed: 16,
+    done: false,
+    incomplete: false,
+    errors: [],
+  });
+  const report = vi.fn();
+  const task = indexCapturedObservations(
+    { indexCapturedPage } as never,
+    controller.signal,
+    report,
+  );
+  try {
+    expect(indexCapturedPage).not.toHaveBeenCalled();
+    await expect
+      .poll(() => indexCapturedPage.mock.calls.length, { timeout: 3000 })
+      .toBe(1);
+    controller.abort();
+    await task;
+    expect(indexCapturedPage).toHaveBeenCalledTimes(1);
+    expect(report).not.toHaveBeenCalled();
+  } finally {
+    controller.abort();
+    await task;
+  }
+});
+
+it("reports capture migration failures without interrupting live recording", async () => {
+  const { indexCapturedObservations } =
+    await import("../../src/observations/collect.js");
+  const failure = new Error("disk I/O error");
+  const indexCapturedPage = vi.fn().mockRejectedValue(failure);
+  const report = vi.fn();
+  const task = indexCapturedObservations(
+    { indexCapturedPage } as never,
+    new AbortController().signal,
+    report,
+  );
+  await task;
+  expect(report).toHaveBeenCalledExactlyOnceWith(failure);
+  expect(indexCapturedPage).toHaveBeenCalledTimes(1);
+});

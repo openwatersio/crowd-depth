@@ -36,6 +36,12 @@ function execute({ id, operation, args }: Request): boolean {
       case "importedPageInView":
         value = store.importedPageInView(...args);
         break;
+      case "indexCapturedPage":
+        value = store.indexCapturedPage();
+        break;
+      case "capturedPageInView":
+        value = store.capturedPageInView(...args);
+        break;
       case "append":
         value = store.append(...args);
         break;

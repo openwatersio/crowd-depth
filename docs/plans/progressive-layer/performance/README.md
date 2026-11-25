@@ -1,6 +1,31 @@
 # Point-store and performance release gate
 
-## Current checkpoint — November 25
+## Current checkpoint — November 25, v44
+
+Release acceptance is **not met**. Docker still runs reviewed v44 (`c974578`):
+loaded full-model HTTP p95 was about 415 ms, above the 250 ms limit, and cold
+viewport gates also failed. The capture-index foundation below is staged only;
+production chart routing and stationary thinning remain unfinished. A later
+review also confirmed that refinement can hide unmatched local preview evidence,
+even though acquisition preserves its rows. That retirement defect remains open.
+
+The new capture index avoids decoding originals at startup and pages candidates
+before exact time filtering. Isolated Docker measurements used temporary databases:
+4,096 one-point chunks opened in 12 ms, with query-page p95 1.1 ms and empty
+same-day first-page p95 1.2 ms. A 65,536-point fixture in 128 full-size chunks
+opened in 9 ms; its eight migration batches took at most 81 ms. Production
+migration yields one second between batches. These runs are component evidence,
+not a browser-paint, storage-wear, or whole-viewport acceptance result.
+[Raw measurements](pi-capture-index-nov25.json) retain the earlier run and limits.
+
+The foundation and header/query fixes pass 716 tests across 58 files, plugin
+build/lint/publint, and nine real Signal K E2E tests. A mapped external Codex
+review and independent internal review identified the repair and same-day scan
+issues; their regression tests failed before the fixes. The focused external
+follow-up found no new issues in those fixes. Broader canonical selection,
+refinement retirement, input revision and hardware acceptance blockers remain open.
+
+## Earlier checkpoint — November 25, v39
 
 Release acceptance is **not met**. The working tree uses observation schema v7;
 678 regressions, plugin lint/publint pass. Nine real Signal K end-to-end tests passed the preview

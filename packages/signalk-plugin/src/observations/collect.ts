@@ -92,9 +92,16 @@ export async function collectObservations(
   committed: () => void = () => {},
 ) {
   const store = createObservationStore(file);
+  const indexing = new AbortController();
+  let migration: Promise<void> | undefined;
   try {
     await store.ready;
     if (signal.aborted) return;
+    migration = indexCapturedObservations(
+      store,
+      AbortSignal.any([signal, indexing.signal]),
+      (error) => app.error(`Original observation index: ${error}`),
+    );
     const writer = observationWriter(
       store,
       {
@@ -119,6 +126,26 @@ export async function collectObservations(
       signal.removeEventListener("abort", stop);
     }
   } finally {
+    indexing.abort();
+    await migration;
     await store.close();
+  }
+}
+
+/** Yield between bounded worker transactions so indexing cannot monopolize capture. */
+export async function indexCapturedObservations(
+  store: Pick<ReturnType<typeof createObservationStore>, "indexCapturedPage">,
+  signal: AbortSignal,
+  report: (error: unknown) => void,
+) {
+  try {
+    while (!signal.aborted) {
+      await sleep(1000, undefined, { signal });
+      const page = await store.indexCapturedPage();
+      for (const error of page.errors) report(error.error);
+      if (page.done) return;
+    }
+  } catch (error) {
+    if (!signal.aborted) report(error);
   }
 }

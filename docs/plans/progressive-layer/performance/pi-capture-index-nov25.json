@@ -1,0 +1,83 @@
+{
+  "date": "2026-11-25",
+  "environment": "pi.local, Docker signalk, Node24, node user, nice10",
+  "activePreview": "v44, unchanged",
+  "candidate": "capture-index foundation; isolated package, not active",
+  "limits": [
+    "Single runs under changing host load; not causal comparisons",
+    "Temporary databases; no production observations modified",
+    "Component timings exclude browser and full viewport acceptance",
+    "Chart consumers not yet wired; empty pages require retained continuation",
+    "Original fixture uses one-point chunks, second fixture tests512-point maximum"
+  ],
+  "firstBeforeQueryFix": {
+    "fixture": "4096 stationary single-point chunks, temp database; excludes history/browser",
+    "appendMs": 52153.79509,
+    "startupMs": 33.15132399999857,
+    "discovered": 4096,
+    "migrationMs": {
+      "count": 256,
+      "p50": 17.887016000000585,
+      "p95": 56.25820999999996,
+      "max": 241.21994200000336
+    },
+    "queryMs": {
+      "count": 88,
+      "p50": 1.6401949999999488,
+      "p95": 3.143319999995583,
+      "max": 39.26138799999899
+    }
+  },
+  "afterQueryFix": {
+    "fixture": "4096 stationary single-point chunks, temp database; excludes history/browser",
+    "appendMs": 41301.46777,
+    "startupMs": 11.803423999997904,
+    "discovered": 4096,
+    "migrationMs": {
+      "count": 256,
+      "p50": 10.439159000001382,
+      "p95": 19.984474999997474,
+      "max": 90.03269600000203
+    },
+    "queryMs": {
+      "count": 88,
+      "p50": 0.7019379999983357,
+      "p95": 1.093045000001439,
+      "max": 8.574083999999857
+    },
+    "emptySameDayFirstPageMs": {
+      "count": 100,
+      "p50": 0.7690860000002431,
+      "p95": 1.2135810000036145,
+      "max": 2.6227340000041295
+    },
+    "emptyContinuation": true
+  },
+  "maximumChunkSize": {
+    "fixture": "stationary chunks, temp database; excludes history/browser",
+    "chunkCount": 128,
+    "pointsPerChunk": 512,
+    "appendMs": 2110.7353780000003,
+    "startupMs": 9.181149000000005,
+    "discovered": 128,
+    "migrationMs": {
+      "count": 8,
+      "p50": 73.46476400000029,
+      "p95": 80.82368700000006,
+      "max": 80.82368700000006
+    },
+    "queryMs": {
+      "count": 2,
+      "p50": 1.207398000000012,
+      "p95": 1.207398000000012,
+      "max": 1.207398000000012
+    },
+    "emptySameDayFirstPageMs": {
+      "count": 100,
+      "p50": 0.4412919999999758,
+      "p95": 0.6025690000001305,
+      "max": 0.65090199999986
+    },
+    "emptyContinuation": true
+  }
+}
