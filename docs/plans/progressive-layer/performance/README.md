@@ -1574,3 +1574,38 @@ supplementary focused reviews covered batching, timeouts, cancellation, local
 preview preservation and rollback recovery. The final reviews found no new
 high/medium issue in those fixes. Canonical raw/live/history routing, production
 thinning, and loaded performance acceptance remain release blockers.
+
+### Active v46 and rendering allocation experiment, November 25
+
+[v46 measurements](pi-v46-active-nov25.json) record the installed Docker package
+from `3552ad1`, SHA1 `49c5ae65b0c2fb96dc33803b1fced61d5c522850`. Both databases
+were backed up and checked before activation; Docker restarted at 21:35:26 UTC.
+Post-restart checks found 8,170,019 original observations, schema 7, and unchanged
+`depth_since`. The capture index is now installed, but canonical chart consumption
+of captures remains unfinished.
+
+Acceptance still fails. North: 15 views, 71 successful HTTP samples, p95 341.9 ms,
+with first-content and cold-viewport failures. Lake Worth: 15 views, 37 successful
+HTTP samples, p95 129.8 ms, but four cold views exceed one second. A synthetic
+18,000-point owned archive with a stalled recent provider produced first preview
+in 151–180 ms over three starts. These are server-side tests, not browser paint.
+The isolated 100,000-window import index has populated-page p95 1.57 ms and
+empty-same-day first-page p95 4.07 ms; it does not prove constant tree traversal
+cost or full viewport acceptance.
+
+[An isolated renderer experiment](pi-render-allocations-nov25.json) removes four
+large temporary arrays per tile by applying caps and scaling in place on fresh
+upsampled arrays. Eighteen local comparisons produce identical field bytes,
+including slopes; shared prepared inputs remain unchanged. All 64 encoded tile
+fixtures also match exactly on the Pi across latitude, zoom, detail, and shoals. Alternating Pi
+component measurements show median CPU for `cut` falling from 8.20 to 3.35 ms
+at z13, 20.28 to 10.93 ms at z14, and 23.65 to 14.04 ms at z15. Each variant ran
+20 batches of ten cuts per zoom. The separate full viewport run still fails;
+changing host load prevents attributing that run's timing to this change. The
+experiment is staged separately and has not replaced active v46.
+
+The renderer profile was obtained from isolated benchmark tile workers using
+Node's worker CPU profiler, without attaching to the running Signal K process.
+It identifies surface interpolation, field preparation/cutting, and contour
+tracing as substantial costs. This does not resolve the earlier failed attempt
+to profile Signal K's main thread.
