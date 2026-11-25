@@ -28,6 +28,7 @@ schedule to the trusted node API.
 | `src/plugin.ts`      | Plugin entry: wires config, collector, reporter, and schedule together                                                                                             |
 | `src/config.ts`      | Plugin settings JSON schema and config types                                                                                                                       |
 | `src/collector.ts`   | Subscribes to live deltas and writes them to storage                                                                                                               |
+| `src/observations/`  | Worker-owned raw observation archive, history import manifests, and the chart's local history reader                                                               |
 | `src/sources/`       | Where report data comes from: `history.ts` (Signal K History API, e.g. signalk-to-influxdb2) with `sqlite.ts` as the fallback local store                          |
 | `src/storage.ts`     | SQLite database setup (`node:sqlite`)                                                                                                                              |
 | `src/streams/`       | Stream pipeline: `live.ts` (deltas → `BathymetryData`), `transforms.ts` (offset correction, precision), `geojson.ts` / `xyz.ts` (output formats)                   |

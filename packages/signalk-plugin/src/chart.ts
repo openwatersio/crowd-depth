@@ -9,6 +9,9 @@ import {
 } from "./tiles/refine.js";
 import { TIDE_CONFIG_KEY, tideConfig } from "./tiles/backfill.js";
 import { cacheChartInputs } from "./tiles/inputs.js";
+import { createObservationStore } from "./observations/client.js";
+import { storedHistorySource } from "./observations/source.js";
+import { join } from "node:path";
 import type { PreviewView } from "./tiles/history-preview.js";
 import { randomUUID } from "node:crypto";
 import { pipeline } from "stream/promises";
@@ -142,6 +145,7 @@ export function startChart({
   const store = createCellStore(db, generation);
   const startedAt = Temporal.Now.instant();
   const jobs = new Set<Promise<unknown>>();
+  let observations: ReturnType<typeof createObservationStore> | undefined;
   const track = <T>(job: Promise<T>) => {
     jobs.add(job);
     void job.then(
@@ -201,18 +205,20 @@ export function startChart({
     const since = source.createWriter
       ? store.getMeta(DEPTH_SINCE_KEY)
       : undefined;
-    void scanPreview({
-      source,
-      store: preview,
-      config,
-      signal: previewRun.signal,
-      until: startedAt.epochMilliseconds,
-      view: () => previewView ?? boatView(),
-      ...(since
-        ? { since: Temporal.Instant.from(since).epochMilliseconds }
-        : {}),
-      onError: (err) => app.debug(`Chart preview source error: ${err}`),
-    }).catch((err) => {
+    void track(
+      scanPreview({
+        source,
+        store: preview,
+        config,
+        signal: previewRun.signal,
+        until: startedAt.epochMilliseconds,
+        view: () => previewView ?? boatView(),
+        ...(since
+          ? { since: Temporal.Instant.from(since).epochMilliseconds }
+          : {}),
+        onError: (err) => app.debug(`Chart preview source error: ${err}`),
+      }),
+    ).catch((err) => {
       if (!signal.aborted) app.debug(`Chart preview stopped: ${err}`);
     });
   };
@@ -343,7 +349,9 @@ export function startChart({
       preview.close(),
       tiles.close(),
       ...jobs,
-    ]).then(() => undefined);
+    ]).then(async () => {
+      await observations?.close();
+    });
     return stopping;
   };
   signal.addEventListener("abort", stop);
@@ -400,23 +408,39 @@ export function startChart({
         let retryMs = 5000;
         while (!signal.aborted) {
           try {
-            source = await cacheChartInputs(
-              db,
-              source,
-              JSON.stringify({
-                version: 1,
-                path: config.path,
-                offset: depthReference(config).offset,
-                sounder: config.sounder.source,
-                gnss: config.gnss.source,
-              }),
-              signal,
-            );
+            if (source.createObservationReader) {
+              observations ??= createObservationStore(
+                join(app.getDataDirPath(), "observations.sqlite"),
+              );
+              await observations.ready;
+              source = storedHistorySource(
+                observations,
+                source,
+                config,
+                signal,
+              );
+            } else
+              source = await cacheChartInputs(
+                db,
+                source,
+                JSON.stringify({
+                  version: 1,
+                  path: config.path,
+                  offset: depthReference(config).offset,
+                  sounder: config.sounder.source,
+                  gnss: config.gnss.source,
+                }),
+                signal,
+              );
             break;
           } catch (error) {
+            const failed = observations;
+            observations = undefined;
+            // Initialization failure has already been reported by ready; close also rejects it.
+            await failed?.close().catch(() => {});
             if (signal.aborted) return;
             app.error(
-              `Historical input cache unavailable; retrying in ${retryMs / 1000}s: ${error}`,
+              `Historical observation storage unavailable; retrying in ${retryMs / 1000}s: ${error}`,
             );
             await setTimeout(retryMs, undefined, { signal }).catch(() => {});
             retryMs = Math.min(retryMs * 2, 300_000);

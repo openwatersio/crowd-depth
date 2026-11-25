@@ -1,3 +1,4 @@
+import type { Observation } from "../observations/store.js";
 import {
   GNSS_FIELDS,
   qualityValue,
@@ -46,7 +47,11 @@ export async function createHistorySource(
     }
   }
 
-  async function createReader({ from, to }: Timeframe, includeQuality = true) {
+  async function createReader(
+    { from, to }: Timeframe,
+    includeQuality = true,
+    original = false,
+  ) {
     checkSourceSelection();
     app.debug("Reading history from %s to %s", from, to);
 
@@ -117,7 +122,9 @@ export async function createHistorySource(
     const column = (row: DataRow, path: string) => {
       const index = columns.get(path);
       const value = index === undefined ? undefined : row[index];
-      return typeof value === "number" ? value : undefined;
+      return typeof value === "number" && Number.isFinite(value)
+        ? value
+        : undefined;
     };
 
     // Query optional quality separately: an unsupported path must not lose soundings.
@@ -163,23 +170,41 @@ export async function createHistorySource(
       }
     }
 
+    type Paired = BathymetryData | Observation;
+    const actualSource = (index: number | undefined) =>
+      index === undefined ? undefined : res.values?.[index - 1]?.$source;
     const data = res.data
-      .map((row): BathymetryData | undefined => {
+      .map((row): Paired | undefined => {
         const depth = depthColumn === undefined ? undefined : row[depthColumn];
         const position =
           positionColumn === undefined
             ? undefined
             : (row[positionColumn] as [number, number] | null | undefined);
-        const [longitude, latitude] = position ?? [];
+        const [longitude, latitude] = Array.isArray(position) ? position : [];
 
         if (
           typeof depth === "number" &&
           Number.isFinite(depth) &&
           typeof longitude === "number" &&
           Number.isFinite(longitude) &&
+          Math.abs(longitude) <= 180 &&
           typeof latitude === "number" &&
-          Number.isFinite(latitude)
+          Number.isFinite(latitude) &&
+          Math.abs(latitude) <= 90
         ) {
+          if (original)
+            return {
+              timestamp: Temporal.Instant.from(row[0]).toString(),
+              longitude,
+              latitude,
+              depth,
+              depthSource: actualSource(depthColumn),
+              positionSource: actualSource(positionColumn),
+              headingTrue: column(row, HEADING),
+              courseOverGroundTrue: column(row, COG),
+              speedOverGround: column(row, SOG),
+              gnss: quality.get(Temporal.Instant.from(row[0]).toString()),
+            };
           return {
             timestamp: Temporal.Instant.from(row[0]),
             longitude,
@@ -196,7 +221,7 @@ export async function createHistorySource(
           };
         }
       })
-      .filter((point): point is BathymetryData => point !== undefined)
+      .filter((point): point is Paired => point !== undefined)
       // Providers include `to`, but the next report starts there, so leave the
       // bucket stamped `to` for it.
       .filter((point) => Temporal.Instant.compare(point.timestamp, to) < 0);
@@ -252,6 +277,8 @@ export async function createHistorySource(
   return {
     // History providers handle the recording of data themselves
     createWriter: undefined,
+    createObservationReader: (window: Timeframe) =>
+      createReader(window, true, true),
     createPreviewReader: (window: Timeframe) => createReader(window, false),
     ...(app.getTrackApi && app.selfId
       ? {

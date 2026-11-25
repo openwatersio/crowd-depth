@@ -256,10 +256,7 @@ export async function refineHistory({
           signal.throwIfAborted();
           const until = Math.min(hi, (Math.floor(at / HOUR) + 1) * HOUR);
           const reader = await request(
-            () =>
-              (source.createPreviewReader ?? source.createReader)(
-                frame(at, until),
-              ),
+            () => source.createReader(frame(at, until)),
             signal,
           );
           // Some local sources use undefined for an empty interval. History's reader

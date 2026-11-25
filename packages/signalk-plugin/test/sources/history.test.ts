@@ -14,7 +14,7 @@ const to = Temporal.Instant.from("2025-01-02T00:00:00.000Z");
 
 type Series = {
   // Omitted for v1-style HTTP responses that carry no column metadata.
-  values?: { path: string; method: string }[];
+  values?: { path: string; method: string; $source?: string }[];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   data: [string, ...any[]][];
 };
@@ -457,4 +457,59 @@ test("explicit selection does not silently use unfiltered legacy HTTP history", 
       Temporal.Duration.from({ hours: 1 }),
     ),
   ).rejects.toThrow("Legacy HTTP history cannot filter sensor sources");
+});
+
+test("archive reader preserves uncorrected history aggregates and actual column sources", async () => {
+  const { app: testApp } = providerApp({
+    values: [
+      { path: "navigation.position", method: "first", $source: "gps.actual" },
+      {
+        path: "environment.depth.belowTransducer",
+        method: "min",
+        $source: "depth.actual",
+      },
+      { path: "navigation.courseOverGroundTrue", method: "min" },
+      { path: "navigation.speedOverGround", method: "min" },
+    ],
+    data: [
+      ["2025-01-01T12:00:00.123456789Z", [1.123456789, 2], 3.123456789, 1.5, 2],
+    ],
+  });
+  const source = await createHistorySource(testApp, {
+    ...config,
+    path: "belowTransducer",
+    sounder: { ...config.sounder, z: 2 },
+  });
+  const reader = await source!.createObservationReader!(
+    new Timeframe(from, to),
+  );
+  expect(await reader!.toArray()).toEqual([
+    {
+      timestamp: "2025-01-01T12:00:00.123456789Z",
+      longitude: 1.123456789,
+      latitude: 2,
+      depth: 3.123456789,
+      depthSource: "depth.actual",
+      positionSource: "gps.actual",
+      headingTrue: undefined,
+      courseOverGroundTrue: 1.5,
+      speedOverGround: 2,
+      gnss: undefined,
+    },
+  ]);
+});
+test("archive reader does not invent source IDs from requested settings", async () => {
+  const { app: testApp } = providerApp({
+    data: [["2025-01-01T12:00:00Z", [1, 2], 3]],
+  });
+  const source = await createHistorySource(testApp, {
+    ...config,
+    sounder: { ...config.sounder, source: "requested.depth" },
+    gnss: { ...config.gnss, source: "requested.gps" },
+  });
+  const points = await (await source!.createObservationReader!(
+    new Timeframe(from, to),
+  ))!.toArray();
+  expect(points[0].depthSource).toBeUndefined();
+  expect(points[0].positionSource).toBeUndefined();
 });

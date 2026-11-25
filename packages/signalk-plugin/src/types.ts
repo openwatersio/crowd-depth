@@ -38,11 +38,15 @@ export type BathymetryData = {
 };
 
 export interface BathymetrySource {
+  /** Uncorrected paired observations, with actual metadata when the provider supplies it. */
+  createObservationReader?: (
+    options: Timeframe,
+  ) => MaybePromise<Readable | undefined>;
   /** Bounded spatial lookup over already acquired local chunks; never calls a provider. */
   getStoredTimeframes?: (
     timeframe: Timeframe,
     bounds: readonly [number, number, number, number],
-  ) => Timeframe[];
+  ) => MaybePromise<Timeframe[]>;
   /** Optional spatial hints for preview acquisition, never a completeness claim. */
   getPreviewTimeframes?: (
     timeframe: Timeframe,

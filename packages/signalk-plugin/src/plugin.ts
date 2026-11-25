@@ -18,6 +18,7 @@ import { createDB } from "./storage.js";
 import { join } from "path";
 import { createCollector } from "./collector.js";
 import { createStatus, Status } from "./status.js";
+import { collectObservations } from "./observations/collect.js";
 import { startChartSafely } from "./chart.js";
 
 interface Session {
@@ -25,6 +26,7 @@ interface Session {
   reporting: AbortController;
   anonymous: boolean;
   reporter?: ReturnType<typeof createReporter>;
+  observations?: Promise<void>;
   chartReady?: Promise<ReturnType<typeof startChartSafely>>;
   previousClosed: Promise<void>;
   stopping?: Promise<void>;
@@ -74,6 +76,46 @@ export default function createPlugin(app: ServerAPI): Plugin {
           ? session.previousClosed.then(createChart)
           : Promise.resolve(createChart());
         session.chartReady = chart;
+        session.observations = (
+          previous?.observations ?? Promise.resolve()
+        ).then(async () => {
+          let delay = 5000;
+          while (!controller.signal.aborted) {
+            try {
+              await collectObservations(
+                app,
+                config,
+                join(app.getDataDirPath(), "observations.sqlite"),
+                controller.signal,
+                () => {
+                  delay = 5000;
+                  if (!controller.signal.aborted)
+                    status.clearError("observations");
+                },
+              );
+              if (!controller.signal.aborted) status.clearError("observations");
+              return;
+            } catch (error) {
+              if (controller.signal.aborted) {
+                app.error(`Observation drain failed during stop: ${error}`);
+                return;
+              }
+              status.error(
+                new Error(
+                  `Original observation recording interrupted: ${error}`,
+                ),
+                "observations",
+              );
+              if (controller.signal.aborted) return;
+              try {
+                await sleep(delay, undefined, { signal: controller.signal });
+              } catch {
+                return;
+              }
+              delay = Math.min(delay * 2, 300000);
+            }
+          }
+        });
 
         // Settling can wait up to BATHY_HISTORY_WAIT for a history provider, so
         // it runs in the background and start() doesn't hold up the server.
@@ -144,8 +186,11 @@ export default function createPlugin(app: ServerAPI): Plugin {
             );
         } finally {
           session.reporting.abort("Stopping crowd-depth reporter");
-          await session.previousClosed;
-          await (await session.chartReady)?.close();
+          await Promise.all([
+            session.observations,
+            session.previousClosed,
+            session.chartReady?.then((chart) => chart?.close()),
+          ]);
         }
       })();
       return session.stopping;

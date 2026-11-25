@@ -1010,3 +1010,75 @@ five timing checks, with HTTP p95 140.40 ms across 70 samples. Browser paint,
 loaded-backfill coverage and other release blockers remain open. V22 remains
 active; v24 is staged only. A further experiment delaying neighbour-offset writes
 was discarded after mixed microbenchmark results; it is not in the candidate.
+
+### Owned observation foundation (November 24, after v24)
+
+The next implementation step is the permanent store, then derived stationary
+thinning and end-to-end Pi acceptance against that architecture. Additional
+renderer micro-optimizations are deferred. v24 is now active through Docker;
+its post-install Abaco run still fails cold-render gates (15 views, 76 concurrent
+Signal K requests, HTTP p95 120.27 ms). No release acceptance claim follows.
+
+The working implementation adds a separate worker-owned `observations.sqlite`
+with compressed, checksummed chunks, atomic integer-RTree indexing, explicit
+acquisition kinds, and original timestamp/depth/source metadata. Live recording
+runs independently of history selection, and orderly stop flushes its current
+batch. Ten-second batching leaves an acknowledged abrupt-power-loss window;
+FULL synchronization protects committed chunks. See
+`packages/signalk-plugin/src/observations/README.md` for limits. History imports,
+chart reads from this store, and stationary thinning are still outstanding.
+
+November 25 checkpoint: live recording is implemented in the worktree, with
+source validation, separate heading/COG fields, full queue drain on the plugin
+stop hook, transient write retries, visible error/restart backoff, and a 256 MiB
+filesystem reserve. The active Pi remains v24; v25 was staged only for an
+isolated storage experiment. [The raw results](pi-observations-nov25.json) show
+10,000 synthetic points/200 FULL commits: 462,848-byte database, 4,140,632-byte
+peak WAL, 17.89 ms commit p95, 33.72 ms maximum, and a 1.53 ms sampled lookup.
+Only 11 HTTP probes were collected and two exceeded 250 ms; this accelerated
+trial is not the end-to-end acceptance gate or an SD wear measurement.
+
+A derived stationary simplifier now has initial tests for configurable maximum
+gaps (60–360 seconds), horizontal shape and original-time depth tolerance,
+source/quality boundaries, duplicate timestamps, unknown/moving speed, and gaps.
+It is not yet connected to chart processing or retention. History now exposes
+uncorrected observation aggregates with returned source metadata; chunk import
+and atomic completion-receipt helpers are implemented and tested, but the owned
+source adapter and chart routing remain unfinished.
+
+Review 38 was interrupted: Sonnet completed; Opus produced no report. Its valid
+input-validation, shutdown-drain, heading provenance and recovery findings were
+addressed. Round 39 completed both reviewers. The saved position-origin omission,
+SQLite auto-rollback error masking, retry backoff reset, chart/capture shutdown
+coupling, and public documentation gaps were addressed. SQLITE_FULL auto-rollback
+was reproduced and is now a regression test. The storage reserve addresses
+filesystem exhaustion by this recorder, while original retention and full
+architecture performance remain release blockers. Source timestamps rewritten
+by Signal K cannot be identified independently; the docs now state that limit.
+History import helpers and subsequent fixes still require the next review.
+
+### November 25: chart history uses owned imports (staged v27)
+
+The chart's original-history source now writes through the observation worker
+and replays current published manifests. Concurrent preview/QC acquisitions share
+one import. Cancelled and superseded chunks remain archived but do not appear in
+manifest reads or spatial hints. Preview can replay stale data immediately;
+refinement requests a fresh manifest. Schema v2 adds indexed import membership
+and migrates v1 receipts without rewriting original chunks.
+
+Validation: 619 unit/integration regressions and 9 real Signal K integration
+tests passed; plugin build and lint passed. The Docker package was staged at
+`progressive-20261125-v27`; the active plugin remains v24.
+
+`bench-observation-source.mjs` on the Pi used an isolated store and 3,600 synthetic
+history observations with GNSS quality and heading. First import produced its
+first sample in 228 ms and completed in 572 ms. Warm replay produced its first
+sample in 6.7 ms and completed in 225 ms. Reopening the worker/store took 101 ms
+to first sample and 302 ms overall. Spatial hints took 0.6–1.2 ms. All three
+reads used one provider acquisition total; maximum sampled event-loop delay was
+59 ms. Raw output: `pi-owned-source-nov25.json`.
+
+This measures source acquisition/replay, not tile generation, browser paint,
+long-term spatial-index scaling, or the release viewport gate. Live/history
+canonical overlap, production thinning, migration of previously refined history,
+and refresh of already published chart summaries remain unfinished.

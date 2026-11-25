@@ -1,3 +1,4 @@
+import { collectObservations } from "../src/observations/collect.js";
 import { createCollector } from "../src/collector.js";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -9,6 +10,15 @@ import { createReporter } from "../src/reporters/index.js";
 import { settleSource } from "../src/sources/settle.js";
 import { app as baseApp, config } from "./helper.js";
 import { startChartSafely } from "../src/chart.js";
+
+vi.mock("../src/observations/collect.js", () => ({
+  collectObservations: vi.fn(
+    async (...args: Parameters<typeof collectObservations>) => {
+      const built = await import("../dist/observations/collect.js");
+      return built.collectObservations(...args);
+    },
+  ),
+}));
 
 vi.mock("../src/collector.js", async (original) => {
   const actual = await original<typeof import("../src/collector.js")>();
@@ -69,6 +79,80 @@ describe("plugin", () => {
       rmSync(dataDir, { recursive: true, force: true });
     } catch {
       // Left in the OS temp directory.
+    }
+  });
+
+  test("observation recording retries visibly and resets backoff after a commit", async () => {
+    vi.mocked(startChartSafely).mockReturnValueOnce({
+      close: async () => {},
+      backfill: async () => {},
+    });
+    vi.mocked(settleSource).mockResolvedValueOnce(undefined);
+    const collect = vi.mocked(collectObservations);
+    const before = collect.mock.calls.length;
+    collect
+      .mockRejectedValueOnce(new Error("fixture storage failure"))
+      .mockImplementationOnce(async (...args) => {
+        args[4]?.();
+        throw new Error("second failure");
+      })
+      .mockImplementationOnce(
+        async (...args) =>
+          new Promise<void>((resolve) => {
+            args[3].addEventListener("abort", () => resolve(), { once: true });
+          }),
+      );
+    const plugin = createPlugin(app);
+    try {
+      plugin.start(config, () => {});
+      await vi.waitFor(() => expect(setPluginError).toHaveBeenCalled());
+      expect(setPluginError).toHaveBeenCalledWith(
+        expect.stringContaining("fixture storage failure"),
+      );
+      await vi.waitFor(
+        () => expect(collect.mock.calls.length - before).toBe(2),
+        { timeout: 6500 },
+      );
+      await vi.waitFor(
+        () => expect(collect.mock.calls.length - before).toBe(3),
+        { timeout: 6500 },
+      );
+    } finally {
+      await plugin.stop();
+    }
+  }, 15000);
+
+  test("an old observation drain cannot overwrite status after stop", async () => {
+    vi.mocked(startChartSafely).mockReturnValueOnce({
+      close: async () => {},
+      backfill: async () => {},
+    });
+    vi.mocked(settleSource).mockResolvedValueOnce(undefined);
+    const setPluginStatus = vi.fn();
+    app.setPluginStatus = setPluginStatus;
+    let listening = false;
+    vi.mocked(collectObservations).mockImplementationOnce(async (...args) => {
+      await new Promise<void>((resolve) => {
+        args[3].addEventListener("abort", () => resolve(), { once: true });
+        listening = true;
+      });
+      args[4]?.();
+      throw Error("drain failed");
+    });
+    const plugin = createPlugin(app);
+    try {
+      plugin.start(config, () => {});
+      await vi.waitFor(() => expect(listening).toBe(true));
+      const normal = setPluginStatus.mock.calls.length,
+        failures = setPluginError.mock.calls.length;
+      await plugin.stop();
+      expect(setPluginStatus.mock.calls.length).toBe(normal);
+      expect(setPluginError.mock.calls.length).toBe(failures);
+      expect(error).toHaveBeenCalledWith(
+        expect.stringContaining("Observation drain failed during stop"),
+      );
+    } finally {
+      await plugin.stop();
     }
   });
 

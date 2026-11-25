@@ -200,6 +200,30 @@ With Signal K security on, the layer needs a login or the server's read-only acc
 
 The plotter extension's provider and page serving are adapted from [signalk-livedepth-plugin](https://github.com/night199uk/signalk-livedepth-plugin) by Nick Roberts, under the MIT License. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
+## Local observation archive (preview)
+
+The progressive preview also records selected live depth/position pairs in
+`observations.sqlite` in the plugin data directory, even when history supplies
+reports. This local archive contains precise positions, source IDs, original
+depths, and acquisition settings. Anonymous upload settings affect sharing;
+they do not anonymize this local archive. Disable the plugin to stop recording.
+
+The archive uses compressed batches and currently retains all originals. A
+synthetic Pi measurement used about 46 bytes per observation, but omitted GNSS
+quality, heading, and position timestamps. It does not establish daily storage
+growth or SD-card wear for a real vessel. Before an append it checks
+for at least 256 MiB of filesystem space remaining. Insufficient space stops
+that recording attempt and shows an error, with periodic retries. This reserve
+is not a storage quota and does not limit other applications' writes. Retention
+and derived thinning are still under development; no originals are deleted.
+
+Batches commit every ten seconds or 512 samples. When the server calls the
+plugin stop hook, it stops subscriptions and drains queued samples. A server
+shutdown that omits that hook (including Signal K 2.33), a crash, or power loss
+can lose the uncommitted batch and queued samples. Persistent storage failures
+can also lose uncommitted observations and samples during recovery. Rolling
+back to an older plugin leaves this file on disk; the older plugin ignores it.
+
 ## Final reports
 
 When a settings change restarts the plugin, it stops collecting and attempts a final report with the previous settings. It waits for any active upload, then flushes available data through the last complete second, with a 15-second timeout covering the active upload and final attempt. A failed or timed-out window retains its checkpoint and is retried after restart using the new settings. SQLite depths keep the offsets applied when collected, while report metadata uses the new settings; changing the depth reference can therefore mislabel that queued data. Completed batches keep their checkpoints. If the server accepted an upload but its response was lost or timed out, retrying can upload that batch again.

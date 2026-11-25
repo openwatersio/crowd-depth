@@ -8,6 +8,8 @@ function setup(
   gps = "",
   model: () => unknown = () => undefined,
   quality?: unknown,
+  original = false,
+  offset = 0,
 ) {
   const subscriptions: {
     command: SubscribeMessage;
@@ -36,12 +38,16 @@ function setup(
       },
     },
   } as unknown as ServerAPI;
-  const stream = createLiveStream(app, {
-    ...config,
-    path: "belowTransducer",
-    sounder: { ...config.sounder, z: 0, source: depth },
-    gnss: { ...config.gnss, source: gps },
-  });
+  const stream = createLiveStream(
+    app,
+    {
+      ...config,
+      path: "belowTransducer",
+      sounder: { ...config.sounder, z: offset, source: depth },
+      gnss: { ...config.gnss, source: gps },
+    },
+    original,
+  );
   const send = (
     path: string,
     source: string,
@@ -200,5 +206,47 @@ test("GNSS quality follows the receiver that supplied the preferred position", (
   s.send(position, "gps.two", { longitude: 4, latitude: 5 });
   s.send(depth, "depth.one", 3);
   expect(s.stream.read().gnss).toEqual({ satellites: 8 });
+  s.stream.destroy();
+});
+
+test("original observations retain source IDs, timestamps and uncorrected depth", () => {
+  const s = setup("", "", () => undefined, undefined, true, 1.75);
+  const time = "2026-01-01T00:00:00.123456789Z";
+  s.send(
+    position,
+    "gps.actual",
+    { longitude: 1.123456789, latitude: 2.123456789 },
+    time,
+  );
+  s.send(depth, "depth.actual", 3.123456789, time);
+  expect(s.stream.read()).toMatchObject({
+    timestamp: time,
+    positionTimestamp: time,
+    longitude: 1.123456789,
+    latitude: 2.123456789,
+    depth: 3.123456789,
+    depthSource: "depth.actual",
+    positionSource: "gps.actual",
+  });
+  s.stream.destroy();
+});
+
+test("malformed cached or streamed fixes cannot poison original recording", () => {
+  let model: unknown = {
+    value: { longitude: null, latitude: 91 },
+    timestamp: "bad",
+  };
+  const s = setup("", "", () => model, undefined, true);
+  s.send(depth, "depth.actual", 3);
+  expect(s.stream.read()).toBeNull();
+  s.send(position, "gps.actual", { longitude: 1, latitude: 91 });
+  s.send(depth, "depth.actual", 3);
+  expect(s.stream.read()).toBeNull();
+  model = undefined;
+  s.send(position, "gps.actual", { longitude: 1, latitude: 2 });
+  s.send(depth, "depth.actual", 3, "invalid");
+  expect(s.stream.read()).toBeNull();
+  s.send(depth, "depth.actual", 4);
+  expect(s.stream.read()).toMatchObject({ depth: 4 });
   s.stream.destroy();
 });
