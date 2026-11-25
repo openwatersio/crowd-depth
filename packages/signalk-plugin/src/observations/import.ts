@@ -1,3 +1,4 @@
+import { ObservationDataError } from "./errors.js";
 import { Readable, addAbortSignal } from "node:stream";
 import { Temporal } from "@js-temporal/polyfill";
 import type { BathymetrySource, Timeframe } from "../types.js";
@@ -18,15 +19,20 @@ export async function* importObservations(
   identity: string,
   window: Timeframe,
   signal: AbortSignal,
+  preview = false,
 ): AsyncGenerator<Observation> {
   if (!source.createObservationReader)
     throw new Error("Source cannot supply uncorrected observations");
   signal.throwIfAborted();
+  // Freshness describes the provider snapshot, not time spent persisting/consuming it.
+  const acquiredAt = Date.now();
   const timeout = AbortSignal.timeout(30000);
   const requestSignal = AbortSignal.any([signal, timeout]);
   let late = false;
   const request = Promise.resolve().then(() =>
-    source.createObservationReader!(window),
+    preview && source.createObservationPreviewReader
+      ? source.createObservationPreviewReader(window)
+      : source.createObservationReader!(window),
   );
   // Providers need not support cancellation. A late result must not retain a stream.
   void request.then(
@@ -57,15 +63,21 @@ export async function* importObservations(
     signal.throwIfAborted();
   }
   const chunks: number[] = [];
+  let incomplete = false;
   let points: Observation[] = [],
     seen = 0;
   try {
     if (reader) {
+      incomplete ||=
+        "metadataIncomplete" in reader && reader.metadataIncomplete === true;
       addAbortSignal(signal, reader);
       for await (const point of reader as AsyncIterable<Observation>) {
         signal.throwIfAborted();
+        incomplete ||= point.metadataIncomplete === true;
         if (++seen > MAX_IMPORT_POINTS)
-          throw new Error("Observation import window exceeds 100,000 samples");
+          throw new ObservationDataError(
+            "Observation import window exceeds 100,000 samples",
+          );
         const time = Temporal.Instant.from(point.timestamp);
         if (
           Temporal.Instant.compare(time, window.from) < 0 ||
@@ -98,6 +110,9 @@ export async function* importObservations(
       window.from.epochMilliseconds,
       window.to.epochMilliseconds,
       chunks,
+      acquiredAt,
+      "backfill",
+      preview ? "preview" : incomplete ? "partial" : "full",
     );
   } finally {
     reader?.destroy();

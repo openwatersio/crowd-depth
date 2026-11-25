@@ -1,5 +1,23 @@
 # Point-store and performance release gate
 
+## Current checkpoint — November 25
+
+Release acceptance is **not met**. The working tree uses observation schema v7;
+678 regressions, plugin lint/publint pass. Nine real Signal K end-to-end tests passed the preview
+coverage changes; the v7 archive follow-up is being checked separately.
+Docker runs private preview v39 as of November 25, 18:15 UTC, after an online
+backup passed SQLite quick_check. Initial capture verification found 12,853
+observations in 33 chunks, with one full and seven preview imports. Integrated
+performance acceptance remains open. The preview includes the follow-up review
+fixes below. The dated measurements and test totals later in
+this document describe their named earlier snapshots, not the current test count.
+
+Repeated Pi fixtures measured owned-hour refinement at 3.5–3.8 s anchored and
+3.0 s underway after the exact-output QC optimization, versus 9.3–9.5 s and
+6.6–6.7 s before. These exclude provider latency and browser paint. Production
+thinning, canonical live/history reads, independent enrichment scheduling,
+storage-retention limits and the loaded viewport/browser gates remain unfinished.
+
 The Pi preview demonstrated that early point publication alone is insufficient:
 refined cells were still empty while chronological backfill visited old history.
 Do not ship based on unit tests, total backfill time, or first database commit.
@@ -1082,3 +1100,257 @@ This measures source acquisition/replay, not tile generation, browser paint,
 long-term spatial-index scaling, or the release viewport gate. Live/history
 canonical overlap, production thinning, migration of previously refined history,
 and refresh of already published chart summaries remain unfinished.
+
+### November 25: retained history and bounded viewport pages (staged v29)
+
+History reconciliation now retains timestamps omitted by a shorter/empty provider
+response and replaces revised timestamp groups atomically. Acquisition time, not
+consumer completion time, determines whether an import was taken after provider
+buffering settled. Original chunk versions remain archived.
+
+The original membership query took ~166 ms on the development host for an empty
+viewport over 500,000 synthetic memberships because SQLite walked the time index
+before testing spatial bounds. Schema v4 instead indexes published windows by
+location, acquisition context, day, and window ID. Spatial queries bisect indexed
+ID ranges into complete pages of at most 64 windows without sorting all matches.
+Refinement keeps the cursor across discovery retries; regression tests verify
+that pages neither omit nor duplicate windows with nonchronological insertion.
+
+On the Pi's staged Docker build `progressive-20261125-v29`, the 100,000-window
+synthetic index fixture measured 30 queries per case. P95: first populated page
+2.43 ms; middle page 2.03 ms; empty viewport 0.16 ms; windows from another context
+only 12.03 ms; outside the time range 0.19 ms. The source fixture imported 3,600
+observations with first output at 252 ms and completion at 536 ms. Warm replay
+was 7.6/165 ms; reopened replay 96/241 ms. Revalidating against a pruned 1,800-row
+provider answer retained all 3,600 owned observations, with first output at
+333 ms and completion at 542 ms. Maximum sampled event-loop delay was 50 ms.
+Raw evidence: `pi-owned-paging-nov25.json`.
+
+This is not the release viewport gate: no renderer/browser or actual History API
+request latency was measured, and no concurrent full-model HTTP probe ran in this
+fixture. Active Pi remains v24. The broader release blockers remain open.
+
+At the v29 checkpoint all 632 regressions and 9 real Signal K integration tests
+passed. The follow-up review then identified sparse-page preview coverage,
+mid-page failure handling, and optional metadata failures replacing richer owned
+rows. Those fixes and their focused regressions are now in the worktree; v29 does
+not contain them. Independent horizontal thinning verification also matches GEOS
+3.14.1 / Shapely 2.2.0 for three tolerances, using a generated reference fixture.
+This validates only the horizontal simplifier, not tide-model fidelity or the
+still-unimplemented production thinning/retention path.
+
+### November 25: owned-store chart pipeline and QC profiling (staged v30/v31)
+
+`bench-owned-chart.mjs` exercises an hour of 5 Hz original observations through
+owned import/replay, sensor correction, the real refinement worker, cell publication,
+and the production tile service. It reopens the archive, builds a new chart with the
+provider disabled, and asserts identical resulting cells. Both anchored and underway
+fixtures contain 18,000 points; adjacent QC context windows are empty. This excludes
+provider latency, tides, browser paint and the concurrent Signal K HTTP gate.
+
+The baseline Pi run took 9.27 s to refine the anchored hour from owned observations,
+and 6.73 s underway. CPU profiling on the development host located most refinement
+work in repeated sorting of overlapping rolling-median windows. The replacement
+maintains a sorted sliding window and preserves the existing float32 median formula.
+It does not thin samples or change QC thresholds. Shared grid reference vectors,
+writer regressions, and 100 randomized full-track comparisons against the previous
+implementation matched. The full suite passes 639 tests and 9 Signal K end-to-end
+tests after this change.
+
+On the Pi, two runs in opposite candidate order measured anchored owned rebuilds at
+9.27/9.45 s before and 3.54/3.76 s after; underway rebuilds at 6.73/6.59 s before and
+2.96/3.02 s after. First imports were 11.24/11.11 s versus 7.14/5.26 s anchored and
+8.55/7.30 s versus 3.93/4.15 s underway. Tile requests were separately timed after
+refinement. These small repeated fixtures locate a processing bottleneck; they do
+not establish release acceptance or immediate-preview performance. Raw results:
+`pi-owned-chart-nov25.json`.
+
+Both candidates are staged only; v24 remains active. Round 43 found that strict
+optional-metadata acquisition can block initial preview, and that a successful
+source-unaware GNSS response can still remove metadata on refresh. These remain
+open: do not activate these candidates until preview acquisition and metadata
+enrichment are separated without downgrading richer stored observations. The QC
+optimization and new pipeline benchmark postdate that review. Production thinning,
+canonical live/history selection and the full loaded rendering gates remain open.
+
+The subsequent local implementation persists first acquisitions as `preview` receipts,
+then enriches them through full acquisition. An optional metadata failure preserves
+the preview; full acquisition refuses source-unaware GNSS results. Schema v5 adds
+receipt stages and conservatively marks older unclassified receipts as previews.
+A full receipt cannot be overwritten by a later provisional acquisition. Regression
+coverage includes the actual History API adapter through `storedHistorySource`,
+failed enrichment, successful later enrichment, late-publication guards,
+and a v4 migration preserving original observations. All 643 tests and 9 Signal K
+end-to-end tests pass; plugin lint/publint pass. Full review of this stage mechanism
+and QC optimization is in progress (round 44); it is not a clean-review claim.
+
+Staged v32 repeats the pipeline test on schema v5: anchored owned rebuild 3.65 s,
+underway 2.94 s, identical cells before and after archive reopen without provider
+access. It remains inactive, with v24 serving Signal K. Full metadata/refinement
+can still remain pending when a provider permanently fails optional metadata;
+independent enrichment scheduling and derived-summary invalidation remain open.
+
+### November 25: review follow-up (staged v33)
+
+The next fixes supersede the earlier strict-metadata contract: failed or unattributed
+optional metadata marks acquisition incomplete but does not prevent track refinement
+from reading usable core observations. Incomplete publication cannot downgrade an
+existing full receipt. Successful metadata-empty refreshes retain optional evidence
+only when timestamp, actual sources, coordinates and position timestamp match
+unambiguously; absent or changed provenance does not inherit fields. A full-first
+hung metadata request no longer blocks preview acquisition: the two stages have
+separate reservations within an overall four-request bound.
+
+Refinement scans all pages of owned history before clearing global backfill, even
+when provider availability succeeds with no retained history. Viewport priority still
+runs between owned windows. A corrupt owned preview window is reported and left
+incomplete while subsequent windows and temporal discovery continue. Uncancellable
+provider-creation timeouts retain the existing stop policy. All 648 regressions and
+9 real Signal K end-to-end tests pass after these fixes; review of the fixes is next.
+
+`check-observation-upgrade.mjs` passed inside Pi Docker with the schema-v2 store from
+531bc81 and staged v33: in-place upgrade retained originals; the older module explicitly
+refused v5; its verified pre-upgrade snapshot was readable on rollback; the separately
+preserved v5 file retained post-upgrade observations on roll-forward. This is an archive
+module rehearsal on temporary synthetic data, not activation/rollback of the running
+Signal K service. Evidence: `pi-observation-upgrade-nov25.json`.
+
+### November 25 — partial refresh and corrupt-window follow-up
+
+Full acquisitions with unavailable optional metadata now publish a distinct
+`partial` receipt, cached for five minutes. They update revised depth/position
+and late observations while preserving unambiguously matched earlier metadata.
+Deliberate preview acquisitions cannot replace partial or full receipts. Schema
+v6 makes older builds refuse this new receipt meaning; synthetic Docker upgrade
+and snapshot rollback checks passed from both schema v2 and v5.
+
+Corrupt-window handling now covers newest-hour and temporal discovery as well as
+viewport scans. Failed windows remain incomplete and prevent overlapping span
+checkpoints, while older independent spans continue. Regression cases cover a
+failed newest hour, a failed older hour, and successful retry after repair.
+
+The final follow-up review found transient provider failures were also being
+skipped. The next candidate retries those errors in the same scan; only known
+corrupt stored records become holes. Three regressions cover newest, viewport,
+and temporal retry. Partial refreshes with missing source attribution now keep
+existing evidence-bearing timestamp groups intact instead of stripping metadata
+or assigning it to an uncertain match. Their core revisions wait for full
+acquisition; newly observed timestamps still publish. The conservative failure
+envelope may repeat availability checks between distant corrupt windows, but
+successful individual windows remain complete. These fixes are staged in v35; 655 regressions and all 9 integration tests pass.
+
+A separate-process v35 Docker run with concurrent full-model Signal K probes
+measured anchored owned refinement at 3.86 s and underway at 2.89 s. All 60 HTTP
+probes succeeded: p95 93.8 ms, worst 520.6 ms. This exercises shared Pi CPU/I/O
+pressure while the server still runs v24; it does not verify v35's event loop
+inside Signal K, live capture/backfill integration, or browser paint.
+
+### November 25 — overlapping owned windows and explicit data failures
+
+Follow-up review reproduced a correctness gap between nonaligned startup preview
+windows and aligned refinement reads. Owned reads now reconcile overlapping
+published manifests, including when the exact aligned receipt is empty after
+provider retention. Source regressions cover retained observations on both sides
+of an hour and deduplication of overlapping versions; an actual owned-source
+refinement regression produces cells after provider pruning.
+
+Permanent observation errors now retain their type across worker IPC, including
+decompression failures and reconciliation limits. Preview leaves those windows
+incomplete while continuing; provider failures still retry. Viewport retries
+yield within a 250 ms wait slice when the view changes, retaining a coverage hole
+for the abandoned window. Evidence inheritance requires uniqueness among both
+old and incoming observations. Exact reimports can repair damaged compressed
+chunks in place; missing derived spatial entries rebuild from verified originals.
+Malformed manifests or unrecoverable original chunks still fail closed and require
+backup recovery. These changes postdate staged v35 and need Pi performance checks.
+
+The v36 overlapping-window benchmark exposed a main-thread regression: event-loop
+stalls reached 274 ms and concurrent HTTP p95 reached 264 ms (80 samples). That
+candidate was not activated. Merged reads now run in the archive worker with two
+active-reader slots and 512-point replies, and archive CPU work uses lower Linux
+scheduling priority. Preview also continues acquisition after showing retained
+partial overlap; it does not treat partial coverage as a complete receipt.
+
+The same fixture on staged v37, with merged reads in the archive worker, measured
+peak event-loop delay 94 ms (39/23 ms for anchored/underway owned rebuilds),
+HTTP p95 203 ms across 76 successful samples, and worst HTTP 556 ms. Anchored
+owned refinement took 4.01 s and underway 3.20 s. This is one comparison under
+shared Pi load, not integrated-plugin acceptance or a browser-paint measurement.
+The v36/v37 JSON includes all four pipeline phases, separate seed time and raw
+HTTP samples. Current validation is 670 regressions plus 9 integration tests.
+
+### November 25: v39 private deployment and initial checks
+
+The overlap fixture completed all four phases with identical rebuilt cells.
+Maximum event-loop stalls were 82/46 ms anchored and 96/35 ms underway for
+first import/rebuild. HTTP p95 was 252 ms over 81 successful samples, exceeding
+the 250 ms gate; the slowest sample was 879 ms. This fixture ran alongside the
+previous active v24 server, before switching the plugin. Raw samples are in
+`pi-owned-chart-nov25.json` under `v39OverlapConcurrentHttp`.
+
+v39 was activated through Docker with backup
+`pre-progressive-v39-2026-11-25T18-14-27-596Z`; the previous v24 package is retained.
+A browser reload after restart loaded Freeboard in 480 ms and requested six
+My Soundings tiles in 112–168 ms, then 15–50 ms on repeat. These are **warm**
+measurements: an already-open browser requested tiles during startup. They do
+not establish the cold viewport or useful-content acceptance criteria.
+
+The active-v39 five-round cold viewport gate failed at both north Lake Worth and
+the previously passing Lake Worth location. North: 64 successful HTTP requests,
+p95 218 ms; Lake Worth: 41 successful requests, p95 216 ms. Server responsiveness
+passed, but first-content and full-viewport render limits did not. Raw results are
+in `pi-v39-active-viewport-nov25.json`. Archive counts grew from 12,853 to 12,933
+observations in the initial checks; `depth_since` stayed
+`2026-11-22T14:06:46.969401946Z`.
+
+### November 25: retained revision origins (v40, isolated)
+
+Working-tree schema v7 separates retained timestamp-group acquisition origins
+from receipt freshness. Empty and partial refresh regressions both reproduced
+obsolete depth replacement before the fix; they now pass across reopen, and a
+genuinely newer acquisition of the original bytes still wins. Old receipts are
+forced stale because their original version ages cannot be reconstructed.
+
+A real v39/schema-v6 to v40/schema-v7 synthetic upgrade on the Pi passed old-build
+refusal, backup rollback readability and preservation of later observations for
+roll-forward. v40 remains staged only; v39/schema-v6 is still active. The isolated
+overlap workload alongside v39 recorded 86 successful HTTP requests at p95
+159 ms. This is not the loaded browser/cold viewport release gate.
+
+### November 25: recovery follow-up (v41, staged)
+
+v41 remains staged inside Docker; v39 is active. All 682 regressions and nine
+Signal K E2E tests pass. The real v39-to-v41 synthetic upgrade now checks
+legacy overlap ordering through an empty refresh, stale-receipt semantics and
+spatial discovery, as well as older-build refusal, readable backup rollback and
+retention of later observations for roll-forward. All passed on the Pi.
+
+Unlike the superseded v40 migration, v41 preserves legacy ordering timestamps
+and forces revalidation with a separate flag. Corrupt pre-v4 imports are
+quarantined without blocking capture; unknown spatial bounds remain worldwide
+hints so affected intervals cannot silently become empty coverage. Tests include
+continued capture/reopen, a migration across 70 healthy imports after corruption,
+and repair after identical reimport. Versioned preview completion sources also
+prevent rollback writes from being accepted as owned-history coverage.
+
+### November 25: reviewed archive checkpoint
+
+The checkpoint passes 685 tests across 57 files and all nine real Signal K E2E
+tests (48 seconds), plus build, plugin lint/publint, scoped oxlint and formatting.
+A fixture generated by the actual v2 implementation verifies migration through
+the built worker and preservation of the original compressed bytes.
+
+Focused review 53 compared the completed round-52 snapshot with the acquisition
+recovery change and genuine-v2 fixture. Codex and Sonnet completed their maps;
+Opus and Copilot failed quota. Codex found no issues. Sonnet correctly identified
+that a malformed exact manifest still prevents publication of newly archived
+chunks. This remains an explicit recovery limitation: overwriting unknown owned
+coverage with a possibly pruned provider response would risk losing evidence.
+Acquisition preservation is not automatic replay recovery. The broad recovery
+catch and concurrent retry diagnostics remain low-priority follow-up findings.
+The fixture covers v2 migration, not every upgrade; separate corruption tests and
+real-module Pi rollback checks provide the other evidence. Rollback restrictions
+are explicitly documented in the observation-store README.
+
+No new Docker activation accompanies this checkpoint: v39 remains active, v41
+is staged, and the active cold-viewport failures remain release blockers.

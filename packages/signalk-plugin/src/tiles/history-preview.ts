@@ -1,4 +1,8 @@
 import {
+  ObservationDataError,
+  isObservationDataError,
+} from "../observations/errors.js";
+import {
   createPreviewWriter,
   createPreviewWriteThread,
 } from "./preview-write.js";
@@ -167,7 +171,11 @@ export function createPreviewStore(
       }));
     },
     done(source: string, start: number, end: number) {
-      return !!has.get(source, start, end);
+      return !!has.get(
+        source === "history" ? "history:v2" : source,
+        start,
+        end,
+      );
     },
     write(source: string, points: Observation[], window?: [number, number]) {
       if (!closed) write(source, points, window);
@@ -320,7 +328,9 @@ export async function scanPreview({
               points.set(key, s);
             publish.push(s);
             if (points.size > 50_000)
-              throw new Error("preview window exceeds cell limit");
+              throw new ObservationDataError(
+                "preview window exceeds cell limit",
+              );
           }
           if (++count % 250 === 0) {
             await store.writeAsync(name, publish);
@@ -343,9 +353,56 @@ export async function scanPreview({
       settled ? [from, to] : undefined,
     );
   };
+  // Keep distinct holes so unrelated healthy spans can be checkpointed. In a
+  // severely damaged archive, coalesce the closest holes to bound bookkeeping;
+  // this can repeat a healthy gap, but never marks failed data complete.
+  let failures: [number, number][] = [];
+  const compactFailures = () => {
+    failures.sort((a, b) => a[0] - b[0]);
+    const merged: [number, number][] = [];
+    for (const range of failures) {
+      const last = merged.at(-1);
+      if (last && range[0] <= last[1]) last[1] = Math.max(last[1], range[1]);
+      else merged.push(range);
+    }
+    while (merged.length > 512) {
+      let closest = 1;
+      for (let i = 2; i < merged.length; i++)
+        if (
+          merged[i][0] - merged[i - 1][1] <
+          merged[closest][0] - merged[closest - 1][1]
+        )
+          closest = i;
+      merged[closest - 1][1] = merged[closest][1];
+      merged.splice(closest, 1);
+    }
+    failures = merged;
+  };
+  const readSafely = async (from: number, to: number) => {
+    try {
+      await read(from, to);
+      failures = failures.flatMap(([a, b]): [number, number][] => {
+        if (to <= a || from >= b) return [[a, b]];
+        return [
+          ...(a < from ? [[a, from] as [number, number]] : []),
+          ...(b > to ? [[to, b] as [number, number]] : []),
+        ];
+      });
+      if (failures.length > 512) compactFailures();
+      return true;
+    } catch (error) {
+      if (!active()) return false;
+      // Also retain a hole when a transient viewport retry yields to a pan.
+      failures.push([from, to]);
+      compactFailures();
+      if (!isObservationDataError(error)) throw error;
+      onError(error);
+      return false;
+    }
+  };
   // Retry failures without converting them to empty successful intervals.
-  const retry = async (run: () => Promise<void>) => {
-    while (active()) {
+  const retry = async (run: () => Promise<void>, relevant?: () => boolean) => {
+    while (active() && (!relevant || relevant())) {
       try {
         await run();
         return;
@@ -356,7 +413,15 @@ export async function scanPreview({
         // behind a timed-out call that may still be executing.
         if (err instanceof Error && err.message === "preview source timed out")
           throw err;
-        await sleep(30_000, undefined, { signal }).catch(() => {});
+        // A viewport failure must yield promptly when the user pans elsewhere.
+        for (
+          let remaining = 30_000;
+          remaining > 0 && active() && (!relevant || relevant());
+        ) {
+          const delay = relevant ? Math.min(250, remaining) : remaining;
+          await sleep(delay, undefined, { signal }).catch(() => {});
+          remaining -= delay;
+        }
       }
     }
   };
@@ -364,10 +429,69 @@ export async function scanPreview({
   let spatial = source.getPreviewTimeframes;
   const prioritize = async () => {
     const area = view();
-    if (!spatial || !area || JSON.stringify(area) === viewed || !active())
-      return;
+    if (!area || JSON.stringify(area) === viewed || !active()) return;
     viewed = JSON.stringify(area);
     const [, west, south, east, north] = area;
+    const draw = async (windows: Timeframe[]) => {
+      for (const window of windows.slice(0, 64)) {
+        if (!active() || JSON.stringify(view()) !== viewed) return;
+        const requestedView = viewed;
+        await retry(
+          async () => {
+            await readSafely(
+              Math.max(since, window.from.epochMilliseconds),
+              Math.min(until, window.to.epochMilliseconds),
+            );
+          },
+          () => JSON.stringify(view()) === requestedView,
+        );
+      }
+    };
+    if (source.getStoredTimeframePage || source.getStoredTimeframes) {
+      try {
+        if (source.getStoredTimeframePage) {
+          let before: number | undefined;
+          let count = 0;
+          // Sparse spatial pages need not be full. Paint each before requesting the next.
+          for (let pages = 0; pages < 64 && count < 64; pages++) {
+            if (!active() || JSON.stringify(view()) !== viewed) return;
+            const page = await request(
+              () =>
+                source.getStoredTimeframePage!(
+                  frame(since, until),
+                  [west, south, east, north],
+                  before,
+                ),
+              signal,
+            );
+            const windows = page.windows.slice(0, 64 - count);
+            await draw(windows);
+            count += windows.length;
+            if (page.before === undefined) break;
+            if (before !== undefined && page.before >= before)
+              throw new Error("Stored viewport cursor did not advance");
+            before = page.before;
+          }
+        } else
+          await draw(
+            await request(
+              () =>
+                source.getStoredTimeframes!(frame(since, until), [
+                  west,
+                  south,
+                  east,
+                  north,
+                ]),
+              signal,
+            ),
+          );
+      } catch (error) {
+        viewed = undefined;
+        throw error;
+      }
+    }
+    // Existing local coverage is painted before waiting on external track discovery.
+    if (!spatial || !active() || JSON.stringify(view()) !== viewed) return;
     let windows: Timeframe[];
     try {
       windows = await request(
@@ -380,15 +504,11 @@ export async function scanPreview({
       if (active()) onError(err);
       return;
     }
-    for (const window of windows.slice(0, 64)) {
-      if (!active() || JSON.stringify(view()) !== viewed) return;
-      await read(
-        Math.max(since, window.from.epochMilliseconds),
-        Math.min(until, window.to.epochMilliseconds),
-      );
-    }
+    await draw(windows);
   };
-  await retry(() => read(Math.max(since, until - HOUR), until));
+  await retry(async () => {
+    await readSafely(Math.max(since, until - HOUR), until);
+  });
   await retry(prioritize);
   let to = Math.floor(until / HOUR) * HOUR;
   let span = DAY;
@@ -411,16 +531,61 @@ export async function scanPreview({
       )) {
         if (!active()) return;
         await prioritize();
-        await read(
+        await readSafely(
           Math.max(from, w.from.epochMilliseconds),
           Math.min(to, w.to.epochMilliseconds),
         );
       }
+      // Provider retention does not establish completeness of the owned archive.
+      if (source.getStoredTimeframePage) {
+        let before: number | undefined;
+        do {
+          const previous = before;
+          const page = await request(
+            () =>
+              source.getStoredTimeframePage!(
+                frame(from, to),
+                [-180, -90, 180, 90],
+                before,
+              ),
+            signal,
+          );
+          before = page.before;
+          if (
+            before !== undefined &&
+            (!Number.isSafeInteger(before) ||
+              before < 1 ||
+              (previous !== undefined && before >= previous))
+          )
+            throw new Error("Owned preview cursor did not advance");
+          for (const window of page.windows) {
+            if (!active()) return;
+            await prioritize();
+            await readSafely(
+              Math.max(from, window.from.epochMilliseconds),
+              Math.min(to, window.to.epochMilliseconds),
+            );
+          }
+          await setImmediate();
+        } while (before !== undefined && active());
+      }
       if (
         active() &&
         to <= Date.now() - BATHY_REPORT_DELAY.total("milliseconds")
-      )
-        await store.writeAsync(name, [], [from, to]);
+      ) {
+        let cursor = from;
+        for (const [a, b] of failures) {
+          if (b <= cursor || a >= to) continue;
+          if (a > cursor) await store.writeAsync(name, [], [cursor, a]);
+          cursor = Math.max(cursor, b);
+        }
+        if (cursor < to) await store.writeAsync(name, [], [cursor, to]);
+      }
+      // The temporal scan has passed these holes; their missing checkpoints
+      // persist in the store and will be retried on a future scan.
+      failures = failures
+        .filter(([a]) => a < from)
+        .map(([a, b]) => [a, Math.min(b, from)]);
       span = windows.length ? DAY : Math.min(span * 2, 365 * DAY);
     });
     to = from;

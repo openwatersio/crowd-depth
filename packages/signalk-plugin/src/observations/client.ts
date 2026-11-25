@@ -1,3 +1,4 @@
+import { ObservationDataError } from "./errors.js";
 import { Worker } from "node:worker_threads";
 import type { openObservationStore } from "./store.js";
 
@@ -44,7 +45,12 @@ export function createObservationStore(file: string) {
     if (message.id === -1 && message.error) fail(new Error(message.error));
     const request = pending.get(message.id);
     pending.delete(message.id);
-    if (message.error) request?.reject(new Error(message.error));
+    if (message.error)
+      request?.reject(
+        message.permanent
+          ? new ObservationDataError(message.error)
+          : new Error(message.error),
+      );
     else request?.resolve(message.value);
   });
   worker.on("error", fail);
@@ -62,7 +68,7 @@ export function createObservationStore(file: string) {
     if (closing) throw new Error("Observation store is closing");
     if (failure) throw failure;
     // Bound the queue before waiting for initialization, including waiting callers.
-    if (pending.size >= 16)
+    if (operation !== "closeMergedRead" && pending.size >= 16)
       throw new Error(
         "Observation store queue full; await writes before submitting more",
       );
@@ -87,14 +93,29 @@ export function createObservationStore(file: string) {
   let closed: Promise<void> | undefined;
   return {
     ready,
+    openMergedRead: (...args: Parameters<Store["openMergedRead"]>) =>
+      request("openMergedRead", args),
+    readMergedPage: (...args: Parameters<Store["readMergedPage"]>) =>
+      request("readMergedPage", args),
+    closeMergedRead: (...args: Parameters<Store["closeMergedRead"]>) =>
+      closing || failure
+        ? Promise.resolve()
+        : request("closeMergedRead", args).catch((error) => {
+            // Worker shutdown releases all readers; cleanup must not mask the read's error.
+            if (!closing && !failure) throw error;
+          }),
     publishImport: (...args: Parameters<Store["publishImport"]>) =>
       request("publishImport", args),
     imported: (...args: Parameters<Store["imported"]>) =>
       request("imported", args),
     importedInView: (...args: Parameters<Store["importedInView"]>) =>
       request("importedInView", args),
+    importedPageInView: (...args: Parameters<Store["importedPageInView"]>) =>
+      request("importedPageInView", args),
     append: (...args: Parameters<Store["append"]>) => request("append", args),
     query: (...args: Parameters<Store["query"]>) => request("query", args),
+    readRange: (...args: Parameters<Store["readRange"]>) =>
+      request("readRange", args),
     read: (...args: Parameters<Store["read"]>) => request("read", args),
     close() {
       if (closed) return closed;

@@ -1,3 +1,8 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { createObservationStore } from "../../dist/observations/client.js";
+import { storedHistorySource } from "../../src/observations/source.js";
 import { expect, test } from "vitest";
 import { Readable } from "node:stream";
 import { Temporal } from "@js-temporal/polyfill";
@@ -401,3 +406,207 @@ test("sparse history discovery expands and a failed large query shrinks the next
     db.close();
   }
 });
+
+test("viewport paging advances past completed windows across discovery retries", async () => {
+  const db = createDB(":memory:"),
+    store = createCellStore(db);
+  store.setMeta("backfill", `${at}/${at.add({ hours: 100 })}`);
+  store.completeEmptyWindow(ms + 90 * HOUR, ms + 91 * HOUR);
+  const cursors: (number | undefined)[] = [];
+  const source: BathymetrySource = {
+    createReader: () => Readable.from([]),
+    getAvailableTimeframes: () => {
+      throw Error("offline availability");
+    },
+    getStoredTimeframePage: (_span, _bounds, before) => {
+      cursors.push(before);
+      return before === undefined
+        ? {
+            windows: [
+              new Timeframe(at.add({ hours: 90 }), at.add({ hours: 91 })),
+            ],
+            before: 123,
+          }
+        : { windows: [new Timeframe(at, at.add({ hours: 1 }))] };
+    },
+  };
+  try {
+    const run = () =>
+      refineHistory({
+        store,
+        source,
+        config,
+        signal: new AbortController().signal,
+        view: () => [14, -81, 25, -79, 27],
+      });
+    await expect(run()).rejects.toThrow("offline availability");
+    expect(store.windowDone(ms, ms + HOUR)).toBe(false);
+    await expect(run()).rejects.toThrow("offline availability");
+    expect(cursors).toEqual([undefined, 123]);
+    expect(store.windowDone(ms, ms + HOUR)).toBe(true);
+  } finally {
+    db.close();
+  }
+});
+
+test("empty provider availability does not clear backfill before all owned pages are consumed", async () => {
+  const db = createDB(":memory:"),
+    store = createCellStore(db);
+  store.setMeta("backfill", `${at}/${at.add({ hours: 100 })}`);
+  store.completeEmptyWindow(ms + 90 * HOUR, ms + 91 * HOUR);
+  const globalCursors: (number | undefined)[] = [];
+  const source: BathymetrySource = {
+    createReader: () => Readable.from([]),
+    getAvailableTimeframes: () => [],
+    getStoredTimeframePage: (_span, bounds, before) => {
+      if (bounds[0] === -180) globalCursors.push(before);
+      return before === undefined
+        ? {
+            windows: [
+              new Timeframe(at.add({ hours: 90 }), at.add({ hours: 91 })),
+            ],
+            before: 123,
+          }
+        : { windows: [new Timeframe(at, at.add({ hours: 1 }))] };
+    },
+  };
+  try {
+    await refineHistory({
+      store,
+      source,
+      config,
+      signal: new AbortController().signal,
+      view: () => [14, -81, 25, -79, 27],
+    });
+    expect(globalCursors).toEqual([undefined, 123]);
+    expect(store.windowDone(ms, ms + HOUR)).toBe(true);
+    expect(getPendingBackfill(store)).toBeUndefined();
+  } finally {
+    db.close();
+  }
+});
+
+test("retains unattempted viewport hints when processing fails mid-page", async () => {
+  const db = createDB(":memory:"),
+    store = createCellStore(db);
+  store.setMeta("backfill", `${at}/${at.add({ hours: 100 })}`);
+  store.completeEmptyWindow(ms + 99 * HOUR, ms + 100 * HOUR);
+  let pages = 0;
+  const source: BathymetrySource = {
+    createReader: ({ from }) => {
+      if (from.epochMilliseconds < ms + 59 * HOUR) throw Error("provider bad");
+      return Readable.from([]);
+    },
+    getAvailableTimeframes: () => {
+      throw Error("discovery offline");
+    },
+    getStoredTimeframePage: () => {
+      pages++;
+      return {
+        windows: [10, 20, 30, 40, 50, 60, 70].map(
+          (h) => new Timeframe(at.add({ hours: h }), at.add({ hours: h + 1 })),
+        ),
+        before: 42,
+      };
+    },
+  };
+  try {
+    const run = () =>
+      refineHistory({
+        store,
+        source,
+        config,
+        signal: new AbortController().signal,
+        view: () => [14, -81, 25, -79, 27],
+      });
+    await expect(run()).rejects.toThrow("provider bad");
+    await expect(run()).rejects.toThrow("discovery offline");
+    expect(pages).toBe(1);
+    expect(store.windowDone(ms + 60 * HOUR, ms + 61 * HOUR)).toBe(true);
+    expect(store.windowDone(ms + 70 * HOUR, ms + 71 * HOUR)).toBe(true);
+    expect(store.windowDone(ms + 50 * HOUR, ms + 51 * HOUR)).toBe(false);
+  } finally {
+    db.close();
+  }
+});
+
+test.each([false, true])(
+  "refines nonaligned owned history once with provider availability=%s",
+  async (available) => {
+    const dir = mkdtempSync(join(tmpdir(), "refine-owned-alias-"));
+    const archive = createObservationStore(join(dir, "observations.sqlite"));
+    const db = createDB(":memory:"),
+      store = createCellStore(db);
+    let pruned = false;
+    const points = Array.from({ length: 31 }, (_, i) => ({
+      timestamp: at.add({ minutes: 40, seconds: i }).toString(),
+      longitude: -80,
+      latitude: 26,
+      depth: 4 + (i % 3) * 0.01,
+      depthSource: "d",
+      positionSource: "g",
+    }));
+    const source = storedHistorySource(
+      archive,
+      {
+        createReader: () => {
+          throw Error("corrected upstream reader should not be called");
+        },
+        createObservationReader: () => Readable.from(pruned ? [] : points),
+        createObservationPreviewReader: () => Readable.from(points),
+        getAvailableTimeframes: () =>
+          available ? [new Timeframe(at, at.add({ hours: 1 }))] : [],
+      },
+      config,
+      new AbortController().signal,
+    );
+    try {
+      await (await source.createPreviewReader!(
+        new Timeframe(
+          at.add({ minutes: 23 }),
+          at.add({ hours: 1, minutes: 23 }),
+        ),
+      ))!.toArray();
+      pruned = true;
+      store.setMeta("backfill", `${at}/${at.add({ hours: 2 })}`);
+      await refineHistory({
+        source,
+        store,
+        config,
+        signal: new AbortController().signal,
+      });
+      expect(cells(store).length).toBeGreaterThan(0);
+      expect(store.windowDone(ms, ms + HOUR)).toBe(true);
+      expect(store.windowDone(ms + 23 * 60_000, ms + HOUR)).toBe(false);
+      const jobs = db
+        .prepare(
+          "SELECT DISTINCT job FROM cell_passes WHERE job LIKE 'window:%'",
+        )
+        .all();
+      expect(jobs).toEqual([{ job: `window:${ms}` }]);
+      const before = db
+        .prepare("SELECT * FROM cell_passes ORDER BY job,ordinal")
+        .all();
+      await refineHistory({
+        source,
+        store,
+        config,
+        signal: new AbortController().signal,
+        windows: [
+          new Timeframe(
+            at.add({ minutes: 23 }),
+            at.add({ hours: 1, minutes: 23 }),
+          ),
+        ],
+      });
+      expect(
+        db.prepare("SELECT * FROM cell_passes ORDER BY job,ordinal").all(),
+      ).toEqual(before);
+      expect(getPendingBackfill(store)).toBeUndefined();
+    } finally {
+      db.close();
+      await archive.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);

@@ -440,7 +440,7 @@ export function startChart({
             await failed?.close().catch(() => {});
             if (signal.aborted) return;
             app.error(
-              `Historical observation storage unavailable; retrying in ${retryMs / 1000}s: ${error}`,
+              `Historical ${source.createObservationReader ? "observation storage" : "input cache"} unavailable; retrying in ${retryMs / 1000}s: ${error}`,
             );
             await setTimeout(retryMs, undefined, { signal }).catch(() => {});
             retryMs = Math.min(retryMs * 2, 300_000);

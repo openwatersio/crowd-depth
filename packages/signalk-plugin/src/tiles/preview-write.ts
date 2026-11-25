@@ -37,7 +37,8 @@ export function createPreviewWriter(db: DatabaseSync, generation: string) {
           ).run(...window);
         for (const s of latest.values())
           insert.run(s.py, s.px, s.lon, s.lat, s.depth, s.time, source);
-        if (window) complete.run(source, ...window);
+        if (window)
+          complete.run(source === "history" ? "history:v2" : source, ...window);
       }
       db.exec("COMMIT");
     } catch (err) {

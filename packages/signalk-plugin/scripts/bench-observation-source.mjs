@@ -35,11 +35,11 @@ const provider = {
   createObservationReader() {
     calls++;
     return Readable.from(
-      Array.from({ length: 3600 }, (_, i) => ({
+      Array.from({ length: calls === 1 ? 3600 : 1800 }, (_, i) => ({
         timestamp: new Date(start + i * 1000).toISOString(),
         longitude: -80 + Math.sin(i / 100) * 0.0001,
         latitude: 26 + Math.cos(i / 100) * 0.0001,
-        depth: 3 + Math.sin(i / 1000) * 0.5,
+        depth: 3 + Math.sin(i / 1000) * 0.5 + (calls === 1 ? 0 : 1),
         headingTrue: 1.2,
         speedOverGround: 0.01,
         depthSource: "sounder.1",
@@ -57,10 +57,27 @@ const lag = monitorEventLoopDelay({ resolution: 10 });
 lag.enable();
 const measurements = [];
 try {
-  for (const phase of ["first-import", "warm-replay", "reopened-replay"]) {
+  for (const phase of [
+    "first-import",
+    "warm-replay",
+    "reopened-replay",
+    "pruned-refresh",
+  ]) {
     if (phase === "reopened-replay") {
       await store.close();
       store = createObservationStore(file);
+    }
+    if (phase === "pruned-refresh") {
+      const first = (await store.query(start, start + 3600000))[0];
+      const identity = JSON.stringify((await store.read(first.id)).acquisition);
+      const receipt = await store.imported(identity, start, start + 3600000);
+      await store.publishImport(
+        identity,
+        start,
+        start + 3600000,
+        receipt.chunks,
+        0,
+      );
     }
     const source = storedHistorySource(
       store,
@@ -84,7 +101,7 @@ try {
     );
     assert.equal(hints.length, 1);
     assert.equal(count, 3600);
-    assert.equal(calls, 1);
+    assert.equal(calls, phase === "pruned-refresh" ? 2 : 1);
     measurements.push({
       phase,
       firstMs: first,

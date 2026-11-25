@@ -1,6 +1,7 @@
 import { expect, it } from "vitest";
 import { thinStationary } from "../../src/observations/thin.js";
 import type { Observation } from "../../src/observations/store.js";
+import { readFileSync } from "node:fs";
 const options = {
   horizontalToleranceM: 1,
   depthToleranceM: 0.02,
@@ -20,6 +21,31 @@ const point = (
   depthSource: "sounder",
   positionSource: "gps",
   ...overrides,
+});
+it("matches independent GEOS Douglas-Peucker results for horizontal geometry", () => {
+  const reference = JSON.parse(
+    readFileSync(
+      new URL("./fixtures/geos-thinning.json", import.meta.url),
+      "utf8",
+    ),
+  ) as {
+    count: number;
+    fixtures: { toleranceM: number; kept: number[] }[];
+  };
+  const points = Array.from({ length: reference.count }, (_, i) =>
+    point(i / 5, {
+      longitude: i / 10 / 111320,
+      latitude: (2 * Math.sin(i * 0.073) + 0.4 * Math.cos(i * 0.157)) / 111320,
+    }),
+  );
+  for (const fixture of reference.fixtures)
+    expect(
+      thinStationary(points, {
+        ...options,
+        horizontalToleranceM: fixture.toleranceM,
+        maxGapSeconds: 360,
+      }),
+    ).toEqual(fixture.kept);
 });
 it("retains at least one observation per configured interval at rest", () => {
   const points = Array.from({ length: 9001 }, (_, i) => point(i / 5));

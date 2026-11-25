@@ -198,7 +198,9 @@ none is represented as complete by the presence of a preview.
 - Spatial Track API support supplies prioritized own-vessel visit hours for the
   active viewport (boat area before a viewport arrives). This is a hint, never
   evidence that the rest of history is empty. Unsupported spatial providers fall
-  back to temporal discovery. Preview history skips optional GNSS metadata reads.
+  back to temporal discovery. Preview history skips optional GNSS metadata reads;
+  the owned store records these imports as preview-stage. Full acquisition enriches
+  the manifest later, and an optional metadata failure leaves the preview usable.
 - Local preview starts before provider selection, enforces legacy `depth_since`,
   and is superseded by successfully read historical intervals. New realtime
   observations are exposed before asynchronous tide lookup completes.

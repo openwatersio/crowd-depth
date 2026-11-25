@@ -42,11 +42,21 @@ export interface BathymetrySource {
   createObservationReader?: (
     options: Timeframe,
   ) => MaybePromise<Readable | undefined>;
+  /** Original paired observations before optional metadata acquisition; never a full receipt. */
+  createObservationPreviewReader?: (
+    options: Timeframe,
+  ) => MaybePromise<Readable | undefined>;
   /** Bounded spatial lookup over already acquired local chunks; never calls a provider. */
   getStoredTimeframes?: (
     timeframe: Timeframe,
     bounds: readonly [number, number, number, number],
   ) => MaybePromise<Timeframe[]>;
+  /** Continue bounded viewport discovery past already-processed windows. */
+  getStoredTimeframePage?: (
+    timeframe: Timeframe,
+    bounds: readonly [number, number, number, number],
+    before?: number,
+  ) => MaybePromise<{ windows: Timeframe[]; before?: number }>;
   /** Optional spatial hints for preview acquisition, never a completeness claim. */
   getPreviewTimeframes?: (
     timeframe: Timeframe,

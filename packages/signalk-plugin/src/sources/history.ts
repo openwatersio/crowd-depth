@@ -98,6 +98,7 @@ export async function createHistorySource(
     };
 
     let res: ValuesResponse;
+    let metadataIncomplete = false;
     let pathSpecs = req.pathSpecs;
     try {
       res = await history!.getValues(req);
@@ -107,7 +108,11 @@ export async function createHistorySource(
       // https://github.com/tkurki/signalk-to-influxdb2/issues/99
       const recorded: string[] = await Promise.resolve()
         .then(() => history!.getPaths({ from, to }))
-        .catch(() => []);
+        .catch((error) => {
+          metadataIncomplete = true;
+          app.debug("Orientation paths unavailable from history: %s", error);
+          return [];
+        });
       pathSpecs = req.pathSpecs.filter(
         (spec, i) => i < 2 || recorded.includes(spec.path),
       );
@@ -127,7 +132,7 @@ export async function createHistorySource(
         : undefined;
     };
 
-    // Query optional quality separately: an unsupported path must not lose soundings.
+    // Optional metadata failures leave usable original observations explicitly incomplete.
     const quality = new Map<string, GnssQuality>();
     if (positionSource && includeQuality) {
       try {
@@ -150,6 +155,14 @@ export async function createHistorySource(
               sourceRef: positionSource as SourceRef,
             })),
           });
+          if (
+            original &&
+            samples.data.length &&
+            !samples.values?.some((column) => column.$source === positionSource)
+          )
+            throw new Error(
+              "History did not identify the requested GNSS source",
+            );
           for (const row of samples.data) {
             const values: GnssQuality = {};
             samples.values?.forEach((column, i) => {
@@ -166,6 +179,7 @@ export async function createHistorySource(
           }
         }
       } catch (error) {
+        metadataIncomplete = true;
         app.debug("GNSS quality unavailable from history: %s", error);
       }
     }
@@ -204,6 +218,7 @@ export async function createHistorySource(
               courseOverGroundTrue: column(row, COG),
               speedOverGround: column(row, SOG),
               gnss: quality.get(Temporal.Instant.from(row[0]).toString()),
+              ...(metadataIncomplete ? { metadataIncomplete: true } : {}),
             };
           return {
             timestamp: Temporal.Instant.from(row[0]),
@@ -228,9 +243,9 @@ export async function createHistorySource(
 
     app.debug("Read %d bathymetry points from history", data.length);
 
-    if (data.length === 0) return;
+    if (data.length === 0 && !original) return;
 
-    return Readable.from(data);
+    return Object.assign(Readable.from(data), { metadataIncomplete });
   }
 
   /**
@@ -279,6 +294,8 @@ export async function createHistorySource(
     createWriter: undefined,
     createObservationReader: (window: Timeframe) =>
       createReader(window, true, true),
+    createObservationPreviewReader: (window: Timeframe) =>
+      createReader(window, false, true),
     createPreviewReader: (window: Timeframe) => createReader(window, false),
     ...(app.getTrackApi && app.selfId
       ? {

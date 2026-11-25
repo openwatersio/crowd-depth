@@ -20,6 +20,11 @@ import type { PreviewView } from "./history-preview.js";
 
 const HOUR = 3600_000;
 const DAY = 24 * HOUR;
+// A transient provider failure must not restart viewport discovery at the same completed page.
+const viewportProgress = new WeakMap<
+  BathymetrySource,
+  { key: string; before?: number; pending: Timeframe[] }
+>();
 const frame = (from: number, to: number) =>
   new Timeframe(
     Temporal.Instant.fromEpochMilliseconds(from),
@@ -328,8 +333,14 @@ export async function refineHistory({
   let incomplete = false;
   let consecutiveFailures = 0;
   const process = async (window: Timeframe) => {
-    const from = Math.max(since, window.from.epochMilliseconds);
-    const to = Math.min(end, window.to.epochMilliseconds);
+    const from = Math.max(
+      since,
+      Math.floor(window.from.epochMilliseconds / HOUR) * HOUR,
+    );
+    const to = Math.min(
+      end,
+      Math.ceil(window.to.epochMilliseconds / HOUR) * HOUR,
+    );
     // Always use deterministic hour boundaries, including for spatial hints.
     for (let stop = to; stop > from;) {
       const start = Math.max(from, Math.floor((stop - 1) / HOUR) * HOUR);
@@ -357,22 +368,40 @@ export async function refineHistory({
     const area = view();
     if (
       !area ||
-      !source.getStoredTimeframes ||
+      (!source.getStoredTimeframes && !source.getStoredTimeframePage) ||
       (JSON.stringify(area) === viewed && Date.now() - prioritizedAt < 5000)
     )
       return;
     viewed = JSON.stringify(area);
     prioritizedAt = Date.now();
     const [, west, south, east, north] = area;
-    const hints = await source.getStoredTimeframes(frame(since, end), [
-      west,
-      south,
-      east,
-      north,
-    ]);
-    for (const window of hints.slice(0, 64)) {
+    let hints: Timeframe[];
+    if (source.getStoredTimeframePage) {
+      const key = `${since}/${end}/${viewed}`;
+      let progress = viewportProgress.get(source);
+      if (progress?.key !== key || !progress.pending.length) {
+        const page = await source.getStoredTimeframePage(
+          frame(since, end),
+          [west, south, east, north],
+          progress?.key === key ? progress.before : undefined,
+        );
+        progress = { key, before: page.before, pending: [...page.windows] };
+        viewportProgress.set(source, progress);
+      }
+      hints = progress.pending;
+    } else
+      hints = [
+        ...(await source.getStoredTimeframes!(frame(since, end), [
+          west,
+          south,
+          east,
+          north,
+        ])),
+      ];
+    for (let i = 0; i < 64 && hints.length; i++) {
       if (JSON.stringify(view()) !== viewed) return;
-      await process(window);
+      // Keep unattempted hints across failures; a poisoned window must not pin the page.
+      await process(hints.shift()!);
     }
   };
   try {
@@ -423,6 +452,35 @@ export async function refineHistory({
       await setImmediate();
     }
     signal.throwIfAborted();
+    // Provider retention cannot establish completeness of the locally owned archive.
+    if (source.getStoredTimeframePage) {
+      let before: number | undefined;
+      do {
+        const previous = before;
+        const page = await request(
+          () =>
+            source.getStoredTimeframePage!(
+              frame(since, end),
+              [-180, -90, 180, 90],
+              before,
+            ),
+          signal,
+        );
+        before = page.before;
+        if (
+          before !== undefined &&
+          (!Number.isSafeInteger(before) ||
+            before < 1 ||
+            (previous !== undefined && before >= previous))
+        )
+          throw new Error("Owned history cursor did not advance");
+        for (const window of page.windows) {
+          await prioritize();
+          await process(window);
+        }
+        await setImmediate();
+      } while (before !== undefined);
+    }
     if (incomplete)
       throw new Error(
         "Some refinement windows remain pending; completed windows are retained",

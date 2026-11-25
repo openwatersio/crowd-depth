@@ -24,6 +24,7 @@ type Series = {
 function providerApp(response: Series) {
   const calls: { path: string; sourceRef?: string }[][] = [];
   const history = {
+    getPaths: async () => [],
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     getValues: async (query: any) => {
       calls.push(query.pathSpecs);
@@ -512,4 +513,72 @@ test("archive reader does not invent source IDs from requested settings", async 
   ))!.toArray();
   expect(points[0].depthSource).toBeUndefined();
   expect(points[0].positionSource).toBeUndefined();
+});
+
+test("returns usable original observations marked incomplete when optional GNSS lookup fails", async () => {
+  const { app: testApp } = providerApp({
+    data: [["2025-01-01T12:00:00Z", [1, 2], 3]],
+  });
+  const api = await testApp.getHistoryApi!();
+  api.getPaths = async () => {
+    throw Error("quality backend unavailable");
+  };
+  const source = await createHistorySource(testApp, {
+    ...config,
+    gnss: { ...config.gnss, source: "gps" },
+  });
+  const reader = await source!.createObservationReader!(
+    new Timeframe(from, to),
+  );
+  expect(reader).toHaveProperty("metadataIncomplete", true);
+  expect((await reader!.toArray())[0]).toMatchObject({
+    depth: 3,
+    metadataIncomplete: true,
+  });
+  // Reporting's optional metadata policy remains independent of durable archive replacement.
+  expect(await source!.createReader(new Timeframe(from, to))).toBeDefined();
+});
+
+test("a failed orientation discovery does not prevent reading available core observations", async () => {
+  const { app: testApp } = providerApp({ data: [] });
+  const api = await testApp.getHistoryApi!();
+  let reads = 0;
+  api.getValues = async () => {
+    reads++;
+    if (reads === 1) throw Error("optional paths unavailable");
+    return {
+      context: "vessels.self",
+      range: { from, to },
+      data: [["2025-01-01T12:00:00Z", [1, 2], 3]],
+    };
+  };
+  api.getPaths = async () => {
+    throw Error("paths unavailable");
+  };
+  const source = await createHistorySource(testApp, config);
+  const reader = await source!.createObservationReader!(
+    new Timeframe(from, to),
+  );
+  expect((await reader!.toArray())[0]).toMatchObject({
+    depth: 3,
+    metadataIncomplete: true,
+  });
+  expect(reads).toBe(2);
+});
+
+test("does not replace archived quality with source-unaware metadata", async () => {
+  const { app: testApp } = providerApp({
+    values: [{ path: "navigation.gnss.satellites", method: "first" }],
+    data: [["2025-01-01T12:00:00Z", 12]],
+  });
+  const api = await testApp.getHistoryApi!();
+  api.getPaths = async () => ["navigation.gnss.satellites"];
+  const source = await createHistorySource(testApp, {
+    ...config,
+    gnss: { ...config.gnss, source: "gps" },
+  });
+  const reader = await source!.createObservationReader!(
+    new Timeframe(from, to),
+  );
+  expect(reader).toHaveProperty("metadataIncomplete", true);
 });

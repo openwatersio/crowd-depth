@@ -40,6 +40,24 @@ async function fixture(
     rmSync(dir, { recursive: true, force: true });
   }
 }
+it("does not mark an empty metadata-failed acquisition full", async () =>
+  fixture(async (store) => {
+    for await (const _point of importObservations(
+      store,
+      provider(() =>
+        Object.assign(Readable.from([]), { metadataIncomplete: true }),
+      ),
+      context,
+      "empty-incomplete",
+      window,
+      new AbortController().signal,
+    )) {
+    }
+    expect(
+      await store.imported("empty-incomplete", start, start + 3600000),
+    ).toMatchObject({ stage: "partial", chunks: [] });
+  }));
+
 it("publishes a complete import after preserving every batch", async () =>
   fixture(async (store) => {
     const received = [];
@@ -153,5 +171,31 @@ it("does not count consumer processing time against reader creation's timeout", 
       ).toBe(true);
     } finally {
       spy.mockRestore();
+    }
+  }));
+
+it("records acquisition time rather than a slow consumer's completion time", async () =>
+  fixture(async (store) => {
+    const acquired = start + 3600000 + 1000;
+    const now = vi.spyOn(Date, "now").mockReturnValue(acquired);
+    try {
+      const iterator = importObservations(
+        store,
+        provider(() => Readable.from(points)),
+        context,
+        "source",
+        window,
+        new AbortController().signal,
+      );
+      await iterator.next();
+      now.mockReturnValue(acquired + 600000);
+      for await (const _ of iterator) {
+        /* finish after the provider settling horizon */
+      }
+      expect(
+        (await store.imported("source", start, start + 3600000))!.recorded,
+      ).toBe(acquired);
+    } finally {
+      now.mockRestore();
     }
   }));

@@ -1,0 +1,164 @@
+{
+  "build": "progressive-20261125-v29",
+  "active": false,
+  "scope": "Isolated synthetic source and import-index fixtures in the Pi Docker container; excludes rendering, browser paint, provider latency, and full-model HTTP concurrency.",
+  "measurements": [
+    {
+      "measurements": [
+        {
+          "phase": "first-import",
+          "firstMs": 251.560872,
+          "elapsedMs": 536.148897,
+          "spatialMs": 1.5313220000000456,
+          "count": 3600
+        },
+        {
+          "phase": "warm-replay",
+          "firstMs": 7.615038000000027,
+          "elapsedMs": 164.977176,
+          "spatialMs": 0.5521079999999756,
+          "count": 3600
+        },
+        {
+          "phase": "reopened-replay",
+          "firstMs": 95.98250099999996,
+          "elapsedMs": 240.83148799999992,
+          "spatialMs": 5.6969960000001265,
+          "count": 3600
+        },
+        {
+          "phase": "pruned-refresh",
+          "firstMs": 332.970018,
+          "elapsedMs": 542.1431209999998,
+          "spatialMs": 0.9522159999999076,
+          "count": 3600
+        }
+      ],
+      "providerCalls": 2,
+      "eventLoopMaxMs": 49.872895
+    },
+    {
+      "kind": "synthetic-import-index",
+      "windows": 1000,
+      "results": [
+        {
+          "name": "populated",
+          "p50Ms": 1.0509549999999876,
+          "p95Ms": 2.4507790000000114,
+          "maxMs": 2.609055999999981,
+          "samples": 30
+        },
+        {
+          "name": "middle-page",
+          "p50Ms": 0.8377529999999922,
+          "p95Ms": 1.4736190000000136,
+          "maxMs": 1.872208999999998,
+          "samples": 30
+        },
+        {
+          "name": "empty",
+          "p50Ms": 0.10140599999999722,
+          "p95Ms": 0.21618399999999838,
+          "maxMs": 0.28346100000001684,
+          "samples": 30
+        },
+        {
+          "name": "other-context-only",
+          "p50Ms": 0.1302400000000148,
+          "p95Ms": 0.2501089999999806,
+          "maxMs": 0.25220200000001114,
+          "samples": 30
+        },
+        {
+          "name": "outside-time",
+          "p50Ms": 0.1048150000000021,
+          "p95Ms": 0.2974229999999807,
+          "maxMs": 0.4656259999999861,
+          "samples": 30
+        }
+      ]
+    },
+    {
+      "kind": "synthetic-import-index",
+      "windows": 10000,
+      "results": [
+        {
+          "name": "populated",
+          "p50Ms": 1.5950810000000502,
+          "p95Ms": 2.6007960000000026,
+          "maxMs": 3.707029000000034,
+          "samples": 30
+        },
+        {
+          "name": "middle-page",
+          "p50Ms": 1.0946220000000153,
+          "p95Ms": 1.6362100000000055,
+          "maxMs": 2.032578000000001,
+          "samples": 30
+        },
+        {
+          "name": "empty",
+          "p50Ms": 0.0707219999999893,
+          "p95Ms": 0.10881400000005215,
+          "maxMs": 0.11627699999996821,
+          "samples": 30
+        },
+        {
+          "name": "other-context-only",
+          "p50Ms": 0.3767379999999889,
+          "p95Ms": 0.4753109999999765,
+          "maxMs": 1.0550660000000107,
+          "samples": 30
+        },
+        {
+          "name": "outside-time",
+          "p50Ms": 0.08216600000002927,
+          "p95Ms": 0.10855500000002394,
+          "maxMs": 0.2138320000000249,
+          "samples": 30
+        }
+      ]
+    },
+    {
+      "kind": "synthetic-import-index",
+      "windows": 100000,
+      "results": [
+        {
+          "name": "populated",
+          "p50Ms": 1.6501180000000204,
+          "p95Ms": 2.429168000000118,
+          "maxMs": 2.6037969999997586,
+          "samples": 30
+        },
+        {
+          "name": "middle-page",
+          "p50Ms": 1.7900250000002416,
+          "p95Ms": 2.0346700000000055,
+          "maxMs": 2.1377809999999045,
+          "samples": 30
+        },
+        {
+          "name": "empty",
+          "p50Ms": 0.09040700000014112,
+          "p95Ms": 0.15864700000020093,
+          "maxMs": 0.22655399999985093,
+          "samples": 30
+        },
+        {
+          "name": "other-context-only",
+          "p50Ms": 9.624283999999989,
+          "p95Ms": 12.033488999999918,
+          "maxMs": 12.337616000000253,
+          "samples": 30
+        },
+        {
+          "name": "outside-time",
+          "p50Ms": 0.0856100000000879,
+          "p95Ms": 0.1919620000003306,
+          "maxMs": 0.2892199999996592,
+          "samples": 30
+        }
+      ]
+    }
+  ]
+}

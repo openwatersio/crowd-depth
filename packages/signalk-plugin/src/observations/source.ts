@@ -1,6 +1,8 @@
+import { ObservationDataError, isObservationDataError } from "./errors.js";
 import { Readable } from "node:stream";
 import { Temporal } from "@js-temporal/polyfill";
 import { depthReference, type Config } from "../config.js";
+import { BATHY_REPORT_DELAY } from "../constants.js";
 import { bowBearing } from "../streams/transforms.js";
 import {
   Timeframe,
@@ -9,7 +11,7 @@ import {
 } from "../types.js";
 import type { createObservationStore } from "./client.js";
 import { importObservations } from "./import.js";
-import type { Acquisition } from "./store.js";
+import { type Acquisition, type AcquisitionStage } from "./store.js";
 
 /** History is an acquisition source; published manifests own subsequent reads. */
 export function storedHistorySource(
@@ -35,28 +37,50 @@ export function storedHistorySource(
   const importing = new Map<string, Promise<void>>();
   const requesting = new Set<string>();
   // A timed-out provider may still be running. Keep its reservation until it settles.
+  async function acquire(window: Timeframe, preview: boolean) {
+    const stage = preview ? "preview" : "full";
+    const key = `${stage}:${window.from}/${window.to}`;
+    if (
+      requesting.has(key) ||
+      [...requesting].filter((key) => key.startsWith(`${stage}:`)).length >= 2
+    )
+      throw new Error("Observation provider request still pending");
+    requesting.add(key);
+    try {
+      const read = preview
+        ? upstream.createObservationPreviewReader!
+        : upstream.createObservationReader!;
+      return await read.call(upstream, window);
+    } finally {
+      requesting.delete(key);
+    }
+  }
   const provider: BathymetrySource = {
     ...upstream,
-    async createObservationReader(window) {
-      const key = `${window.from}/${window.to}`;
-      if (requesting.has(key) || requesting.size >= 4)
-        throw new Error("Observation provider request still pending");
-      requesting.add(key);
-      try {
-        return await upstream.createObservationReader!(window);
-      } finally {
-        requesting.delete(key);
-      }
-    },
+    createObservationReader: (window) => acquire(window, false),
+    ...(upstream.createObservationPreviewReader
+      ? {
+          createObservationPreviewReader: (window: Timeframe) =>
+            acquire(window, true),
+        }
+      : {}),
   };
   async function* replay(chunks: readonly number[], window: Timeframe) {
     // The receipt is a snapshot. New imports cannot splice versions into this read.
     for (const id of chunks) {
       signal.throwIfAborted();
-      const chunk = await store.read(id);
-      if (!chunk) throw new Error(`Missing published observation chunk ${id}`);
+      const chunk = await store.readRange(
+        id,
+        window.from.epochMilliseconds,
+        window.to.epochMilliseconds,
+      );
+      if (chunk === null) continue;
+      if (!chunk)
+        throw new ObservationDataError(
+          `Missing published observation chunk ${id}`,
+        );
       if (JSON.stringify(chunk.acquisition) !== identity)
-        throw new Error(
+        throw new ObservationDataError(
           `Observation chunk ${id} has incompatible acquisition settings`,
         );
       for (const point of chunk.points) {
@@ -70,27 +94,137 @@ export function storedHistorySource(
       }
     }
   }
+  async function manifests(window: Timeframe) {
+    const snapshots: {
+      start: number;
+      end: number;
+      recorded: number;
+      chunks: number[];
+      stage: AcquisitionStage;
+      origins?: Uint8Array;
+    }[] = [];
+    const start = window.from.epochMilliseconds,
+      end = window.to.epochMilliseconds;
+    const exact = await store.imported(identity, start, end);
+    if (exact?.chunks.length) snapshots.push({ start, end, ...exact });
+    let before: number | undefined;
+    for (let pages = 0; pages < 64; pages++) {
+      signal.throwIfAborted();
+      const page = await store.importedPageInView(
+        identity,
+        window.from.epochMilliseconds,
+        window.to.epochMilliseconds,
+        [-180, -90, 180, 90],
+        before,
+      );
+      for (const bounds of page.windows) {
+        if (
+          exact?.chunks.length &&
+          bounds.start === start &&
+          bounds.end === end
+        )
+          continue;
+        const saved = await store.imported(identity, bounds.start, bounds.end);
+        if (saved) snapshots.push({ ...bounds, ...saved });
+      }
+      if (page.before === undefined) return snapshots;
+      if (before !== undefined && page.before >= before)
+        throw new ObservationDataError("Owned window cursor did not advance");
+      before = page.before;
+    }
+    throw new ObservationDataError("Owned window exceeds manifest page limit");
+  }
+  async function* replayWindow(window: Timeframe, atomic = false) {
+    const snapshots = await manifests(window);
+    if (snapshots.length === 1 && !atomic) {
+      yield* replay(snapshots[0].chunks, window);
+      return;
+    }
+    signal.throwIfAborted();
+    const id = await store.openMergedRead(
+      identity,
+      snapshots,
+      window.from.epochMilliseconds,
+      window.to.epochMilliseconds,
+    );
+    try {
+      for (;;) {
+        signal.throwIfAborted();
+        const { points, done } = await store.readMergedPage(id);
+        for (const point of points) {
+          signal.throwIfAborted();
+          yield point;
+        }
+        if (done) return;
+      }
+    } finally {
+      await store.closeMergedRead(id);
+    }
+  }
   async function* observations(window: Timeframe, preview: boolean) {
     signal.throwIfAborted();
-    const key = `${window.from}/${window.to}`;
+    const partial = preview && !!provider.createObservationPreviewReader;
+    const key = `${partial ? "preview" : "full"}:${window.from}/${window.to}`;
     const receipt = () =>
       store.imported(
         identity,
         window.from.epochMilliseconds,
         window.to.epochMilliseconds,
       );
-    let saved = await receipt();
-    if (saved && (preview || saved.fresh)) {
-      yield* replay(saved.chunks, window);
-      return;
+    let saved: Awaited<ReturnType<typeof receipt>> = undefined;
+    let hasOwned: boolean;
+    try {
+      saved = await receipt();
+      hasOwned = !!saved?.chunks.length || (await manifests(window)).length > 0;
+    } catch (error) {
+      if (!isObservationDataError(error)) throw error;
+      // Corrupt retained evidence must not prevent acquiring new originals.
+      // Persist the acquisition first; replay still fails until the hole is repaired.
+      hasOwned = true;
+    }
+    if (preview && hasOwned && !saved) {
+      // Show retained overlap immediately, then acquire the requested window.
+      // Preview consumers replace observations in place; QC emits one merged snapshot.
+      try {
+        yield* replayWindow(window, !preview);
+      } catch (error) {
+        if (!isObservationDataError(error)) throw error;
+      }
+    }
+    // A preview acquired before provider buffering settled never becomes QC-complete merely by aging.
+    const settled = (recorded: number) =>
+      recorded >= window.to.add(BATHY_REPORT_DELAY).epochMilliseconds;
+    if (
+      saved &&
+      (preview ||
+        ((saved.stage === "full" || saved.stage === "partial") &&
+          saved.fresh &&
+          settled(saved.recorded)))
+    ) {
+      try {
+        yield* replayWindow(window, !preview);
+        return;
+      } catch (error) {
+        if (!isObservationDataError(error)) throw error;
+      }
     }
     while (importing.has(key)) {
       await importing.get(key);
       signal.throwIfAborted();
       saved = await receipt();
-      if (saved?.fresh) {
-        yield* replay(saved.chunks, window);
-        return;
+      if (
+        saved &&
+        (preview ||
+          ((saved.stage === "full" || saved.stage === "partial") &&
+            saved.fresh &&
+            settled(saved.recorded)))
+      ) {
+        try {
+          yield* replayWindow(window, !preview);
+          return;
+        } catch (error) {
+          if (!isObservationDataError(error)) throw error;
+        }
       }
     }
     let release!: () => void;
@@ -101,14 +235,25 @@ export function storedHistorySource(
       }),
     );
     try {
-      yield* importObservations(
+      const incoming = importObservations(
         store,
         provider,
         acquisition,
         identity,
         window,
         signal,
+        partial,
       );
+      if (saved || hasOwned) {
+        // QC consumes the reconciled snapshot, including observations pruned upstream.
+        for await (const _point of incoming) {
+          /* persist incoming versions */
+        }
+        const reconciled = await receipt();
+        if (!reconciled)
+          throw new Error("Completed import has no observation receipt");
+        yield* replayWindow(window, !preview);
+      } else yield* incoming;
     } finally {
       importing.delete(key);
       release();
@@ -156,13 +301,42 @@ export function storedHistorySource(
     ...upstream,
     createObservationReader: (window) =>
       Readable.from(observations(window, false)),
+    createObservationPreviewReader: (window) =>
+      Readable.from(observations(window, true)),
     createReader: (window) => reader(window, false),
     createPreviewReader: (window) => reader(window, true),
     getStoredTimeframes: stored,
+    async getStoredTimeframePage(span, bounds, before) {
+      const page = await store.importedPageInView(
+        identity,
+        span.from.epochMilliseconds,
+        span.to.epochMilliseconds,
+        bounds,
+        before,
+      );
+      return {
+        windows: page.windows.map(({ start, end }) =>
+          new Timeframe(
+            Temporal.Instant.fromEpochMilliseconds(start),
+            Temporal.Instant.fromEpochMilliseconds(end),
+          ).clamp(span),
+        ),
+        before: page.before,
+      };
+    },
     async getPreviewTimeframes(span, bounds) {
       const local = await stored(span, bounds);
-      if (local.length || !upstream.getPreviewTimeframes) return local;
-      return upstream.getPreviewTimeframes(span, bounds);
+      if (!upstream.getPreviewTimeframes) return local;
+      const remote = await upstream.getPreviewTimeframes(span, bounds);
+      const merged = new Map<string, Timeframe>();
+      // Neither hint source is complete; reserve room for undiscovered visits.
+      for (let i = 0; i < 64 && merged.size < 64; i++) {
+        for (const window of [remote[i], local[i]]) {
+          if (window && merged.size < 64)
+            merged.set(`${window.from}/${window.to}`, window);
+        }
+      }
+      return [...merged.values()];
     },
   };
 }
