@@ -3,6 +3,8 @@
 Thanks for helping vessels share depth data! This doc covers how the repo is
 organized, how to develop and test each piece, and how releases work.
 
+Every change follows the org-wide [rigor rules](https://github.com/openwatersio/.github/blob/main/docs/agents/rigor.md). The first of them: when something fails or looks wrong, find the cause and fix it there instead of working around it.
+
 ## Repository layout
 
 This is an npm workspaces monorepo with two npm packages and one Python project:
