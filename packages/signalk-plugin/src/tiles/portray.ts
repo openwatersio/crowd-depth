@@ -285,12 +285,24 @@ export function cut(
     (Math.min(w - 1, x1 - ox) + 1) * u - 1,
     (Math.min(w - 1, y1 - oy) + 1) * u - 1,
   ];
-  const fine = upsample(slice(p.depth), w, u, true, samples, DEEP).map((d, i) =>
-    Math.min(d, caps[i]),
+  const fine = upsample(slice(p.depth), w, u, true, samples, DEEP);
+  const fineWet = upsample(slice(p.wet), w, u, true, samples, DEEP);
+  const extent = upsample(slice(p.extent), w, u, false, samples, FAR_EXTENT);
+  const measured = upsample(
+    slice(p.measured),
+    w,
+    u,
+    false,
+    samples,
+    FAR_MEASURED,
   );
-  const fineWet = upsample(slice(p.wet), w, u, true, samples, DEEP).map(
-    (d, i) => Math.min(d, caps[i]),
-  );
+  // These arrays belong to this cut; transform them without allocating copies.
+  for (let i = 0; i < fine.length; i++) {
+    fine[i] = Math.min(fine[i], caps[i]);
+    fineWet[i] = Math.min(fineWet[i], caps[i]);
+    extent[i] *= u;
+    measured[i] *= u;
+  }
   const depthSlope = slope(fine, m, samples);
   return {
     m,
@@ -299,17 +311,8 @@ export function cut(
     wet: fineWet,
     depthSlope,
     wetSlope: slope(fineWet, m, samples),
-    extent: upsample(slice(p.extent), w, u, false, samples, FAR_EXTENT).map(
-      (e) => e * u,
-    ),
-    measured: upsample(
-      slice(p.measured),
-      w,
-      u,
-      false,
-      samples,
-      FAR_MEASURED,
-    ).map((e) => e * u),
+    extent,
+    measured,
     toTile: (s: number) => Math.round((s / u - PAD_PX) * scale),
   };
 }

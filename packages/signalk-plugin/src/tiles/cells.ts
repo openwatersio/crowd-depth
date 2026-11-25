@@ -375,8 +375,14 @@ export function createCellStore(db: DatabaseSync, generation?: string) {
     }
   };
 
+  const windowSuperseded = (start: number, end: number) =>
+    !!db
+      .prepare("SELECT 1 FROM refined_windows WHERE start=? AND end>? LIMIT 1")
+      .get(start, end);
+
   return {
     generation,
+    windowSuperseded,
     windowDone(start: number, end: number, includeEmpty = true) {
       return !!db
         .prepare(
@@ -387,6 +393,14 @@ export function createCellStore(db: DatabaseSync, generation?: string) {
     /** A successful empty read is coverage, not permission to erase live evidence. */
     completeEmptyWindow(start: number, end: number) {
       transaction(() => {
+        if (
+          db
+            .prepare(
+              "SELECT 1 FROM refined_windows WHERE start=? AND end>? UNION ALL SELECT 1 FROM refined_empty_windows WHERE start=? AND end>? LIMIT 1",
+            )
+            .get(start, end, start, end)
+        )
+          return;
         db.prepare("DELETE FROM refined_empty_windows WHERE start=?").run(
           start,
         );
@@ -400,6 +414,8 @@ export function createCellStore(db: DatabaseSync, generation?: string) {
      * A crash before commit leaves the previous contribution intact. */
     replaceWindow(start: number, end: number, passes: Pass[], shoals: Shoal[]) {
       return transaction(() => {
+        // A slower partial-hour job must not retract a completed extended tail.
+        if (windowSuperseded(start, end)) return [];
         const job = `window:${start}`;
         const positions = new Map<string, { py: number; px: number }>();
         const hours = new Map<string, Set<number>>();

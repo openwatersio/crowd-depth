@@ -246,7 +246,11 @@ export async function refineHistory({
   signal.addEventListener("abort", abort, { once: true });
   const run = async (start: number, stop: number) => {
     signal.throwIfAborted();
-    if (store.windowDone(start, stop, !windows)) return;
+    if (
+      store.windowDone(start, stop, !windows) ||
+      store.windowSuperseded(start, stop)
+    )
+      return;
     // Read one adjacent hour on each side for QC context. Ownership stays in
     // the central interval, so a boundary never adds the same observation twice.
     const lo = Math.max(since, Math.floor(start / HOUR) * HOUR - HOUR);
@@ -535,12 +539,17 @@ export async function refineVisible({
       .filter(
         (h) =>
           (retryAt.get(h) ?? 0) <= Date.now() &&
+          !options.store.windowSuperseded(h, Math.min(h + HOUR, end)) &&
           !options.store.windowDone(h, Math.min(h + HOUR, end), false),
       )
       .slice(0, 4)) {
       if (options.signal.aborted) return;
       const stop = Math.min(hour + HOUR, end);
-      if (options.store.windowDone(hour, stop, false)) continue;
+      if (
+        options.store.windowDone(hour, stop, false) ||
+        options.store.windowSuperseded(hour, stop)
+      )
+        continue;
       onBusy(true);
       try {
         await refineHistory({ ...options, windows: [frame(hour, stop)] });

@@ -652,3 +652,72 @@ test("segmented history may complete a healthy hour beyond the single-request de
     db.close();
   }
 });
+
+test("a late shorter refinement cannot retract an extended window", () => {
+  const db = createDB(":memory:"),
+    store = createCellStore(db);
+  try {
+    const earlier = pass(4, 0);
+    const later = {
+      ...pass(8, 0),
+      py: position.py + 1,
+      time: (ms + 50 * 60000) * 1000,
+    };
+    store.replaceWindow(ms, ms + HOUR, [earlier, later], []);
+    const before = cells(store);
+    expect(
+      store.replaceWindow(ms, ms + HOUR / 2, [{ ...earlier, depth: 3 }], []),
+    ).toEqual([]);
+    expect(cells(store)).toEqual(before);
+    expect(store.windowDone(ms, ms + HOUR)).toBe(true);
+    expect(store.windowDone(ms, ms + HOUR / 2)).toBe(false);
+    store.completeEmptyWindow(ms, ms + HOUR / 2);
+    expect(
+      db.prepare("SELECT count(*) n FROM refined_empty_windows").get(),
+    ).toEqual({ n: 0 });
+    expect(cells(store)).toEqual(before);
+  } finally {
+    db.close();
+  }
+});
+
+test("superseded partial windows skip acquisition and visible worker scheduling", async () => {
+  const { refineVisible } = await import("../../src/tiles/refine.js");
+  const db = createDB(":memory:"),
+    store = createCellStore(db);
+  const read = vi.fn(() => undefined);
+  const source: BathymetrySource = {
+    createReader: read,
+    getAvailableTimeframes: () => [],
+  };
+  const end = at.add({ minutes: 30 });
+  try {
+    store.replaceWindow(ms, ms + HOUR, [pass(4, 0)], []);
+    await refineHistory({
+      source,
+      store,
+      config,
+      availableThrough: end,
+      windows: [new Timeframe(at, end)],
+      signal: new AbortController().signal,
+    });
+    expect(read).not.toHaveBeenCalled();
+    const abort = new AbortController(),
+      onBusy = vi.fn();
+    const visible = refineVisible({
+      source,
+      store,
+      config,
+      availableThrough: end,
+      signal: abort.signal,
+      timestamps: () => [ms + 1],
+      onBusy,
+    });
+    abort.abort();
+    await visible;
+    expect(onBusy).not.toHaveBeenCalled();
+    expect(read).not.toHaveBeenCalled();
+  } finally {
+    db.close();
+  }
+});

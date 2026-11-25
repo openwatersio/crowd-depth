@@ -8,12 +8,25 @@ type Sensor = {
   fromCenter: number | null;
 };
 
+/** Replace streams have no per-sample flag distinguishing raw from corrected fixes. */
+export function assertGnssPositionMode(app: ServerAPI) {
+  const settings = (
+    app as ServerAPI & { config?: { settings?: { gnssCorrection?: string } } }
+  ).config?.settings;
+  if (settings?.gnssCorrection === "replace") {
+    throw new Error(
+      "Signal K GNSS replace mode mixes raw and corrected positions when heading is unavailable. Use both mode and select the raw GPS source or its .ccrp source, then restart Crowd Depth.",
+    );
+  }
+}
+
 /** Signal K's per-source geometry; never fall back to another antenna's offsets. */
 export function gnssOffsets(
   app: ServerAPI,
   source: string | undefined,
   legacy?: { x?: number; y?: number; source?: string },
 ) {
+  assertGnssPositionMode(app);
   const { settings } =
     (
       app as ServerAPI & {
@@ -52,13 +65,6 @@ export function gnssOffsets(
   if (!sensor || !finite(sensor.fromBow) || !finite(sensor.fromCenter)) {
     throw new Error(
       "Set the selected GPS source's distance from bow and centerline in Signal K's GNSS sensor settings, then restart Crowd Depth.",
-    );
-  }
-  // In replace mode a source can contain both raw and corrected positions when
-  // heading is unavailable. History has no per-sample flag to distinguish them.
-  if (mode === "replace") {
-    throw new Error(
-      "Signal K GNSS replace mode mixes raw and corrected positions when heading is unavailable. Use both mode and select the raw GPS source or its .ccrp source, then restart Crowd Depth.",
     );
   }
   const gnss = { x: sensor.fromCenter, y: sensor.fromBow };

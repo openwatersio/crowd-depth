@@ -1,6 +1,6 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { createSourceDiscovery } from "./source-discovery.js";
-import { gnssOffsets } from "./gnss-offsets.js";
+import { assertGnssPositionMode, gnssOffsets } from "./gnss-offsets.js";
 import { ServerAPI, Plugin } from "@signalk/server-api";
 import {
   schema,
@@ -61,6 +61,12 @@ export default function createPlugin(app: ServerAPI): Plugin {
       };
       current = session;
       const ready = (config: Config) => {
+        try {
+          assertGnssPositionMode(app);
+        } catch (error) {
+          status.error(error, "configuration");
+          return;
+        }
         const db = createDB(join(app.getDataDirPath(), `bathymetry.sqlite`));
         const createChart = () => {
           if (controller.signal.aborted) return undefined;

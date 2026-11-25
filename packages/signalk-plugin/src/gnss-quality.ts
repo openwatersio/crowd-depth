@@ -1,5 +1,6 @@
 import type { ServerAPI } from "@signalk/server-api";
 import { Temporal } from "@js-temporal/polyfill";
+import { sameSource } from "./device-info.js";
 
 // Preserve Signal K names and SI units in the report's gnss extension.
 export const GNSS_FIELDS = {
@@ -39,18 +40,28 @@ export function liveGnssQuality(
     const node = app.getSelfPath(`navigation.gnss.${field}`) as
       | (Sample & { $source?: string; values?: Record<string, Sample> })
       | undefined;
-    const sample = node?.$source === source ? node : node?.values?.[source];
-    if (!sample?.timestamp) continue;
-    try {
-      const age =
-        time.epochMilliseconds -
-        Temporal.Instant.from(sample.timestamp).epochMilliseconds;
-      if (age < 0 || age > 2000) continue;
-    } catch {
-      continue;
+    const samples = Object.entries(node?.values ?? {})
+      .filter(([ref]) => sameSource(app, ref, source))
+      .map(([, sample]) => sample);
+    if (node && sameSource(app, node.$source, source)) samples.unshift(node);
+    let youngest = Infinity;
+    for (const sample of samples) {
+      if (!sample?.timestamp) continue;
+      let age: number;
+      try {
+        age =
+          time.epochMilliseconds -
+          Temporal.Instant.from(sample.timestamp).epochMilliseconds;
+      } catch {
+        continue;
+      }
+      if (age < 0 || age > 2000 || age >= youngest) continue;
+      const value = qualityValue(field, sample.value);
+      if (value !== undefined) {
+        result[field] = value;
+        youngest = age;
+      }
     }
-    const value = qualityValue(field, sample.value);
-    if (value !== undefined) result[field] = value;
   }
   return Object.keys(result).length ? result : undefined;
 }

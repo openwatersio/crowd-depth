@@ -250,3 +250,24 @@ test("malformed cached or streamed fixes cannot poison original recording", () =
   expect(s.stream.read()).toMatchObject({ depth: 4 });
   s.stream.destroy();
 });
+
+test("raw and corrected live readers retain quality for a stable receiver alias", () => {
+  for (const original of [false, true]) {
+    const timestamp = "2026-01-01T00:00:00Z";
+    const s = setup(
+      "",
+      "bus.stable",
+      () => undefined,
+      {
+        $source: "bus.35",
+        value: 12,
+        timestamp,
+      },
+      original,
+    );
+    s.send(position, "bus.35", { longitude: 1, latitude: 2 });
+    s.send(depth, "depth.one", 3);
+    expect(s.stream.read().gnss).toEqual({ satellites: 12 });
+    s.stream.destroy();
+  }
+});

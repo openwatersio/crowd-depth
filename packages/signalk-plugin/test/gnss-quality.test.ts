@@ -45,3 +45,56 @@ test("quality follows the chosen GPS and rejects stale, future and malformed val
   });
   expect(liveGnssQuality(app, undefined, now)).toBeUndefined();
 });
+
+test.each([true, false])(
+  "quality accepts a receiver's CAN-name alias (active=%s)",
+  (active) => {
+    const app = {
+      getPath: () => ({ bus: { "35": { n2k: { canName: "stable" } } } }),
+      getSelfPath: (path: string) =>
+        path.endsWith("satellites")
+          ? {
+              $source: active ? "bus.35" : "other.35",
+              value: active ? 12 : 99,
+              timestamp: now.toString(),
+              values: { "bus.35": { value: 12, timestamp: now.toString() } },
+            }
+          : undefined,
+    } as unknown as ServerAPI;
+    expect(liveGnssQuality(app, "bus.stable", now)).toEqual({ satellites: 12 });
+    expect(liveGnssQuality(app, "different.stable", now)).toBeUndefined();
+    expect(
+      liveGnssQuality(app, "bus.stable", now.add({ seconds: 3 })),
+    ).toBeUndefined();
+  },
+);
+
+test.each([true, false])(
+  "fresh receiver quality survives a stale CAN alias (active=%s)",
+  (active) => {
+    const app = {
+      getPath: () => ({
+        bus: {
+          "35": { n2k: { canName: "stable" } },
+          "36": { n2k: { canName: "stable" } },
+        },
+      }),
+      getSelfPath: (path: string) =>
+        path.endsWith("satellites")
+          ? {
+              $source: active ? "bus.35" : "other.1",
+              value: 7,
+              timestamp: now.subtract({ seconds: 10 }).toString(),
+              values: {
+                "bus.35": {
+                  value: 7,
+                  timestamp: now.subtract({ seconds: 10 }).toString(),
+                },
+                "bus.36": { value: 12, timestamp: now.toString() },
+              },
+            }
+          : undefined,
+    } as unknown as ServerAPI;
+    expect(liveGnssQuality(app, "bus.stable", now)).toEqual({ satellites: 12 });
+  },
+);

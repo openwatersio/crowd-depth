@@ -11,6 +11,36 @@ const Z = 14;
 const LON = -76.2;
 const LAT = 36.98;
 
+test.each([1, 2, 4])(
+  "cut at scale %i leaves shared prepared fields intact",
+  (u) => {
+    const n = 4;
+    const w = n + 2 * PAD_PX;
+    const p = {
+      w,
+      depth: new Float64Array(w * w).fill(9),
+      wet: new Float64Array(w * w).fill(8),
+      extent: new Float64Array(w * w).fill(1),
+      measured: new Float64Array(w * w).fill(-1),
+      shoal: new Float64Array(w * w).fill(2),
+      window: [0, 0, w - 1, w - 1] as [number, number, number, number],
+    };
+    const saved = structuredClone(p);
+    const first = cut(p, 0, 0, n, u);
+    const second = cut(p, 0, 0, n, u);
+    expect(p).toEqual(saved);
+    for (const key of ["depth", "wet", "extent", "measured"] as const) {
+      expect(first[key]).toEqual(second[key]);
+      expect(first[key].buffer).not.toBe(p[key].buffer);
+    }
+    const middle = Math.floor(first.depth.length / 2) + Math.floor(first.m / 2);
+    expect(first.depth[middle]).toBe(2);
+    expect(first.wet[middle]).toBe(2);
+    expect(first.extent[middle]).toBe(u);
+    expect(first.measured[middle]).toBe(-u);
+  },
+);
+
 test("a one-sample cut preserves depths and leaves missing water outside the window", () => {
   const n = 4,
     w = n + 2 * PAD_PX;

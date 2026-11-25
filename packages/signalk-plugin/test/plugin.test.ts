@@ -222,6 +222,37 @@ describe("plugin", () => {
     }
   });
 
+  test.each([true, false])(
+    "saved offsets cannot bypass replace-mode validation (saved path=%s)",
+    async (savedPath) => {
+      Object.assign(app, {
+        config: { settings: { gnssCorrection: "replace" } },
+      });
+      app.getSelfPath = ((path: string) =>
+        path === "environment.depth.belowTransducer"
+          ? { $source: "depth.one" }
+          : undefined) as typeof app.getSelfPath;
+      const charts = vi.mocked(startChartSafely).mock.calls.length;
+      const captures = vi.mocked(collectObservations).mock.calls.length;
+      const plugin = createPlugin(app);
+      try {
+        plugin.start(
+          { ...config, path: savedPath ? config.path : undefined },
+          () => {},
+        );
+        await vi.waitFor(() =>
+          expect(setPluginError).toHaveBeenCalledWith(
+            expect.stringContaining("replace mode"),
+          ),
+        );
+        expect(vi.mocked(startChartSafely).mock.calls.length).toBe(charts);
+        expect(vi.mocked(collectObservations).mock.calls.length).toBe(captures);
+      } finally {
+        await plugin.stop();
+      }
+    },
+  );
+
   test("settings from the progressive preview resolve a missing depth path", async () => {
     app.getSelfPath = ((path: string) =>
       path === "environment.depth.belowTransducer"
