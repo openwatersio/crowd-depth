@@ -62,6 +62,34 @@ try {
         samples: ms.length,
       });
     }
+    // Many overlapping visits in one day used to pass the day index and all
+    // reach the exact-time filter before LIMIT could stop an empty lookup.
+    db.exec(`BEGIN;
+      UPDATE observation_import_windows SET identity='history',start=id,end=id+1;
+      UPDATE observation_import_spatial SET min_lon=-800000000,max_lon=-800000000,
+        min_context=1,max_context=1,min_day=0,max_day=0;
+      COMMIT;`);
+    const sameDay = [];
+    for (let i = 0; i < 30; i++) {
+      const begin = performance.now();
+      const page = store.importedPageInView(
+        "history",
+        count + 100,
+        count + 101,
+        [-81, 25, -79, 27],
+      );
+      sameDay.push(performance.now() - begin);
+      assert.equal(page.windows.length, 0);
+      assert.notEqual(page.before, undefined);
+    }
+    sameDay.sort((a, b) => a - b);
+    results.push({
+      name: "empty-same-day-first-page",
+      p50Ms: sameDay[15],
+      p95Ms: sameDay[28],
+      maxMs: sameDay[29],
+      samples: 30,
+    });
     console.log(
       JSON.stringify({
         kind: "synthetic-import-index",

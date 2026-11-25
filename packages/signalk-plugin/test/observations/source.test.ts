@@ -755,3 +755,80 @@ it.each([
       ).toBeUndefined();
     }),
 );
+
+it("replays owned history past empty candidate pages without requesting an offline provider", async () => {
+  const { openObservationStore } =
+    await import("../../src/observations/store.js");
+  const store = openObservationStore(":memory:");
+  let offline = false;
+  const read = vi.fn(() => {
+    if (offline) throw new Error("provider offline");
+    return Readable.from([point]);
+  });
+  const source = storedHistorySource(
+    store as never,
+    upstream(read),
+    config,
+    new AbortController().signal,
+  );
+  try {
+    await (await source.createReader(window))!.toArray();
+    const original = store.read(store.query(from, from + 3600000)[0].id)!;
+    const acquisition = original.acquisition;
+    const identity = JSON.stringify(acquisition);
+    const after = from + 3600000;
+    const later = store.append(acquisition, [
+      { ...point, timestamp: new Date(after).toISOString() },
+    ]);
+    for (let i = 1; i <= 10000; i++)
+      store.publishImport(identity, after, after + i, [later.id]);
+    offline = true;
+    read.mockClear();
+    const rows = await (await source.createPreviewReader!(window))!.toArray();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].timestamp.toString()).toBe(point.timestamp);
+    expect(read).not.toHaveBeenCalled();
+  } finally {
+    store.close();
+  }
+});
+
+it("cancels an owned manifest scan between empty pages when its reader closes", async () => {
+  const { openObservationStore } =
+    await import("../../src/observations/store.js");
+  const store = openObservationStore(":memory:");
+  const controller = new AbortController();
+  const pages = vi
+    .spyOn(store, "importedPageInView")
+    .mockImplementation((_identity, _from, _to, _bounds, before = 1000000) => ({
+      windows: [],
+      before: before - 1,
+    }));
+  const provider = vi.fn(() => {
+    throw Error("must not request provider");
+  });
+  const source = storedHistorySource(
+    store as never,
+    upstream(provider),
+    config,
+    controller.signal,
+  );
+  const reader = (await source.createPreviewReader!(window))!;
+  const result = reader.toArray();
+  void result.catch(() => {});
+  try {
+    await expect.poll(() => pages.mock.calls.length).toBeGreaterThan(1);
+    reader.destroy(new Error("reader stopped"));
+    await expect(result).rejects.toThrow();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const count = pages.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(pages).toHaveBeenCalledTimes(count);
+    expect(provider).not.toHaveBeenCalled();
+  } finally {
+    controller.abort();
+    reader.destroy();
+    await result.catch(() => {});
+    store.close();
+  }
+});

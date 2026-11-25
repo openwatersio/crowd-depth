@@ -25,6 +25,20 @@ issues; their regression tests failed before the fixes. The focused external
 follow-up found no new issues in those fixes. Broader canonical selection,
 refinement retirement, input revision and hardware acceptance blockers remain open.
 
+The same candidate-first query fix now also applies to historical import discovery,
+which production chart readers use. The new regression follows empty pages to an
+older matching window. All 719 tests in this checkpoint and plugin lint pass
+locally. The focused mapped external review found no new issues, but independent
+internal review subsequently reproduced a caller regression: replay exhausted its
+64-page budget on empty candidates and requested an offline provider despite
+retained evidence. Replay now limits matching manifests, yields between pages,
+and honors reader-specific cancellation. Both regressions pass; the internal
+reviewer verified the fixes and all 25 source tests. This caller fix was made
+after the third external round; no fourth external review was run. Local index-only scaling includes
+100,000 same-day candidates; [raw results](import-index-candidates-nov25.json)
+measure pages, not whole traversal. Pi transfer was blocked by SSH signing, so
+these new import-query figures are not hardware acceptance evidence.
+
 ## Earlier checkpoint — November 25, v39
 
 Release acceptance is **not met**. The working tree uses observation schema v7;

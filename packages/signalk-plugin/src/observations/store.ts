@@ -980,14 +980,11 @@ export function openObservationStore(file: string) {
         .prepare("SELECT id FROM observation_import_contexts WHERE identity=?")
         .get(identity)?.id;
       if (context === undefined) return { windows: [] };
-      // CROSS JOIN fixes the spatial index as the outer loop. Sorting all matches would
-      // turn a bounded hint read into a whole-archive scan in dense anchorages.
-      const query =
-        db.prepare(`SELECT w.start,w.end FROM observation_import_spatial s
-        CROSS JOIN observation_import_windows w ON w.id=s.id
+      // Bound index candidates before exact filtering, including empty time ranges.
+      const query = db.prepare(`SELECT s.id FROM observation_import_spatial s
         WHERE s.min_context<=? AND s.max_context>=? AND s.min_day<=? AND s.max_day>=?
           AND s.max_lon>=? AND s.min_lon<=? AND s.max_lat>=? AND s.min_lat<=?
-          AND w.start<? AND w.end>? AND s.min_window<? AND s.max_window>? LIMIT 65`);
+          AND s.min_window<? AND s.max_window>? LIMIT 65`);
       let upper =
         before ??
         Number(
@@ -1001,7 +998,7 @@ export function openObservationStore(file: string) {
       // Bisect indexed ID ranges until the whole matching range fits. The cursor
       // skips that complete range, rather than repeatedly returning finished windows.
       for (let attempt = 0; attempt < 64; attempt++) {
-        const found = new Map<string, { start: number; end: number }>();
+        const found = new Set<number>();
         for (const [w, e] of west <= east
           ? [[west, east]]
           : [
@@ -1017,25 +1014,36 @@ export function openObservationStore(file: string) {
             Math.ceil(e * SCALE),
             Math.floor(south * SCALE),
             Math.ceil(north * SCALE),
-            to,
-            from,
             upper,
             lower,
-          ) as unknown as { start: number; end: number }[];
-          for (const row of rows) found.set(`${row.start}/${row.end}`, row);
+          );
+          for (const row of rows) found.add(Number(row.id));
         }
         if (found.size > 64) {
           lower = Math.floor((lower + upper) / 2);
         } else if (!found.size && lower > 0) {
           upper = lower + 1;
           lower = 0;
-        } else
+        } else {
+          const windows = db
+            .prepare(
+              "SELECT start,end FROM observation_import_windows WHERE id IN (SELECT value FROM json_each(?))",
+            )
+            .all(JSON.stringify([...found])) as unknown as {
+            start: number;
+            end: number;
+          }[];
+          if (windows.length !== found.size)
+            throw new ObservationDataError(
+              "Import index references missing windows",
+            );
           return {
-            windows: [...found.values()].sort(
-              (a, b) => b.start - a.start || b.end - a.end,
-            ),
+            windows: windows
+              .filter((w) => w.start < to && w.end > from)
+              .sort((a, b) => b.start - a.start || b.end - a.end),
             ...(lower > 0 ? { before: lower + 1 } : {}),
           };
+        }
       }
       throw new Error("Observation viewport paging exceeded its work budget");
     },

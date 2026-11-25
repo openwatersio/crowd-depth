@@ -1,0 +1,157 @@
+{
+  "date": "2026-11-25",
+  "environment": "local macOS Node24",
+  "fixture": "index-only; no samples, provider or renderer",
+  "limits": [
+    "Not Pi acceptance",
+    "Each result is one bounded page, not complete traversal",
+    "Candidate count bounded; RTree search complexity can still depend on data distribution",
+    "Pi transfer blocked by SSH signing failure"
+  ],
+  "runs": [
+    {
+      "kind": "synthetic-import-index",
+      "windows": 1000,
+      "results": [
+        {
+          "name": "populated",
+          "p50Ms": 0.11370800000000258,
+          "p95Ms": 0.29112500000000097,
+          "maxMs": 0.3241669999999992,
+          "samples": 30
+        },
+        {
+          "name": "middle-page",
+          "p50Ms": 0.08200000000000074,
+          "p95Ms": 0.10404199999999975,
+          "maxMs": 0.20237499999999642,
+          "samples": 30
+        },
+        {
+          "name": "empty",
+          "p50Ms": 0.018333000000005484,
+          "p95Ms": 0.03041600000000244,
+          "maxMs": 0.03795800000000327,
+          "samples": 30
+        },
+        {
+          "name": "other-context-only",
+          "p50Ms": 0.0241670000000056,
+          "p95Ms": 0.029166999999993948,
+          "maxMs": 0.11979099999999931,
+          "samples": 30
+        },
+        {
+          "name": "outside-time",
+          "p50Ms": 0.02233299999999616,
+          "p95Ms": 0.0296250000000029,
+          "maxMs": 0.03275000000000006,
+          "samples": 30
+        },
+        {
+          "name": "empty-same-day-first-page",
+          "p50Ms": 0.11666699999999963,
+          "p95Ms": 0.1888749999999959,
+          "maxMs": 0.21587500000000404,
+          "samples": 30
+        }
+      ]
+    },
+    {
+      "kind": "synthetic-import-index",
+      "windows": 10000,
+      "results": [
+        {
+          "name": "populated",
+          "p50Ms": 0.15666699999999878,
+          "p95Ms": 0.27437500000000625,
+          "maxMs": 0.30991699999999867,
+          "samples": 30
+        },
+        {
+          "name": "middle-page",
+          "p50Ms": 0.1265420000000006,
+          "p95Ms": 0.16983299999999701,
+          "maxMs": 0.1722080000000119,
+          "samples": 30
+        },
+        {
+          "name": "empty",
+          "p50Ms": 0.015499999999988745,
+          "p95Ms": 0.018292000000002417,
+          "maxMs": 0.02270800000000861,
+          "samples": 30
+        },
+        {
+          "name": "other-context-only",
+          "p50Ms": 0.09316700000000822,
+          "p95Ms": 0.13770900000000097,
+          "maxMs": 0.2993749999999977,
+          "samples": 30
+        },
+        {
+          "name": "outside-time",
+          "p50Ms": 0.02375000000000682,
+          "p95Ms": 0.039042000000009125,
+          "maxMs": 0.0456659999999971,
+          "samples": 30
+        },
+        {
+          "name": "empty-same-day-first-page",
+          "p50Ms": 0.15774999999999295,
+          "p95Ms": 0.2521250000000066,
+          "maxMs": 0.3041249999999991,
+          "samples": 30
+        }
+      ]
+    },
+    {
+      "kind": "synthetic-import-index",
+      "windows": 100000,
+      "results": [
+        {
+          "name": "populated",
+          "p50Ms": 0.20195799999999053,
+          "p95Ms": 0.29608300000006693,
+          "maxMs": 0.3310830000000351,
+          "samples": 30
+        },
+        {
+          "name": "middle-page",
+          "p50Ms": 0.23050000000000637,
+          "p95Ms": 0.2800410000000966,
+          "maxMs": 0.30600000000004,
+          "samples": 30
+        },
+        {
+          "name": "empty",
+          "p50Ms": 0.01495799999997871,
+          "p95Ms": 0.01637500000003911,
+          "maxMs": 0.018707999999946878,
+          "samples": 30
+        },
+        {
+          "name": "other-context-only",
+          "p50Ms": 1.9333750000000691,
+          "p95Ms": 2.0049169999999776,
+          "maxMs": 2.274833000000058,
+          "samples": 30
+        },
+        {
+          "name": "outside-time",
+          "p50Ms": 0.02279199999998127,
+          "p95Ms": 0.025916999999935797,
+          "maxMs": 0.03583400000002257,
+          "samples": 30
+        },
+        {
+          "name": "empty-same-day-first-page",
+          "p50Ms": 0.22025000000007822,
+          "p95Ms": 0.42712500000016007,
+          "maxMs": 0.7255000000000109,
+          "samples": 30
+        }
+      ]
+    }
+  ]
+}

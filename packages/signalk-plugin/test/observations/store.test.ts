@@ -1181,3 +1181,37 @@ it("repairs damaged revision metadata when every group is freshly reacquired", (
     store.close();
   }
 });
+
+it("bounds same-day import candidates before filtering and continues empty pages", () => {
+  const store = openObservationStore(":memory:");
+  const identity = JSON.stringify(acquisition);
+  const at = Date.parse(point.timestamp);
+  try {
+    for (let i = 0; i < 258; i++) {
+      const time = at + i * 1000;
+      const chunk = store.append(acquisition, [
+        { ...point, timestamp: new Date(time).toISOString() },
+      ]);
+      store.publishImport(identity, time, time + 1, [chunk.id]);
+    }
+    let before: number | undefined;
+    let emptyPages = 0;
+    const windows = [];
+    do {
+      const page = store.importedPageInView(
+        identity,
+        at,
+        at + 1,
+        [-81, 25, -79, 27],
+        before,
+      );
+      if (!page.windows.length && page.before !== undefined) emptyPages++;
+      windows.push(...page.windows);
+      before = page.before;
+    } while (before !== undefined);
+    expect(emptyPages).toBeGreaterThan(0);
+    expect(windows).toEqual([{ start: at, end: at + 1 }]);
+  } finally {
+    store.close();
+  }
+});

@@ -1,3 +1,4 @@
+import { setImmediate } from "node:timers/promises";
 import { ObservationDataError, isObservationDataError } from "./errors.js";
 import { Readable } from "node:stream";
 import { Temporal } from "@js-temporal/polyfill";
@@ -65,10 +66,14 @@ export function storedHistorySource(
         }
       : {}),
   };
-  async function* replay(chunks: readonly number[], window: Timeframe) {
+  async function* replay(
+    chunks: readonly number[],
+    window: Timeframe,
+    readSignal: AbortSignal,
+  ) {
     // The receipt is a snapshot. New imports cannot splice versions into this read.
     for (const id of chunks) {
-      signal.throwIfAborted();
+      readSignal.throwIfAborted();
       const chunk = await store.readRange(
         id,
         window.from.epochMilliseconds,
@@ -84,7 +89,7 @@ export function storedHistorySource(
           `Observation chunk ${id} has incompatible acquisition settings`,
         );
       for (const point of chunk.points) {
-        signal.throwIfAborted();
+        readSignal.throwIfAborted();
         const time = Temporal.Instant.from(point.timestamp);
         if (
           Temporal.Instant.compare(time, window.from) >= 0 &&
@@ -94,7 +99,7 @@ export function storedHistorySource(
       }
     }
   }
-  async function manifests(window: Timeframe) {
+  async function manifests(window: Timeframe, readSignal: AbortSignal) {
     const snapshots: {
       start: number;
       end: number;
@@ -108,8 +113,8 @@ export function storedHistorySource(
     const exact = await store.imported(identity, start, end);
     if (exact?.chunks.length) snapshots.push({ start, end, ...exact });
     let before: number | undefined;
-    for (let pages = 0; pages < 64; pages++) {
-      signal.throwIfAborted();
+    for (;;) {
+      readSignal.throwIfAborted();
       const page = await store.importedPageInView(
         identity,
         window.from.epochMilliseconds,
@@ -126,21 +131,27 @@ export function storedHistorySource(
           continue;
         const saved = await store.imported(identity, bounds.start, bounds.end);
         if (saved) snapshots.push({ ...bounds, ...saved });
+        if (snapshots.length > 4097)
+          throw new ObservationDataError("Owned window exceeds manifest limit");
       }
       if (page.before === undefined) return snapshots;
       if (before !== undefined && page.before >= before)
         throw new ObservationDataError("Owned window cursor did not advance");
       before = page.before;
+      await setImmediate(undefined, { signal: readSignal });
     }
-    throw new ObservationDataError("Owned window exceeds manifest page limit");
   }
-  async function* replayWindow(window: Timeframe, atomic = false) {
-    const snapshots = await manifests(window);
+  async function* replayWindow(
+    window: Timeframe,
+    atomic: boolean,
+    readSignal: AbortSignal,
+  ) {
+    const snapshots = await manifests(window, readSignal);
     if (snapshots.length === 1 && !atomic) {
-      yield* replay(snapshots[0].chunks, window);
+      yield* replay(snapshots[0].chunks, window, readSignal);
       return;
     }
-    signal.throwIfAborted();
+    readSignal.throwIfAborted();
     const id = await store.openMergedRead(
       identity,
       snapshots,
@@ -149,10 +160,10 @@ export function storedHistorySource(
     );
     try {
       for (;;) {
-        signal.throwIfAborted();
+        readSignal.throwIfAborted();
         const { points, done } = await store.readMergedPage(id);
         for (const point of points) {
-          signal.throwIfAborted();
+          readSignal.throwIfAborted();
           yield point;
         }
         if (done) return;
@@ -179,7 +190,9 @@ export function storedHistorySource(
     let hasOwned: boolean;
     try {
       saved = await receipt();
-      hasOwned = !!saved?.chunks.length || (await manifests(window)).length > 0;
+      hasOwned =
+        !!saved?.chunks.length ||
+        (await manifests(window, readSignal)).length > 0;
     } catch (error) {
       if (!isObservationDataError(error)) throw error;
       // Corrupt retained evidence must not prevent acquiring new originals.
@@ -190,7 +203,7 @@ export function storedHistorySource(
       // Show retained overlap immediately, then acquire the requested window.
       // Preview consumers replace observations in place; QC emits one merged snapshot.
       try {
-        yield* replayWindow(window, !preview);
+        yield* replayWindow(window, !preview, readSignal);
       } catch (error) {
         if (!isObservationDataError(error)) throw error;
       }
@@ -206,7 +219,7 @@ export function storedHistorySource(
           settled(saved.recorded)))
     ) {
       try {
-        yield* replayWindow(window, !preview);
+        yield* replayWindow(window, !preview, readSignal);
         return;
       } catch (error) {
         if (!isObservationDataError(error)) throw error;
@@ -224,7 +237,7 @@ export function storedHistorySource(
             settled(saved.recorded)))
       ) {
         try {
-          yield* replayWindow(window, !preview);
+          yield* replayWindow(window, !preview, readSignal);
           return;
         } catch (error) {
           if (!isObservationDataError(error)) throw error;
@@ -256,7 +269,7 @@ export function storedHistorySource(
         const reconciled = await receipt();
         if (!reconciled)
           throw new Error("Completed import has no observation receipt");
-        yield* replayWindow(window, !preview);
+        yield* replayWindow(window, !preview, readSignal);
       } else yield* incoming;
     } finally {
       importing.delete(key);
