@@ -110,6 +110,57 @@ test("recent preview publishes before availability discovery completes", async (
   db.close();
 });
 
+test.each([false, true])(
+  "stored viewport renders during a stalled recent acquisition (paged=%s)",
+  async (paged) => {
+    const db = createDB(":memory:");
+    const store = createPreviewStore(db, "owned-first");
+    const abort = new AbortController();
+    const owned = new Timeframe(
+      Temporal.Instant.fromEpochMilliseconds(t - 10 * hour),
+      Temporal.Instant.fromEpochMilliseconds(t - 9 * hour),
+    );
+    let started!: () => void;
+    const recentStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const discover = vi.fn(() => []);
+    const source: BathymetrySource = {
+      createReader: ({ from }) => {
+        if (from.epochMilliseconds === owned.from.epochMilliseconds)
+          return Readable.from([sample(from.epochMilliseconds)]);
+        started();
+        return new Promise(() => {});
+      },
+      ...(paged
+        ? { getStoredTimeframePage: () => ({ windows: [owned] }) }
+        : { getStoredTimeframes: () => [owned] }),
+      getPreviewTimeframes: discover,
+      getAvailableTimeframes: discover,
+    };
+    const run = scanPreview({
+      source,
+      store,
+      config,
+      signal: abort.signal,
+      until: t,
+      since: t - 24 * hour,
+      view: () => view,
+    });
+    try {
+      await recentStarted;
+      await vi.waitFor(() => expect(store.features(view, 0)).toHaveLength(1));
+      expect(store.features(view, 0)[0].properties.time).toBe(t - 10 * hour);
+      expect(discover).not.toHaveBeenCalled();
+      expect(store.done("history", t - hour, t)).toBe(false);
+    } finally {
+      abort.abort();
+      await run;
+      db.close();
+    }
+  },
+);
+
 test("scanner reads newest windows first, clamps provider output, and resumes completed windows", async () => {
   const db = createDB(":memory:");
   const store = createPreviewStore(db, "a");
@@ -635,6 +686,232 @@ test("distant failed windows leave healthy intervening history complete", async 
       expect(store.done("history", start, start + hour)).toBe(false);
     expect(store.done("history", t - 48 * hour, t - 24 * hour)).toBe(true);
     expect(store.done("history", t - 9 * hour, t)).toBe(true);
+  } finally {
+    db.close();
+  }
+});
+
+test.each(["index", "reader"])(
+  "recent preview renders during a stalled owned %s",
+  async (stalled) => {
+    const db = createDB(":memory:");
+    const store = createPreviewStore(db, "recent-independent");
+    const abort = new AbortController();
+    const owned = new Timeframe(
+      Temporal.Instant.fromEpochMilliseconds(t - 10 * hour),
+      Temporal.Instant.fromEpochMilliseconds(t - 9 * hour),
+    );
+    const source: BathymetrySource = {
+      createReader: ({ from }) =>
+        from.epochMilliseconds === t - hour
+          ? Readable.from([sample(t - 1000)])
+          : new Promise(() => {}),
+      getStoredTimeframePage: () =>
+        stalled === "index" ? new Promise(() => {}) : { windows: [owned] },
+      getAvailableTimeframes: () => [],
+    };
+    const run = scanPreview({
+      source,
+      store,
+      config,
+      signal: abort.signal,
+      until: t,
+      since: t - 24 * hour,
+      view: () => view,
+    });
+    try {
+      await vi.waitFor(() => expect(store.features(view, 0)).toHaveLength(1));
+      expect(store.features(view, 0)[0].properties.time).toBe(t - 1000);
+      expect(
+        store.done(
+          "history",
+          owned.from.epochMilliseconds,
+          owned.to.epochMilliseconds,
+        ),
+      ).toBe(false);
+    } finally {
+      abort.abort();
+      await run;
+      db.close();
+    }
+  },
+);
+
+test.each([false, true])(
+  "returning to a view retries owned windows skipped by a pan (paged=%s)",
+  async (paged) => {
+    const db = createDB(":memory:");
+    const store = createPreviewStore(db, "pan-return");
+    let area: readonly [number, number, number, number, number] = view;
+    let firstDone!: () => void;
+    const first = new Promise<void>((resolve) => {
+      firstDone = resolve;
+    });
+    const windows = [10, 11].map(
+      (h) =>
+        new Timeframe(
+          Temporal.Instant.fromEpochMilliseconds(t - h * hour),
+          Temporal.Instant.fromEpochMilliseconds(t - (h - 1) * hour),
+        ),
+    );
+    const reads: number[] = [];
+    let beforeDiscovery: number[] | undefined;
+    const source: BathymetrySource = {
+      async createReader({ from }) {
+        const start = from.epochMilliseconds;
+        if (start === t - hour) {
+          await first;
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          area = view;
+          return Readable.from([]);
+        }
+        reads.push(start);
+        return Readable.from(
+          (async function* () {
+            yield sample(start, start === t - 10 * hour ? -80 : -80.1);
+            if (start === t - 10 * hour) {
+              area = [14, -75, 20, -73, 22];
+              firstDone();
+            }
+          })(),
+        );
+      },
+      ...(paged
+        ? {
+            getStoredTimeframePage: (
+              _span: Timeframe,
+              _bounds: readonly number[],
+              before?: number,
+            ) =>
+              before === undefined
+                ? { windows: [windows[0]], before: 2 }
+                : { windows: [windows[1]] },
+          }
+        : { getStoredTimeframes: () => windows }),
+      getAvailableTimeframes: () => {
+        beforeDiscovery ??= [...reads];
+        return [];
+      },
+    };
+    try {
+      await scanPreview({
+        source,
+        store,
+        config,
+        signal: new AbortController().signal,
+        until: t,
+        since: t - 24 * hour,
+        view: () => area,
+      });
+      expect(beforeDiscovery).toContain(t - 11 * hour);
+      expect(store.features(view, 0)).toHaveLength(2);
+    } finally {
+      db.close();
+    }
+  },
+);
+
+test("startup observes the owned reader before propagating a recent timeout", async () => {
+  const db = createDB(":memory:");
+  const store = createPreviewStore(db, "startup-drain");
+  const owned = new Timeframe(
+    Temporal.Instant.fromEpochMilliseconds(t - 10 * hour),
+    Temporal.Instant.fromEpochMilliseconds(t - 9 * hour),
+  );
+  let release!: (page: { windows: Timeframe[] }) => void;
+  const page = new Promise<{ windows: Timeframe[] }>((resolve) => {
+    release = resolve;
+  });
+  const index = vi.fn(() => page);
+  const discover = vi.fn(() => []);
+  const source: BathymetrySource = {
+    createReader: ({ from }) => {
+      if (from.epochMilliseconds === t - hour)
+        throw new Error("preview source timed out");
+      return Readable.from([sample(from.epochMilliseconds)]);
+    },
+    getStoredTimeframePage: index,
+    getAvailableTimeframes: discover,
+    getPreviewTimeframes: discover,
+  };
+  const run = scanPreview({
+    source,
+    store,
+    config,
+    signal: new AbortController().signal,
+    until: t,
+    since: t - 24 * hour,
+    view: () => view,
+  });
+  let finished = false;
+  void run.then(
+    () => {
+      finished = true;
+    },
+    () => {
+      finished = true;
+    },
+  );
+  try {
+    await vi.waitFor(() => expect(index).toHaveBeenCalled());
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(finished).toBe(false);
+    release({ windows: [owned] });
+    await expect(run).rejects.toThrow("preview source timed out");
+    expect(discover).not.toHaveBeenCalled();
+    const features = store.features(view, 0);
+    expect(features).toHaveLength(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(store.features(view, 0)).toEqual(features);
+  } finally {
+    release({ windows: [] });
+    await run.catch(() => {});
+    db.close();
+  }
+});
+
+test("returning to a view retries spatial hints interrupted by a pan", async () => {
+  const db = createDB(":memory:");
+  const store = createPreviewStore(db, "spatial-pan-return");
+  let area: readonly [number, number, number, number, number] = view;
+  const windows = [20, 21].map(
+    (h) =>
+      new Timeframe(
+        Temporal.Instant.fromEpochMilliseconds(t - h * hour),
+        Temporal.Instant.fromEpochMilliseconds(t - (h - 1) * hour),
+      ),
+  );
+  const reads: number[] = [];
+  const source: BathymetrySource = {
+    createReader({ from }) {
+      const start = from.epochMilliseconds;
+      if (start === t - hour) return Readable.from([]);
+      reads.push(start);
+      return Readable.from(
+        (async function* () {
+          yield sample(start, start === t - 20 * hour ? -80 : -80.1);
+          if (start === t - 20 * hour) area = [14, -75, 20, -73, 22];
+        })(),
+      );
+    },
+    getPreviewTimeframes: () => windows,
+    getAvailableTimeframes: () => {
+      area = view;
+      return [];
+    },
+  };
+  try {
+    await scanPreview({
+      source,
+      store,
+      config,
+      signal: new AbortController().signal,
+      until: t,
+      since: t - 24 * hour,
+      view: () => area,
+    });
+    expect(reads).toEqual([t - 20 * hour, t - 21 * hour]);
+    expect(store.features(view, 0)).toHaveLength(2);
   } finally {
     db.close();
   }

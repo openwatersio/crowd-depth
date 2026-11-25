@@ -190,11 +190,15 @@ none is represented as complete by the presence of a preview.
   viewport responses (1,200 points), antimeridian queries, cheap validity checks,
   source/reference configuration identity, and transactional generation fences.
   This is a sample preview, not a mean or an input to the final depth statistic.
-- Recent-first acquisition publishes the first hour before availability scanning;
-  settled half-open windows are checkpointed, partial reads remain retryable.
+- Recent acquisition and stored viewport reads start independently, so either can
+  publish before availability scanning even if the other stalls. Settled half-open
+  windows are checkpointed, partial reads remain retryable.
   Empty periods expand discovery to at most a year. Source calls are bounded at
-  30 seconds; an uncancellable timed-out temporal query stops preview acquisition
-  until restart instead of piling up more queries. Stream reads are bounded too.
+  30 seconds; a timed-out task stops issuing requests instead of stacking calls
+  behind an uncancellable query. Its independent startup sibling is observed before
+  the error propagates and stops the scan until restart or provider reselection.
+  A spatial-hint timeout instead disables that hint source and continues temporal
+  acquisition. Stream reads are bounded too.
 - Spatial Track API support supplies prioritized own-vessel visit hours for the
   active viewport (boat area before a viewport arrives). This is a hint, never
   evidence that the rest of history is empty. Unsupported spatial providers fall

@@ -410,7 +410,8 @@ export async function scanPreview({
         if (!active()) return;
         onError(err);
         // An in-process provider query cannot be cancelled. Don't stack retries
-        // behind a timed-out call that may still be executing.
+        // behind a timed-out call that may still be executing. An independent
+        // startup task may finish before that timeout is propagated.
         if (err instanceof Error && err.message === "preview source timed out")
           throw err;
         // A viewport failure must yield promptly when the user pans elsewhere.
@@ -426,29 +427,34 @@ export async function scanPreview({
     }
   };
   let viewed: string | undefined;
+  let storedView: string | undefined;
   let spatial = source.getPreviewTimeframes;
-  const prioritize = async () => {
+  const prioritize = async (localOnly = false) => {
     const area = view();
     if (!area || JSON.stringify(area) === viewed || !active()) return;
     viewed = JSON.stringify(area);
-    const [, west, south, east, north] = area;
-    const draw = async (windows: Timeframe[]) => {
-      for (const window of windows.slice(0, 64)) {
-        if (!active() || JSON.stringify(view()) !== viewed) return;
-        const requestedView = viewed;
-        await retry(
-          async () => {
-            await readSafely(
-              Math.max(since, window.from.epochMilliseconds),
-              Math.min(until, window.to.epochMilliseconds),
-            );
-          },
-          () => JSON.stringify(view()) === requestedView,
-        );
-      }
-    };
-    if (source.getStoredTimeframePage || source.getStoredTimeframes) {
-      try {
+    let completed = false;
+    try {
+      const [, west, south, east, north] = area;
+      const draw = async (windows: Timeframe[]) => {
+        for (const window of windows.slice(0, 64)) {
+          if (!active() || JSON.stringify(view()) !== viewed) return;
+          const requestedView = viewed;
+          await retry(
+            async () => {
+              await readSafely(
+                Math.max(since, window.from.epochMilliseconds),
+                Math.min(until, window.to.epochMilliseconds),
+              );
+            },
+            () => JSON.stringify(view()) === requestedView,
+          );
+        }
+      };
+      if (
+        storedView !== viewed &&
+        (source.getStoredTimeframePage || source.getStoredTimeframes)
+      ) {
         if (source.getStoredTimeframePage) {
           let before: number | undefined;
           let count = 0;
@@ -485,30 +491,49 @@ export async function scanPreview({
               signal,
             ),
           );
-      } catch (error) {
-        viewed = undefined;
-        throw error;
+        if (active() && JSON.stringify(view()) === viewed) storedView = viewed;
       }
+      if (localOnly) {
+        // Leave remote discovery pending, while owned coverage survives a stalled recent read.
+        return;
+      }
+      // Existing local coverage is painted before waiting on external track discovery.
+      if (!active() || JSON.stringify(view()) !== viewed) return;
+      if (!spatial) {
+        completed = true;
+        return;
+      }
+      let windows: Timeframe[];
+      try {
+        windows = await request(
+          () => spatial!(frame(since, until), [west, south, east, north]),
+          signal,
+        );
+      } catch (err) {
+        // A server may expose the API without a spatial provider; use recent-first.
+        spatial = undefined;
+        if (active()) onError(err);
+        completed = active() && JSON.stringify(view()) === viewed;
+        return;
+      }
+      await draw(windows);
+      completed = active() && JSON.stringify(view()) === viewed;
+    } finally {
+      if (!completed) viewed = undefined;
     }
-    // Existing local coverage is painted before waiting on external track discovery.
-    if (!spatial || !active() || JSON.stringify(view()) !== viewed) return;
-    let windows: Timeframe[];
-    try {
-      windows = await request(
-        () => spatial!(frame(since, until), [west, south, east, north]),
-        signal,
-      );
-    } catch (err) {
-      // A server may expose the API without a spatial provider; use recent-first.
-      spatial = undefined;
-      if (active()) onError(err);
-      return;
-    }
-    await draw(windows);
   };
-  await retry(async () => {
-    await readSafely(Math.max(since, until - HOUR), until);
-  });
+  // Either source can provide first content; neither gets to block the other's read.
+  const startup = await Promise.allSettled([
+    view() && (source.getStoredTimeframePage || source.getStoredTimeframes)
+      ? retry(() => prioritize(true))
+      : Promise.resolve(),
+    retry(async () => {
+      await readSafely(Math.max(since, until - HOUR), until);
+    }),
+  ]);
+  // Observe both tasks before returning; neither may keep publishing after a failed scan.
+  for (const result of startup)
+    if (result.status === "rejected") throw result.reason;
   await retry(prioritize);
   let to = Math.floor(until / HOUR) * HOUR;
   let span = DAY;

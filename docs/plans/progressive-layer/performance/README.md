@@ -1370,3 +1370,46 @@ for 4.4 seconds, and `buildTile` for 12.9 seconds across the profile. These are
 profiled serial totals, not viewport/HTTP acceptance measurements. The summary
 and per-tile timings are in `pi-v39-cold-profile-nov25.json`; raw profile remains
 `/tmp/pi-cold-v39.cpuprofile` locally and `/tmp/cold-v39.cpuprofile` in Docker.
+
+### November 25: rejected subtree-bounds experiment (v42, staged only)
+
+A candidate stored each nearest-neighbour subtree's bounds to prune empty water
+between tracks. All 25 surface tests passed, and 54 active-Pi tile comparisons
+were byte-identical. The alternating-order kernel benchmark improved the sparse
+track median from 17.50 to 10.34 ms, but the complete serial cold-tile comparison
+was mixed: z13 total 2793→2488 ms, z14 3385→3389 ms, z15 3071→3459 ms.
+No reliable viewport improvement was established, so the production-source
+change was reverted. The isolated v42 package remains staged only; v39 is active.
+Raw timings and independent full-search checks are in
+`pi-v42-search-experiment-nov25.json`. These serial measurements include active
+server contention and are not the viewport acceptance gate.
+
+Checkpoint `82e3d2f` passed the complete Signal K plugin CI matrix, including
+Windows Node 24 and 26. Its integration job is explicitly skipped by that
+workflow; the repository's own real Signal K E2E job provides separate coverage.
+
+### November 25: independent startup acquisition and viewport replay
+
+Recent acquisition and stored viewport reads now start independently, allowing
+either to publish when the other stalls. Both startup tasks are observed before
+returning a timeout. Interrupted viewport passes clear their in-memory marker,
+so returning to the view retries unfinished stored pages and spatial hints.
+No schema or persisted coverage-marker change is involved.
+
+Focused Open Waters review: round 54 completed Codex/Opus maps (Sonnet partial;
+Copilot quota failure); rounds 55 and 56 completed Opus/Sonnet maps. Findings
+about sequential stored-first starvation and incomplete paged-pan markers were
+fixed with regressions that fail before the fix. Final reviewers found no high
+or medium findings. Low follow-ups added spatial-hint pan coverage and clarified
+that source timeouts stop the scan after its startup sibling settles; hint
+timeouts instead disable spatial hints. These test/doc-only follow-ups were not
+sent through another model round. Non-timeout retries can still delay temporal
+scanning while the healthy startup sibling supplies first content.
+
+Before the final test-only addition, 692 tests/57 files and nine real Signal K
+E2E tests passed, with build, plugin lint/publint and scoped oxlint. A local
+synthetic benchmark using the real archive worker, source adapter and preview
+writer, with 18,000 retained observations and a stalled recent provider, reached
+first preview in 22–28 ms across three cold worker opens. This is host evidence,
+not Pi/browser acceptance. SSH agent signing blocked Pi verification; v39
+remains the last verified active Docker package.
