@@ -1413,3 +1413,32 @@ writer, with 18,000 retained observations and a stalled recent provider, reached
 first preview in 22–28 ms across three cold worker opens. This is host evidence,
 not Pi/browser acceptance. SSH agent signing blocked Pi verification; v39
 remains the last verified active Docker package.
+
+### November 25: v43 active in Docker
+
+After SSH access resumed, reviewed commit `0a99d98` (package SHA-1
+`ef6b906f9c20ab955a1fdaf755b2948a1d8d5523`) was staged and checked inside Docker.
+The real v39-to-v43 synthetic upgrade/rollback checks passed. The same
+18,000-observation stalled-provider startup fixture reached first preview in
+138, 135 and 120 ms on the Pi. These are worker/source/preview measurements, not
+full browser-paint acceptance. All 693 local tests passed, plus nine E2E tests
+and package validation.
+
+Before activation, both SQLite backups passed quick_check in
+`pre-progressive-v43-2026-11-25T19-24-01-464Z`; v39 and its configuration remain
+retained. Docker was restarted and the active link/schema verified as v43/v7.
+Archive counts subsequently increased from 26,985 to 54,261 points, while
+`depth_since` remained `2026-11-22T14:06:46.969401946Z`.
+
+Loaded cold viewport acceptance still fails. North Lake Worth: 15 views, 46
+successful full-model HTTP probes, p95 450 ms; the first populated z13 tile and
+one subsequent z13 viewport also failed their limits. That run overlapped a
+Freeboard navigation. Lake Worth: 15 views, 33 HTTP probes, p95 807 ms; the first
+populated z13 tile and one subsequent z13 viewport failed. These failures remain
+release blockers, not superseded by the fast synthetic preview result. Raw
+results are in `pi-v43-active-nov25.json`.
+
+Freeboard navigation during the north run reached DOMContentLoaded in 918 ms,
+load in 1326 ms and first contentful paint in 164 ms. A later screenshot showed
+My Soundings tracks in the current Tybee Island viewport. This was not a cold
+browser-cache experiment and does not measure first useful sounding latency.
