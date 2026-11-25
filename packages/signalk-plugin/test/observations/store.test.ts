@@ -776,7 +776,8 @@ it("filters import hints by source context, exact time, and a dateline viewport"
 });
 
 it("pages every visible window once without relying on spatial traversal or chronological insertion order", () => {
-  const store = openObservationStore(fixture());
+  // Exercise the real index without timing 257 durable fixture commits on CI disks.
+  const store = openObservationStore(":memory:");
   try {
     const chunk = store.append(acquisition, [point]);
     const expected = new Set<number>();

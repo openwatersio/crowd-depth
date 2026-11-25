@@ -1354,3 +1354,19 @@ are explicitly documented in the observation-store README.
 
 No new Docker activation accompanies this checkpoint: v39 remains active, v41
 is staged, and the active cold-viewport failures remain release blockers.
+
+The pushed checkpoint `9134fa3` passed GitHub CI: 685 tests/57 files, nine E2E
+tests, lint, and Worker startup. The separate Windows Node 26 plugin job timed
+out while constructing 257 durable receipts for the pagination test. That
+query-only test now uses an in-memory SQLite store with the same index and
+assertions; the 35 store tests pass locally. File-backed durability, migration
+and reopen tests are unchanged. Cross-platform validation is pending.
+
+A low-priority serial CPU profile of active v39 at north Lake Worth (three cold
+rounds each at z13–15, nine tiles per view) identifies work across interpolation
+and contour generation, rather than one dominant function. Nearest-neighbour
+search accounted for about 1.9 seconds inclusive; the enclosing surface build
+for 4.4 seconds, and `buildTile` for 12.9 seconds across the profile. These are
+profiled serial totals, not viewport/HTTP acceptance measurements. The summary
+and per-tile timings are in `pi-v39-cold-profile-nov25.json`; raw profile remains
+`/tmp/pi-cold-v39.cpuprofile` locally and `/tmp/cold-v39.cpuprofile` in Docker.
