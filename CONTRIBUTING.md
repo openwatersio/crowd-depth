@@ -258,6 +258,8 @@ one, plus anything carried forward:
 
 ## Pull requests
 
+- Run `gh actions-lock` after adding, removing, or renaming a workflow or changing an action reference, and commit the generated lockfile with the workflow changes. Install it with `gh extension install github/gh-actions-lock`; Dependabot updates entries for action version bumps in onboarded workflows.
+- Actions lockfiles do not cover reusable workflow calls or their dependencies. Check `SignalK/signalk-server`'s `master` commit monthly and review upstream changes before updating the SHA in `.github/workflows/plugin-ci.yml`, including when Dependabot proposes an update. Confirm the plugin CI run passes before merging.
 - Keep changes scoped to one package where possible.
 - `npm run check && npm test` should pass before pushing (CI will verify).
 - Commit `package-lock.json` alongside any dependency change.
