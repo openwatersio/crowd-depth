@@ -1,7 +1,36 @@
 import { expect, test } from "vitest";
 import definitions from "../../grid/src/grid/definitions.json" with { type: "json" };
 import vectors from "../../grid/tests/qc_vectors.json" with { type: "json" };
-import { trackQC, type Flag } from "../src/qc.js";
+import { rollingMedian, trackQC, type Flag } from "../src/qc.js";
+
+test("sliding medians match independently sorted windows including edges and duplicates", () => {
+  let seed = 1729;
+  const random = () => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return seed / 2 ** 32;
+  };
+  for (const size of [0, 1, 2, 11, 50, 1000]) {
+    const values = Array.from({ length: size }, () =>
+      Math.fround(Math.floor(random() * 30) / 7),
+    );
+    for (const input of [
+      values,
+      [...values].sort((a, b) => a - b),
+      [...values].sort((a, b) => b - a),
+    ])
+      for (const radius of [0, 1, 5, 10, 25]) {
+        const expected = input.map((_, i) => {
+          const sorted = input
+            .slice(Math.max(0, i - radius), i + radius + 1)
+            .sort((a, b) => a - b);
+          const low = sorted[(sorted.length - 1) >> 1];
+          const high = sorted[sorted.length >> 1];
+          return Math.fround(low + Math.fround(high - low) / 2);
+        });
+        expect(rollingMedian(input, radius)).toEqual(expected);
+      }
+  }
+});
 
 const us = (seconds: number) => Math.round(seconds * 1e6);
 const sorted = (flags: Flag[]) =>

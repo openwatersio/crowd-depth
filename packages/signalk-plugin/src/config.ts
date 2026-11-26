@@ -1,7 +1,6 @@
-import { detectSensor, sourceDevice } from "./device-info.js";
+import { detectSensor, sourceDevice, sameSource } from "./device-info.js";
 import { cachedGpsdSensor } from "./gpsd-info.js";
 import { ServerAPI } from "@signalk/server-api";
-import { Temporal } from "@js-temporal/polyfill";
 import { DEFAULT_OWN_STYLE, TINTS, type Tint } from "./tiles/style.js";
 
 // Can this be inferred from the JSON schema?
@@ -27,6 +26,7 @@ export type Config = {
     model?: string;
     source?: string;
   };
+  positionOrigin?: { x: number; y: number };
   sharing: {
     anonymous: boolean;
   };
@@ -35,6 +35,7 @@ export type Config = {
     show?: boolean;
     /** Depth areas and soundings shoaler than this, in metres, draw as unsafe. */
     safetyDepth?: number;
+    halfLifeDays?: number;
     /** The colour of the boat's own soundings, contours and tint, as `#rrggbb`. */
     color?: string;
     /** The colour of soundings shoaler than the safety depth, as `#rrggbb`. */
@@ -43,33 +44,10 @@ export type Config = {
     tint?: Tint;
     /** Draw depth contours; on unless turned off. */
     contours?: boolean;
-    /** How far back the layer fills from the plugin's source. */
-    history?: History;
     /** Contours every metre and every foot zoomed in, or the chart's isobaths. */
     contourDetail?: "high" | "standard";
   };
 };
-
-/** The spans the layer can fill from, in days; all of the source's history for "all". */
-export const HISTORY_DAYS = { month: 30, year: 365, all: undefined };
-export type History = keyof typeof HISTORY_DAYS;
-export const DEFAULT_HISTORY: History = "year";
-
-/** The history setting, a hand-edited value that isn't one falling back to the default. */
-export function historySetting(config: Config): History {
-  const history = config.chart?.history;
-  return history && Object.hasOwn(HISTORY_DAYS, history)
-    ? history
-    : DEFAULT_HISTORY;
-}
-
-/** How far back the layer fills; undefined for all of it. */
-export function historySpan(config: Config): Temporal.Duration | undefined {
-  const days = HISTORY_DAYS[historySetting(config)];
-  return days === undefined
-    ? undefined
-    : Temporal.Duration.from({ hours: days * 24 });
-}
 
 /**
  * The source Signal K currently prioritizes for a path (its `$source`) plus the
@@ -87,6 +65,9 @@ export function sourcesFor(app: ServerAPI, path: string) {
   if (selected && !available.includes(selected)) available.unshift(selected);
   return { selected, available };
 }
+
+/** Source refs returned by the History API, indexed by Signal K path. */
+export type RecordedSources = Record<string, string[]>;
 
 /** Configured source if set, else the server's prioritized source, else undefined. */
 export function resolveSource(
@@ -139,6 +120,36 @@ export const DepthPaths = [
   "belowTransducer",
   "belowKeel",
 ] as const;
+
+/** Pick one path for one source; never borrow availability from another sensor. */
+export function selectDepth(
+  app: ServerAPI,
+  source: string | undefined,
+  recorded: RecordedSources = {},
+  savedPath?: Config["path"],
+) {
+  const candidates = savedPath ? [savedPath] : DepthPaths;
+  const paths = candidates.map((path) => ({
+    path,
+    ...sourcesFor(app, `environment.depth.${path}`),
+    recorded: recorded[`environment.depth.${path}`] ?? [],
+  }));
+  const available = [
+    ...new Set(paths.flatMap((p) => [...p.available, ...p.recorded])),
+  ].filter((s) => s !== "derived-data");
+  const selected =
+    source && source !== "derived-data"
+      ? source
+      : (paths.find((p) => p.selected && p.selected !== "derived-data")
+          ?.selected ?? (available.length === 1 ? available[0] : undefined));
+  if (!selected) return;
+  const path = paths.find((p) =>
+    [...p.available, ...p.recorded].some((ref) =>
+      sameSource(app, ref, selected),
+    ),
+  )?.path;
+  return path ? { path, source: selected } : undefined;
+}
 
 /** The CSB `verticalReferenceOfDepth` values (IHO B-12 Table 1). */
 export type VerticalReference = "Waterline" | "Transducer" | "Unknown";
@@ -349,6 +360,15 @@ function buildSchema(app: ServerAPI) {
             description:
               "Draw the depths this boat records as a layer in chartplotters that support Signal K plotter extensions, such as Freeboard-SK 3.4 or later. With signalk-tides installed, depths are reduced to chart datum by predicted tides where a station is in reach. Not for navigation.",
           },
+          halfLifeDays: {
+            type: "number",
+            default: 365,
+            minimum: 1,
+            maximum: 36500,
+            title: "Sounding weight half-life (days)",
+            description:
+              "An observation this old has half the weight of a new one. Larger values retain more historical influence. This does not delete observations.",
+          },
           safetyDepth: {
             type: "number",
             default: 3,
@@ -386,19 +406,6 @@ function buildSchema(app: ServerAPI) {
             type: "boolean",
             default: DEFAULT_OWN_STYLE.contours,
             title: "Draw depth contours",
-          },
-          history: {
-            type: "string",
-            enum: Object.keys(HISTORY_DAYS),
-            enumNames: [
-              "The last 30 days",
-              "The last year",
-              "All recorded history",
-            ],
-            default: DEFAULT_HISTORY,
-            title: "Fill the layer from",
-            description:
-              "How far back the layer fills in from recorded soundings when it starts or rebuilds. A longer span takes longer to fill in, and new soundings wait for it, for up to 3 hours. Changing it rebuilds the layer.",
           },
           contourDetail: {
             type: "string",

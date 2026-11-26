@@ -1,0 +1,69 @@
+{
+  "localBefore": [
+    {
+      "method": "createReader",
+      "rounds": 10,
+      "medianMs": 22.437999999999988,
+      "p90Ms": 24.125792000000047,
+      "hash": "5d120bcd011ee2775a9c1f12def758d8db727a78dc31deb37a1ac6e5f6df3e97"
+    },
+    {
+      "method": "createObservationReader",
+      "rounds": 10,
+      "medianMs": 36.664499999999975,
+      "p90Ms": 45.22662500000001,
+      "hash": "181126025068633b5496cb6ad922fb90d56861fb00470015a848ff01faa7dd3e"
+    }
+  ],
+  "localAfter": [
+    {
+      "method": "createReader",
+      "rounds": 10,
+      "medianMs": 19.534959000000015,
+      "p90Ms": 32.39616699999999,
+      "hash": "5d120bcd011ee2775a9c1f12def758d8db727a78dc31deb37a1ac6e5f6df3e97"
+    },
+    {
+      "method": "createObservationReader",
+      "rounds": 10,
+      "medianMs": 22.398708000000056,
+      "p90Ms": 22.978208999999993,
+      "hash": "181126025068633b5496cb6ad922fb90d56861fb00470015a848ff01faa7dd3e"
+    }
+  ],
+  "piV44ThenV45": [
+    {
+      "method": "createReader",
+      "rounds": 10,
+      "medianMs": 218.234737,
+      "p90Ms": 290.78847199999973,
+      "medianCpuMs": 236.509,
+      "hash": "5d120bcd011ee2775a9c1f12def758d8db727a78dc31deb37a1ac6e5f6df3e97"
+    },
+    {
+      "method": "createObservationReader",
+      "rounds": 10,
+      "medianMs": 381.38522999999986,
+      "p90Ms": 444.46444900000006,
+      "medianCpuMs": 347.71,
+      "hash": "181126025068633b5496cb6ad922fb90d56861fb00470015a848ff01faa7dd3e"
+    },
+    {
+      "method": "createReader",
+      "rounds": 10,
+      "medianMs": 220.52148199999988,
+      "p90Ms": 259.4167379999999,
+      "medianCpuMs": 210.926,
+      "hash": "5d120bcd011ee2775a9c1f12def758d8db727a78dc31deb37a1ac6e5f6df3e97"
+    },
+    {
+      "method": "createObservationReader",
+      "rounds": 10,
+      "medianMs": 255.94091899999967,
+      "p90Ms": 300.72446200000013,
+      "medianCpuMs": 254.236,
+      "hash": "181126025068633b5496cb6ad922fb90d56861fb00470015a848ff01faa7dd3e"
+    }
+  ],
+  "limits": "Isolated synthetic conversion with provider data preloaded; excludes provider parsing, persistence and viewport rendering. v45 staged only; v44 active."
+}

@@ -47,10 +47,10 @@
     "docs/screenshots"
   ],
   "scripts": {
-    "build": "tsc -b && node scripts/build-web.mjs",
-    "dev": "tsc -w",
+    "build": "tsc -b && node scripts/build-workers.mjs && node scripts/build-web.mjs",
+    "dev": "tsc -b --force && tsc -w",
     "prepack": "npm run build",
-    "lint": "tsc -b && tsc -p tsconfig.web.json && publint --strict",
+    "lint": "tsc -b && node scripts/build-workers.mjs && tsc -p tsconfig.web.json && publint --strict",
     "test": "vitest",
     "test:e2e": "vitest run --config vitest.e2e.config.ts"
   },

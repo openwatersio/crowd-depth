@@ -6,6 +6,7 @@ export type Status = ReturnType<typeof createStatus>;
 export function createStatus(app: ServerAPI) {
   const state = {
     usingHistory: false,
+    waitingForDepth: false,
     waitingForHistory: false,
     collecting: false,
     lastReport: undefined as Temporal.Instant | undefined,
@@ -16,6 +17,8 @@ export function createStatus(app: ServerAPI) {
   function getStatusMessage() {
     return (
       [
+        state.waitingForDepth &&
+          "Waiting for depth source in live data or history",
         state.collecting && "Collecting bathymetry",
         state.usingHistory && "Using history",
         state.waitingForHistory && "Waiting for a history provider",

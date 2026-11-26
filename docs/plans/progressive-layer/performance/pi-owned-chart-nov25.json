@@ -1,0 +1,2253 @@
+{
+  "scope": "Synthetic 18000-point one-hour 5 Hz fixtures through owned import/replay, correction, refinement worker and tile worker in Signal K Docker on pi.local. No provider latency, concurrent HTTP gate, browser paint or tide reduction. Separate temporary stores; active plugin remains v24.",
+  "runs": [
+    {
+      "candidate": "v30",
+      "round": 1,
+      "results": [
+        {
+          "scenario": "anchored",
+          "phase": "first-import",
+          "hz": 5,
+          "observations": 18000,
+          "providerCalls": 3,
+          "firstCommitMs": 11229.966549,
+          "refineMs": 11244.127246,
+          "tileMs": 523.2567230000004,
+          "totalMs": 11768.635726,
+          "cells": 4,
+          "tileBytes": 686,
+          "eventLoopMaxMs": 118.161407,
+          "rssBytes": 401063936
+        },
+        {
+          "scenario": "anchored",
+          "phase": "owned-rebuild",
+          "hz": 5,
+          "observations": 18000,
+          "providerCalls": 3,
+          "firstCommitMs": 9267.900151000002,
+          "refineMs": 9274.968092,
+          "tileMs": 337.174078,
+          "totalMs": 9614.532743,
+          "cells": 4,
+          "tileBytes": 686,
+          "eventLoopMaxMs": 51.511295,
+          "rssBytes": 395657216
+        },
+        {
+          "scenario": "underway",
+          "phase": "first-import",
+          "hz": 5,
+          "observations": 18000,
+          "providerCalls": 3,
+          "firstCommitMs": 8515.136010999999,
+          "refineMs": 8546.869737,
+          "tileMs": 389.06894699999975,
+          "totalMs": 8937.796331000001,
+          "cells": 199,
+          "tileBytes": 1075,
+          "eventLoopMaxMs": 69.468159,
+          "rssBytes": 439828480
+        },
+        {
+          "scenario": "underway",
+          "phase": "owned-rebuild",
+          "hz": 5,
+          "observations": 18000,
+          "providerCalls": 3,
+          "firstCommitMs": 6707.575794,
+          "refineMs": 6725.783323,
+          "tileMs": 376.10327099999995,
+          "totalMs": 7104.368852000003,
+          "cells": 199,
+          "tileBytes": 1075,
+          "eventLoopMaxMs": 47.841279,
+          "rssBytes": 447135744
+        }
+      ]
+    },
+    {
+      "candidate": "v31-sliding-median",
+      "round": 1,
+      "results": [
+        {
+          "scenario": "anchored",
+          "phase": "first-import",
+          "hz": 5,
+          "observations": 18000,
+          "providerCalls": 3,
+          "firstCommitMs": 7133.257275,
+          "refineMs": 7140.161773,
+          "tileMs": 281.97903399999996,
+          "totalMs": 7423.1826949999995,
+          "cells": 4,
+          "tileBytes": 686,
+          "eventLoopMaxMs": 102.957055,
+          "rssBytes": 356810752
+        },
+        {
+          "scenario": "anchored",
+          "phase": "owned-rebuild",
+          "hz": 5,
+          "observations": 18000,
+          "providerCalls": 3,
+          "firstCommitMs": 3532.699702,
+          "refineMs": 3537.351774999999,
+          "tileMs": 341.0106850000011,
+          "totalMs": 3880.041885999999,
+          "cells": 4,
+          "tileBytes": 686,
+          "eventLoopMaxMs": 66.060287,
+          "rssBytes": 365412352
+        },
+        {
+          "scenario": "underway",
+          "phase": "first-import",
+          "hz": 5,
+          "observations": 18000,
+          "providerCalls": 3,
+          "firstCommitMs": 3875.3297159999984,
+          "refineMs": 3929.8407939999997,
+          "tileMs": 390.7456170000005,
+          "totalMs": 4322.580632999998,
+          "cells": 199,
+          "tileBytes": 1075,
+          "eventLoopMaxMs": 69.861375,
+          "rssBytes": 368869376
+        },
+        {
+          "scenario": "underway",
+          "phase": "owned-rebuild",
+          "hz": 5,
+          "observations": 18000,
+          "providerCalls": 3,
+          "firstCommitMs": 2941.8571999999986,
+          "refineMs": 2963.5243789999986,
+          "tileMs": 398.5011349999986,
+          "totalMs": 3364.9966619999977,
+          "cells": 199,
+          "tileBytes": 1075,
+          "eventLoopMaxMs": 53.051391,
+          "rssBytes": 369819648
+        }
+      ]
+    },
+    {
+      "candidate": "v31-sliding-median",
+      "round": 2,
+      "results": [
+        {
+          "scenario": "anchored",
+          "phase": "first-import",
+          "hz": 5,
+          "observations": 18000,
+          "providerCalls": 3,
+          "firstCommitMs": 5257.007903,
+          "refineMs": 5263.571513,
+          "tileMs": 282.3737879999999,
+          "totalMs": 5546.762393999999,
+          "cells": 4,
+          "tileBytes": 686,
+          "eventLoopMaxMs": 130.220031,
+          "rssBytes": 355418112
+        },
+        {
+          "scenario": "anchored",
+          "phase": "owned-rebuild",
+          "hz": 5,
+          "observations": 18000,
+          "providerCalls": 3,
+          "firstCommitMs": 3758.856478999999,
+          "refineMs": 3763.7111259999992,
+          "tileMs": 428.17527599999994,
+          "totalMs": 4193.494587,
+          "cells": 4,
+          "tileBytes": 686,
+          "eventLoopMaxMs": 52.592639,
+          "rssBytes": 366641152
+        },
+        {
+          "scenario": "underway",
+          "phase": "first-import",
+          "hz": 5,
+          "observations": 18000,
+          "providerCalls": 3,
+          "firstCommitMs": 4121.536244999999,
+          "refineMs": 4149.500572999999,
+          "tileMs": 356.8027739999998,
+          "totalMs": 4508.029290999999,
+          "cells": 199,
+          "tileBytes": 1075,
+          "eventLoopMaxMs": 72.155135,
+          "rssBytes": 370622464
+        },
+        {
+          "scenario": "underway",
+          "phase": "owned-rebuild",
+          "hz": 5,
+          "observations": 18000,
+          "providerCalls": 3,
+          "firstCommitMs": 2999.0735379999987,
+          "refineMs": 3017.6455899999983,
+          "tileMs": 358.67194200000085,
+          "totalMs": 3379.0920309999983,
+          "cells": 199,
+          "tileBytes": 1075,
+          "eventLoopMaxMs": 62.324735,
+          "rssBytes": 371179520
+        }
+      ]
+    },
+    {
+      "candidate": "v30",
+      "round": 2,
+      "results": [
+        {
+          "scenario": "anchored",
+          "phase": "first-import",
+          "hz": 5,
+          "observations": 18000,
+          "providerCalls": 3,
+          "firstCommitMs": 11098.250787,
+          "refineMs": 11108.82934,
+          "tileMs": 325.4672299999984,
+          "totalMs": 11435.225477,
+          "cells": 4,
+          "tileBytes": 686,
+          "eventLoopMaxMs": 92.864511,
+          "rssBytes": 399605760
+        },
+        {
+          "scenario": "anchored",
+          "phase": "owned-rebuild",
+          "hz": 5,
+          "observations": 18000,
+          "providerCalls": 3,
+          "firstCommitMs": 9447.787497,
+          "refineMs": 9453.550988,
+          "tileMs": 316.0097029999997,
+          "totalMs": 9771.093008000002,
+          "cells": 4,
+          "tileBytes": 686,
+          "eventLoopMaxMs": 57.966591,
+          "rssBytes": 393035776
+        },
+        {
+          "scenario": "underway",
+          "phase": "first-import",
+          "hz": 5,
+          "observations": 18000,
+          "providerCalls": 3,
+          "firstCommitMs": 7266.172368,
+          "refineMs": 7298.082591000002,
+          "tileMs": 411.08620399999927,
+          "totalMs": 7710.882017,
+          "cells": 199,
+          "tileBytes": 1075,
+          "eventLoopMaxMs": 70.320127,
+          "rssBytes": 437501952
+        },
+        {
+          "scenario": "underway",
+          "phase": "owned-rebuild",
+          "hz": 5,
+          "observations": 18000,
+          "providerCalls": 3,
+          "firstCommitMs": 6555.844675999997,
+          "refineMs": 6585.921312000002,
+          "tileMs": 396.8058200000014,
+          "totalMs": 6986.509497999996,
+          "cells": 199,
+          "tileBytes": 1075,
+          "eventLoopMaxMs": 42.336255,
+          "rssBytes": 438157312
+        }
+      ]
+    },
+    {
+      "candidate": "v32-preview-stage-and-sliding-median",
+      "round": 1,
+      "results": [
+        {
+          "scenario": "anchored",
+          "phase": "first-import",
+          "hz": 5,
+          "observations": 18000,
+          "providerCalls": 3,
+          "firstCommitMs": 5816.7940530000005,
+          "refineMs": 5823.9456040000005,
+          "tileMs": 341.7065280000006,
+          "totalMs": 6166.708793000001,
+          "cells": 4,
+          "tileBytes": 686,
+          "eventLoopMaxMs": 147.324927,
+          "rssBytes": 352256000
+        },
+        {
+          "scenario": "anchored",
+          "phase": "owned-rebuild",
+          "hz": 5,
+          "observations": 18000,
+          "providerCalls": 3,
+          "firstCommitMs": 3647.740264,
+          "refineMs": 3653.402139,
+          "tileMs": 310.24555599999985,
+          "totalMs": 3965.3492779999997,
+          "cells": 4,
+          "tileBytes": 686,
+          "eventLoopMaxMs": 39.485439,
+          "rssBytes": 362921984
+        },
+        {
+          "scenario": "underway",
+          "phase": "first-import",
+          "hz": 5,
+          "observations": 18000,
+          "providerCalls": 3,
+          "firstCommitMs": 3900.2232079999994,
+          "refineMs": 3928.790099,
+          "tileMs": 368.5535090000012,
+          "totalMs": 4299.057580000001,
+          "cells": 199,
+          "tileBytes": 1075,
+          "eventLoopMaxMs": 86.638591,
+          "rssBytes": 368427008
+        },
+        {
+          "scenario": "underway",
+          "phase": "owned-rebuild",
+          "hz": 5,
+          "observations": 18000,
+          "providerCalls": 3,
+          "firstCommitMs": 2917.4413430000004,
+          "refineMs": 2936.306956999999,
+          "tileMs": 335.9926489999998,
+          "totalMs": 3274.842128000002,
+          "cells": 199,
+          "tileBytes": 1075,
+          "eventLoopMaxMs": 71.237631,
+          "rssBytes": 370835456
+        }
+      ]
+    }
+  ],
+  "v35ConcurrentHttp": {
+    "scope": "Synthetic owned pipeline in a separate Docker process alongside active v24 Signal K; no production archive writes or browser measurement. Raw full-model HTTP probes sampled every 250 ms.",
+    "results": [
+      {
+        "scenario": "anchored",
+        "phase": "first-import",
+        "hz": 5,
+        "observations": 18000,
+        "providerCalls": 3,
+        "firstCommitMs": 4800.948083,
+        "refineMs": 4812.164622,
+        "tileMs": 344.28297100000054,
+        "totalMs": 5157.837654,
+        "cells": 4,
+        "tileBytes": 686,
+        "eventLoopMaxMs": 94.568447,
+        "rssBytes": 390004736
+      },
+      {
+        "scenario": "anchored",
+        "phase": "owned-rebuild",
+        "hz": 5,
+        "observations": 18000,
+        "providerCalls": 3,
+        "firstCommitMs": 3843.230866,
+        "refineMs": 3858.218455,
+        "tileMs": 390.04791999999907,
+        "totalMs": 4250.332067000001,
+        "cells": 4,
+        "tileBytes": 686,
+        "eventLoopMaxMs": 66.715647,
+        "rssBytes": 397000704
+      },
+      {
+        "scenario": "underway",
+        "phase": "first-import",
+        "hz": 5,
+        "observations": 18000,
+        "providerCalls": 3,
+        "firstCommitMs": 4025.4957780000004,
+        "refineMs": 4063.085666000001,
+        "tileMs": 351.8035779999991,
+        "totalMs": 4416.935715,
+        "cells": 199,
+        "tileBytes": 1075,
+        "eventLoopMaxMs": 72.613887,
+        "rssBytes": 403931136
+      },
+      {
+        "scenario": "underway",
+        "phase": "owned-rebuild",
+        "hz": 5,
+        "observations": 18000,
+        "providerCalls": 3,
+        "firstCommitMs": 2873.1277679999985,
+        "refineMs": 2891.1217370000013,
+        "tileMs": 344.04437999999936,
+        "totalMs": 3237.381476999999,
+        "cells": 199,
+        "tileBytes": 1075,
+        "eventLoopMaxMs": 45.580287,
+        "rssBytes": 403161088
+      },
+      {
+        "scope": "Synthetic owned pipeline in separate Docker process alongside active v24 Signal K",
+        "httpSamples": 60,
+        "httpP95Ms": 93.78202600000077,
+        "samples": [
+          {
+            "ms": 520.59689,
+            "status": 200
+          },
+          {
+            "ms": 18.296655999999984,
+            "status": 200
+          },
+          {
+            "ms": 29.80230799999981,
+            "status": 200
+          },
+          {
+            "ms": 18.751658000000134,
+            "status": 200
+          },
+          {
+            "ms": 56.22226999999998,
+            "status": 200
+          },
+          {
+            "ms": 50.78338000000008,
+            "status": 200
+          },
+          {
+            "ms": 26.103183000000172,
+            "status": 200
+          },
+          {
+            "ms": 13.14304600000014,
+            "status": 200
+          },
+          {
+            "ms": 30.3158269999999,
+            "status": 200
+          },
+          {
+            "ms": 24.34178800000018,
+            "status": 200
+          },
+          {
+            "ms": 27.50707700000021,
+            "status": 200
+          },
+          {
+            "ms": 36.879925000000185,
+            "status": 200
+          },
+          {
+            "ms": 106.036924,
+            "status": 200
+          },
+          {
+            "ms": 13.323730999999498,
+            "status": 200
+          },
+          {
+            "ms": 45.36602700000003,
+            "status": 200
+          },
+          {
+            "ms": 26.017683000000034,
+            "status": 200
+          },
+          {
+            "ms": 30.000473999999485,
+            "status": 200
+          },
+          {
+            "ms": 42.807425999999396,
+            "status": 200
+          },
+          {
+            "ms": 60.06592999999975,
+            "status": 200
+          },
+          {
+            "ms": 26.372295000000122,
+            "status": 200
+          },
+          {
+            "ms": 14.961811000000125,
+            "status": 200
+          },
+          {
+            "ms": 43.110389999999825,
+            "status": 200
+          },
+          {
+            "ms": 22.2510029999994,
+            "status": 200
+          },
+          {
+            "ms": 25.96790499999952,
+            "status": 200
+          },
+          {
+            "ms": 26.40116499999931,
+            "status": 200
+          },
+          {
+            "ms": 31.81822100000045,
+            "status": 200
+          },
+          {
+            "ms": 34.90100900000016,
+            "status": 200
+          },
+          {
+            "ms": 15.951073000000179,
+            "status": 200
+          },
+          {
+            "ms": 25.197847000001275,
+            "status": 200
+          },
+          {
+            "ms": 25.975626999999804,
+            "status": 200
+          },
+          {
+            "ms": 83.49332499999946,
+            "status": 200
+          },
+          {
+            "ms": 36.77544200000011,
+            "status": 200
+          },
+          {
+            "ms": 90.63496000000123,
+            "status": 200
+          },
+          {
+            "ms": 63.484033000000636,
+            "status": 200
+          },
+          {
+            "ms": 12.049967000000834,
+            "status": 200
+          },
+          {
+            "ms": 74.45266399999855,
+            "status": 200
+          },
+          {
+            "ms": 92.02740999999878,
+            "status": 200
+          },
+          {
+            "ms": 52.86182999999983,
+            "status": 200
+          },
+          {
+            "ms": 82.10702300000048,
+            "status": 200
+          },
+          {
+            "ms": 14.362790000001041,
+            "status": 200
+          },
+          {
+            "ms": 26.531295000000682,
+            "status": 200
+          },
+          {
+            "ms": 9.665587999999843,
+            "status": 200
+          },
+          {
+            "ms": 41.02538200000163,
+            "status": 200
+          },
+          {
+            "ms": 93.78202600000077,
+            "status": 200
+          },
+          {
+            "ms": 9.775330000000395,
+            "status": 200
+          },
+          {
+            "ms": 28.150206999998773,
+            "status": 200
+          },
+          {
+            "ms": 14.087140999999974,
+            "status": 200
+          },
+          {
+            "ms": 16.860501999999542,
+            "status": 200
+          },
+          {
+            "ms": 11.638076999999612,
+            "status": 200
+          },
+          {
+            "ms": 23.439061999999467,
+            "status": 200
+          },
+          {
+            "ms": 27.487871999999697,
+            "status": 200
+          },
+          {
+            "ms": 13.552527999998347,
+            "status": 200
+          },
+          {
+            "ms": 22.135447000000568,
+            "status": 200
+          },
+          {
+            "ms": 15.454498000000967,
+            "status": 200
+          },
+          {
+            "ms": 95.32886399999916,
+            "status": 200
+          },
+          {
+            "ms": 38.60333600000013,
+            "status": 200
+          },
+          {
+            "ms": 40.407859999999346,
+            "status": 200
+          },
+          {
+            "ms": 42.27197800000067,
+            "status": 200
+          },
+          {
+            "ms": 15.841757999998663,
+            "status": 200
+          },
+          {
+            "ms": 13.279138000001694,
+            "status": 200
+          }
+        ]
+      }
+    ]
+  },
+  "v36OverlapConcurrentHttp": {
+    "scope": "Synthetic 5 Hz owned pipeline, with a nonaligned preview seeded before the timed refinement. Separate Docker process alongside active v24 Signal K. seedMs is excluded from totalMs. No production database writes or browser measurements.",
+    "results": [
+      {
+        "scenario": "anchored",
+        "phase": "first-import",
+        "overlap": true,
+        "seedMs": 1337.825767,
+        "hz": 5,
+        "observations": 18000,
+        "providerCalls": 4,
+        "firstCommitMs": 6851.313233000001,
+        "refineMs": 6858.047974000001,
+        "tileMs": 310.80766700000095,
+        "totalMs": 7169.801165000001,
+        "cells": 4,
+        "tileBytes": 686,
+        "eventLoopMaxMs": 240.254975,
+        "rssBytes": 485359616
+      },
+      {
+        "scenario": "anchored",
+        "phase": "owned-rebuild",
+        "overlap": true,
+        "seedMs": 0,
+        "hz": 5,
+        "observations": 18000,
+        "providerCalls": 4,
+        "firstCommitMs": 4432.0807669999995,
+        "refineMs": 4437.880169,
+        "tileMs": 360.0546650000015,
+        "totalMs": 4800.501206000001,
+        "cells": 4,
+        "tileBytes": 686,
+        "eventLoopMaxMs": 273.678335,
+        "rssBytes": 505724928
+      },
+      {
+        "scenario": "underway",
+        "phase": "first-import",
+        "overlap": true,
+        "seedMs": 998.8707610000001,
+        "hz": 5,
+        "observations": 18000,
+        "providerCalls": 4,
+        "firstCommitMs": 5980.534231,
+        "refineMs": 6059.354819000002,
+        "tileMs": 425.9764879999966,
+        "totalMs": 6487.157874999999,
+        "cells": 199,
+        "tileBytes": 1075,
+        "eventLoopMaxMs": 157.548543,
+        "rssBytes": 518733824
+      },
+      {
+        "scenario": "underway",
+        "phase": "owned-rebuild",
+        "overlap": true,
+        "seedMs": 0,
+        "hz": 5,
+        "observations": 18000,
+        "providerCalls": 4,
+        "firstCommitMs": 3630.677230999998,
+        "refineMs": 3651.2355119999993,
+        "tileMs": 374.35972200000106,
+        "totalMs": 4027.8826109999973,
+        "cells": 199,
+        "tileBytes": 1075,
+        "eventLoopMaxMs": 131.792895,
+        "rssBytes": 482820096
+      },
+      {
+        "scope": "Synthetic owned pipeline in separate Docker process alongside active v24 Signal K",
+        "httpSamples": 80,
+        "httpP95Ms": 264.3932050000003,
+        "samples": [
+          {
+            "ms": 388.162663,
+            "status": 200
+          },
+          {
+            "ms": 55.510429000000045,
+            "status": 200
+          },
+          {
+            "ms": 61.02070299999991,
+            "status": 200
+          },
+          {
+            "ms": 68.86264900000015,
+            "status": 200
+          },
+          {
+            "ms": 105.19527399999993,
+            "status": 200
+          },
+          {
+            "ms": 42.327354000000014,
+            "status": 200
+          },
+          {
+            "ms": 32.32678999999962,
+            "status": 200
+          },
+          {
+            "ms": 24.651879000000008,
+            "status": 200
+          },
+          {
+            "ms": 31.21171299999969,
+            "status": 200
+          },
+          {
+            "ms": 36.882431,
+            "status": 200
+          },
+          {
+            "ms": 83.63196800000014,
+            "status": 200
+          },
+          {
+            "ms": 104.38684599999988,
+            "status": 200
+          },
+          {
+            "ms": 33.62342200000057,
+            "status": 200
+          },
+          {
+            "ms": 264.3932050000003,
+            "status": 200
+          },
+          {
+            "ms": 35.06895800000075,
+            "status": 200
+          },
+          {
+            "ms": 17.40655500000048,
+            "status": 200
+          },
+          {
+            "ms": 15.578488000000107,
+            "status": 200
+          },
+          {
+            "ms": 19.39691700000003,
+            "status": 200
+          },
+          {
+            "ms": 14.968829999999798,
+            "status": 200
+          },
+          {
+            "ms": 19.115810000000238,
+            "status": 200
+          },
+          {
+            "ms": 25.59477599999991,
+            "status": 200
+          },
+          {
+            "ms": 30.594724999999926,
+            "status": 200
+          },
+          {
+            "ms": 16.81311899999946,
+            "status": 200
+          },
+          {
+            "ms": 50.581396000000495,
+            "status": 200
+          },
+          {
+            "ms": 75.05102100000022,
+            "status": 200
+          },
+          {
+            "ms": 10.578223999999864,
+            "status": 200
+          },
+          {
+            "ms": 24.20137000000068,
+            "status": 200
+          },
+          {
+            "ms": 13.623978999999963,
+            "status": 200
+          },
+          {
+            "ms": 26.21380599999975,
+            "status": 200
+          },
+          {
+            "ms": 11.881948000000193,
+            "status": 200
+          },
+          {
+            "ms": 30.589302000000316,
+            "status": 200
+          },
+          {
+            "ms": 52.79334899999958,
+            "status": 200
+          },
+          {
+            "ms": 110.95445699999982,
+            "status": 200
+          },
+          {
+            "ms": 296.50760100000116,
+            "status": 200
+          },
+          {
+            "ms": 45.961128999999346,
+            "status": 200
+          },
+          {
+            "ms": 42.29890200000045,
+            "status": 200
+          },
+          {
+            "ms": 85.12646500000119,
+            "status": 200
+          },
+          {
+            "ms": 40.57027800000105,
+            "status": 200
+          },
+          {
+            "ms": 21.73379599999862,
+            "status": 200
+          },
+          {
+            "ms": 18.286286999998993,
+            "status": 200
+          },
+          {
+            "ms": 11.345084999999017,
+            "status": 200
+          },
+          {
+            "ms": 21.72592600000098,
+            "status": 200
+          },
+          {
+            "ms": 118.01372100000117,
+            "status": 200
+          },
+          {
+            "ms": 49.704915000000256,
+            "status": 200
+          },
+          {
+            "ms": 128.94489000000067,
+            "status": 200
+          },
+          {
+            "ms": 15.099516000000222,
+            "status": 200
+          },
+          {
+            "ms": 13.405391000000236,
+            "status": 200
+          },
+          {
+            "ms": 13.158618000001297,
+            "status": 200
+          },
+          {
+            "ms": 16.134651000000304,
+            "status": 200
+          },
+          {
+            "ms": 11.651545000000624,
+            "status": 200
+          },
+          {
+            "ms": 12.721178999998301,
+            "status": 200
+          },
+          {
+            "ms": 13.764220000000932,
+            "status": 200
+          },
+          {
+            "ms": 10.39306200000101,
+            "status": 200
+          },
+          {
+            "ms": 34.64941900000122,
+            "status": 200
+          },
+          {
+            "ms": 15.116480000000593,
+            "status": 200
+          },
+          {
+            "ms": 74.27836300000126,
+            "status": 200
+          },
+          {
+            "ms": 50.264171000002534,
+            "status": 200
+          },
+          {
+            "ms": 74.70391500000187,
+            "status": 200
+          },
+          {
+            "ms": 30.807342000000062,
+            "status": 200
+          },
+          {
+            "ms": 28.43272699999943,
+            "status": 200
+          },
+          {
+            "ms": 27.135263000000123,
+            "status": 200
+          },
+          {
+            "ms": 389.47955300000103,
+            "status": 200
+          },
+          {
+            "ms": 25.97211299999981,
+            "status": 200
+          },
+          {
+            "ms": 11.391419999999925,
+            "status": 200
+          },
+          {
+            "ms": 1135.1031739999999,
+            "status": 200
+          },
+          {
+            "ms": 10.681227000000945,
+            "status": 200
+          },
+          {
+            "ms": 10.702449000000342,
+            "status": 200
+          },
+          {
+            "ms": 123.75709600000118,
+            "status": 200
+          },
+          {
+            "ms": 34.71707000000242,
+            "status": 200
+          },
+          {
+            "ms": 35.748631999998906,
+            "status": 200
+          },
+          {
+            "ms": 134.09747900000002,
+            "status": 200
+          },
+          {
+            "ms": 14.826875999999174,
+            "status": 200
+          },
+          {
+            "ms": 24.582837999998446,
+            "status": 200
+          },
+          {
+            "ms": 27.554724000001443,
+            "status": 200
+          },
+          {
+            "ms": 21.178900999999314,
+            "status": 200
+          },
+          {
+            "ms": 16.96969900000113,
+            "status": 200
+          },
+          {
+            "ms": 16.021175000001676,
+            "status": 200
+          },
+          {
+            "ms": 19.27726099999927,
+            "status": 200
+          },
+          {
+            "ms": 28.171086999998806,
+            "status": 200
+          },
+          {
+            "ms": 35.56645199999912,
+            "status": 200
+          }
+        ]
+      }
+    ]
+  },
+  "v37OverlapConcurrentHttp": {
+    "scope": "Synthetic 5 Hz owned pipeline, with a nonaligned preview seeded before the timed refinement. Separate Docker process alongside active v24 Signal K. seedMs is excluded from totalMs. No production database writes or browser measurements.",
+    "results": [
+      {
+        "scenario": "anchored",
+        "phase": "first-import",
+        "overlap": true,
+        "seedMs": 1280.68349,
+        "hz": 5,
+        "observations": 18000,
+        "providerCalls": 4,
+        "firstCommitMs": 5159.952,
+        "refineMs": 5167.162475,
+        "tileMs": 423.2379719999999,
+        "totalMs": 5591.298627,
+        "cells": 4,
+        "tileBytes": 686,
+        "eventLoopMaxMs": 82.182143,
+        "rssBytes": 453853184
+      },
+      {
+        "scenario": "anchored",
+        "phase": "owned-rebuild",
+        "overlap": true,
+        "seedMs": 0,
+        "hz": 5,
+        "observations": 18000,
+        "providerCalls": 4,
+        "firstCommitMs": 3995.2187379999996,
+        "refineMs": 4011.3996239999997,
+        "tileMs": 248.36758200000077,
+        "totalMs": 4261.322362999999,
+        "cells": 4,
+        "tileBytes": 686,
+        "eventLoopMaxMs": 39.026687,
+        "rssBytes": 475086848
+      },
+      {
+        "scenario": "underway",
+        "phase": "first-import",
+        "overlap": true,
+        "seedMs": 1328.0154899999998,
+        "hz": 5,
+        "observations": 18000,
+        "providerCalls": 4,
+        "firstCommitMs": 5103.553059000002,
+        "refineMs": 5149.439418999998,
+        "tileMs": 362.30835699999807,
+        "totalMs": 5514.452315999999,
+        "cells": 199,
+        "tileBytes": 1075,
+        "eventLoopMaxMs": 94.109695,
+        "rssBytes": 543948800
+      },
+      {
+        "scenario": "underway",
+        "phase": "owned-rebuild",
+        "overlap": true,
+        "seedMs": 0,
+        "hz": 5,
+        "observations": 18000,
+        "providerCalls": 4,
+        "firstCommitMs": 3178.9652760000026,
+        "refineMs": 3196.784912000003,
+        "tileMs": 341.963584000001,
+        "totalMs": 3541.3785180000013,
+        "cells": 199,
+        "tileBytes": 1075,
+        "eventLoopMaxMs": 23.101439,
+        "rssBytes": 475840512
+      },
+      {
+        "scope": "Synthetic owned pipeline in separate Docker process alongside active v24 Signal K",
+        "httpSamples": 76,
+        "httpP95Ms": 202.9759019999983,
+        "samples": [
+          {
+            "ms": 556.281526,
+            "status": 200
+          },
+          {
+            "ms": 17.10517399999992,
+            "status": 200
+          },
+          {
+            "ms": 19.899269000000004,
+            "status": 200
+          },
+          {
+            "ms": 11.979556999999886,
+            "status": 200
+          },
+          {
+            "ms": 14.65913300000011,
+            "status": 200
+          },
+          {
+            "ms": 63.080656999999974,
+            "status": 200
+          },
+          {
+            "ms": 35.345380000000205,
+            "status": 200
+          },
+          {
+            "ms": 26.272601000000122,
+            "status": 200
+          },
+          {
+            "ms": 29.43554499999982,
+            "status": 200
+          },
+          {
+            "ms": 21.85512800000015,
+            "status": 200
+          },
+          {
+            "ms": 24.171262000000297,
+            "status": 200
+          },
+          {
+            "ms": 21.180836,
+            "status": 200
+          },
+          {
+            "ms": 35.34738000000016,
+            "status": 200
+          },
+          {
+            "ms": 26.257064999999784,
+            "status": 200
+          },
+          {
+            "ms": 15.63790599999993,
+            "status": 200
+          },
+          {
+            "ms": 20.31047000000035,
+            "status": 200
+          },
+          {
+            "ms": 28.4191809999993,
+            "status": 200
+          },
+          {
+            "ms": 17.83787399999983,
+            "status": 200
+          },
+          {
+            "ms": 46.50592499999948,
+            "status": 200
+          },
+          {
+            "ms": 31.67569999999978,
+            "status": 200
+          },
+          {
+            "ms": 13.483992999999828,
+            "status": 200
+          },
+          {
+            "ms": 70.20602400000007,
+            "status": 200
+          },
+          {
+            "ms": 23.640636000000086,
+            "status": 200
+          },
+          {
+            "ms": 41.009125999999924,
+            "status": 200
+          },
+          {
+            "ms": 13.822084000000359,
+            "status": 200
+          },
+          {
+            "ms": 27.128764000000047,
+            "status": 200
+          },
+          {
+            "ms": 35.59956500000044,
+            "status": 200
+          },
+          {
+            "ms": 12.689127999999982,
+            "status": 200
+          },
+          {
+            "ms": 22.881084999999075,
+            "status": 200
+          },
+          {
+            "ms": 17.340767000001506,
+            "status": 200
+          },
+          {
+            "ms": 25.704697999999553,
+            "status": 200
+          },
+          {
+            "ms": 39.5893930000002,
+            "status": 200
+          },
+          {
+            "ms": 15.58233299999847,
+            "status": 200
+          },
+          {
+            "ms": 13.303235999999742,
+            "status": 200
+          },
+          {
+            "ms": 24.092411999999968,
+            "status": 200
+          },
+          {
+            "ms": 38.15036599999985,
+            "status": 200
+          },
+          {
+            "ms": 23.840266000001066,
+            "status": 200
+          },
+          {
+            "ms": 39.00908399999935,
+            "status": 200
+          },
+          {
+            "ms": 21.942387999999482,
+            "status": 200
+          },
+          {
+            "ms": 11.941855000000942,
+            "status": 200
+          },
+          {
+            "ms": 14.06123099999968,
+            "status": 200
+          },
+          {
+            "ms": 14.789505000000645,
+            "status": 200
+          },
+          {
+            "ms": 22.64158900000075,
+            "status": 200
+          },
+          {
+            "ms": 13.04212600000028,
+            "status": 200
+          },
+          {
+            "ms": 26.139141999999993,
+            "status": 200
+          },
+          {
+            "ms": 10.854083999998693,
+            "status": 200
+          },
+          {
+            "ms": 112.33026099999915,
+            "status": 200
+          },
+          {
+            "ms": 285.73023900000044,
+            "status": 200
+          },
+          {
+            "ms": 24.87692700000116,
+            "status": 200
+          },
+          {
+            "ms": 20.893340000000535,
+            "status": 200
+          },
+          {
+            "ms": 11.877559999998994,
+            "status": 200
+          },
+          {
+            "ms": 11.028287000001,
+            "status": 200
+          },
+          {
+            "ms": 17.353619999999864,
+            "status": 200
+          },
+          {
+            "ms": 449.53979900000013,
+            "status": 200
+          },
+          {
+            "ms": 48.53058500000043,
+            "status": 200
+          },
+          {
+            "ms": 17.92130200000247,
+            "status": 200
+          },
+          {
+            "ms": 15.433371999999508,
+            "status": 200
+          },
+          {
+            "ms": 23.657454000000143,
+            "status": 200
+          },
+          {
+            "ms": 20.198232999999163,
+            "status": 200
+          },
+          {
+            "ms": 202.9759019999983,
+            "status": 200
+          },
+          {
+            "ms": 23.984266999999818,
+            "status": 200
+          },
+          {
+            "ms": 15.099781999997504,
+            "status": 200
+          },
+          {
+            "ms": 9.304446000001917,
+            "status": 200
+          },
+          {
+            "ms": 27.860132999998314,
+            "status": 200
+          },
+          {
+            "ms": 22.152556000000914,
+            "status": 200
+          },
+          {
+            "ms": 19.869940000000497,
+            "status": 200
+          },
+          {
+            "ms": 20.299104000001535,
+            "status": 200
+          },
+          {
+            "ms": 26.178272999997716,
+            "status": 200
+          },
+          {
+            "ms": 46.16015700000207,
+            "status": 200
+          },
+          {
+            "ms": 24.952502000000095,
+            "status": 200
+          },
+          {
+            "ms": 29.908269999999902,
+            "status": 200
+          },
+          {
+            "ms": 22.701015999999072,
+            "status": 200
+          },
+          {
+            "ms": 31.014986000001954,
+            "status": 200
+          },
+          {
+            "ms": 14.481359999997949,
+            "status": 200
+          },
+          {
+            "ms": 12.019875000001775,
+            "status": 200
+          },
+          {
+            "ms": 15.917073999997228,
+            "status": 200
+          }
+        ]
+      }
+    ]
+  },
+  "v39OverlapConcurrentHttp": [
+    {
+      "scenario": "anchored",
+      "phase": "first-import",
+      "overlap": true,
+      "seedMs": 2777.946218,
+      "hz": 5,
+      "observations": 18000,
+      "providerCalls": 4,
+      "firstCommitMs": 6199.107636000001,
+      "refineMs": 6204.633718000001,
+      "tileMs": 293.78974799999924,
+      "totalMs": 6499.272021000001,
+      "cells": 4,
+      "tileBytes": 686,
+      "eventLoopMaxMs": 82.247679,
+      "rssBytes": 450215936
+    },
+    {
+      "scenario": "anchored",
+      "phase": "owned-rebuild",
+      "overlap": true,
+      "seedMs": 0,
+      "hz": 5,
+      "observations": 18000,
+      "providerCalls": 4,
+      "firstCommitMs": 4045.2556429999986,
+      "refineMs": 4062.641406999999,
+      "tileMs": 298.63090900000134,
+      "totalMs": 4362.8244429999995,
+      "cells": 4,
+      "tileBytes": 686,
+      "eventLoopMaxMs": 46.039039,
+      "rssBytes": 523468800
+    },
+    {
+      "scenario": "underway",
+      "phase": "first-import",
+      "overlap": true,
+      "seedMs": 1403.3276590000005,
+      "hz": 5,
+      "observations": 18000,
+      "providerCalls": 4,
+      "firstCommitMs": 5061.274969000002,
+      "refineMs": 5086.802163,
+      "tileMs": 379.5831900000012,
+      "totalMs": 5468.424534000002,
+      "cells": 199,
+      "tileBytes": 1075,
+      "eventLoopMaxMs": 96.272383,
+      "rssBytes": 542228480
+    },
+    {
+      "scenario": "underway",
+      "phase": "owned-rebuild",
+      "overlap": true,
+      "seedMs": 0,
+      "hz": 5,
+      "observations": 18000,
+      "providerCalls": 4,
+      "firstCommitMs": 3302.907413000001,
+      "refineMs": 3324.99265,
+      "tileMs": 461.89613499999905,
+      "totalMs": 3789.464670000001,
+      "cells": 199,
+      "tileBytes": 1075,
+      "eventLoopMaxMs": 35.028991,
+      "rssBytes": 470532096
+    },
+    {
+      "scope": "Synthetic owned pipeline in separate Docker process alongside active v24 Signal K",
+      "httpSamples": 81,
+      "httpP95Ms": 252.13229299999875,
+      "samples": [
+        {
+          "ms": 878.589641,
+          "status": 200
+        },
+        {
+          "ms": 304.1387790000001,
+          "status": 200
+        },
+        {
+          "ms": 128.47018400000002,
+          "status": 200
+        },
+        {
+          "ms": 38.987223000000085,
+          "status": 200
+        },
+        {
+          "ms": 137.94385200000033,
+          "status": 200
+        },
+        {
+          "ms": 72.55947399999968,
+          "status": 200
+        },
+        {
+          "ms": 680.1675370000003,
+          "status": 200
+        },
+        {
+          "ms": 12.745920000000297,
+          "status": 200
+        },
+        {
+          "ms": 10.671425000000454,
+          "status": 200
+        },
+        {
+          "ms": 15.908932999999706,
+          "status": 200
+        },
+        {
+          "ms": 35.38595299999997,
+          "status": 200
+        },
+        {
+          "ms": 18.90496499999972,
+          "status": 200
+        },
+        {
+          "ms": 44.70339700000022,
+          "status": 200
+        },
+        {
+          "ms": 47.39609699999983,
+          "status": 200
+        },
+        {
+          "ms": 18.486353999999665,
+          "status": 200
+        },
+        {
+          "ms": 14.1977880000004,
+          "status": 200
+        },
+        {
+          "ms": 28.589019999999437,
+          "status": 200
+        },
+        {
+          "ms": 40.79686800000036,
+          "status": 200
+        },
+        {
+          "ms": 46.97482000000036,
+          "status": 200
+        },
+        {
+          "ms": 65.09758200000033,
+          "status": 200
+        },
+        {
+          "ms": 12.41805100000056,
+          "status": 200
+        },
+        {
+          "ms": 37.907633000000715,
+          "status": 200
+        },
+        {
+          "ms": 13.494677999999112,
+          "status": 200
+        },
+        {
+          "ms": 107.91179799999918,
+          "status": 200
+        },
+        {
+          "ms": 15.721803999998883,
+          "status": 200
+        },
+        {
+          "ms": 18.911668999999165,
+          "status": 200
+        },
+        {
+          "ms": 36.76989399999911,
+          "status": 200
+        },
+        {
+          "ms": 22.88527199999953,
+          "status": 200
+        },
+        {
+          "ms": 14.577768999999535,
+          "status": 200
+        },
+        {
+          "ms": 40.77159000000029,
+          "status": 200
+        },
+        {
+          "ms": 14.496527999999671,
+          "status": 200
+        },
+        {
+          "ms": 17.154356999999436,
+          "status": 200
+        },
+        {
+          "ms": 26.54132099999879,
+          "status": 200
+        },
+        {
+          "ms": 22.250272999999652,
+          "status": 200
+        },
+        {
+          "ms": 27.033282999998846,
+          "status": 200
+        },
+        {
+          "ms": 18.12376200000108,
+          "status": 200
+        },
+        {
+          "ms": 39.186094000000594,
+          "status": 200
+        },
+        {
+          "ms": 35.12743500000033,
+          "status": 200
+        },
+        {
+          "ms": 16.67457999999897,
+          "status": 200
+        },
+        {
+          "ms": 17.131357000000207,
+          "status": 200
+        },
+        {
+          "ms": 11.145590000000084,
+          "status": 200
+        },
+        {
+          "ms": 21.359478999998828,
+          "status": 200
+        },
+        {
+          "ms": 51.61747900000046,
+          "status": 200
+        },
+        {
+          "ms": 16.76037600000018,
+          "status": 200
+        },
+        {
+          "ms": 377.7298179999998,
+          "status": 200
+        },
+        {
+          "ms": 44.58002800000031,
+          "status": 200
+        },
+        {
+          "ms": 12.012144000000262,
+          "status": 200
+        },
+        {
+          "ms": 19.443334999999934,
+          "status": 200
+        },
+        {
+          "ms": 50.02242599999954,
+          "status": 200
+        },
+        {
+          "ms": 115.67880400000286,
+          "status": 200
+        },
+        {
+          "ms": 252.13229299999875,
+          "status": 200
+        },
+        {
+          "ms": 21.549294000000373,
+          "status": 200
+        },
+        {
+          "ms": 19.137593999999808,
+          "status": 200
+        },
+        {
+          "ms": 67.01350599999932,
+          "status": 200
+        },
+        {
+          "ms": 10.783665000002657,
+          "status": 200
+        },
+        {
+          "ms": 21.621423000000505,
+          "status": 200
+        },
+        {
+          "ms": 22.09336600000097,
+          "status": 200
+        },
+        {
+          "ms": 65.07669500000338,
+          "status": 200
+        },
+        {
+          "ms": 58.4474850000006,
+          "status": 200
+        },
+        {
+          "ms": 49.00528000000122,
+          "status": 200
+        },
+        {
+          "ms": 52.9205129999973,
+          "status": 200
+        },
+        {
+          "ms": 22.208291999999346,
+          "status": 200
+        },
+        {
+          "ms": 16.947449999999662,
+          "status": 200
+        },
+        {
+          "ms": 14.704528999998729,
+          "status": 200
+        },
+        {
+          "ms": 23.23371599999882,
+          "status": 200
+        },
+        {
+          "ms": 18.317706999998336,
+          "status": 200
+        },
+        {
+          "ms": 38.0892070000009,
+          "status": 200
+        },
+        {
+          "ms": 15.318119999999908,
+          "status": 200
+        },
+        {
+          "ms": 15.562286000000313,
+          "status": 200
+        },
+        {
+          "ms": 12.022144999999,
+          "status": 200
+        },
+        {
+          "ms": 18.115633000001253,
+          "status": 200
+        },
+        {
+          "ms": 20.7394060000006,
+          "status": 200
+        },
+        {
+          "ms": 47.72085700000025,
+          "status": 200
+        },
+        {
+          "ms": 47.22609800000282,
+          "status": 200
+        },
+        {
+          "ms": 10.223407000001316,
+          "status": 200
+        },
+        {
+          "ms": 35.77141599999959,
+          "status": 200
+        },
+        {
+          "ms": 10.953442999998515,
+          "status": 200
+        },
+        {
+          "ms": 16.840580000000045,
+          "status": 200
+        },
+        {
+          "ms": 45.27608400000099,
+          "status": 200
+        },
+        {
+          "ms": 16.278878000000987,
+          "status": 200
+        },
+        {
+          "ms": 23.445864000001166,
+          "status": 200
+        }
+      ]
+    }
+  ],
+  "v40OverlapConcurrentHttp": [
+    {
+      "scenario": "anchored",
+      "phase": "first-import",
+      "overlap": true,
+      "seedMs": 1227.278032,
+      "hz": 5,
+      "observations": 18000,
+      "providerCalls": 4,
+      "firstCommitMs": 5018.788331000001,
+      "refineMs": 5029.61289,
+      "tileMs": 237.57862599999953,
+      "totalMs": 5267.99139,
+      "cells": 4,
+      "tileBytes": 686,
+      "eventLoopMaxMs": 78.839807,
+      "rssBytes": 475873280
+    },
+    {
+      "scenario": "anchored",
+      "phase": "owned-rebuild",
+      "overlap": true,
+      "seedMs": 0,
+      "hz": 5,
+      "observations": 18000,
+      "providerCalls": 4,
+      "firstCommitMs": 6394.15076,
+      "refineMs": 6493.760287000001,
+      "tileMs": 555.6420519999992,
+      "totalMs": 7055.266976999999,
+      "cells": 4,
+      "tileBytes": 686,
+      "eventLoopMaxMs": 113.704959,
+      "rssBytes": 541982720
+    },
+    {
+      "scenario": "underway",
+      "phase": "first-import",
+      "overlap": true,
+      "seedMs": 2371.595892000001,
+      "hz": 5,
+      "observations": 18000,
+      "providerCalls": 4,
+      "firstCommitMs": 5872.806758000002,
+      "refineMs": 5898.463882,
+      "tileMs": 416.65276900000026,
+      "totalMs": 6316.906158000002,
+      "cells": 199,
+      "tileBytes": 1075,
+      "eventLoopMaxMs": 161.218559,
+      "rssBytes": 488718336
+    },
+    {
+      "scenario": "underway",
+      "phase": "owned-rebuild",
+      "overlap": true,
+      "seedMs": 0,
+      "hz": 5,
+      "observations": 18000,
+      "providerCalls": 4,
+      "firstCommitMs": 2967.832391,
+      "refineMs": 2985.2194390000004,
+      "tileMs": 385.5275990000009,
+      "totalMs": 3373.7840990000004,
+      "cells": 199,
+      "tileBytes": 1075,
+      "eventLoopMaxMs": 39.780351,
+      "rssBytes": 500826112
+    },
+    {
+      "scope": "Synthetic owned pipeline in separate Docker process alongside active v39 Signal K",
+      "httpSamples": 86,
+      "httpP95Ms": 158.88000400000055,
+      "samples": [
+        {
+          "ms": 456.653117,
+          "status": 200
+        },
+        {
+          "ms": 55.21116299999994,
+          "status": 200
+        },
+        {
+          "ms": 32.64961399999993,
+          "status": 200
+        },
+        {
+          "ms": 38.28382099999999,
+          "status": 200
+        },
+        {
+          "ms": 13.943586000000096,
+          "status": 200
+        },
+        {
+          "ms": 19.754919999999856,
+          "status": 200
+        },
+        {
+          "ms": 25.93778300000031,
+          "status": 200
+        },
+        {
+          "ms": 250.45243600000003,
+          "status": 200
+        },
+        {
+          "ms": 35.975818999999774,
+          "status": 200
+        },
+        {
+          "ms": 13.820756999999958,
+          "status": 200
+        },
+        {
+          "ms": 17.228767999999945,
+          "status": 200
+        },
+        {
+          "ms": 18.859515999999985,
+          "status": 200
+        },
+        {
+          "ms": 30.520796000000246,
+          "status": 200
+        },
+        {
+          "ms": 36.47166500000003,
+          "status": 200
+        },
+        {
+          "ms": 13.308898999999656,
+          "status": 200
+        },
+        {
+          "ms": 41.44861299999957,
+          "status": 200
+        },
+        {
+          "ms": 37.40907700000025,
+          "status": 200
+        },
+        {
+          "ms": 45.96286499999951,
+          "status": 200
+        },
+        {
+          "ms": 21.8881109999993,
+          "status": 200
+        },
+        {
+          "ms": 73.65585199999987,
+          "status": 200
+        },
+        {
+          "ms": 24.15179100000023,
+          "status": 200
+        },
+        {
+          "ms": 21.429419000000053,
+          "status": 200
+        },
+        {
+          "ms": 27.618452000000616,
+          "status": 200
+        },
+        {
+          "ms": 13.784115999999813,
+          "status": 200
+        },
+        {
+          "ms": 20.131516999999803,
+          "status": 200
+        },
+        {
+          "ms": 69.35102200000074,
+          "status": 200
+        },
+        {
+          "ms": 21.006336000000374,
+          "status": 200
+        },
+        {
+          "ms": 38.672529999999824,
+          "status": 200
+        },
+        {
+          "ms": 27.361666999999215,
+          "status": 200
+        },
+        {
+          "ms": 59.06260699999984,
+          "status": 200
+        },
+        {
+          "ms": 42.88043899999866,
+          "status": 200
+        },
+        {
+          "ms": 73.97411999999895,
+          "status": 200
+        },
+        {
+          "ms": 35.12730600000032,
+          "status": 200
+        },
+        {
+          "ms": 238.3920249999992,
+          "status": 200
+        },
+        {
+          "ms": 46.67584299999908,
+          "status": 200
+        },
+        {
+          "ms": 96.39468699999998,
+          "status": 200
+        },
+        {
+          "ms": 61.119119999999384,
+          "status": 200
+        },
+        {
+          "ms": 158.88000400000055,
+          "status": 200
+        },
+        {
+          "ms": 98.64697199999864,
+          "status": 200
+        },
+        {
+          "ms": 79.49561200000062,
+          "status": 200
+        },
+        {
+          "ms": 55.358995000000505,
+          "status": 200
+        },
+        {
+          "ms": 99.96694099999877,
+          "status": 200
+        },
+        {
+          "ms": 77.15849600000001,
+          "status": 200
+        },
+        {
+          "ms": 123.4719810000006,
+          "status": 200
+        },
+        {
+          "ms": 71.44042099999933,
+          "status": 200
+        },
+        {
+          "ms": 61.00840099999914,
+          "status": 200
+        },
+        {
+          "ms": 143.71047200000066,
+          "status": 200
+        },
+        {
+          "ms": 236.8258709999991,
+          "status": 200
+        },
+        {
+          "ms": 50.59442999999919,
+          "status": 200
+        },
+        {
+          "ms": 77.92661899999985,
+          "status": 200
+        },
+        {
+          "ms": 81.10672999999952,
+          "status": 200
+        },
+        {
+          "ms": 57.30422700000054,
+          "status": 200
+        },
+        {
+          "ms": 65.61054599999989,
+          "status": 200
+        },
+        {
+          "ms": 137.7220890000026,
+          "status": 200
+        },
+        {
+          "ms": 17.13859300000331,
+          "status": 200
+        },
+        {
+          "ms": 9.859959999997955,
+          "status": 200
+        },
+        {
+          "ms": 10.871033999999781,
+          "status": 200
+        },
+        {
+          "ms": 41.94385499999771,
+          "status": 200
+        },
+        {
+          "ms": 13.3550490000016,
+          "status": 200
+        },
+        {
+          "ms": 22.365968000001885,
+          "status": 200
+        },
+        {
+          "ms": 44.91858200000206,
+          "status": 200
+        },
+        {
+          "ms": 18.68079299999954,
+          "status": 200
+        },
+        {
+          "ms": 9.856128999999783,
+          "status": 200
+        },
+        {
+          "ms": 11.501655000000028,
+          "status": 200
+        },
+        {
+          "ms": 53.76360299999942,
+          "status": 200
+        },
+        {
+          "ms": 22.455359999999928,
+          "status": 200
+        },
+        {
+          "ms": 15.798139999998966,
+          "status": 200
+        },
+        {
+          "ms": 45.247473999999784,
+          "status": 200
+        },
+        {
+          "ms": 50.67683300000135,
+          "status": 200
+        },
+        {
+          "ms": 10.877243000002636,
+          "status": 200
+        },
+        {
+          "ms": 19.37821100000292,
+          "status": 200
+        },
+        {
+          "ms": 23.7120270000014,
+          "status": 200
+        },
+        {
+          "ms": 31.379031000000396,
+          "status": 200
+        },
+        {
+          "ms": 10.728190999998333,
+          "status": 200
+        },
+        {
+          "ms": 15.755478000002768,
+          "status": 200
+        },
+        {
+          "ms": 13.77960499999972,
+          "status": 200
+        },
+        {
+          "ms": 14.754440000000614,
+          "status": 200
+        },
+        {
+          "ms": 36.499596999998175,
+          "status": 200
+        },
+        {
+          "ms": 92.06459100000211,
+          "status": 200
+        },
+        {
+          "ms": 19.561584000002767,
+          "status": 200
+        },
+        {
+          "ms": 12.670846000000893,
+          "status": 200
+        },
+        {
+          "ms": 16.54885700000159,
+          "status": 200
+        },
+        {
+          "ms": 10.393089000001055,
+          "status": 200
+        },
+        {
+          "ms": 26.073145999998815,
+          "status": 200
+        },
+        {
+          "ms": 12.454980999998952,
+          "status": 200
+        },
+        {
+          "ms": 50.70567300000039,
+          "status": 200
+        }
+      ]
+    }
+  ]
+}

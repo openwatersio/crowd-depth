@@ -11,7 +11,13 @@ import {
   createTileService,
   registerLayerRoutes,
 } from "../../src/tiles/index.js";
-import { parseView, drawn, refreshMs, thin } from "../../src/tiles/api.js";
+import {
+  parseView,
+  drawn,
+  provisionalFeatures,
+  refreshMs,
+  thin,
+} from "../../src/tiles/api.js";
 import { MAX_PUBLISHED_DEPTH_M } from "../../src/tiles/surface.js";
 import { DEFAULT_OWN_STYLE } from "../../src/tiles/style.js";
 import type { Layer } from "../../src/tiles/api.js";
@@ -42,7 +48,11 @@ const response = (): Res => {
 
 type Req = { params?: Record<string, string>; query?: Record<string, string> };
 
-function serve(own = DEFAULT_OWN_STYLE, preview?: Layer["preview"]) {
+function serve(
+  own = DEFAULT_OWN_STYLE,
+  preview?: Layer["preview"],
+  historyPreview?: Layer["historyPreview"],
+) {
   const handlers = new Map<string, (req: Req, res: Res) => unknown>();
   const app = {
     get: (path: string, handler: (req: Req, res: Res) => void) =>
@@ -52,6 +62,7 @@ function serve(own = DEFAULT_OWN_STYLE, preview?: Layer["preview"]) {
   const tiles = createTileService(store);
   registerLayerRoutes(app, () => ({
     tiles,
+    historyPreview,
     provisional: () => [{ time: 1, lon: -76.2, lat: 36.98, depth: 4.37 }],
     stored: () => [],
     safetyDepth: 3,
@@ -220,6 +231,54 @@ test("refreshes are batched by how much the plotter's view holds", async () => {
   expect((await live("13,-1e18,40,1e18,30")).refreshMs).toBeUndefined();
 });
 
+test("unchanged historyPreview payloads are omitted using the client's revision", async () => {
+  const historyPreview = () => [
+    {
+      type: "Feature",
+      id: "history:1:2",
+      geometry: { type: "Point", coordinates: [-80, 26] },
+      properties: {
+        depth_m: 5,
+        provisional: true,
+        reference: "untided",
+        time: 1,
+      },
+    },
+  ];
+  const { get } = serve(DEFAULT_OWN_STYLE, undefined, historyPreview as never);
+  const first = (await get(LIVE_PATH, { query: {} })).body as {
+    historyPreviewRevision: string;
+    historyPreview: { features: unknown[] };
+  };
+  expect(first.historyPreview.features).toHaveLength(2);
+  expect(first.historyPreviewRevision).toMatch(/^[a-f0-9]{24}$/);
+  const next = (
+    await get(LIVE_PATH, {
+      query: { historyPreviewRevision: first.historyPreviewRevision },
+    })
+  ).body as typeof first;
+  expect(next.historyPreview).toBeUndefined();
+  expect(next.historyPreviewRevision).toBe(first.historyPreviewRevision);
+});
+
+test("a stationary high-rate stream sends only its newest and shoalest values without thinning storage", async () => {
+  const { spatialProvisional } = await import("../../src/tiles/api.js");
+  const pings = Array.from({ length: 40000 }, (_, i) => ({
+    lon: -80,
+    lat: 26,
+    time: 1000000 + i * 200000,
+    depth: i === 100 ? 2 : 5,
+  }));
+  expect(spatialProvisional(pings).map((s) => s.time)).toEqual([
+    pings[100].time,
+    pings.at(-1)!.time,
+  ]);
+  expect(pings).toHaveLength(40000);
+  expect(
+    provisionalFeatures(spatialProvisional(pings)).length,
+  ).toBeLessThanOrEqual(3);
+});
+
 test("the preview goes to a runtime that asks, when it's changed, in its unit", async () => {
   const line = (properties: GeoFeature["properties"]): GeoFeature => ({
     type: "Feature",
@@ -276,6 +335,44 @@ test("a live poll that fails is answered, not left hanging", async () => {
   });
   const res = await get(LIVE_PATH, { query: { since: "-1", preview: "0" } });
   expect(res.code).toBe(500);
+});
+
+test("live surface and historical previews coexist with independent revisions", async () => {
+  const history = () => [
+    {
+      type: "Feature",
+      id: "history:1:2",
+      geometry: { type: "Point", coordinates: [-80, 26] },
+      properties: {
+        depth_m: 5,
+        provisional: true,
+        reference: "untided",
+        time: 1,
+      },
+    },
+  ];
+  const surface = {
+    get: async () => ({ rev: 7, features: [] }),
+    latest: () => ({ rev: 7, features: [] }),
+  };
+  const { get } = serve(DEFAULT_OWN_STYLE, surface, history as never);
+  const first = (await get(LIVE_PATH, { query: { preview: "-1" } })).body as {
+    preview: { rev: number };
+    historyPreview: { features: unknown[] };
+    historyPreviewRevision: string;
+  };
+  expect(first.preview.rev).toBe(7);
+  expect(first.historyPreview.features).toHaveLength(2);
+  const next = (
+    await get(LIVE_PATH, {
+      query: {
+        preview: "7",
+        historyPreviewRevision: first.historyPreviewRevision,
+      },
+    })
+  ).body;
+  expect(next).not.toHaveProperty("preview");
+  expect(next).not.toHaveProperty("historyPreview");
 });
 
 test("provisional soundings past the published limit aren't drawn", () => {

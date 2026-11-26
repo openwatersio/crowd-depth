@@ -519,6 +519,7 @@ test("the nearest-first search finds the neighbours a full search does, in its o
   for (const [pm, searchM, density] of [
     [15, 200, 0.6],
     [15, 200, 0.05],
+    [15, 200, 0.02],
     [300, 300 * Math.SQRT1_2, 0.3],
   ]) {
     // At most one point a pixel, some at its corner or edge, so distances tie.
@@ -592,6 +593,133 @@ test("fields worked only near the depths match fields worked over the whole rast
       const built = (p: typeof windowed) =>
         buildTile(Z + 1, x, y, cells, [], "high", new Map([[key, p]]));
       expect(built(windowed)).toEqual(built(whole));
+    }
+  }
+});
+
+test("both searches include radius ties and handle empty and one-sided tracks", () => {
+  const points = [
+    { x: 7.5, y: 4.5 },
+    { x: 4.5, y: 7.5 },
+    { x: 1.5, y: 4.5 },
+    { x: 4.5, y: 1.5 },
+  ];
+  // Four points are dense at size 8, sparse at size 16; a three-pixel radius
+  // avoids the small-radius raster fallback. Exercise both dispatch paths.
+  for (const size of [8, 16])
+    for (const max of [1, 3, 12]) {
+      const out = neighbours(max);
+      nearestSearch(points, size, 10, 30, max)(4, 4, out);
+      expect([...out.j.subarray(0, out.n)]).toEqual([3, 2, 0, 1].slice(0, max));
+      expect([...out.d2.subarray(0, out.n)]).toEqual(
+        Array(Math.min(max, 4)).fill(900),
+      );
+      nearestSearch([], size, 10, 30, max)(4, 4, out);
+      expect(out.n).toBe(0);
+      nearestSearch(points.slice(0, 1), size, 10, 29, max)(4, 4, out);
+      expect(out.n).toBe(0);
+      nearestSearch(points.slice(0, 1), size, 10, 30, max)(4, 4, out);
+      expect(out.n).toBe(1);
+      expect(out.j[0]).toBe(0);
+      // The small-radius fallback also covers empty and single-point inputs.
+      nearestSearch([], size, 10, 20, max)(4, 4, out);
+      expect(out.n).toBe(0);
+      nearestSearch([{ x: 6.5, y: 4.5 }], size, 10, 20, max)(4, 4, out);
+      expect(out.n).toBe(1);
+      expect(out.d2[0]).toBe(400);
+    }
+  const track = Array.from({ length: 60 }, (_, i) => ({ x: 20.5, y: 5.5 + i }));
+  const out = neighbours(12);
+  nearestSearch(track, 128, 10, 200, 12)(0, 30, out);
+  expect(out.n).toBe(1);
+  expect(out.j[0]).toBe(25);
+  expect(out.d2[0]).toBe(40000);
+});
+
+test("clustered and spread inputs agree with a full search across dispatch thresholds", () => {
+  for (const size of [48, 288]) {
+    const threshold = (size * size) / 32;
+    const width = Math.ceil(Math.sqrt(threshold));
+    const origin = Math.floor((size - width) / 2);
+    const cluster = Array.from({ length: threshold - 1 }, (_, i) => ({
+      x: origin + (i % width) + 0.25,
+      y: origin + Math.floor(i / width) + 0.25,
+    }));
+    const spread = Array.from({ length: threshold + 1 }, (_, i) => {
+      const pixel = (i * 37) % (size * size);
+      return { x: (pixel % size) + 0.25, y: Math.floor(pixel / size) + 0.25 };
+    });
+    for (const pool of [
+      [...cluster, { x: 0.25, y: 0.25 }, { x: size - 0.75, y: size - 0.75 }],
+      spread,
+    ])
+      for (const count of [threshold - 1, threshold, threshold + 1]) {
+        const points = pool.slice(0, count);
+        for (const max of [1, 3, 12, threshold + 1]) {
+          const search = nearestSearch(points, size, 10, 100, max);
+          const out = neighbours(max);
+          for (const [px, py] of [
+            [size / 2, size / 2],
+            [0, 0],
+            [size - 1, size - 1],
+            ...Array.from({ length: 20 }, (_, i) => [
+              (i * 37) % size,
+              (i * 61) % size,
+            ]),
+          ]) {
+            const expected = points
+              .map((p, j) => {
+                const dx = (p.x - (px + 0.5)) * 10;
+                const dy = (p.y - (py + 0.5)) * 10;
+                return {
+                  j,
+                  d2: dx * dx + dy * dy,
+                  b: Math.floor(p.y) * size + Math.floor(p.x),
+                };
+              })
+              .filter((p) => p.d2 <= 10000)
+              .sort((a, b) => a.d2 - b.d2 || a.b - b.b)
+              .slice(0, max);
+            search(px, py, out);
+            expect([...out.j.subarray(0, out.n)]).toEqual(
+              expected.map((p) => p.j),
+            );
+            expect([...out.d2.subarray(0, out.n)]).toEqual(
+              expected.map((p) => p.d2),
+            );
+          }
+        }
+      }
+  }
+});
+
+test("local occupancy guard preserves neighbours at its block boundary", () => {
+  for (const count of [8, 9, 15, 16]) {
+    const points = Array.from({ length: count }, (_, i) => ({
+      x: 24.25 + (i % 8),
+      y: 24.25 + Math.floor(i / 8),
+    }));
+    for (const max of [1, 12, 32]) {
+      const out = neighbours(max);
+      const search = nearestSearch(points, 64, 10, 80, max);
+      for (const [px, py] of [
+        [26, 25],
+        [24, 24],
+        [0, 0],
+      ]) {
+        const full = points
+          .map((p, j) => ({
+            j,
+            d2: ((p.x - px - 0.5) * 10) ** 2 + ((p.y - py - 0.5) * 10) ** 2,
+            b: Math.floor(p.y) * 64 + Math.floor(p.x),
+          }))
+          .filter((p) => p.d2 <= 6400)
+          .sort((a, b) => a.d2 - b.d2 || a.b - b.b)
+          .slice(0, max);
+        search(px, py, out);
+        expect([...out.j.subarray(0, out.n)]).toEqual(full.map((p) => p.j));
+        expect([...out.d2.subarray(0, out.n)]).toEqual(full.map((p) => p.d2));
+      }
     }
   }
 });

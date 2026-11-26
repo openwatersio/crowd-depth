@@ -4,12 +4,74 @@ import { PbfReader as Pbf } from "pbf";
 import { Cell } from "../../src/tiles/cells.js";
 import { cellAt, cellCenter, tileFraction } from "../../src/tiles/geometry.js";
 import { EXTENT } from "../../src/tiles/mvt.js";
-import { isolines } from "../../src/tiles/portray.js";
+import { isolines, carry, cut, PAD_PX } from "../../src/tiles/portray.js";
 import { buildTile } from "../../src/tiles/surface.js";
 
 const Z = 14;
 const LON = -76.2;
 const LAT = 36.98;
+
+test.each([1, 2, 4])(
+  "cut at scale %i leaves shared prepared fields intact",
+  (u) => {
+    const n = 4;
+    const w = n + 2 * PAD_PX;
+    const p = {
+      w,
+      depth: new Float64Array(w * w).fill(9),
+      wet: new Float64Array(w * w).fill(8),
+      extent: new Float64Array(w * w).fill(1),
+      measured: new Float64Array(w * w).fill(-1),
+      shoal: new Float64Array(w * w).fill(2),
+      window: [0, 0, w - 1, w - 1] as [number, number, number, number],
+    };
+    const saved = structuredClone(p);
+    const first = cut(p, 0, 0, n, u);
+    const second = cut(p, 0, 0, n, u);
+    expect(p).toEqual(saved);
+    for (const key of ["depth", "wet", "extent", "measured"] as const) {
+      expect(first[key]).toEqual(second[key]);
+      expect(first[key].buffer).not.toBe(p[key].buffer);
+    }
+    const middle = Math.floor(first.depth.length / 2) + Math.floor(first.m / 2);
+    expect(first.depth[middle]).toBe(2);
+    expect(first.wet[middle]).toBe(2);
+    expect(first.extent[middle]).toBe(u);
+    expect(first.measured[middle]).toBe(-u);
+  },
+);
+
+test("a one-sample cut preserves depths and leaves missing water outside the window", () => {
+  const n = 4,
+    w = n + 2 * PAD_PX;
+  const depth = new Float64Array(w * w).fill(NaN);
+  const at = (PAD_PX + 1) * w + PAD_PX + 1;
+  depth[at] = 9;
+  const result = cut(
+    {
+      w,
+      depth,
+      wet: depth.slice(),
+      extent: new Float64Array(w * w).fill(1),
+      measured: new Float64Array(w * w).fill(1),
+      shoal: new Float64Array(w * w).fill(Infinity),
+      window: [PAD_PX, PAD_PX, PAD_PX + n - 1, PAD_PX + n - 1],
+    },
+    0,
+    0,
+    n,
+    1,
+  );
+  expect(result.depth[at]).toBe(9);
+  expect(result.wet[at]).toBe(9);
+  expect(result.extent[at]).toBe(1);
+  expect(result.measured[at]).toBe(1);
+  expect(result.depth[at + 1]).toBe(10_000);
+  expect(result.depth[0]).toBe(10_000);
+  expect(result.extent[0]).toBeLessThan(0);
+  expect(result.measured[0]).toBeLessThan(0);
+  expect(Number.isNaN(depth[at + 1])).toBe(true);
+});
 const tile = (() => {
   const f = tileFraction(LON, LAT, Z);
   return { x: Math.floor(f.x), y: Math.floor(f.y) };
@@ -283,4 +345,37 @@ test("a contour round a shoal narrower than the simplification stays drawn", () 
   };
   const [loop] = isolines(t, [2], 8).get(2)!;
   expect(new Set(loop.map(String)).size).toBeGreaterThan(2);
+});
+
+test("frontier fill matches nearest Manhattan sources without changing measured pixels", () => {
+  for (let mask = 0; mask < 512; mask++) {
+    const input = Float64Array.from({ length: 9 }, (_, i) =>
+      mask & (1 << i) ? 9 - i : NaN,
+    );
+    const original = input.slice();
+    const expected = input.map((value, i) => {
+      if (!Number.isNaN(value)) return value;
+      let distance = Infinity,
+        depth = NaN;
+      for (let j = 0; j < input.length; j++) {
+        if (Number.isNaN(input[j])) continue;
+        const d =
+          Math.abs((i % 3) - (j % 3)) +
+          Math.abs(Math.floor(i / 3) - Math.floor(j / 3));
+        if (d < distance) {
+          distance = d;
+          depth = input[j];
+        } else if (d === distance) depth = Math.min(depth, input[j]);
+      }
+      return depth;
+    });
+    expect(carry(input, 3)).toEqual(expected);
+    expect(input).toEqual(original);
+  }
+  const strip = new Float64Array(30).fill(NaN);
+  strip[0] = 5;
+  const result = carry(strip, 30);
+  expect([...result.slice(0, PAD_PX + 3)]).toEqual(Array(PAD_PX + 3).fill(5));
+  expect([...result.slice(PAD_PX + 3)].every(Number.isNaN)).toBe(true);
+  expect(Object.is(carry(Float64Array.of(-0, NaN, 0), 3)[1], -0)).toBe(true);
 });

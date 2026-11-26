@@ -447,11 +447,128 @@ export function neighbours(max: number): Neighbours {
  * fills `out` in the order a full search sorts them: by distance, then by pixel, row by
  * row, so the sums and ties that follow come out the same.
  *
- * It visits the pixels within reach nearest first, by how close to the centre a point
- * in each can be, and stops at the first that can't hold one nearer than the `max`-th
- * found: dense water stops early; between tracks, the whole radius is still searched.
+ * Sparse searches use a balanced spatial tree to skip empty pixels and distant
+ * branches. Globally dense grids and small radii use raster search; sparse grids
+ * with dense patches choose per pixel so empty water can still use the tree.
  */
 export function nearestSearch(
+  points: { x: number; y: number }[],
+  size: number,
+  pm: number,
+  searchM: number,
+  max: number,
+): (px: number, py: number, out: Neighbours) => void {
+  // Keep denser data on the raster search to leave setup-cost headroom.
+  // Tiny radii need too few raster probes to justify a tree.
+  if (points.length >= (size * size) / 32 || searchM / pm <= 2)
+    return rasterSearch(points, size, pm, searchM, max);
+  // A dense harbour patch can hide inside a sparse tile. Use raster probing
+  // inside that patch, without making distant track pixels probe empty space.
+  const across = Math.ceil(size / 8);
+  const occupied = new Uint8Array(across * across);
+  let dense = false;
+  for (const p of points) {
+    const b = Math.floor(p.y / 8) * across + Math.floor(p.x / 8);
+    if (++occupied[b] >= 9) dense = true;
+  }
+  const raster = dense
+    ? rasterSearch(points, size, pm, searchM, max)
+    : undefined;
+  // A balanced spatial tree visits occupied pixels only. Sparse tracks otherwise
+  // spend most of the search probing empty pixels across the entire radius.
+  const xs = Float64Array.from(points, (p) => p.x);
+  const ys = Float64Array.from(points, (p) => p.y);
+  const pixels = Int32Array.from(
+    points,
+    (p) => Math.floor(p.y) * size + Math.floor(p.x),
+  );
+  const left = new Int32Array(points.length).fill(-1);
+  const right = new Int32Array(points.length).fill(-1);
+  const split = new Uint8Array(points.length);
+  const tree = (ids: number[], axis: number): number => {
+    if (!ids.length) return -1;
+    const coords = axis ? ys : xs;
+    ids.sort((a, b) => coords[a] - coords[b] || pixels[a] - pixels[b]);
+    const mid = ids.length >> 1;
+    const j = ids[mid];
+    split[j] = axis;
+    left[j] = tree(ids.slice(0, mid), 1 - axis);
+    right[j] = tree(ids.slice(mid + 1), 1 - axis);
+    return j;
+  };
+  const root = tree(
+    Array.from(points, (_, i) => i),
+    0,
+  );
+  const r2 = searchM * searchM;
+  // A depth-first stack avoids a recursive call for every visited point.
+  const pending = new Int32Array(points.length + 1);
+  const bounds = new Float64Array(points.length + 1);
+  return (px, py, out) => {
+    if (
+      raster &&
+      occupied[Math.floor(py / 8) * across + Math.floor(px / 8)] >= 9
+    )
+      return raster(px, py, out);
+    const cx = px + 0.5,
+      cy = py + 0.5;
+    const { j: js, d2: d2s, dx: dxs, dy: dys, b: bs } = out;
+    let n = 0,
+      count = 1;
+    pending[0] = root;
+    bounds[0] = 0;
+    while (count) {
+      const at = --count;
+      const j = pending[at];
+      // Include equal distances: pixel order decides which tied neighbour wins.
+      if (j < 0 || bounds[at] > (n === max ? Math.min(r2, d2s[max - 1]) : r2))
+        continue;
+      const dx = (xs[j] - cx) * pm;
+      const dy = (ys[j] - cy) * pm;
+      const d2 = dx * dx + dy * dy;
+      const b = pixels[j];
+      if (d2 <= r2) {
+        let k = n;
+        while (
+          k > 0 &&
+          (d2s[k - 1] > d2 || (d2s[k - 1] === d2 && bs[k - 1] > b))
+        )
+          k--;
+        if (k < max) {
+          for (let q = Math.min(n, max - 1); q > k; q--) {
+            js[q] = js[q - 1];
+            d2s[q] = d2s[q - 1];
+            dxs[q] = dxs[q - 1];
+            dys[q] = dys[q - 1];
+            bs[q] = bs[q - 1];
+          }
+          js[k] = j;
+          d2s[k] = d2;
+          dxs[k] = dx;
+          dys[k] = dy;
+          bs[k] = b;
+          if (n < max) n++;
+        }
+      }
+      const delta = split[j] ? dy : dx;
+      const far = delta > 0 ? right[j] : left[j];
+      const near = delta > 0 ? left[j] : right[j];
+      if (far >= 0) {
+        pending[count] = far;
+        bounds[count++] = delta * delta;
+      }
+      if (near >= 0) {
+        pending[count] = near;
+        bounds[count++] = 0;
+      }
+    }
+    out.n = n;
+  };
+}
+
+/** Visit raster offsets nearest first; stop once none can beat the last retained
+ * neighbour. Dense water fills the list before many empty pixels are visited. */
+function rasterSearch(
   points: { x: number; y: number }[],
   size: number,
   pm: number,

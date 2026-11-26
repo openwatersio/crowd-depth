@@ -57,9 +57,9 @@ test("each crossing of a cell is one pass, and only sounded cells get one", asyn
   expect(cells).toHaveLength(30);
   for (const c of cells) {
     expect(c.passes).toBe(2);
-    // Second pass 1 m deeper: m moves a fifth of the way.
-    expect(c.m).toBeGreaterThan(5.1);
-    expect(c.m).toBeLessThan(5.5);
+    // Similar-age passes share weight; the fixture adds up to 0.2 m of variation.
+    expect(c.m).toBeGreaterThanOrEqual(5.5);
+    expect(c.m).toBeLessThanOrEqual(5.7);
   }
 });
 
@@ -182,18 +182,31 @@ test("a deep spike isn't shown: drawn, it would read deeper than the water", asy
   expect(store.shoals(-76.3, 36, -76.1, 37.1)).toEqual([]);
 });
 
-test("held passes wait for the backfill, then go in after it", async () => {
-  const store = createCellStore(createDB(":memory:"));
-  const writer = createCellWriter(store, { flushIntervalMs: 100_000 });
-  writer.hold(true);
-  for (const d of track(40)) writer.write(d, () => {});
-  // A flush while held writes nothing.
-  writer.hold(true);
-  expect(store.cells(-76.3, 36, -76.1, 37.1)).toHaveLength(0);
-  writer.hold(false);
-  expect(store.cells(-76.3, 36, -76.1, 37.1).length).toBeGreaterThan(0);
-  writer.destroy();
-});
+test.each([false, true])(
+  "held passes survive a busy release (busy=%s)",
+  async (busy) => {
+    const store = createCellStore(createDB(":memory:"));
+    const writer = createCellWriter(store, { flushIntervalMs: 100_000 });
+    writer.hold(true);
+    for (const d of track(40)) writer.write(d, () => {});
+    // A flush while held writes nothing.
+    writer.hold(true);
+    expect(store.cells(-76.3, 36, -76.1, 37.1)).toHaveLength(0);
+    if (busy) {
+      const transaction = vi
+        .spyOn(store, "transaction")
+        .mockImplementationOnce(() => {
+          throw new Error("database is locked");
+        });
+      expect(() => writer.hold(false)).not.toThrow();
+      expect(store.cells(-76.3, 36, -76.1, 37.1)).toHaveLength(0);
+      transaction.mockRestore();
+    }
+    writer.hold(false);
+    expect(store.cells(-76.3, 36, -76.1, 37.1).length).toBeGreaterThan(0);
+    writer.destroy();
+  },
+);
 
 test("a flush that fails once is written whole on the next", async () => {
   const store = createCellStore(createDB(":memory:"));
@@ -216,6 +229,52 @@ test("a flush that fails once is written whole on the next", async () => {
   expect(store.cells(-76.3, 36, -76.1, 37.1)).toHaveLength(40);
 });
 
+test("live buffers survive a prolonged lock and retry without duplicate cells", async () => {
+  const db = createDB(":memory:"),
+    store = createCellStore(db);
+  vi.useFakeTimers();
+  const writer = createCellWriter(store);
+  const locked = vi.spyOn(store, "transaction").mockImplementation(() => {
+    throw new Error("database is locked");
+  });
+  try {
+    for (const d of track(40)) writer.write(d, () => {});
+    vi.advanceTimersByTime(20_000);
+    expect(writer.destroyed).toBe(false);
+    expect(store.cells(-76.3, 36, -76.1, 37.1)).toHaveLength(0);
+    locked.mockRestore();
+    vi.advanceTimersByTime(100);
+    expect(store.cells(-76.3, 36, -76.1, 37.1).length).toBeGreaterThan(0);
+    await end(writer);
+    expect(store.cells(-76.3, 36, -76.1, 37.1)).toHaveLength(40);
+  } finally {
+    locked.mockRestore();
+    writer.destroy();
+    vi.useRealTimers();
+    db.close();
+  }
+});
+
+test("a final flush retries busy without losing its closed passes", async () => {
+  const db = createDB(":memory:"),
+    store = createCellStore(db);
+  const writer = createCellWriter(store, { flushIntervalMs: 100_000 });
+  for (const d of track(40)) writer.write(d, () => {});
+  const locked = vi.spyOn(store, "transaction").mockImplementationOnce(() => {
+    throw new Error("database is locked");
+  });
+  try {
+    await end(writer);
+    expect(writer.errored).toBeNull();
+    expect(store.cells(-76.3, 36, -76.1, 37.1)).toHaveLength(40);
+    expect(locked.mock.calls.length).toBeGreaterThan(1);
+  } finally {
+    locked.mockRestore();
+    writer.destroy();
+    db.close();
+  }
+});
+
 test("a long steady run at anchor reaches the cells, then QC picks up again", async () => {
   // 10 Hz for 40 minutes at one depth, swinging within 20 m, then the depth moves.
   const { store, writer } = run(
@@ -231,7 +290,8 @@ test("a long steady run at anchor reaches the cells, then QC picks up again", as
   expect(cells.length).toBeGreaterThan(0);
   // Both depths reached the cells: the run wasn't taken for a stuck sounder.
   expect(Math.min(...cells.map((c) => c.m))).toBeLessThan(5.2);
-  expect(Math.max(...cells.map((c) => c.m))).toBeGreaterThan(5.2);
+  // Short deeper segment contributes without the old per-pass EMA exaggerating it.
+  expect(Math.max(...cells.map((c) => c.m))).toBeGreaterThan(5.05);
   expect(store.shoals(-76.3, 36, -76.1, 37.1)).toEqual([]);
 }, 30_000);
 
@@ -461,6 +521,32 @@ test("under way, a sounding is stored within about 25 s: QC's look-ahead, the pa
   } finally {
     vi.useRealTimers();
   }
+});
+
+test("change listeners run after commit and can start their own transaction", async () => {
+  const db = createDB(":memory:");
+  const store = createCellStore(db);
+  let notifications = 0;
+  const writer = createCellWriter(store, {
+    bulk: true,
+    onChange: () => {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        expect(db.prepare("SELECT count(*) n FROM cells").get()).toMatchObject({
+          n: expect.any(Number),
+        });
+        notifications++;
+      } finally {
+        db.exec("COMMIT");
+      }
+    },
+  });
+  for (const sounding of track(100)) writer.write(sounding);
+  await new Promise<void>((resolve, reject) =>
+    writer.end((error?: Error | null) => (error ? reject(error) : resolve())),
+  );
+  expect(notifications).toBeGreaterThan(0);
+  db.close();
 });
 
 test("what's pending is what the cells take once it's all written", async () => {

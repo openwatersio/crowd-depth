@@ -14,10 +14,10 @@ export type Identity = {
 };
 
 export type VesselInfo = Identity & {
-  sensors?: { sounder: SensorInfo; gnss: SensorInfo };
   mmsi?: string;
   imo?: string;
   name?: string;
+  sensors?: { sounder: SensorInfo; gnss: SensorInfo };
   loa?: number;
   type?: string;
 };

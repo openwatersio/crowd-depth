@@ -1,0 +1,18 @@
+{
+  "candidate": "progressive-20261122-handoff",
+  "halfLifeDays": 365,
+  "cachedHours": 11,
+  "initialPreviews": 474,
+  "remainingPreviews": 0,
+  "firstCellsMs": 1700.890486,
+  "totalMs": 24176.267336,
+  "commits": 11,
+  "changed": 2075,
+  "cells": 1730,
+  "windows": 11,
+  "eventLoopMaxMs": 184.287231,
+  "usesTide": false,
+  "productionContainerRunning": true,
+  "availabilityDiscoveryDisabled": true,
+  "temporaryDatabase": true
+}

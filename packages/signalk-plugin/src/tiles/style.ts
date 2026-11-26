@@ -214,6 +214,10 @@ export function buildStyle({
         minzoom: MIN_ZOOM,
         maxzoom: MAX_ZOOM,
       },
+      historyPreview: {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      },
       provisional: {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
@@ -224,6 +228,48 @@ export function buildStyle({
       },
     },
     layers: [
+      {
+        id: "history-preview-area",
+        type: "fill",
+        source: "historyPreview",
+        filter: ["==", ["geometry-type"], "Polygon"],
+        paint: {
+          "fill-color": DAY.provisional,
+          "fill-opacity": 0.24,
+        },
+      },
+      {
+        id: "history-preview",
+        type: "circle",
+        source: "historyPreview",
+        filter: isPoint,
+        paint: {
+          "circle-color": DAY.provisional,
+          "circle-opacity": 0.22,
+          "circle-radius": 7,
+          "circle-stroke-color": DAY.provisional,
+          "circle-stroke-width": 1,
+          "circle-stroke-opacity": 0.5,
+        },
+      },
+      {
+        id: "history-preview-label",
+        type: "symbol",
+        source: "historyPreview",
+        filter: isPoint,
+        minzoom: 14,
+        layout: {
+          "text-field": ["to-string", ["get", ["global-state", "depthLabel"]]],
+          "text-font": DEPTH_FONT,
+          "text-size": 10,
+          "text-offset": [0, 0.9],
+        },
+        paint: {
+          "text-color": DAY.provisional,
+          "text-halo-color": DAY.labelHalo,
+          "text-halo-width": 1,
+        },
+      },
       // The surface round the boat as its soundings not yet in a tile draw it, the same
       // way: below the tiles, which take over as they refresh, so over water sounded
       // before the stored area shows. Its contours dashed, as provisional.

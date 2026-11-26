@@ -20,6 +20,18 @@ export async function xyzToGeoJSON({
   input = process.stdin,
   output = process.stdout,
 } = {}) {
+  if (
+    ![
+      configuration.gnss?.x,
+      configuration.gnss?.y,
+      configuration.sounder?.x,
+      configuration.sounder?.y,
+    ].every((value) => typeof value === "number" && Number.isFinite(value))
+  ) {
+    throw new Error(
+      "XYZ conversion requires explicit finite gnss.x/gnss.y and sounder.x/sounder.y offsets in the saved configuration. Server-only GNSS geometry is not available to this offline converter.",
+    );
+  }
   const data = chain([
     input,
     fromXyz(),

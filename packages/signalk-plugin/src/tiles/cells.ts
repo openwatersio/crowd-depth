@@ -1,3 +1,5 @@
+import { resetPreviewSpatial } from "./preview-spatial.js";
+import { createEstimates, estimateHour } from "./estimates.js";
 import { DatabaseSync } from "node:sqlite";
 import { hasKeptTiles, keptTileTriggers } from "../storage.js";
 import { DEFINITIONS, cellAt, cellRanges } from "./geometry.js";
@@ -55,6 +57,9 @@ export interface Pass {
   depth: number;
   day: number;
   tide?: number;
+  /** Stable chronological identity for independently processed passes, in microseconds. */
+  time?: number;
+  start?: number;
 }
 
 /** A sounding QC kept as an unconfirmed shoal: published, never in the surface, but no
@@ -137,7 +142,31 @@ type Row = Omit<Cell, "t" | "untidedBelow"> & { t: number | null; u?: number };
  * blob per block of cells would bring the busiest boat's 1.5M cells from about 114 MB
  * toward the raw 12 MB.
  */
-export function createCellStore(db: DatabaseSync) {
+export function createCellStore(db: DatabaseSync, generation?: string) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS cell_passes(
+      job TEXT NOT NULL, ordinal INTEGER NOT NULL, py INTEGER NOT NULL, px INTEGER NOT NULL,
+      time INTEGER NOT NULL, day INTEGER NOT NULL, depth REAL NOT NULL, tide REAL,
+      PRIMARY KEY(job, ordinal)
+    ) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS cell_passes_order ON cell_passes(py, px, time, job, ordinal);
+    CREATE INDEX IF NOT EXISTS cell_passes_time ON cell_passes(time);
+    CREATE TABLE IF NOT EXISTS cell_job_shoals(
+      job TEXT NOT NULL, ordinal INTEGER NOT NULL, py INTEGER NOT NULL, px INTEGER NOT NULL,
+      lon REAL NOT NULL, lat REAL NOT NULL, depth REAL NOT NULL, time INTEGER NOT NULL,
+      PRIMARY KEY(job, ordinal)
+    ) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS cell_job_shoals_position ON cell_job_shoals(py, px, depth);
+    CREATE INDEX IF NOT EXISTS cell_job_shoals_time ON cell_job_shoals(time);
+    CREATE TABLE IF NOT EXISTS refined_windows(start INTEGER NOT NULL, end INTEGER NOT NULL,
+      PRIMARY KEY(start,end)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS refined_empty_windows(start INTEGER NOT NULL, end INTEGER NOT NULL,
+      PRIMARY KEY(start,end)) WITHOUT ROWID;
+  `);
+  const estimates = createEstimates(db);
+  const insertPass = db.prepare(
+    "INSERT OR IGNORE INTO cell_passes VALUES(?,?,?,?,?,?,?,?)",
+  );
   const readCell = db.prepare(
     "SELECT m, d, t, passes, first, last FROM cells WHERE py = ? AND px = ?",
   );
@@ -293,11 +322,20 @@ export function createCellStore(db: DatabaseSync) {
     }
   };
 
+  let transactionDepth = 0;
   const transaction = <T>(fn: () => T): T => {
+    if (transactionDepth) return fn();
     // IMMEDIATE takes the write lock up front, so a second connection writing at the
     // same time, the backfill's, waits for it rather than failing midway.
     db.exec("BEGIN IMMEDIATE");
     try {
+      if (
+        generation !== undefined &&
+        (getMetaStmt.get("build_generation") as { value: string } | undefined)
+          ?.value !== generation
+      )
+        throw new Error("chart generation superseded");
+      transactionDepth++;
       const result = fn();
       db.exec("COMMIT");
       return result;
@@ -308,14 +346,288 @@ export function createCellStore(db: DatabaseSync) {
         // Don't mask the original error.
       }
       throw err;
+    } finally {
+      transactionDepth = 0;
     }
   };
 
+  const replayCell = (py: number, px: number, hours: Iterable<number>) => {
+    const cell = estimates.rebuild(py, px, hours);
+    if (cell) write(writeCell, [], cell);
+    else db.prepare("DELETE FROM cells WHERE py=? AND px=?").run(py, px);
+    return cell;
+  };
+  const refreshBlocks = (py: number, px: number) => {
+    for (const level of OVERVIEW_LEVELS) {
+      const { oy, ox } = block(py, px, level);
+      const best = shoalest(level, oy, ox, py);
+      if (best) {
+        const previous = readBlock.get(level, oy, ox) as Row | undefined;
+        write(writeBlock, [level, oy, ox], best, [
+          previous?.u || best.t === undefined ? 1 : 0,
+        ]);
+      } else
+        db.prepare("DELETE FROM overviews WHERE level=? AND oy=? AND ox=?").run(
+          level,
+          oy,
+          ox,
+        );
+    }
+  };
+
+  const windowSuperseded = (start: number, end: number) =>
+    !!db
+      .prepare("SELECT 1 FROM refined_windows WHERE start=? AND end>? LIMIT 1")
+      .get(start, end);
+
   return {
+    generation,
+    windowSuperseded,
+    windowDone(start: number, end: number, includeEmpty = true) {
+      return !!db
+        .prepare(
+          "SELECT 1 FROM refined_windows WHERE start=? AND end=? UNION ALL SELECT 1 FROM refined_empty_windows WHERE start=? AND end=? AND ? LIMIT 1",
+        )
+        .get(start, end, start, end, Number(includeEmpty));
+    },
+    /** A successful empty read is coverage, not permission to erase live evidence. */
+    completeEmptyWindow(start: number, end: number) {
+      transaction(() => {
+        if (
+          db
+            .prepare(
+              "SELECT 1 FROM refined_windows WHERE start=? AND end>? UNION ALL SELECT 1 FROM refined_empty_windows WHERE start=? AND end>? LIMIT 1",
+            )
+            .get(start, end, start, end)
+        )
+          return;
+        db.prepare("DELETE FROM refined_empty_windows WHERE start=?").run(
+          start,
+        );
+        db.prepare("INSERT INTO refined_empty_windows VALUES(?,?)").run(
+          start,
+          end,
+        );
+      });
+    },
+    /** Atomically replace one bounded refinement job, including its coverage receipt.
+     * A crash before commit leaves the previous contribution intact. */
+    replaceWindow(start: number, end: number, passes: Pass[], shoals: Shoal[]) {
+      return transaction(() => {
+        // A slower partial-hour job must not retract a completed extended tail.
+        if (windowSuperseded(start, end)) return [];
+        const job = `window:${start}`;
+        const positions = new Map<string, { py: number; px: number }>();
+        const hours = new Map<string, Set<number>>();
+        const touch = (p: { py: number; px: number; time?: number }) => {
+          const key = `${p.py}/${p.px}`;
+          positions.set(key, p);
+          const found = hours.get(key) ?? new Set<number>();
+          found.add(estimateHour(p.time ?? start * 1000));
+          hours.set(key, found);
+        };
+        for (const row of db
+          .prepare(
+            "SELECT py,px,time FROM cell_passes WHERE job=? UNION SELECT py,px,time FROM cell_job_shoals WHERE job=?",
+          )
+          .all(job, job))
+          touch(row as { py: number; px: number });
+        // A history provider is not proof of complete live coverage. Never erase
+        // live contributions merely because a later query is empty or partial.
+        // Preserve previously imported evidence when this cell/hour now also has
+        // live data. An extended window must not discard its earlier partial job.
+        db.prepare(
+          `INSERT OR IGNORE INTO cell_passes
+          SELECT 'preserved:' || p.job || ':' || p.py || '/' || p.px, p.ordinal,p.py,p.px,p.time,p.day,p.depth,p.tide
+          FROM cell_passes p WHERE p.job=? AND EXISTS(SELECT 1 FROM cell_passes l
+            WHERE l.py=p.py AND l.px=p.px AND l.job LIKE 'live:%' AND l.time>=? AND l.time<?)`,
+        ).run(job, start * 1000, end * 1000);
+        db.prepare(
+          `INSERT OR IGNORE INTO cell_job_shoals
+          SELECT 'preserved:' || p.job || ':' || p.py || '/' || p.px,p.ordinal,p.py,p.px,p.lon,p.lat,p.depth,p.time
+          FROM cell_job_shoals p WHERE p.job=? AND EXISTS(SELECT 1 FROM cell_passes l
+            WHERE l.py=p.py AND l.px=p.px AND l.job LIKE 'live:%' AND l.time>=? AND l.time<?)`,
+        ).run(job, start * 1000, end * 1000);
+        db.prepare("DELETE FROM cell_passes WHERE job=?").run(job);
+        db.prepare("DELETE FROM cell_job_shoals WHERE job=?").run(job);
+        for (const [i, p] of passes.entries()) {
+          if (p.time === undefined)
+            throw new Error("refinement pass requires timestamp");
+          if (
+            db
+              .prepare(
+                "SELECT 1 FROM cell_passes WHERE py=? AND px=? AND time>=? AND time<? AND job LIKE 'live:%' LIMIT 1",
+              )
+              .get(p.py, p.px, start * 1000, end * 1000)
+          )
+            continue;
+          insertPass.run(
+            job,
+            i,
+            p.py,
+            p.px,
+            p.time,
+            p.day,
+            p.depth,
+            p.tide ?? null,
+          );
+          touch(p);
+        }
+        const putShoal = db.prepare(
+          "INSERT INTO cell_job_shoals VALUES(?,?,?,?,?,?,?,?)",
+        );
+        for (const [i, s] of shoals.entries()) {
+          const p = cellAt(s.lon, s.lat);
+          putShoal.run(job, i, p.py, p.px, s.lon, s.lat, s.depth, s.time);
+          touch(p);
+        }
+        const rebuilt = new Map<string, Cell>();
+        for (const p of positions.values()) {
+          const cell = replayCell(p.py, p.px, hours.get(`${p.py}/${p.px}`)!);
+          if (cell) rebuilt.set(`${p.py}/${p.px}`, cell);
+          db.prepare("DELETE FROM shoals WHERE py=? AND px=?").run(p.py, p.px);
+          const shoal = db
+            .prepare(
+              "SELECT lon,lat,depth,time FROM cell_job_shoals WHERE py=? AND px=? ORDER BY depth,time LIMIT 1",
+            )
+            .get(p.py, p.px) as Shoal | undefined;
+          if (shoal)
+            insertShoal.run(
+              p.py,
+              p.px,
+              shoal.lon,
+              shoal.lat,
+              shoal.depth,
+              shoal.time,
+            );
+        }
+        for (const p of positions.values()) {
+          const cell = rebuilt.get(`${p.py}/${p.px}`);
+          if (cell) updateBlocks(cell);
+          else refreshBlocks(p.py, p.px);
+        }
+        db.prepare("DELETE FROM refined_empty_windows WHERE start=?").run(
+          start,
+        );
+        // Replacing an already covered window need not retire its preview index
+        // twice. A changed end still retracts the old coverage atomically.
+        db.prepare("DELETE FROM refined_windows WHERE start=? AND end!=?").run(
+          start,
+          end,
+        );
+        db.prepare("INSERT OR IGNORE INTO refined_windows VALUES(?,?)").run(
+          start,
+          end,
+        );
+        return [...positions.values()];
+      });
+    },
+    /** Reweight retained summaries without rereading observations or deleting QC receipts. */
+    reweightNext(limit = 64) {
+      if (!this.getMeta("reweight_pending"))
+        return { done: true, changed: [] as { py: number; px: number }[] };
+      const after = JSON.parse(
+        this.getMeta("reweight_after") || "[-1000000000,-1000000000]",
+      ) as [number, number];
+      const rows = db
+        .prepare(
+          "SELECT py,px FROM cells WHERE (py,px)>(?,?) ORDER BY py,px LIMIT ?",
+        )
+        .all(...after, limit) as { py: number; px: number }[];
+      for (const p of rows)
+        transaction(() => {
+          const cell = estimates.rebuild(p.py, p.px, []);
+          if (cell) {
+            write(writeCell, [], cell);
+            updateBlocks(cell);
+          }
+        });
+      transaction(() => {
+        if (rows.length < limit) {
+          setMetaStmt.run("reweight_pending", "");
+          setMetaStmt.run("reweight_after", "");
+        } else
+          setMetaStmt.run(
+            "reweight_after",
+            JSON.stringify([rows.at(-1)!.py, rows.at(-1)!.px]),
+          );
+      });
+      return { done: rows.length < limit, changed: rows };
+    },
+    /** Estimate pending passes without changing the published cells. */
+    previewPasses(pending: Pass[]): Cell[] {
+      const groups = new Map<string, Pass[]>();
+      const seen = new Set<string>();
+      const exists = db.prepare(
+        "SELECT 1 FROM cell_passes WHERE job>=? AND job<? AND ordinal=0 AND time>=? LIMIT 1",
+      );
+      for (const p of pending) {
+        const job = `live:${p.py}/${p.px}/${p.start ?? p.time}/${p.time}`;
+        const prefix = `live:${p.py}/${p.px}/${p.start ?? p.time}/`;
+        // A request can arrive after a longer version of its open pass committed.
+        if (seen.has(job) || exists.get(prefix, `${prefix}~`, p.time!))
+          continue;
+        seen.add(job);
+        const key = `${p.py}/${p.px}`;
+        const group = groups.get(key) ?? [];
+        group.push(p);
+        groups.set(key, group);
+      }
+      return [...groups.values()].flatMap((group) => {
+        const cell = estimates.preview(group[0].py, group[0].px, group);
+        return cell
+          ? [
+              {
+                ...cell,
+                m: cmDown(cell.m) / 100,
+                d: cmUp(cell.d) / 100,
+                ...(cell.t === undefined ? {} : { t: cmUp(cell.t) / 100 }),
+              },
+            ]
+          : [];
+      });
+    },
+
     /** Fold passes into their cells in one transaction; returns the cells written.
      * Without `overviews`, as during a backfill, the overviews are left for
      * {@link rebuildOverviews}. */
     addPasses(passes: Pass[], overviews = true): Cell[] {
+      if (passes.length && passes.every((p) => p.time !== undefined))
+        return transaction(() => {
+          const touched = new Map<
+            string,
+            { py: number; px: number; hours: Set<number> }
+          >();
+          for (const p of passes) {
+            const job = `live:${p.py}/${p.px}/${p.start ?? p.time}/${p.time}`;
+            if (
+              !insertPass.run(
+                job,
+                0,
+                p.py,
+                p.px,
+                p.time!,
+                p.day,
+                p.depth,
+                p.tide ?? null,
+              ).changes
+            )
+              continue;
+            const key = `${p.py}/${p.px}`;
+            const item = touched.get(key) ?? {
+              py: p.py,
+              px: p.px,
+              hours: new Set<number>(),
+            };
+            item.hours.add(estimateHour(p.time!));
+            touched.set(key, item);
+          }
+          return [...touched.values()].map((p) => {
+            const cell = replayCell(p.py, p.px, p.hours)!;
+            if (overviews) updateBlocks(cell);
+            return cell;
+          });
+        });
       return transaction(() =>
         passes.map((pass) => {
           const row = readCell.get(pass.py, pass.px) as
@@ -335,6 +647,18 @@ export function createCellStore(db: DatabaseSync) {
       transaction(() => {
         for (const s of shoals) {
           const { py, px } = cellAt(s.lon, s.lat);
+          db.prepare(
+            "INSERT OR IGNORE INTO cell_job_shoals VALUES(?,?,?,?,?,?,?,?)",
+          ).run(
+            `live:${s.time}/${s.lon}/${s.lat}`,
+            0,
+            py,
+            px,
+            s.lon,
+            s.lat,
+            s.depth,
+            s.time,
+          );
           insertShoal.run(py, px, s.lon, s.lat, s.depth, s.time);
         }
       });
@@ -374,7 +698,10 @@ export function createCellStore(db: DatabaseSync) {
     getMeta: (key: string) =>
       (getMetaStmt.get(key) as { value: string } | undefined)?.value,
     setMeta: (key: string, value: string) => {
-      setMetaStmt.run(key, value);
+      // Only the chart lifecycle may install a generation; all other metadata
+      // belongs to the currently fenced build, including progress-only commits.
+      if (key === "build_generation") setMetaStmt.run(key, value);
+      else transaction(() => setMetaStmt.run(key, value));
     },
     transaction,
     /** Clear the cells, overviews and shoals, and with them every kept tile. */
@@ -389,9 +716,14 @@ export function createCellStore(db: DatabaseSync) {
             "DELETE FROM kept_tile_boxes; DELETE FROM kept_tile_box_owners; DELETE FROM kept_tiles;",
           );
         }
-        db.exec(
-          "DELETE FROM cells; DELETE FROM overviews; DELETE FROM shoals;",
+        resetPreviewSpatial(db, () =>
+          db.exec(
+            "DELETE FROM cells; DELETE FROM overviews; DELETE FROM shoals; DELETE FROM cell_passes; DELETE FROM cell_job_shoals; DELETE FROM refined_windows; DELETE FROM refined_empty_windows;",
+          ),
         );
+        estimates.clear();
+        setMetaStmt.run("reweight_pending", "");
+        setMetaStmt.run("reweight_after", "");
         if (kept) keptTileTriggers(db, true);
       });
     },

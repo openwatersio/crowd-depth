@@ -29,10 +29,11 @@ const db = new DatabaseSync(workerData.file);
 // a wait rather than a failure when that connection is writing its sounding log.
 db.exec("PRAGMA synchronous = NORMAL");
 db.exec("PRAGMA busy_timeout = 10000");
-const store = createCellStore(db);
+const store = createCellStore(db, workerData.generation);
 const writer = createCellWriter(store, {
   bulk: true,
-  overviews: false,
+  overviews: true,
+  onChange: (changed) => parentPort!.postMessage({ changed }),
   progress: (micros) => advancePendingBackfill(store, micros),
 });
 // A write that fails surfaces here, not from `write`, which only queues.
@@ -71,7 +72,6 @@ parentPort!.on(
       } else if (msg.end) {
         writer.end((err?: Error | null) => {
           if (err) return parentPort!.postMessage({ error: String(err) });
-          store.rebuildOverviews();
           db.close();
           parentPort!.postMessage({ done: true });
         });

@@ -76,13 +76,34 @@ function speed(a: Sounding, b: Sounding): number {
 }
 
 /** Median of each sounding's window of k either side, as numpy's rolling_median. */
-function rollingMedian(values: number[], k: number): number[] {
-  return values.map((_, j) => {
-    const w = values.slice(Math.max(0, j - k), j + k + 1).sort((a, b) => a - b);
+export function rollingMedian(values: number[], k: number): number[] {
+  // Keep the reference sort semantics for non-finite input; normal QC windows are finite.
+  if (!values.every(Number.isFinite))
+    return values.map((_, j) => {
+      const w = values
+        .slice(Math.max(0, j - k), j + k + 1)
+        .sort((a, b) => a - b);
+      const lo = w[(w.length - 1) >> 1];
+      const hi = w[w.length >> 1];
+      return f32(lo + f32(hi - lo) * 0.5);
+    });
+  const w = values.slice(0, k + 1).sort((a, b) => a - b);
+  const medians = new Array<number>(values.length);
+  for (let j = 0; j < values.length; j++) {
+    if (j > 0) {
+      if (j > k) w.splice(w.indexOf(values[j - k - 1]), 1);
+      if (j + k < values.length) {
+        const value = values[j + k];
+        let at = w.length;
+        while (at > 0 && w[at - 1] > value) at--;
+        w.splice(at, 0, value);
+      }
+    }
     const lo = w[(w.length - 1) >> 1];
     const hi = w[w.length >> 1];
-    return f32(lo + f32(hi - lo) * 0.5);
-  });
+    medians[j] = f32(lo + f32(hi - lo) * 0.5);
+  }
+  return medians;
 }
 
 /** Positions in `track` deeper than the steep bound from the last one before them that wasn't. */

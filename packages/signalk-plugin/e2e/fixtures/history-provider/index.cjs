@@ -33,6 +33,7 @@ module.exports = (app) => ({
           range: { from, to },
           values: query.pathSpecs.map((p) => ({
             path: p.path,
+            $source: "e2e",
             method: p.aggregate,
           })),
           data: bucketed(inRange(from, to), query.resolution ?? 1).map((r) => [

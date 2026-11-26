@@ -24,6 +24,7 @@ export function toPrecision({ coordinates = 7, depth = 3, heading = 3 } = {}) {
 }
 
 export type SensorConfig = {
+  positionOrigin?: { x: number; y: number };
   gnss: { x: number; y: number };
   sounder: { x: number; y: number };
 };
@@ -86,14 +87,15 @@ function isFiniteNumber(value: unknown): value is number {
 }
 
 /** Get the offsets between the gnss and the sounder */
-export function getOffsets({ gnss, sounder }: SensorConfig) {
+export function getOffsets({ gnss, sounder, positionOrigin }: SensorConfig) {
+  const origin = positionOrigin ?? gnss;
   // y offset is distance from bow as a positive number
   // e.g. gnss is 13m from bow, sounder is 3m from bow, so offset is 10m
-  const dy = gnss.y - sounder.y;
+  const dy = origin.y - sounder.y;
 
   // x offset is distance from centerline, -ve to port, +ve to starboard
   // e.g. gnss is -1.5m, sounder is -0.5m, so offset is 1m
-  const dx = sounder.x - gnss.x;
+  const dx = sounder.x - origin.x;
 
   return {
     dx,

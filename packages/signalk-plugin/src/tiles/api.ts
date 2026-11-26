@@ -1,3 +1,6 @@
+import { createHash } from "node:crypto";
+import { cellAt as historyPreviewCellAt } from "./geometry.js";
+import { cellBounds } from "./geometry.js";
 import type { Request, Response } from "express";
 import type { ServerAPI } from "@signalk/server-api";
 import { ASSET_BASE } from "../plotterext/manifest.js";
@@ -9,6 +12,7 @@ import {
   depthLabels,
   type Detail,
 } from "./surface.js";
+import type { PreviewView, PreviewStore } from "./history-preview.js";
 import type { TileService } from "./service.js";
 import type { GeoFeature, Preview } from "./preview.js";
 import { buildStyle, type OwnStyle } from "./style.js";
@@ -52,6 +56,7 @@ export function parseView(view: unknown) {
   const lon = (l: number) => l >= -180 && l <= 180;
   const lat = (l: number) => l >= -85.06 && l <= 85.06;
   if (
+    fields.length !== 5 ||
     !(zoom >= 0 && zoom <= 30) ||
     !lon(west) ||
     !lon(east) ||
@@ -79,6 +84,34 @@ export function provisionalFeatures(soundings: Sounding[]) {
   }));
 }
 
+/** Rendering alone is thinned: retain the newest and shoalest provisional value
+ * per cell/reference. Thousands of stationary pings must not become Wi-Fi payloads. */
+export function spatialProvisional(soundings: Sounding[]) {
+  const cells = new Map<string, { latest: Sounding; shoal: Sounding }>();
+  for (const s of soundings) {
+    if (
+      ![s.lon, s.lat, s.depth, s.time].every(Number.isFinite) ||
+      Math.abs(s.lon) > 180 ||
+      Math.abs(s.lat) > 85.0511 ||
+      s.depth <= 0
+    )
+      continue;
+    const { py, px } = historyPreviewCellAt(s.lon, s.lat);
+    const key = `${py}/${px}/${s.tide ? 1 : 0}`;
+    const cell = cells.get(key);
+    if (!cell) cells.set(key, { latest: s, shoal: s });
+    else {
+      if (s.time > cell.latest.time) cell.latest = s;
+      if (charted(s) < charted(cell.shoal)) cell.shoal = s;
+    }
+  }
+  return [...cells.values()]
+    .flatMap(({ latest, shoal }) =>
+      latest.time === shoal.time ? [latest] : [latest, shoal],
+    )
+    .sort((a, b) => a.time - b.time);
+}
+
 /** Keep the newest soundings of `n`, in time order, and an even share of the rest. */
 export function thin(n: number) {
   const older = n - NEWEST_PROVISIONAL;
@@ -89,6 +122,9 @@ export function thin(n: number) {
 /** What the routes read; replaced on each start. */
 export interface Layer {
   tiles: TileService;
+  historyPreview?: (
+    view: PreviewView | undefined,
+  ) => ReturnType<PreviewStore["features"]>;
   provisional: () => Sounding[];
   stored: () => number[];
   safetyDepth: number;
@@ -222,7 +258,7 @@ export function registerLayerRoutes(
     guard(async (req, res, layer) => {
       const view = parseView(req.query.view);
       // Only to a runtime that draws it, which says which it holds.
-      const held = Number(req.query.preview);
+      const heldPreview = Number(req.query.preview);
       let preview: { rev: number; features: GeoFeature[] } | undefined;
       if (layer.preview && req.query.preview !== undefined) {
         let timer: ReturnType<typeof setTimeout> | undefined;
@@ -233,7 +269,7 @@ export function registerLayerRoutes(
           }),
         ]).finally(() => clearTimeout(timer));
         preview ??= layer.preview.latest();
-        if (preview.rev === held) preview = undefined;
+        if (preview.rev === heldPreview) preview = undefined;
         // Contours in the plotter's unit only, where it says which.
         const unit = req.query.unit;
         if (preview && (unit === "m" || unit === "ft")) {
@@ -247,12 +283,52 @@ export function registerLayerRoutes(
         }
       }
       const since = Number(req.query.since ?? -1);
-      const provisional = layer.provisional().filter(drawn);
+      const provisional = spatialProvisional(layer.provisional().filter(drawn));
       layer.tiles.watched(view);
-      const bytes = view && layer.tiles.held(...view);
+      const held = view && layer.tiles.held(...view);
+      const historyPreviewPoints = layer.historyPreview?.(view);
+      const historyPreviewRevision =
+        historyPreviewPoints &&
+        createHash("sha256")
+          .update(JSON.stringify(historyPreviewPoints))
+          .digest("hex")
+          .slice(0, 24);
       res.set("Cache-Control", "no-store").json({
         ...layer.tiles.since(Number.isInteger(since) ? since : -1),
-        ...(bytes !== undefined ? { refreshMs: refreshMs(bytes) } : {}),
+        ...(historyPreviewRevision ? { historyPreviewRevision } : {}),
+        ...(historyPreviewPoints &&
+        historyPreviewRevision !== req.query.historyPreviewRevision
+          ? {
+              historyPreview: {
+                type: "FeatureCollection",
+                features: historyPreviewPoints.flatMap((point) => {
+                  const [lon, lat] = point.geometry.coordinates;
+                  const { py, px } = historyPreviewCellAt(lon, lat);
+                  const { west, east, south, north } = cellBounds(py, px);
+                  return [
+                    point,
+                    {
+                      ...point,
+                      id: `${point.id}:area`,
+                      geometry: {
+                        type: "Polygon",
+                        coordinates: [
+                          [
+                            [west, south],
+                            [east, south],
+                            [east, north],
+                            [west, north],
+                            [west, south],
+                          ],
+                        ],
+                      },
+                    },
+                  ];
+                }),
+              },
+            }
+          : {}),
+        ...(held !== undefined ? { refreshMs: refreshMs(held) } : {}),
         // The surface round the boat as it stands, when it's changed.
         ...(preview && {
           preview: {

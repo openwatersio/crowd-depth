@@ -1,0 +1,35 @@
+{
+  "scope": "Synthetic archive-module rehearsal inside Docker on pi.local, staged v34 (schema v6). Baselines: commit 531bc81 (schema v2) and staged v33 (schema v5). Does not switch the active plugin or production database.",
+  "results": [
+    {
+      "fromSchema": 2,
+      "olderOpenRefused": true,
+      "snapshotRollbackReadable": true,
+      "laterObservationsPreservedForRollForward": true
+    },
+    {
+      "fromSchema": 5,
+      "olderOpenRefused": true,
+      "snapshotRollbackReadable": true,
+      "laterObservationsPreservedForRollForward": true
+    }
+  ],
+  "v40FromV39": [
+    {
+      "fromSchema": 6,
+      "olderOpenRefused": true,
+      "snapshotRollbackReadable": true,
+      "laterObservationsPreservedForRollForward": true
+    }
+  ],
+  "v41FromV39": [
+    {
+      "fromSchema": 6,
+      "legacyRevisionOrderPreserved": true,
+      "importFreshnessAndSpatialHintsChecked": true,
+      "olderOpenRefused": true,
+      "snapshotRollbackReadable": true,
+      "laterObservationsPreservedForRollForward": true
+    }
+  ]
+}

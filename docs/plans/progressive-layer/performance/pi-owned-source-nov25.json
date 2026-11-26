@@ -1,0 +1,27 @@
+{
+  "measurements": [
+    {
+      "phase": "first-import",
+      "firstMs": 228.02342699999997,
+      "elapsedMs": 571.629433,
+      "spatialMs": 1.1940599999999222,
+      "count": 3600
+    },
+    {
+      "phase": "warm-replay",
+      "firstMs": 6.717802000000006,
+      "elapsedMs": 224.73413700000003,
+      "spatialMs": 0.5733910000000151,
+      "count": 3600
+    },
+    {
+      "phase": "reopened-replay",
+      "firstMs": 101.23780700000009,
+      "elapsedMs": 301.97804299999996,
+      "spatialMs": 0.8672060000001238,
+      "count": 3600
+    }
+  ],
+  "providerCalls": 1,
+  "eventLoopMaxMs": 59.441151
+}

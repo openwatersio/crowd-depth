@@ -28,6 +28,7 @@ schedule to the trusted node API.
 | `src/plugin.ts`      | Plugin entry: wires config, collector, reporter, and schedule together                                                                                             |
 | `src/config.ts`      | Plugin settings JSON schema and config types                                                                                                                       |
 | `src/collector.ts`   | Subscribes to live deltas and writes them to storage                                                                                                               |
+| `src/observations/`  | Worker-owned raw observation archive, history import manifests, and the chart's local history reader                                                               |
 | `src/sources/`       | Where report data comes from: `history.ts` (Signal K History API, e.g. signalk-to-influxdb2) with `sqlite.ts` as the fallback local store                          |
 | `src/storage.ts`     | SQLite database setup (`node:sqlite`)                                                                                                                              |
 | `src/streams/`       | Stream pipeline: `live.ts` (deltas → `BathymetryData`), `transforms.ts` (offset correction, precision), `geojson.ts` / `xyz.ts` (output formats)                   |
@@ -63,7 +64,7 @@ Requires Node >= 24. Local development and CI read the tested Node version from 
 
 ```sh
 npm ci            # installs all workspaces from package-lock.json
-npm run build     # tsc -b, all packages
+npm run build     # TypeScript, plugin worker bundle and web assets
 npm test          # vitest, all packages
 npm run check     # oxlint + prettier + per-package lint
 npm run format    # auto-fix lint and formatting issues
@@ -92,7 +93,7 @@ It also runs the end-to-end suite (below) and boots the API Worker under `wrangl
 ```sh
 npm test -- --project crowd-depth   # plugin tests only
 npm run build -w crowd-depth
-npm run dev -w crowd-depth     # tsc --watch
+npm run dev -w crowd-depth     # tsc -b --force && tsc -w
 ```
 
 The end-to-end suite boots a real Signal K server with the built plugin,

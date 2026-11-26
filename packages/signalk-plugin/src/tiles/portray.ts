@@ -285,12 +285,24 @@ export function cut(
     (Math.min(w - 1, x1 - ox) + 1) * u - 1,
     (Math.min(w - 1, y1 - oy) + 1) * u - 1,
   ];
-  const fine = upsample(slice(p.depth), w, u, true, samples, DEEP).map((d, i) =>
-    Math.min(d, caps[i]),
+  const fine = upsample(slice(p.depth), w, u, true, samples, DEEP);
+  const fineWet = upsample(slice(p.wet), w, u, true, samples, DEEP);
+  const extent = upsample(slice(p.extent), w, u, false, samples, FAR_EXTENT);
+  const measured = upsample(
+    slice(p.measured),
+    w,
+    u,
+    false,
+    samples,
+    FAR_MEASURED,
   );
-  const fineWet = upsample(slice(p.wet), w, u, true, samples, DEEP).map(
-    (d, i) => Math.min(d, caps[i]),
-  );
+  // These arrays belong to this cut; transform them without allocating copies.
+  for (let i = 0; i < fine.length; i++) {
+    fine[i] = Math.min(fine[i], caps[i]);
+    fineWet[i] = Math.min(fineWet[i], caps[i]);
+    extent[i] *= u;
+    measured[i] *= u;
+  }
   const depthSlope = slope(fine, m, samples);
   return {
     m,
@@ -299,17 +311,8 @@ export function cut(
     wet: fineWet,
     depthSlope,
     wetSlope: slope(fineWet, m, samples),
-    extent: upsample(slice(p.extent), w, u, false, samples, FAR_EXTENT).map(
-      (e) => e * u,
-    ),
-    measured: upsample(
-      slice(p.measured),
-      w,
-      u,
-      false,
-      samples,
-      FAR_MEASURED,
-    ).map((e) => e * u),
+    extent,
+    measured,
     toTile: (s: number) => Math.round((s / u - PAD_PX) * scale),
   };
 }
@@ -352,13 +355,17 @@ function gauss(
         if (set[p + hi + 1] === set[p + lo]) continue;
         const i = first + p * step;
         let a = 0;
-        for (let j = lo; j <= hi; j++) a += k[j + r] * s[i + j * step];
-        o[i] = a;
         if (c && oc) {
           let b = 0;
-          for (let j = lo; j <= hi; j++) b += k[j + r] * c[i + j * step];
+          for (let j = lo; j <= hi; j++) {
+            const weight = k[j + r],
+              at = i + j * step;
+            a += weight * s[at];
+            b += weight * c[at];
+          }
           oc[i] = b;
-        }
+        } else for (let j = lo; j <= hi; j++) a += k[j + r] * s[i + j * step];
+        o[i] = a;
       }
     }
     return [o, oc ?? o];
@@ -429,35 +436,61 @@ function soften(cap: Float64Array, w: number, h: number) {
 }
 
 /** Each pixel without a value takes the shoalest of its neighbours', a few times over. */
-function carry(v: Float64Array, w: number) {
-  let a = v;
-  for (let pass = 0; pass < CARRY_PX; pass++) {
-    const prev = a;
-    const next = prev.slice();
-    let changed = false;
-    for (let i = 0; i < prev.length; i++) {
-      if (!Number.isNaN(prev[i])) continue;
-      const x = i % w;
-      let best = NaN;
-      // Left, right, up and down, the shoalest first found winning a tie.
-      const take = (j: number) => {
-        const p = prev[j];
-        if (!Number.isNaN(p) && !(p >= best)) best = p;
-      };
-      if (x > 0) take(i - 1);
-      if (x < w - 1) take(i + 1);
-      if (i - w >= 0) take(i - w);
-      if (i + w < prev.length) take(i + w);
-      if (!Number.isNaN(best)) {
-        next[i] = best;
-        changed = true;
-      }
+export function carry(v: Float64Array, w: number) {
+  const queue = new Int32Array(v.length);
+  const state = new Uint8Array(v.length);
+  let end = 0;
+  for (let i = 0; i < v.length; i++) {
+    if (!Number.isNaN(v[i])) {
+      queue[end++] = i;
+      state[i] = 1;
     }
-    // A pass that carries nothing leaves every later one the same.
-    if (!changed) break;
-    a = next;
   }
-  return a;
+  if (!end || end === v.length) return v;
+  const out = v.slice();
+  const values = new Float64Array(v.length);
+  let start = 0;
+  const enqueue = (i: number) => {
+    if (!state[i]) {
+      state[i] = 2;
+      queue[end++] = i;
+    }
+  };
+  for (let pass = 0; pass < CARRY_PX && start < end; pass++) {
+    const through = end;
+    // Only the frontier can reach previously empty pixels in the next pass.
+    for (let q = start; q < through; q++) {
+      const i = queue[q],
+        x = i % w;
+      if (x > 0) enqueue(i - 1);
+      if (x < w - 1) enqueue(i + 1);
+      if (i >= w) enqueue(i - w);
+      if (i + w < v.length) enqueue(i + w);
+    }
+    // Read the previous pass completely before publishing this pass's values.
+    for (let q = through; q < end; q++) {
+      const i = queue[q],
+        x = i % w;
+      let best = NaN;
+      if (x > 0) best = out[i - 1];
+      if (x < w - 1) {
+        const p = out[i + 1];
+        if (!Number.isNaN(p) && !(p >= best)) best = p;
+      }
+      if (i >= w) {
+        const p = out[i - w];
+        if (!Number.isNaN(p) && !(p >= best)) best = p;
+      }
+      if (i + w < v.length) {
+        const p = out[i + w];
+        if (!Number.isNaN(p) && !(p >= best)) best = p;
+      }
+      values[q] = best;
+    }
+    for (let q = through; q < end; q++) out[queue[q]] = values[q];
+    start = through;
+  }
+  return out;
 }
 
 /** About the distance in pixels to where `share` is a half, for a straight edge blurred
@@ -485,13 +518,16 @@ function upsample(
   const m = w * u;
   const o = new Float64Array(m * m).fill(far);
   if (X1 < X0 || Y1 < Y0) return o;
-  const src = v.map((d) => (Number.isNaN(d) ? DEEP : d));
   if (u === 1) {
     for (let Y = Y0; Y <= Y1; Y++) {
-      o.set(src.subarray(Y * w + X0, Y * w + X1 + 1), Y * m + X0);
+      for (let X = X0; X <= X1; X++) {
+        const i = Y * w + X;
+        o[i] = Number.isNaN(v[i]) ? DEEP : v[i];
+      }
     }
     return o;
   }
+  const src = v.map((d) => (Number.isNaN(d) ? DEEP : d));
   // Each sample's four source pixels along an axis, and their weights: Catmull-Rom's,
   // or linear; the same for rows and columns, so it's done in two passes.
   const taps = 4;
@@ -643,6 +679,7 @@ export function isolines(
   levels: number[],
   tolerance: number,
 ): Map<number, Point[][]> {
+  if (!levels.length) return new Map();
   const { m, extent, depth } = t;
   const sorted = [...levels].sort((a, b) => a - b);
   const segments = new Map<number, [Point, Point][]>(
@@ -671,10 +708,14 @@ export function isolines(
     ] as Point;
   };
   const f = [0, 0, 0, 0];
+  const c = [0, 0, 0, 0];
   for (let y = 0; y < m - 1; y++) {
     for (let x = 0; x < m - 1; x++) {
       const i = y * m + x;
-      const c = [i, i + 1, i + m + 1, i + m];
+      c[0] = i;
+      c[1] = i + 1;
+      c[2] = i + m + 1;
+      c[3] = i + m;
       if (!(
         extent[c[0]] >= 0 &&
         extent[c[1]] >= 0 &&
@@ -704,29 +745,51 @@ export function isolines(
         const right = mid(f, 1, 2, x + 1, y, x + 1, y + 1);
         const bottom = mid(f, 3, 2, x, y + 1, x + 1, y + 1);
         const left = mid(f, 0, 3, x, y, x, y + 1);
-        const cases: Record<number, [Point, Point][]> = {
-          1: [[left, top]],
-          2: [[top, right]],
-          3: [[left, right]],
-          4: [[right, bottom]],
-          5: [
-            [left, top],
-            [right, bottom],
-          ],
-          6: [[top, bottom]],
-          7: [[left, bottom]],
-          8: [[bottom, left]],
-          9: [[bottom, top]],
-          10: [
-            [top, right],
-            [bottom, left],
-          ],
-          11: [[bottom, right]],
-          12: [[right, left]],
-          13: [[right, top]],
-          14: [[top, left]],
-        };
-        segments.get(level)!.push(...cases[code]);
+        const output = segments.get(level)!;
+        switch (code) {
+          case 1:
+            output.push([left, top]);
+            break;
+          case 2:
+            output.push([top, right]);
+            break;
+          case 3:
+            output.push([left, right]);
+            break;
+          case 4:
+            output.push([right, bottom]);
+            break;
+          case 5:
+            output.push([left, top], [right, bottom]);
+            break;
+          case 6:
+            output.push([top, bottom]);
+            break;
+          case 7:
+            output.push([left, bottom]);
+            break;
+          case 8:
+            output.push([bottom, left]);
+            break;
+          case 9:
+            output.push([bottom, top]);
+            break;
+          case 10:
+            output.push([top, right], [bottom, left]);
+            break;
+          case 11:
+            output.push([bottom, right]);
+            break;
+          case 12:
+            output.push([right, left]);
+            break;
+          case 13:
+            output.push([right, top]);
+            break;
+          case 14:
+            output.push([top, left]);
+            break;
+        }
       }
     }
   }

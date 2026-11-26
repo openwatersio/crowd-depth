@@ -33,10 +33,16 @@ const M_PER_FT = 0.3048;
 const client = await connectExtension();
 
 let drawn = true;
+let loadingUnits = false;
 /** The host's view, for the plugin to batch refreshes by what it holds. */
 let view: MapView | undefined;
 let busy = false;
 let timer: ReturnType<typeof setInterval> | undefined;
+let depthUnit: string | undefined;
+let historyPreviewShown: string | undefined;
+let historyPreviewRevision: string | undefined;
+let historyPreviewView: string | undefined;
+let historyPreviewHeld = new Map<string | number, { id: string | number }>();
 const batch = createBatch(REFRESH_MS);
 /** The preview's revision the host holds, -1 for none; how many times it's been
  * forgotten, so a poll in flight doesn't record one the host may have dropped; and the
@@ -48,22 +54,46 @@ let contourUnit = "m";
 async function poll(): Promise<void> {
   if (busy) return;
   busy = true;
+  // The host has no units-changed event. Recheck while drawn, without redrawing
+  // the overlay unless the preference changed.
+  void loadUnits();
   // Not `AbortSignal.timeout`, which Safari before 16 lacks.
   const abort = new AbortController();
   const timeout = setTimeout(() => abort.abort(), TIMEOUT_MS);
   try {
     const at = view ? `&view=${[view.zoom, ...view.bounds].join(",")}` : "";
+    const historyPreviewAt = historyPreviewRevision
+      ? `&historyPreviewRevision=${encodeURIComponent(historyPreviewRevision)}`
+      : "";
     const unit = contourUnit;
     const asOf = forgotten;
     const ask = `&preview=${previewRev}&unit=${unit}`;
-    const res = await fetch(`${LIVE_URL}?since=${batch.rev}${at}${ask}`, {
-      credentials: "include",
-      signal: abort.signal,
-    });
+    const res = await fetch(
+      `${LIVE_URL}?since=${batch.rev}${at}${ask}${historyPreviewAt}`,
+      {
+        credentials: "include",
+        signal: abort.signal,
+      },
+    );
     if (!res.ok) return;
     const live = (await res.json()) as Live & {
       preview?: { rev: number; features: unknown[] };
+      historyPreview?: { type: string; features: unknown[] };
+      historyPreviewRevision?: string;
     };
+    // QC can retire a historyPreview without producing cells. Still schedule its handoff.
+    if (
+      live.historyPreview &&
+      historyPreviewView === JSON.stringify(view?.bounds)
+    ) {
+      const ids = new Set(
+        (live.historyPreview.features as { id: string | number }[]).map(
+          (f) => f.id,
+        ),
+      );
+      if ([...historyPreviewHeld.keys()].some((id) => !ids.has(id)))
+        live.all = true;
+    }
     const { refresh, data, upsert, remove } = batch.next(live);
     if (refresh) {
       await client.call("overlay.refresh", {
@@ -71,6 +101,32 @@ async function poll(): Promise<void> {
         source: "cells",
         ...refresh,
       });
+    }
+    if (live.historyPreview) {
+      const currentView = JSON.stringify(view?.bounds);
+      const next = new Map(
+        (live.historyPreview.features as { id: string | number }[]).map((f) => [
+          f.id,
+          f,
+        ]),
+      );
+      // Don't remove the old historyPreview while its tile refresh is still batched or failed.
+      // The host acknowledges refresh requests, not individual tile generations.
+      if (!refresh && historyPreviewView === currentView)
+        for (const [id, feature] of historyPreviewHeld)
+          if (!next.has(id) && next.size < 2400) next.set(id, feature);
+      const shown = { type: "FeatureCollection", features: [...next.values()] };
+      const encoded = JSON.stringify(shown);
+      if (encoded !== historyPreviewShown) {
+        await client.call("overlay.setData", {
+          overlayId,
+          source: "historyPreview",
+          data: shown,
+        });
+        historyPreviewShown = encoded;
+        historyPreviewView = currentView;
+        historyPreviewHeld = next;
+      }
     }
     if (data) {
       await client.call("overlay.setData", {
@@ -86,6 +142,14 @@ async function poll(): Promise<void> {
         ...(remove ? { remove } : {}),
       });
     }
+    // Request the payload again until its retained old features have been cleared
+    // after a successful tile refresh. A failed host update must also retry it.
+    if (
+      !live.historyPreview ||
+      historyPreviewHeld.size === live.historyPreview.features.length
+    )
+      historyPreviewRevision = live.historyPreviewRevision;
+    else historyPreviewRevision = undefined;
     batch.taken();
     // Apart from the rest, so a host that can't take it, as one holding a style from
     // before the preview, doesn't redo the refresh each poll: asked for again instead.
@@ -122,6 +186,10 @@ function schedule(): void {
     // The host may have dropped the soundings, and the preview, while the overlay was
     // off.
     batch.resend();
+    historyPreviewShown = undefined;
+    historyPreviewRevision = undefined;
+    historyPreviewView = undefined;
+    historyPreviewHeld.clear();
     previewRev = -1;
     forgotten++;
     timer = setInterval(() => void poll(), POLL_MS);
@@ -133,6 +201,8 @@ function schedule(): void {
 }
 
 async function loadUnits(): Promise<void> {
+  if (loadingUnits || !client.hasCapability("units")) return;
+  loadingUnits = true;
   try {
     const res = (await client.call("units.get")) as {
       units?: { depth?: string };
@@ -142,6 +212,7 @@ async function loadUnits(): Promise<void> {
     // The preview held has the other unit's contours: sent again.
     if (unit !== contourUnit) previewRev = -1;
     contourUnit = unit;
+    if (unit === depthUnit) return;
     await client.call("overlay.setState", {
       overlayId,
       values: {
@@ -150,8 +221,11 @@ async function loadUnits(): Promise<void> {
         contourUnit: feet ? "ft" : "m",
       },
     });
+    depthUnit = unit;
   } catch {
     // No units capability: the labels stay in metres.
+  } finally {
+    loadingUnits = false;
   }
 }
 
@@ -168,6 +242,7 @@ if (client.hasCapability("map")) {
   await client
     .subscribe(["map.view"], (_name, payload) => {
       view = payload as MapView;
+      if (drawn && document.visibilityState === "visible") void poll();
     })
     .catch(() => {});
   // Not awaited, nor over a view the host has sent since.
@@ -177,5 +252,5 @@ if (client.hasCapability("map")) {
     .catch(() => {});
 }
 
-await loadUnits();
+void loadUnits();
 schedule();

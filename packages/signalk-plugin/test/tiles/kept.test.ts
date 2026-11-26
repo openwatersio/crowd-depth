@@ -36,6 +36,28 @@ beforeEach(() => {
 });
 afterEach(() => rmSync(dir, { recursive: true, force: true, maxRetries: 10 }));
 
+test("optional cache writes refuse a busy writer without blocking or changing its timeout", () => {
+  const db = createDB(file);
+  const kept = createKeptTiles(db, "high");
+  const id = kept.reserve(...tileAt(14));
+  const writer = createDB(file);
+  writer.exec("BEGIN IMMEDIATE");
+  try {
+    const start = performance.now();
+    expect(() => kept.reserve(...tileAt(15))).toThrow(/locked/);
+    expect(() => kept.keep(id, Buffer.from("tile"))).toThrow(/locked/);
+    expect(performance.now() - start).toBeLessThan(250);
+    expect(db.prepare("PRAGMA busy_timeout").get()?.timeout).toBe(5000);
+    expect(kept.get(...tileAt(14))).toBeUndefined();
+  } finally {
+    writer.exec("ROLLBACK");
+    writer.close();
+  }
+  expect(kept.keep(id, Buffer.from("tile"))).toBe(true);
+  expect(kept.get(...tileAt(14))).toEqual(Buffer.from("tile"));
+  db.close();
+});
+
 test("a tile built once is read back after a restart", async () => {
   const db = createDB(file);
   const store = createCellStore(db);
@@ -280,13 +302,58 @@ test("tiles built while a backfill writes aren't kept", async () => {
   const kept = createKeptTiles(db, "high");
   const tiles = createTileService(store, undefined, "high", kept);
   const at = tileAt(14);
-  tiles.share(false);
+  tiles.persist(false);
   expect((await tiles.get(...at))?.length).toBeGreaterThan(0);
   expect(kept.get(...at)).toBeUndefined();
-  tiles.share(true);
+  tiles.persist(true);
   tiles.reset();
   await tiles.get(...at);
   expect(kept.get(...at)?.length).toBeGreaterThan(0);
+  await tiles.close();
+  db.close();
+});
+
+test("backfill can share sibling surfaces without writing tiles, and commit invalidation rebuilds them", async () => {
+  const db = createDB(file);
+  const store = createCellStore(db);
+  store.addPasses(pass(8));
+  const kept = createKeptTiles(db, "high");
+  const tiles = createTileService(store, undefined, "high", kept);
+  const cells = vi.spyOn(store, "cells");
+  const at = tileAt(15);
+  const sibling = [15, at[1] ^ 1, at[2]] as const;
+  try {
+    tiles.persist(false);
+    const before = await tiles.get(...at);
+    const first = cells.mock.calls.at(-1)!;
+    await tiles.get(...sibling);
+    const second = cells.mock.calls.at(-1)!;
+    expect(second[2] - second[0]).toBeLessThan(first[2] - first[0]);
+    expect(kept.get(...at)).toBeUndefined();
+    store.addPasses(pass(2));
+    tiles.changed([{ lon: LON, lat: LAT }]);
+    const after = await tiles.get(...at);
+    const third = cells.mock.calls.at(-1)!;
+    expect(third[2] - third[0]).toBe(first[2] - first[0]);
+    expect(after).not.toEqual(before);
+    expect(kept.get(...at)).toBeUndefined();
+  } finally {
+    await tiles.close();
+    db.close();
+  }
+});
+
+test("starting a background writer also prevents a previously reserved tile from being kept", async () => {
+  const db = createDB(file);
+  const store = createCellStore(db);
+  store.addPasses(pass(8));
+  const kept = createKeptTiles(db, "high");
+  const tiles = createTileService(store, undefined, "high", kept);
+  const at = tileAt(14);
+  const pending = tiles.get(...at);
+  tiles.persist(false);
+  await pending;
+  expect(kept.get(...at)).toBeUndefined();
   await tiles.close();
   db.close();
 });

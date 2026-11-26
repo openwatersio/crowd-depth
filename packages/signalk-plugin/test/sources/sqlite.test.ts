@@ -1,7 +1,12 @@
 import { expect, test } from "vitest";
-import { createSqliteSource } from "../../src/sources/sqlite.js";
+import {
+  createSqliteSource,
+  createSqliteReader,
+  createSqliteWriter,
+} from "../../src/sources/sqlite.js";
 import { Readable } from "stream";
 import { pipeline } from "stream/promises";
+import { finished } from "node:stream/promises";
 import { app } from "../helper.js";
 import { createDB } from "../../src/storage.js";
 import { DatabaseSync } from "node:sqlite";
@@ -10,6 +15,59 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Temporal } from "@js-temporal/polyfill";
 import { Timeframe } from "../../src/types.js";
+
+test("recording retries a write lock without blocking timers or duplicating observations", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "crowd-depth-record-lock-"));
+  const file = join(dir, "test.sqlite");
+  const db = createDB(file);
+  const lock = new DatabaseSync(file);
+  lock.exec("BEGIN IMMEDIATE");
+  const start = performance.now();
+  let releasedAfter = Infinity;
+  const release = setTimeout(() => {
+    releasedAfter = performance.now() - start;
+    lock.exec("ROLLBACK");
+  }, 50);
+  try {
+    await pipeline(Readable.from(data), createSqliteWriter(db));
+    expect(releasedAfter).toBeLessThan(500);
+    expect(db.prepare("SELECT count(*) n FROM bathymetry").get()?.n).toBe(
+      data.length,
+    );
+    expect(db.prepare("PRAGMA busy_timeout").get()?.timeout).toBe(5000);
+  } finally {
+    clearTimeout(release);
+    if (lock.isTransaction) lock.exec("ROLLBACK");
+    lock.close();
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("stopping recording cancels a pending lock retry", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "crowd-depth-record-stop-"));
+  const file = join(dir, "test.sqlite"),
+    db = createDB(file);
+  const lock = new DatabaseSync(file);
+  lock.exec("BEGIN IMMEDIATE");
+  const writer = createSqliteWriter(db);
+  const done = finished(writer).catch((error) => error);
+  try {
+    writer.write(data[0]);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    writer.destroy(new Error("stopped"));
+    expect((await done).message).toBe("stopped");
+    lock.exec("ROLLBACK");
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(db.prepare("SELECT count(*) n FROM bathymetry").get()?.n).toBe(0);
+  } finally {
+    writer.destroy();
+    if (lock.isTransaction) lock.exec("ROLLBACK");
+    lock.close();
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 const data = [
   {
@@ -190,6 +248,7 @@ test("the log keeps no index on position", () => {
     // Back to a log from user_version 6, with the index.
     db.exec(`
       CREATE INDEX idx_bathymetry_location ON bathymetry(latitude, longitude);
+      ALTER TABLE bathymetry DROP COLUMN gnss;
       PRAGMA user_version = 6;
     `);
     db.close();
@@ -223,4 +282,64 @@ test("getAvailableTimeframes counts windows from the span's start, up to its end
     "2025-01-01T00:10:00Z/2025-01-01T01:10:00Z",
     "2025-01-01T03:10:00Z/2025-01-01T04:10:00Z",
   ]);
+});
+
+test("GNSS quality survives SQLite storage and restart", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "crowd-depth-quality-"));
+  try {
+    const file = join(dir, "data.sqlite");
+    const db = createDB(file);
+    const point = {
+      ...data[0],
+      gnss: {
+        satellites: 12,
+        methodQuality: "DGNSS fix",
+        horizontalDilution: 0.7,
+      },
+    };
+    await pipeline(
+      Readable.from([point]),
+      createSqliteSource(app, db).createWriter!(),
+    );
+    db.close();
+    const reopened = createDB(file);
+    const rows = await (await createSqliteSource(app, reopened).createReader(
+      new Timeframe(
+        Temporal.Instant.fromEpochMilliseconds(0),
+        Temporal.Now.instant(),
+      ),
+    ))!.toArray();
+    expect(rows[0].gnss).toEqual(point.gnss);
+    reopened.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("keyset batches preserve tied timestamps and chronological order", async () => {
+  const db = createDB(":memory:");
+  const insert = db.prepare(
+    "INSERT INTO bathymetry(longitude,latitude,depth,timestamp) VALUES(0,0,?,?)",
+  );
+  const base = data[0].timestamp.epochMilliseconds;
+  // Insert in reverse time order with many ties across each batch boundary.
+  for (let i = 0; i < 101; i++) insert.run(i, base + 2 - (i % 3));
+  insert.run(999, base + 3); // exclusive upper boundary
+  try {
+    const points = await createSqliteReader(db, {
+      from: data[0].timestamp,
+      to: Temporal.Instant.fromEpochMilliseconds(base + 3),
+      batchSize: 7,
+    })!.toArray();
+    expect(points.map((p) => p.depth)).toEqual(
+      Array.from({ length: 101 }, (_, i) => i).sort(
+        (a, b) => 2 - (a % 3) - (2 - (b % 3)) || a - b,
+      ),
+    );
+    expect(() => createSqliteReader(db, { batchSize: 0 })).toThrow(
+      "positive integer",
+    );
+  } finally {
+    db.close();
+  }
 });

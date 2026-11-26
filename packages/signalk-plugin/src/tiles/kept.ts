@@ -1,9 +1,10 @@
+import { Worker } from "node:worker_threads";
 import { createHash } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { DatabaseSync } from "node:sqlite";
-import { keptTileSchema } from "../storage.js";
+import { keptTileSchema, withoutBusyWait } from "../storage.js";
 import {
   cellRanges,
   M_PER_DEG_LAT,
@@ -56,7 +57,7 @@ function installed(dir: string, name: string): string {
  * another build is built again, so a change to how tiles are drawn shows without
  * anyone remembering to bump a number.
  */
-function drawnBy(): string {
+export function drawnBy(): string {
   const here = dirname(fileURLToPath(import.meta.url));
   const hash = createHash("sha256");
   for (const f of readdirSync(here).sort()) {
@@ -89,32 +90,33 @@ export type KeptTiles = ReturnType<typeof createKeptTiles>;
 export function createKeptTiles(
   db: DatabaseSync,
   detail: Detail,
-  { maxBytes = KEPT_BYTES, version = drawnBy() } = {},
+  { maxBytes = KEPT_BYTES, version = drawnBy(), prepared = false } = {},
 ) {
-  // Throws where they can't be made, leaving the database without them.
-  keptTileSchema(db);
-  const getVersion = db.prepare("SELECT value FROM tile_meta WHERE key = ?");
-  if (
-    (getVersion.get(VERSION_KEY) as { value: string } | undefined)?.value !==
-    version
-  ) {
-    // The boxes first, so the trigger finds none to drop.
-    db.exec(
-      "DELETE FROM kept_tile_boxes; DELETE FROM kept_tile_box_owners; DELETE FROM kept_tiles;",
-    );
-    db.prepare(
-      `INSERT INTO tile_meta(key, value) VALUES(?, ?)
+  if (!prepared) {
+    // Throws where they can't be made, leaving the database without them.
+    keptTileSchema(db);
+    const getVersion = db.prepare("SELECT value FROM tile_meta WHERE key = ?");
+    if (
+      (getVersion.get(VERSION_KEY) as { value: string } | undefined)?.value !==
+      version
+    ) {
+      // The boxes first, so the trigger finds none to drop.
+      db.exec(
+        "DELETE FROM kept_tile_boxes; DELETE FROM kept_tile_box_owners; DELETE FROM kept_tiles;",
+      );
+      db.prepare(
+        `INSERT INTO tile_meta(key, value) VALUES(?, ?)
        ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-    ).run(VERSION_KEY, version);
-  }
-  // Reserved by a start that stopped before its builds came back, and any boxes left
-  // without a tile.
-  db.exec(`
+      ).run(VERSION_KEY, version);
+    }
+    // Reserved by a start that stopped before its builds came back, and any boxes left
+    // without a tile.
+    db.exec(`
     DELETE FROM kept_tiles WHERE tile IS NULL;
     DELETE FROM kept_tile_box_owners WHERE tile NOT IN (SELECT id FROM kept_tiles);
     DELETE FROM kept_tile_boxes
     WHERE id NOT IN (SELECT box FROM kept_tile_box_owners);`);
-
+  }
   const read = db.prepare(
     `SELECT tile FROM kept_tiles
      WHERE z = ? AND x = ? AND y = ? AND detail = ? AND tile IS NOT NULL`,
@@ -219,27 +221,69 @@ export function createKeptTiles(
     reserve(z: number, x: number, y: number): number {
       let id = 0;
       const r = tileReach(z, x, y);
-      transaction(() => {
-        unreserve.run(z, x, y, detail);
-        ({ id } = reserveTile.get(z, x, y, detail) as { id: number });
-        for (const b of cellRanges(r.west, r.south, r.east, r.north)) {
-          const box = addBox.run(b.py0, b.py1, b.px0, b.px1).lastInsertRowid;
-          addOwner.run(box, id);
-        }
-      });
+      withoutBusyWait(db, () =>
+        transaction(() => {
+          unreserve.run(z, x, y, detail);
+          ({ id } = reserveTile.get(z, x, y, detail) as { id: number });
+          for (const b of cellRanges(r.west, r.south, r.east, r.north)) {
+            const box = addBox.run(b.py0, b.py1, b.px0, b.px1).lastInsertRowid;
+            addOwner.run(box, id);
+          }
+        }),
+      );
       return id;
     },
 
     /** Keep a reserved tile, unless a write under it dropped its reservation; returns
      * whether it was kept. */
     keep(id: number, tile: Buffer | undefined): boolean {
-      const n = (tile?.length ?? 0) + ROW_BYTES;
-      if (Number(fillTile.run(tile ?? new Uint8Array(0), id).changes) === 0) {
-        return false;
-      }
-      bytes += n;
-      if (bytes > maxBytes) evict();
-      return true;
+      return withoutBusyWait(db, () => {
+        const n = (tile?.length ?? 0) + ROW_BYTES;
+        if (Number(fillTile.run(tile ?? new Uint8Array(0), id).changes) === 0) {
+          return false;
+        }
+        bytes += n;
+        if (bytes > maxBytes) evict();
+        return true;
+      });
     },
   };
+}
+
+/** Prepare disposable disk caches off-thread; requested tiles can render meanwhile. */
+export async function prepareKeptTiles(
+  db: DatabaseSync,
+  detail: Detail,
+  signal: AbortSignal,
+): Promise<KeptTiles> {
+  signal.throwIfAborted();
+  const file = db.location();
+  if (!file) return createKeptTiles(db, detail);
+  const version = await new Promise<string>((resolve, reject) => {
+    const worker = new Worker(new URL("./kept-worker.js", import.meta.url), {
+      workerData: { file, detail },
+    });
+    let failure: Error | undefined;
+    let preparedVersion: string | undefined;
+    worker.on("message", (result: { version: string }) => {
+      preparedVersion = result.version;
+    });
+    const abort = () => {
+      void worker.terminate();
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    worker.on("error", (error) => {
+      failure = error instanceof Error ? error : new Error(String(error));
+    });
+    worker.on("exit", (code) => {
+      signal.removeEventListener("abort", abort);
+      if (signal.aborted) reject(signal.reason);
+      else if (failure || code !== 0)
+        reject(failure ?? new Error(`Tile cache preparation exited: ${code}`));
+      else if (preparedVersion) resolve(preparedVersion);
+      else reject(new Error("Tile cache preparation returned no version"));
+    });
+  });
+  signal.throwIfAborted();
+  return createKeptTiles(db, detail, { version, prepared: true });
 }

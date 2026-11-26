@@ -134,11 +134,19 @@ export function readPreview(
   const cells = new Map<string, Cell>(
     store.cells(west, south, east, north).map((c) => [`${c.py},${c.px}`, c]),
   );
-  for (const p of passes) {
+  const visiblePasses = passes.filter((p) => {
     const c = cellCenter(p.py, p.px);
-    if (!inside(c.lon, c.lat)) continue;
-    const k = `${p.py},${p.px}`;
-    cells.set(k, addPass(cells.get(k), p));
+    return inside(c.lon, c.lat);
+  });
+  if (visiblePasses.every((p) => p.time !== undefined)) {
+    for (const c of store.previewPasses(visiblePasses))
+      cells.set(`${c.py},${c.px}`, c);
+  } else {
+    // Untimestamped passes only exist in legacy stores/fixtures.
+    for (const p of visiblePasses) {
+      const k = `${p.py},${p.px}`;
+      cells.set(k, addPass(cells.get(k), p));
+    }
   }
   const all = [
     ...store.shoals(west, south, east, north),
