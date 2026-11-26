@@ -6,6 +6,7 @@ on:
     paths:
       - "packages/grid/**"
       - ".github/workflows/grid.yml"
+      - ".github/workflows/actions.lock"
       - "packages/api/src/r2.ts"
       - "packages/signalk-plugin/src/reporters/noaa.ts"
   push:
@@ -13,6 +14,7 @@ on:
     paths:
       - "packages/grid/**"
       - ".github/workflows/grid.yml"
+      - ".github/workflows/actions.lock"
       - "packages/api/src/r2.ts"
       - "packages/signalk-plugin/src/reporters/noaa.ts"
 
@@ -35,7 +37,7 @@ jobs:
         working-directory: packages/grid
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@v7.0.1
 
       # Tests and lint run in the image ./docker.sh builds, the same tools as locally.
       - name: Lint
